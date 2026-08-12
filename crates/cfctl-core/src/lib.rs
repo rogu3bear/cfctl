@@ -1075,9 +1075,9 @@ pub struct D1RestoreExactBookmarkContractV1 {
     pub post_retry_count: u64,
 }
 
-/// Closed catalogue for the only D1 imports cfctl may execute. Source bytes
-/// are staged and hash-bound while the plan is created; execution never
-/// accepts SQL, a path, or provider protocol controls.
+/// Source identity for a legacy embedded D1 migration catalogue. Provider-
+/// generic reviewed-Git imports intentionally keep their exact source identity
+/// in the immutable plan target instead of extending this catalogue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct D1ApprovedMlnMigrationV1 {
     pub migration_id: String,
@@ -1091,6 +1091,9 @@ pub struct D1ApprovedMlnMigrationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct D1ApprovedMlnImportContractV1 {
+    /// Empty only for the provider-generic `d1-import-database` overlay. Its
+    /// repository, HEAD, path, blob, and byte identities are derived from the
+    /// clean tracked source at plan creation and revalidated at execution.
     pub repository_id: String,
     pub repository_head: String,
     pub pre_import_capability_version: u8,
@@ -1100,6 +1103,7 @@ pub struct D1ApprovedMlnImportContractV1 {
     pub database_id: String,
     pub import_path: String,
     pub migrations: Vec<D1ApprovedMlnMigrationV1>,
+    pub max_source_bytes: u64,
     pub max_response_bytes: u64,
     pub max_poll_attempts: u64,
     pub max_timeout_seconds: u64,
@@ -1113,6 +1117,8 @@ pub struct D1ApprovedMlnImportContractV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct D1ApprovedMlnImportPollResumeContractV1 {
     pub root_capability_id: String,
+    /// Empty only for the provider-generic continuation; its exact target is
+    /// derived from the immutable root and parent plans.
     pub account_id: String,
     pub database_id: String,
     pub import_path: String,
@@ -1993,6 +1999,16 @@ impl CapabilityV1 {
                 matches!(
                     self.id.as_str(),
                     "d1-import-approved-mln-migration" | "d1-resume-approved-mln-import-poll"
+                ) && self.method == "POST"
+                    && self.risk == RiskClass::Irreversible
+                    && self.effect == EffectClass::DataWrite
+                    && (self.d1_approved_mln_import.is_some()
+                        ^ self.d1_approved_mln_import_poll_resume.is_some())
+            }
+            "d1_import_provider_completion_matches_reviewed_source" => {
+                matches!(
+                    self.id.as_str(),
+                    "d1-import-database" | "d1-resume-database-import-poll"
                 ) && self.method == "POST"
                     && self.risk == RiskClass::Irreversible
                     && self.effect == EffectClass::DataWrite
@@ -3077,6 +3093,8 @@ fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) ->
         "d1-import-approved-mln-migration"
             | "d1-import-approved-osint-research-migration"
             | "d1-resume-approved-mln-import-poll"
+            | "d1-import-database"
+            | "d1-resume-database-import-poll"
     ) && capability.method == "POST"
         && capability.risk == RiskClass::Irreversible
         && capability.effect == EffectClass::DataWrite
@@ -3328,7 +3346,7 @@ fn d1_database_create_request_contract_supported(capability: &CapabilityV1) -> b
     capability.request_schema.as_ref()
         == Some(&serde_json::json!({
             "properties": {
-                "jurisdiction": {"enum": ["eu", "fedramp"], "type": "string"},
+                "jurisdiction": {"enum": ["eu", "fedramp", "us"], "type": "string"},
                 "name": {"type": "string"},
                 "primary_location_hint": {
                     "enum": ["wnam", "enam", "weur", "eeur", "apac", "oc"],

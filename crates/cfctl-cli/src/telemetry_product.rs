@@ -219,6 +219,12 @@ pub(crate) fn record_operational_proof(
         evidence,
     );
     if capability.d1_full_export.is_some() {
+        // `call` retains the provider's Cloudflare envelope under `result`.
+        // Require that production shape so an invented flat fixture cannot be
+        // indexed as governed export authority.
+        let manifest = envelope.result.get("result").ok_or_else(|| {
+            CliError::Input("D1 full export omitted its provider result envelope".to_owned())
+        })?;
         let account_id = input
             .selectors
             .get("account_id")
@@ -233,15 +239,13 @@ pub(crate) fn record_operational_proof(
             .ok_or_else(|| {
                 CliError::Input("D1 full export omitted its database selector".to_owned())
             })?;
-        let output_sha256 = envelope
-            .result
+        let output_sha256 = manifest
             .pointer("/output_file/sha256")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 CliError::Input("D1 full export omitted the verified output hash".to_owned())
             })?;
-        let at_bookmark = envelope
-            .result
+        let at_bookmark = manifest
             .pointer("/provider/at_bookmark")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
@@ -249,13 +253,11 @@ pub(crate) fn record_operational_proof(
                 CliError::Input("D1 full export omitted its captured provider bookmark".to_owned())
             })?;
         if !envelope.ok
-            || envelope
-                .result
+            || manifest
                 .pointer("/output_file/complete")
                 .and_then(Value::as_bool)
                 != Some(true)
-            || envelope
-                .result
+            || manifest
                 .pointer("/output_file/hash_matches")
                 .and_then(Value::as_bool)
                 != Some(true)

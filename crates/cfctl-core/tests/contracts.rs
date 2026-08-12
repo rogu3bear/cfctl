@@ -2511,7 +2511,7 @@ fn d1_create_rollback_is_bound_to_returned_uuid_and_empty_database_compensation(
         "required":["name"],
         "x-cfctl-body-required":true,
         "properties":{
-            "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+            "jurisdiction":{"type":"string","enum":["eu","fedramp","us"]},
             "name":{"type":"string"},
             "primary_location_hint":{
                 "type":"string",

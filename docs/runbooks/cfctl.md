@@ -382,6 +382,36 @@ database unavailable while producing a large export, so capture the snapshot
 in the migration window. The receipt proves only the local pre-migration
 snapshot; importing or applying it is a separate protected workflow.
 
+Use `d1-import-database` for one reviewed migration owned by any registered
+application repository. Planning accepts exactly one absolute `--source-file`
+ending in `.sql`; the file must be tracked, byte-identical to the clean Git
+`HEAD`, and inside the canonical worktree. cfctl copies those bytes to a new
+private mode-0600 stage file and binds the repository, origin, full commit,
+relative path, Git blob, SHA-256, byte count, account, database, selected
+profile generation, catalog, and the exact pre-import full-export recovery
+anchor into the immutable plan:
+
+```bash
+printf '%s' \
+  '{"pre_recovery_anchor_operation_id":"<export-operation-uuid>","pre_recovery_anchor_evidence_hash":"sha256:<export-evidence>","pre_recovery_anchor_output_sha256":"sha256:<export-file>","pre_recovery_anchor_bookmark_hash":"sha256:<bookmark-string>"}' |
+  cfctl call d1-import-database \
+    --profile <d1-write-profile> \
+    --account <account-id> \
+    --selector account_id=<account-id> \
+    --selector database_id=<database-id> \
+    --source-file /absolute/clean/repository/migrations/0001.sql \
+    --body-stdin --json
+```
+
+The recovery anchor must be a current successful `d1-full-export` for the same
+account, database, profile generation, and catalog. Callers cannot supply an
+import action, upload URL, filename, ETag, bookmark, or polling body. Execution
+revalidates the Git authority and private stage before init/upload/ingest, and
+provider completion verifies only that Cloudflare applied the exact reviewed
+bytes to the immutable target. Schema meaning remains a separate governed
+`d1-schema-introspection` receipt. If bounded polling exhausts, continue only
+with `d1-resume-database-import-poll`; never replay the consumed import root.
+
 OSINT Research Center migrations 0028 through 0034 use the narrower
 `d1-import-approved-osint-research-migration` adapter. It pins account
 `ca30e922fda7f5578e49873542e4aaca`, database
@@ -592,9 +622,16 @@ be absolute, its parent must already exist with mode `0700`, and no ancestor
 may be a Git repository. The output file, when Cloudflare actually returns a
 secret, is created with mode `0600`.
 
-For `wrangler.deploy`, pass an absolute `config` selector. An optional `var`
-selector binds one plain-text `KEY:VALUE` Worker variable into the plan and
-evidence; never pass a secret through `var`. Both the deploy subprocess and the
+For `wrangler.deploy`, pass an absolute `config`, the exact Worker `name`, and
+the exact identity message cfctl reports after hashing the clean repository's
+source SHA and every file under the config's `main` bundle directory and
+`assets.directory`. The plan binds those artifact roots, the aggregate artifact
+hash, the Wrangler config hash, the clean Git HEAD, and either exact Worker
+absence or both the current live Worker settings and complete active-deployment
+identity. Execution rereads both local artifacts and both live Worker views
+before crossing the upload boundary. An optional `var` selector
+binds one plain-text `KEY:VALUE` Worker variable into the plan and evidence;
+never pass a secret through `var`. Both the deploy subprocess and the
 deployment-status verifier run from the reviewed config file's own directory,
 because Wrangler resolves dotenv credentials relative to its working directory
 — a plan reviewed against one config must not publish with a token discovered
@@ -614,7 +651,8 @@ message; it does not change production traffic:
 ```bash
 cfctl call wrangler.versions-upload \
   --query config=/absolute/path/to/wrangler.toml \
-  --query message='release <full-source-sha>' \
+  --query name=<exact-worker-name> \
+  --query message='source=<full-source-sha> artifact-sha256=<artifact-sha256>' \
   --json
 ```
 
@@ -631,8 +669,17 @@ cfctl call wrangler.versions-deploy \
 ```
 
 Promotion verification reads Wrangler's production deployment status and
-requires the planned version at 100 percent. Rolling back remains a separate
-reviewed `wrangler.versions-deploy` plan targeting a known prior version.
+requires the planned version at 100 percent. The promotion plan also binds the
+exact clean source commit, config bytes, service, Worker settings, and complete
+active-deployments state. Execution recomputes the local target before and
+after the live reads; any intervening local or provider drift leaves the
+approved plan unconsumed. The delegated promotion removes the mutable config
+path, passes the reviewed service explicitly, and runs from a private
+configless directory so a later config edit cannot retarget Wrangler. The
+deployment-status verifier uses that same exact service in a separate private
+configless directory and records it in the readback receipt. Rolling back
+remains a separate reviewed `wrangler.versions-deploy` plan targeting a known
+prior version.
 
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate

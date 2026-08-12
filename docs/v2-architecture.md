@@ -57,7 +57,11 @@ classifies every newly built capability as `provider_generic`, `cfctl_product`,
 `workspace_owned`, or `legacy_embedded`. Generic provider contracts must remain
 portable across application repositories. cfctl-product contracts may describe
 cfctl's own site, OAuth identity, and release surface, but cannot absorb another
-product's source or deployment policy. Workspace-owned operations belong in a
+product's source or deployment policy. The provider-generic
+`d1-import-database` contract remains portable by deriving one clean tracked
+SQL blob and its exact repository identity at plan creation, binding an
+immutable target plus full-export recovery anchor, and leaving application
+semantics in the owning repository. Workspace-owned operations belong in a
 future typed, hash-bound operation pack loaded from an explicitly registered
 root; inserting one directly into the provider catalog fails closed.
 

@@ -2,6 +2,7 @@
 
 mod event_batch;
 mod worker_custom_domain;
+mod worker_deployment;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1281,13 +1282,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         capability.d1_approved_mln_import_poll_resume.is_some();
     if is_d1_approved_mln_import != arguments.source_file.is_some() {
         return Err(CliError::Input(
-            "the approved MLNavigator D1 import requires exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports require exactly one plan-creation-only `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
     if is_d1_approved_mln_import_poll_resume && arguments.source_file.is_some() {
         return Err(CliError::Input(
-            "approved MLNavigator import poll continuation derives source authority from its parent and never accepts `--source-file`"
+            "D1 import poll continuation derives source authority from its parent and never accepts `--source-file`"
                 .to_owned(),
         ));
     }
@@ -1432,6 +1433,14 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
     let mut adapter_targets = Map::new();
+    if worker_deployment::binds_live_state(&capability) {
+        let graph = discover_registered(store)?;
+        let target = worker_deployment::prepare_target(&graph, &capability, &prepared.input)?
+            .ok_or_else(|| {
+                CliError::Input("Worker deployment target could not be derived".to_owned())
+            })?;
+        adapter_targets.insert("worker_deployment".to_owned(), target);
+    }
     if let Some(security_action) = security_action {
         adapter_targets.insert("security_action".to_owned(), security_action);
     }
@@ -1487,6 +1496,9 @@ fn stage_approved_mln_migration(
     input: &CallInput,
     source: &Path,
 ) -> Result<Value> {
+    if capability.id == "d1-import-database" {
+        return stage_reviewed_git_d1_migration(store, capability, input, source);
+    }
     let contract = capability
         .d1_approved_mln_import
         .as_ref()
@@ -1696,6 +1708,270 @@ fn stage_approved_mln_migration(
     }))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "generic Git source identity, byte capture, and private staging are one fail-closed planning boundary"
+)]
+fn stage_reviewed_git_d1_migration(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    source: &Path,
+) -> Result<Value> {
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .filter(|contract| contract.repository_id.is_empty() && contract.migrations.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("provider-generic reviewed-Git import contract is missing".to_owned())
+        })?;
+    if !source.is_absolute()
+        || source.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || source.extension().and_then(|value| value.to_str()) != Some("sql")
+    {
+        return Err(CliError::Input(
+            "reviewed D1 migration source must be an absolute normalized `.sql` path".to_owned(),
+        ));
+    }
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| CliError::Input("reviewed migration source has no parent".to_owned()))?;
+    let discovered_root = PathBuf::from(git_authority_output(
+        source_parent,
+        &["rev-parse", "--show-toplevel"],
+    )?);
+    let canonical_root = fs::canonicalize(&discovered_root).map_err(|source| CliError::Io {
+        path: discovered_root.display().to_string(),
+        source,
+    })?;
+    if canonical_root != discovered_root || !source.starts_with(&canonical_root) {
+        return Err(CliError::Input(
+            "reviewed migration source is outside its canonical Git worktree".to_owned(),
+        ));
+    }
+    let relative = source
+        .strip_prefix(&canonical_root)
+        .ok()
+        .and_then(Path::to_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("reviewed migration path is not a portable Git path".to_owned())
+        })?;
+    let head = git_authority_output(&canonical_root, &["rev-parse", "HEAD"])?;
+    let remote = git_authority_output(&canonical_root, &["remote", "get-url", "origin"])?;
+    let repository_id = normalize_reviewed_git_repository_id(&remote)?;
+    let tracked = git_authority_output(
+        &canonical_root,
+        &["ls-files", "--error-unmatch", "--", relative],
+    )?;
+    let blob_spec = format!("{head}:{relative}");
+    let git_blob_oid = git_authority_output(&canonical_root, &["rev-parse", &blob_spec])?;
+    let status = git_authority_output(
+        &canonical_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if tracked != relative || !status.is_empty() {
+        return Err(CliError::Input(
+            "reviewed migration repository must be clean and the source must be tracked at HEAD"
+                .to_owned(),
+        ));
+    }
+    let common = git_authority_output(&canonical_root, &["rev-parse", "--git-common-dir"])?;
+    let common_path = if Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        canonical_root.join(common)
+    };
+    let canonical_common = fs::canonicalize(&common_path).map_err(|source| CliError::Io {
+        path: common_path.display().to_string(),
+        source,
+    })?;
+    let mut cursor = PathBuf::new();
+    for component in source.components() {
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor).map_err(|source| CliError::Io {
+            path: cursor.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliError::Input(format!(
+                "reviewed migration source has symlink component `{}`",
+                cursor.display()
+            )));
+        }
+    }
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW);
+    let mut source_file = source_options
+        .open(source)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let metadata = source_file
+        .metadata()
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > contract.max_source_bytes {
+        return Err(CliError::Input(format!(
+            "reviewed migration must be a non-empty regular file no larger than {} bytes",
+            contract.max_source_bytes
+        )));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| CliError::Input("reviewed migration size exceeds this host".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    source_file
+        .read_to_end(&mut bytes)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let blob_bytes = git_authority_bytes(&canonical_root, &["cat-file", "blob", &git_blob_oid])?;
+    if bytes != blob_bytes || bytes.len() as u64 != metadata.len() {
+        return Err(CliError::Input(
+            "reviewed migration source differs from its exact HEAD Git blob".to_owned(),
+        ));
+    }
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let md5 = hex::encode(Md5::digest(&bytes));
+    let source_authority = json!({
+        "schema_version":1,
+        "repository_id":repository_id,
+        "observed_worktree_root":canonical_root,
+        "observed_git_common_dir":canonical_common,
+        "head":head,
+        "repository_relative_path":relative,
+        "git_blob_oid":git_blob_oid,
+    });
+    let source_authority_hash = hash_value(&source_authority)?;
+    let basename = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CliError::Input("reviewed migration basename is not UTF-8".to_owned()))?;
+    let stage_dir = store
+        .paths()
+        .data_dir
+        .join("import-stages")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&stage_dir).map_err(|source| CliError::Io {
+        path: stage_dir.display().to_string(),
+        source,
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        CliError::Io {
+            path: stage_dir.display().to_string(),
+            source,
+        }
+    })?;
+    let stage_path = stage_dir.join(basename);
+    let mut stage_options = OpenOptions::new();
+    stage_options.write(true).create_new(true);
+    #[cfg(unix)]
+    stage_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut stage = stage_options
+        .open(&stage_path)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    stage.write_all(&bytes).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    stage.sync_all().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    drop(stage);
+    let staged = fs::read(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    if staged != bytes {
+        return Err(CliError::Input(
+            "private import stage did not reopen with the reviewed bytes".to_owned(),
+        ));
+    }
+    let target = json!({
+        "account_id":input.selectors.get("account_id"),
+        "database_id":input.selectors.get("database_id"),
+    });
+    if target
+        .pointer("/account_id")
+        .and_then(Value::as_str)
+        .is_none()
+        || target
+            .pointer("/database_id")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Err(CliError::Input(
+            "reviewed D1 import target selectors are missing".to_owned(),
+        ));
+    }
+    Ok(json!({
+        "schema_version":1,
+        "migration_id":source_authority_hash,
+        "catalog_basename":basename,
+        "source_authority":source_authority,
+        "source_authority_hash":source_authority_hash,
+        "bytes":bytes.len(),
+        "sha256":format!("sha256:{sha256}"),
+        "md5":md5,
+        "stage_path":stage_path,
+        "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+        "target":target,
+        "prerequisites":input.body,
+    }))
+}
+
+fn normalize_reviewed_git_repository_id(remote: &str) -> Result<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    if trimmed.contains('?') || trimmed.contains('#') || trimmed.contains('\n') {
+        return Err(CliError::Input(
+            "Git origin contains query, fragment, or control data and cannot be retained safely"
+                .to_owned(),
+        ));
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix("https://") {
+        if rest
+            .split('/')
+            .next()
+            .is_none_or(|authority| authority.contains('@'))
+        {
+            return Err(CliError::Input(
+                "Git HTTPS origin must not contain embedded credentials".to_owned(),
+            ));
+        }
+        rest.to_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@") {
+        rest.to_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("git@") {
+        rest.replacen(':', "/", 1)
+    } else {
+        return Err(CliError::Input(
+            "Git origin must be a credential-free HTTPS or git SSH repository identity".to_owned(),
+        ));
+    };
+    if normalized.split('/').count() < 3 || normalized.contains('@') || normalized.contains(':') {
+        return Err(CliError::Input(
+            "Git origin is not a portable host/owner/repository identity".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
 fn git_authority_output(repository_root: &Path, arguments: &[&str]) -> Result<String> {
     let mut command = StdCommand::new("git");
     command.arg("-C").arg(repository_root).args(arguments);
@@ -1893,6 +2169,9 @@ fn validate_approved_mln_import_prerequisites(
     input: &CallInput,
     context: ImportPrerequisiteContext<'_>,
 ) -> Result<()> {
+    if capability.id == "d1-import-database" {
+        return validate_reviewed_git_import_prerequisites(store, input, context);
+    }
     let contract = capability
         .d1_approved_mln_import
         .as_ref()
@@ -2161,6 +2440,73 @@ fn validate_approved_mln_import_prerequisites(
             validator_contract_hash: &contract.pre_import_validator_contract_hash,
             fixed_query_sha256: &contract.pre_import_fixed_query_sha256,
             after: anchor_completed_at,
+            before: context.before,
+        },
+    )?;
+    Ok(())
+}
+
+fn validate_reviewed_git_import_prerequisites(
+    store: &StateStore,
+    input: &CallInput,
+    context: ImportPrerequisiteContext<'_>,
+) -> Result<()> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("reviewed D1 import body is missing".to_owned()))?;
+    let operation_id = body
+        .get("pre_recovery_anchor_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input(
+                "pre_recovery_anchor_operation_id must be a canonical operation id".to_owned(),
+            )
+        })?;
+    if context.import_operation_id == Some(operation_id) {
+        return Err(CliError::Input(
+            "pre-import recovery export must be distinct from the import operation".to_owned(),
+        ));
+    }
+    let evidence_hash = required_body_string(body, "pre_recovery_anchor_evidence_hash")?;
+    let output_sha256 = required_body_string(body, "pre_recovery_anchor_output_sha256")?;
+    let bookmark_hash = required_body_string(body, "pre_recovery_anchor_bookmark_hash")?;
+    store.read_evidence_value(evidence_hash)?;
+    let account_id = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("reviewed import account_id is missing".to_owned()))?;
+    let database_id = input
+        .selectors
+        .get("database_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("reviewed import database_id is missing".to_owned()))?;
+    let expected_target_hash = hash_value(&json!({
+        "account_id":account_id,
+        "database_id":database_id,
+    }))?;
+    let expected_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    validate_exact_d1_recovery_anchor(
+        store,
+        &D1RecoveryAnchorExpectation {
+            operation_id,
+            evidence_hash,
+            output_sha256: Some(output_sha256),
+            bookmark_hash,
+            catalog_hash: context.catalog_hash,
+            request_hash: &expected_request_hash,
+            target_scope_hash: &expected_target_hash,
+            account_id,
+            profile_id: context.profile_id,
+            credential_generation_id: context.credential_generation_id,
+            after: None,
             before: context.before,
         },
     )?;
@@ -5813,18 +6159,7 @@ async fn execute_delegated_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let receipt = if plan.capability.id == "cloudflared.tunnel" {
-        run_quick_tunnel(store, plan, input).await?
-    } else {
-        run_delegated_cli(
-            &plan.capability,
-            input,
-            credential,
-            Some(&plan.account_id),
-            &store.paths().cache_dir,
-        )
-        .await?
-    };
+    let receipt = run_delegated_plan_boundary(store, plan, input, credential).await?;
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -5915,6 +6250,30 @@ async fn execute_delegated_plan(
         });
     }
     Ok(envelope)
+}
+
+async fn run_delegated_plan_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Value> {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let delegated_input =
+        worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
+    let receipt = if plan.capability.id == "cloudflared.tunnel" {
+        run_quick_tunnel(store, plan, input).await?
+    } else {
+        run_delegated_cli(
+            &plan.capability,
+            &delegated_input,
+            credential,
+            Some(&plan.account_id),
+            &store.paths().cache_dir,
+        )
+        .await?
+    };
+    Ok(receipt)
 }
 
 fn delegated_cli_failure_envelope(
@@ -6048,7 +6407,7 @@ async fn verify_delegated_cli_plan(
     };
 
     verify_wrangler_deployment_status(
-        config,
+        WranglerDeploymentStatusTarget::Config(config),
         &version_id,
         credential,
         &plan.account_id,
@@ -6112,15 +6471,16 @@ async fn verify_wrangler_worker_versions_deploy_plan(
             "basis": "the versions deployment plan did not contain exactly one UUID@100 traffic target",
         });
     };
-    let Some(config) = input.query.get("config").and_then(Value::as_str) else {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let Ok(service_name) = worker_deployment::service_name(adapter_targets) else {
         return json!({
             "passed": false,
-            "basis": "the versions deployment plan omitted its required Wrangler config selector",
+            "basis": "the versions deployment plan omitted its exact reviewed service identity",
             "version_id": version_id,
         });
     };
     verify_wrangler_deployment_status(
-        config,
+        WranglerDeploymentStatusTarget::Service(service_name),
         &version_id,
         credential,
         &plan.account_id,
@@ -6297,27 +6657,43 @@ fn wrangler_config_directory(config: &str) -> Result<PathBuf> {
     }
 }
 
-async fn verify_wrangler_deployment_status(
-    config: &str,
-    version_id: &str,
-    credential: &AuthCredential,
+enum WranglerDeploymentStatusTarget<'a> {
+    Config(&'a str),
+    Service(&'a str),
+}
+
+struct WranglerDeploymentStatusCommand<'a> {
+    command: ProcessCommand,
+    isolated_directory: Option<tempfile::TempDir>,
+    exact_service_name: Option<&'a str>,
+}
+
+fn prepare_wrangler_deployment_status_command<'a>(
+    target: WranglerDeploymentStatusTarget<'a>,
     account_id: &str,
     cache_dir: &Path,
-) -> Value {
-    let working_directory = match wrangler_config_directory(config) {
-        Ok(directory) => directory,
-        Err(error) => {
-            return json!({
-                "passed": false,
-                "basis": format!("Wrangler deployment-status verification could not resolve the reviewed config directory: {error}"),
-                "version_id": version_id,
-            });
+) -> Result<WranglerDeploymentStatusCommand<'a>> {
+    let mut command = ProcessCommand::new("wrangler");
+    command.args(["deployments", "status"]);
+    let (isolated_directory, exact_service_name) = match target {
+        WranglerDeploymentStatusTarget::Config(config) => {
+            command
+                .args(["--config", config])
+                .current_dir(wrangler_config_directory(config)?);
+            (None, None)
+        }
+        WranglerDeploymentStatusTarget::Service(service_name) => {
+            command.args(["--name", service_name]);
+            let directory = tempfile::Builder::new()
+                .prefix("configless-worker-readback-")
+                .tempdir()
+                .map_err(|source| cli_io(cache_dir, source))?;
+            command.current_dir(directory.path());
+            (Some(directory), Some(service_name))
         }
     };
-    let mut command = ProcessCommand::new("wrangler");
     command
-        .args(["deployments", "status", "--config", config, "--json"])
-        .current_dir(working_directory)
+        .arg("--json")
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
         .env("HOME", env::var_os("HOME").unwrap_or_default())
@@ -6329,6 +6705,35 @@ async fn verify_wrangler_deployment_status(
     for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
         command.env(name, value);
     }
+    Ok(WranglerDeploymentStatusCommand {
+        command,
+        isolated_directory,
+        exact_service_name,
+    })
+}
+
+async fn verify_wrangler_deployment_status(
+    target: WranglerDeploymentStatusTarget<'_>,
+    version_id: &str,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+) -> Value {
+    let prepared = match prepare_wrangler_deployment_status_command(target, account_id, cache_dir) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler deployment-status verification could not prepare its exact target: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
+    let WranglerDeploymentStatusCommand {
+        mut command,
+        isolated_directory: _isolated_directory,
+        exact_service_name,
+    } = prepared;
     match credential {
         AuthCredential::Bearer { token } => {
             command.env("CLOUDFLARE_API_TOKEN", token);
@@ -6384,11 +6789,18 @@ async fn verify_wrangler_deployment_status(
     json!({
         "passed": passed,
         "basis": if passed {
-            format!("Wrangler production deployment reports promoted version {version_id}")
+            exact_service_name.map_or_else(
+                || format!("Wrangler production deployment reports promoted version {version_id}"),
+                |service_name| format!("Wrangler production deployment for exact service {service_name} reports promoted version {version_id}"),
+            )
         } else {
-            format!("Wrangler production deployment does not report version {version_id} at 100 percent")
+            exact_service_name.map_or_else(
+                || format!("Wrangler production deployment does not report version {version_id} at 100 percent"),
+                |service_name| format!("Wrangler production deployment for exact service {service_name} does not report version {version_id} at 100 percent"),
+            )
         },
         "version_id": version_id,
+        "service_name": exact_service_name,
         "readback": status,
         "stderr": stderr,
     })
@@ -6645,6 +7057,17 @@ async fn run_delegated_cli(
     }
     let mut command = ProcessCommand::new(program);
     command.args(path_parts);
+    let isolated_wrangler_directory =
+        if worker_deployment::requires_configless_working_directory(capability, input) {
+            Some(
+                tempfile::Builder::new()
+                    .prefix("configless-worker-promotion-")
+                    .tempdir()
+                    .map_err(|source| cli_io(cache_dir, source))?,
+            )
+        } else {
+            None
+        };
     if let Some(config) = input
         .query
         .get("config")
@@ -6652,6 +7075,8 @@ async fn run_delegated_cli(
         .filter(|value| !value.is_empty())
     {
         command.current_dir(wrangler_config_directory(config)?);
+    } else if let Some(directory) = &isolated_wrangler_directory {
+        command.current_dir(directory.path());
     }
     append_cli_input(&mut command, &input.selectors)?;
     append_cli_input(&mut command, &input.query)?;
@@ -11088,6 +11513,7 @@ async fn read_live_zone_account(
 
 fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
     should_bind_pages_project_absence(capability)
+        || worker_deployment::target(adapter_targets).is_some()
         || should_resolve_entitlement_probe(capability)
         || should_resolve_zone_entitlement(capability)
         || should_bind_zone_account(capability)
@@ -11791,6 +12217,105 @@ async fn prepare_oauth_client_update_state_precondition(
         .map(Some)
 }
 
+async fn read_live_worker_deployment_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !worker_deployment::binds_live_state(capability) {
+        return Err(CliError::Input(
+            "Worker deployment state read was requested for another capability".to_owned(),
+        ));
+    }
+    let service_name = worker_deployment::service_name(adapter_targets)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let settings_source = exact_worker_deployment_read_capability(
+        catalog,
+        worker_deployment::SETTINGS_CAPABILITY_ID,
+        worker_deployment::SETTINGS_PATH,
+    )?;
+    let input = CallInput {
+        selectors: json!({
+            "account_id": account_id,
+            "script_name": service_name,
+        }),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    };
+    let settings = executor
+        .execute_read(settings_source, &input, credential)
+        .await?;
+    let deployments = if settings.success && (200..300).contains(&settings.status) {
+        let source = exact_worker_deployment_read_capability(
+            catalog,
+            worker_deployment::DEPLOYMENTS_CAPABILITY_ID,
+            worker_deployment::DEPLOYMENTS_PATH,
+        )?;
+        Some(executor.execute_read(source, &input, credential).await?)
+    } else {
+        None
+    };
+    let receipt = worker_deployment::apply_state_responses(
+        account_id,
+        service_name,
+        &settings,
+        deployments.as_ref(),
+    )?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+fn exact_worker_deployment_read_capability<'a>(
+    catalog: &'a CatalogSnapshot,
+    id: &str,
+    path: &str,
+) -> Result<&'a CapabilityV1> {
+    let source = catalog.get(id).ok_or_else(|| capability_missing(id))?;
+    if source.method != "GET"
+        || source.path != path
+        || source.mutating
+        || !matches!(
+            source.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(format!(
+            "Worker deployment state source `{id}` drifted from its governed exact read"
+        )));
+    }
+    Ok(source)
+}
+
+async fn prepare_worker_deployment_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if worker_deployment::target(adapter_targets).is_none() {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("Worker deployment state credential was not resolved".to_owned())
+    })?;
+    read_live_worker_deployment_state(
+        store,
+        catalog,
+        capability,
+        adapter_targets,
+        account_id,
+        credential,
+    )
+    .await
+    .map(Some)
+}
+
 async fn prepare_same_path_prior_state_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -11932,6 +12457,15 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        worker_deployment_state: prepare_worker_deployment_state_precondition(
+            store,
+            catalog,
+            capability,
+            adapter_targets,
+            account_id,
+            credential,
+        )
+        .await?,
     })
 }
 
@@ -11958,6 +12492,7 @@ struct LivePlanPreconditions {
     oauth_client_secret_state: Option<(Value, EvidenceV1)>,
     oauth_client_update_state: Option<(Value, EvidenceV1)>,
     worker_custom_domain_state: Option<(Value, EvidenceV1)>,
+    worker_deployment_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -12015,6 +12550,9 @@ fn plan_targets(
     if let Some((receipt, _)) = &live_preconditions.worker_custom_domain_state {
         targets["live_preconditions"]
             [worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.worker_deployment_state {
+        targets["live_preconditions"][worker_deployment::STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.r2_parent_token {
         targets["live_preconditions"][R2_PARENT_TOKEN_PRECONDITION] = receipt.clone();
@@ -12084,6 +12622,10 @@ fn bind_live_plan_preconditions(
         (
             worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION,
             &live_preconditions.worker_custom_domain_state,
+        ),
+        (
+            worker_deployment::STATE_PRECONDITION,
+            &live_preconditions.worker_deployment_state,
         ),
         (
             R2_PARENT_TOKEN_PRECONDITION,
@@ -12200,7 +12742,18 @@ fn planned_cloudflare_diff(
         });
     }
     apply_oauth_client_update_plan_diff(&mut diff, input, live_preconditions);
+    apply_worker_deployment_plan_diff(&mut diff, plan, live_preconditions);
     diff
+}
+
+fn apply_worker_deployment_plan_diff(
+    diff: &mut Value,
+    plan: &PlanV1,
+    live_preconditions: &LivePlanPreconditions,
+) {
+    if let Some((state, _)) = &live_preconditions.worker_deployment_state {
+        worker_deployment::apply_plan_diff(diff, plan, state);
+    }
 }
 
 fn apply_oauth_client_update_plan_diff(
@@ -13485,6 +14038,7 @@ fn plan_impact(
         .iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    append_local_artifact_diffs(&graph, &local_artifact_paths, &mut local_diffs)?;
     for repository_id in &affected_repositories {
         let Some(repository) = graph.repository(repository_id) else {
             continue;
@@ -13526,7 +14080,35 @@ fn plan_impact(
     })
 }
 
+fn append_local_artifact_diffs(
+    graph: &WorkspaceGraph,
+    artifact_paths: &[PathBuf],
+    local_diffs: &mut Vec<Value>,
+) -> Result<()> {
+    for artifact in artifact_paths {
+        let repository = repository_owning_path(graph, artifact).ok_or_else(|| {
+            CliError::Input(format!(
+                "local deployment artifact `{}` is not owned by a registered repository",
+                artifact.display()
+            ))
+        })?;
+        local_diffs.push(json!({
+            "repository": repository.path,
+            "path": artifact,
+            "kind": "deployment_artifact",
+            "content_hash": hash_directory_artifact(artifact)?,
+            "head_content_hash": Value::Null,
+            "worktree_diff_hash": Value::Null,
+            "dirty": false,
+        }));
+    }
+    Ok(())
+}
+
 fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Result<Vec<PathBuf>> {
+    if worker_deployment::binds_artifact(capability) {
+        return worker_deployment::artifact_paths(capability, input);
+    }
     if capability.id != "wrangler.pages-deploy" {
         return Ok(Vec::new());
     }
@@ -14013,6 +14595,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
         &execution_input,
@@ -14028,6 +14611,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         None,
     )
     .await?;
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
     persist_transaction_stage(
@@ -14096,6 +14680,7 @@ async fn run_plan_under_standing_authority(
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
         &execution_input,
@@ -14111,6 +14696,7 @@ async fn run_plan_under_standing_authority(
         Some(&authority_snapshot),
     )
     .await?;
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     authorize_standing_execution(&authority_snapshot, &plan, &execution_input)?;
     let standing_evidence =
         admit_standing_plan(store, &mut plan, &authority_snapshot, &execution_input)?;
@@ -14473,6 +15059,7 @@ struct LivePreconditionEvidence {
     oauth_client_secret_state: Option<EvidenceV1>,
     oauth_client_update_state: Option<EvidenceV1>,
     worker_custom_domain_state: Option<EvidenceV1>,
+    worker_deployment_state: Option<EvidenceV1>,
     r2_parent_token: Option<EvidenceV1>,
 }
 
@@ -14559,6 +15146,10 @@ async fn validate_live_plan_precondition_evidence(
             store, catalog, plan, input, credential,
         )
         .await?,
+        worker_deployment_state: validate_live_worker_deployment_state_precondition(
+            store, catalog, plan, credential,
+        )
+        .await?,
         r2_parent_token: validate_live_r2_parent_token_precondition(
             store, catalog, plan, input, credential,
         )
@@ -14642,6 +15233,7 @@ fn prepend_live_precondition_evidence(
         evidence.oauth_client_secret_state,
         evidence.oauth_client_update_state,
         evidence.worker_custom_domain_state,
+        evidence.worker_deployment_state,
         evidence.dns_record_state,
         evidence.same_path_prior_state,
         evidence.security_action_state,
@@ -14802,6 +15394,81 @@ fn validate_pages_project_absence_receipt(plan: &PlanV1, receipt: &Value) -> Res
     if !exact {
         return Err(CliError::Input(
             "Pages project absence receipt has an invalid source, target, account, or absence shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_worker_deployment_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if worker_deployment::target(adapter).is_none() {
+        return Ok(None);
+    }
+    if !worker_deployment::binds_live_state(&plan.capability) {
+        return Err(CliError::Input(
+            "Worker deployment target is attached to an unrelated capability".to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(worker_deployment::STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker deployment plan predates the exact live-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer(&format!(
+            "/live_preconditions/{}",
+            worker_deployment::STATE_PRECONDITION
+        ))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker deployment plan omitted its hash-bound live-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    worker_deployment::validate_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "Worker deployment state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_worker_deployment_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_worker_deployment_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let (receipt, evidence) = read_live_worker_deployment_state(
+        store,
+        catalog,
+        &plan.capability,
+        adapter,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    validate_current_worker_deployment_state(expected_hash, &receipt)?;
+    Ok(Some(evidence))
+}
+
+fn validate_current_worker_deployment_state(expected_hash: &str, receipt: &Value) -> Result<()> {
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Worker service state drifted after planning; the deployment boundary was not crossed and a new plan is required"
                 .to_owned(),
         ));
     }
@@ -16772,6 +17439,10 @@ async fn execute_api_plan(
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "poll continuation execution keeps lineage admission, journal persistence, bounded provider polling, and terminal proof visible as one no-replay state machine"
+)]
 async fn execute_approved_mln_import_poll_resume_plan(
     store: &StateStore,
     executor: &Executor,
@@ -16838,6 +17509,47 @@ async fn execute_approved_mln_import_poll_resume_plan(
             &error,
             true,
             "the poll-only boundary was crossed but exact durable provider completion was not proven",
+        ));
+    }
+    if plan.capability.id == "d1-resume-database-import-poll" {
+        let verification = match verify_api_plan(
+            store,
+            executor,
+            plan,
+            &response,
+            execution_input,
+            credential,
+        )
+        .await
+        {
+            Ok(verification) => verification,
+            Err(error) => {
+                return Ok(post_boundary_failure_envelope(
+                    plan,
+                    response_value,
+                    Some(apply_evidence),
+                    lineage_evidence,
+                    &error,
+                    true,
+                    "the reviewed-Git D1 import completed through a poll child, but its exact source receipt could not be persisted",
+                ));
+            }
+        };
+        let finalization: Result<()> =
+            if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
+                persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+            } else {
+                store.save_plan(plan).map_err(CliError::from)
+            };
+        let finalization_error = finalization.err();
+        return Ok(api_plan_result_envelope(
+            plan,
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+            verification,
+            true,
+            finalization_error.as_ref(),
         ));
     }
     plan.status = PlanStatus::Running;
@@ -16908,14 +17620,17 @@ fn trusted_native_capability(capability_id: &str) -> Result<CapabilityV1> {
 fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Result<()> {
     plan_v2.validate()?;
     let plan = &plan_v2.plan;
-    let trusted = trusted_native_capability("d1-import-approved-mln-migration")?;
+    let trusted = trusted_native_capability(&plan.capability.id)?;
     if plan.capability != trusted
         || plan_v2.pins.catalog_hash != plan.catalog_hash
         || plan.precondition_hashes.get("catalog") != Some(&plan.catalog_hash)
     {
         return Err(CliError::Input(
-            "approved MLN import does not match the trusted native catalog declaration".to_owned(),
+            "governed D1 import does not match its trusted native catalog declaration".to_owned(),
         ));
+    }
+    if plan.capability.id == "d1-import-database" {
+        return validate_trusted_reviewed_git_root_plan(store, plan_v2, &trusted);
     }
     let contract = trusted
         .d1_approved_mln_import
@@ -17014,6 +17729,52 @@ fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Re
         ));
     }
     Ok(())
+}
+
+fn validate_trusted_reviewed_git_root_plan(
+    store: &StateStore,
+    plan_v2: &PlanV2,
+    trusted: &CapabilityV1,
+) -> Result<()> {
+    let plan = &plan_v2.plan;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let stage = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("trusted reviewed-Git stage is missing".to_owned()))?;
+    let target = stage
+        .get("target")
+        .ok_or_else(|| CliError::Input("trusted reviewed-Git target is missing".to_owned()))?;
+    if input.selectors != *target
+        || input.query != json!({})
+        || input.if_match.is_some()
+        || input.if_none_match.is_some()
+        || stage.get("prerequisites") != input.body.as_ref()
+        || plan.account_id
+            != input
+                .selectors
+                .get("account_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err(CliError::Input(
+            "reviewed-Git root input, target, or prerequisite binding drifted".to_owned(),
+        ));
+    }
+    preflight_call_input(trusted, &input, None)?;
+    validate_approved_mln_import_prerequisites(
+        store,
+        trusted,
+        &input,
+        ImportPrerequisiteContext {
+            profile_id: &plan.profile_id,
+            credential_generation_id: Some(&plan_v2.pins.credential_generation_id),
+            catalog_hash: &plan.catalog_hash,
+            import_operation_id: Some(&plan.operation_id),
+            before: plan.created_at,
+        },
+    )?;
+    validate_managed_reviewed_git_stage_authority(plan)
 }
 
 #[expect(
@@ -17188,23 +17949,7 @@ fn exact_durable_provider_complete_boundary(
                 .to_owned(),
         ));
     }
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
-    let migration_id = input
-        .body
-        .as_ref()
-        .and_then(|body| body.get("migration_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
-    let migration = contract
-        .migrations
-        .iter()
-        .find(|migration| migration.migration_id == migration_id)
-        .ok_or_else(|| CliError::Input("managed import migration is not catalogued".to_owned()))?;
     let staged = plan
         .targets
         .pointer("/adapter/approved_mln_import")
@@ -17214,22 +17959,68 @@ fn exact_durable_provider_complete_boundary(
         .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
     let expected_source_authority_hash = hash_value(source_authority)?;
     let expected_stage_identity_hash = hash_value(staged)?;
+    let migration_id = staged
+        .get("migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
+    let expected_sha256 = staged
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source SHA-256 is missing".to_owned()))?;
+    let expected_md5 = staged
+        .get("md5")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source MD5 is missing".to_owned()))?;
+    let expected_bytes = staged
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::Input("managed source size is missing".to_owned()))?;
+    let target = staged
+        .get("target")
+        .cloned()
+        .ok_or_else(|| CliError::Input("managed import target is missing".to_owned()))?;
+    let legacy_catalog_matches = if plan.capability.id == "d1-import-database" {
+        staged.get("source_authority_hash").and_then(Value::as_str) == Some(migration_id)
+    } else {
+        let contract = plan
+            .capability
+            .d1_approved_mln_import
+            .as_ref()
+            .ok_or_else(|| CliError::Input("approved import contract is missing".to_owned()))?;
+        contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == migration_id)
+            .is_some_and(|migration| {
+                source_authority
+                    .get("repository_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.repository_id.as_str())
+                    && source_authority.get("head").and_then(Value::as_str)
+                        == Some(contract.repository_head.as_str())
+                    && source_authority
+                        .get("repository_relative_path")
+                        .and_then(Value::as_str)
+                        == Some(migration.repository_relative_path.as_str())
+                    && source_authority.get("git_blob_oid").and_then(Value::as_str)
+                        == Some(migration.git_blob_oid.as_str())
+                    && staged.get("catalog_basename").and_then(Value::as_str)
+                        == Some(migration.basename.as_str())
+                    && expected_sha256 == format!("sha256:{}", migration.sha256)
+                    && expected_md5 == migration.md5
+                    && expected_bytes == migration.bytes
+                    && target
+                        == json!({
+                            "account_id":contract.account_id,
+                            "database_id":contract.database_id,
+                        })
+            })
+    };
     if source_authority
         .get("schema_version")
         .and_then(Value::as_u64)
         != Some(1)
-        || source_authority
-            .get("repository_id")
-            .and_then(Value::as_str)
-            != Some(contract.repository_id.as_str())
-        || source_authority.get("head").and_then(Value::as_str)
-            != Some(contract.repository_head.as_str())
-        || source_authority
-            .get("repository_relative_path")
-            .and_then(Value::as_str)
-            != Some(migration.repository_relative_path.as_str())
-        || source_authority.get("git_blob_oid").and_then(Value::as_str)
-            != Some(migration.git_blob_oid.as_str())
+        || !legacy_catalog_matches
         || source_authority
             .get("observed_worktree_root")
             .and_then(Value::as_str)
@@ -17242,18 +18033,7 @@ fn exact_durable_provider_complete_boundary(
         || staged.get("source_authority_hash").and_then(Value::as_str)
             != Some(expected_source_authority_hash.as_str())
         || staged.get("migration_id").and_then(Value::as_str) != Some(migration_id)
-        || staged.get("catalog_basename").and_then(Value::as_str)
-            != Some(migration.basename.as_str())
-        || staged.pointer("/target/account_id").and_then(Value::as_str)
-            != Some(contract.account_id.as_str())
-        || staged
-            .pointer("/target/database_id")
-            .and_then(Value::as_str)
-            != Some(contract.database_id.as_str())
-        || staged.get("sha256").and_then(Value::as_str)
-            != Some(format!("sha256:{}", migration.sha256).as_str())
-        || staged.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
-        || staged.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+        || target.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str())
         || staged
             .get("stage_path")
             .and_then(Value::as_str)
@@ -17267,10 +18047,6 @@ fn exact_durable_provider_complete_boundary(
                 .to_owned(),
         ));
     }
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
     let input_hash = hash_value(&plan.input)?;
     let checkpoints = store.read_d1_import_checkpoints(operation_id)?;
     let provider_complete = checkpoints
@@ -17348,15 +18124,15 @@ fn exact_durable_provider_complete_boundary(
         && checkpoint
             .pointer("/receipt/source_sha256")
             .and_then(Value::as_str)
-            == Some(format!("sha256:{}", migration.sha256).as_str())
+            == Some(expected_sha256)
         && checkpoint
             .pointer("/receipt/source_md5")
             .and_then(Value::as_str)
-            == Some(migration.md5.as_str())
+            == Some(expected_md5)
         && checkpoint
             .pointer("/receipt/source_bytes")
             .and_then(Value::as_u64)
-            == Some(migration.bytes)
+            == Some(expected_bytes)
         && checkpoint
             .pointer("/receipt/source_authority_hash")
             .and_then(Value::as_str)
@@ -17395,7 +18171,12 @@ fn exact_linear_poll_child_provider_complete(
     store: &StateStore,
     root: &PlanV1,
 ) -> Result<DurableProviderCompleteBoundary> {
-    let canonical_capability = trusted_native_capability("d1-resume-approved-mln-import-poll")?;
+    let resume_capability_id = if root.capability.id == "d1-import-database" {
+        "d1-resume-database-import-poll"
+    } else {
+        "d1-resume-approved-mln-import-poll"
+    };
+    let canonical_capability = trusted_native_capability(resume_capability_id)?;
     let canonical_contract_hash = hash_value(&serde_json::to_value(&canonical_capability)?)?;
     let root_v2 = store.load_plan_v2(&root.operation_id)?;
     validate_trusted_root_import_plan(store, &root_v2)?;
@@ -17415,13 +18196,29 @@ fn exact_linear_poll_child_provider_complete(
         .ok_or_else(|| {
             CliError::Input("trusted poll continuation contract is missing".to_owned())
         })?;
-    let root_target = json!({
-        "account_id":root_contract.account_id,
-        "database_id":root_contract.database_id,
-    });
-    if root.account_id != root_contract.account_id
-        || canonical_contract.account_id != root_contract.account_id
-        || canonical_contract.database_id != root_contract.database_id
+    let root_target = if root.capability.id == "d1-import-database" {
+        root.targets
+            .pointer("/adapter/approved_mln_import/target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("reviewed root import target is missing".to_owned()))?
+    } else {
+        json!({
+            "account_id":root_contract.account_id,
+            "database_id":root_contract.database_id,
+        })
+    };
+    let canonical_target_matches = if root.capability.id == "d1-import-database" {
+        canonical_contract.account_id.is_empty()
+            && canonical_contract.database_id.is_empty()
+            && canonical_contract.root_capability_id == "d1-import-database"
+            && root_target.get("account_id").and_then(Value::as_str)
+                == Some(root.account_id.as_str())
+    } else {
+        root.account_id == root_contract.account_id
+            && canonical_contract.account_id == root_contract.account_id
+            && canonical_contract.database_id == root_contract.database_id
+    };
+    if !canonical_target_matches
         || root.targets.pointer("/adapter/approved_mln_import/target") != Some(&root_target)
     {
         return Err(CliError::Input(
@@ -17432,7 +18229,7 @@ fn exact_linear_poll_child_provider_complete(
         .list_plans()?
         .into_iter()
         .filter(|candidate| {
-            candidate.capability.id == "d1-resume-approved-mln-import-poll"
+            candidate.capability.id == resume_capability_id
                 && candidate
                     .targets
                     .pointer("/adapter/approved_mln_import_poll_resume/root_operation_id")
@@ -17456,7 +18253,7 @@ fn exact_linear_poll_child_provider_complete(
                 || current.pins.catalog_hash != root_v2.pins.catalog_hash
                 || current.pins.credential_generation_id
                     != root_v2.pins.credential_generation_id
-                || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
+                || current.plan.capability.id != resume_capability_id
                 || current.plan.capability != canonical_capability
                 || current.plan.approval.is_none()
             {
@@ -17477,10 +18274,17 @@ fn exact_linear_poll_child_provider_complete(
                 .d1_approved_mln_import_poll_resume
                 .as_ref()
                 .ok_or_else(|| CliError::Input("poll child contract is missing".to_owned()))?;
-            let target = json!({
-                "account_id":contract.account_id,
-                "database_id":contract.database_id,
-            });
+            let target = if resume_capability_id == "d1-resume-database-import-poll" {
+                authority
+                    .get("target")
+                    .cloned()
+                    .ok_or_else(|| CliError::Input("poll child target is missing".to_owned()))?
+            } else {
+                json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                })
+            };
             let input: CallInput = serde_json::from_value(current.plan.input.clone())?;
             let body = input
                 .body
@@ -17687,6 +18491,10 @@ fn exact_accepted_ingest_bookmarks(
     let migration_id = plan
         .input
         .pointer("/body/migration_id")
+        .or_else(|| {
+            plan.targets
+                .pointer("/adapter/approved_mln_import/migration_id")
+        })
         .and_then(Value::as_str);
     checkpoints
         .iter()
@@ -17767,15 +18575,23 @@ fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<S
         let migration_id = plan
             .input
             .pointer("/body/migration_id")
+            .or_else(|| {
+                plan.targets
+                    .pointer("/adapter/approved_mln_import/migration_id")
+            })
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 CliError::Input("approved MLN import migration id is missing".to_owned())
             })?;
-        return Ok((
-            json!({"account_id":contract.account_id,"database_id":contract.database_id}),
-            migration_id.to_owned(),
-            None,
-        ));
+        let target = if plan.capability.id == "d1-import-database" {
+            plan.targets
+                .pointer("/adapter/approved_mln_import/target")
+                .cloned()
+                .ok_or_else(|| CliError::Input("reviewed import target is missing".to_owned()))?
+        } else {
+            json!({"account_id":contract.account_id,"database_id":contract.database_id})
+        };
+        return Ok((target, migration_id.to_owned(), None));
     }
     let contract = plan
         .capability
@@ -17787,6 +18603,10 @@ fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<S
     let migration_id = plan
         .targets
         .pointer("/adapter/approved_mln_import_poll_resume/root_input/body/migration_id")
+        .or_else(|| {
+            plan.targets
+                .pointer("/adapter/approved_mln_import_poll_resume/root_stage/migration_id")
+        })
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("poll continuation migration id is missing".to_owned()))?;
     let bookmark = plan
@@ -17794,11 +18614,15 @@ fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<S
         .pointer("/adapter/approved_mln_import_poll_resume/accepted_bookmark")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("poll continuation bookmark is missing".to_owned()))?;
-    Ok((
-        json!({"account_id":contract.account_id,"database_id":contract.database_id}),
-        migration_id.to_owned(),
-        Some(bookmark.to_owned()),
-    ))
+    let target = if plan.capability.id == "d1-resume-database-import-poll" {
+        plan.targets
+            .pointer("/adapter/approved_mln_import_poll_resume/target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("poll continuation target is missing".to_owned()))?
+    } else {
+        json!({"account_id":contract.account_id,"database_id":contract.database_id})
+    };
+    Ok((target, migration_id.to_owned(), Some(bookmark.to_owned())))
 }
 
 #[expect(
@@ -18176,20 +19000,7 @@ fn exact_durable_init_response_failure(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value)> {
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let migration_id = plan
-        .input
-        .pointer("/body/migration_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
     let input_hash = hash_value(&plan.input)?;
     let failures = store
         .read_d1_import_checkpoints(&plan.operation_id)?
@@ -18251,7 +19062,7 @@ fn exact_durable_init_response_failure(
                 && checkpoint
                     .pointer("/receipt/migration_id")
                     .and_then(Value::as_str)
-                    == Some(migration_id)
+                    == Some(migration_id.as_str())
                 && checkpoint.pointer("/receipt/target") == Some(&target)
                 && checkpoint
                     .pointer("/receipt/plan_input_hash")
@@ -18694,21 +19505,14 @@ fn exact_durable_poll_exhaustion(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value, EvidenceV1)> {
-    let contract = plan
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
+    let max_poll_attempts = plan
         .capability
         .d1_approved_mln_import
         .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+        .map(|contract| contract.max_poll_attempts)
+        .ok_or_else(|| CliError::Input("governed D1 import contract is missing".to_owned()))?;
     let input_hash = hash_value(&plan.input)?;
-    let migration_id = plan
-        .input
-        .pointer("/body/migration_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
     let source_sha256 = plan
         .targets
         .pointer("/adapter/approved_mln_import/sha256")
@@ -18763,14 +19567,14 @@ fn exact_durable_poll_exhaustion(
                 attempt,
                 &target,
                 &input_hash,
-                migration_id,
+                migration_id.as_str(),
                 bookmark,
             );
             exact.then_some((index, attempt))
         })
         .collect::<Vec<_>>();
     attempts.sort_unstable_by_key(|(_, attempt)| *attempt);
-    let expected_attempts = (1..=contract.max_poll_attempts)
+    let expected_attempts = (1..=max_poll_attempts)
         .enumerate()
         .map(|(offset, attempt)| (accepted_index + offset + 1, attempt))
         .collect::<Vec<_>>();
@@ -18795,10 +19599,7 @@ fn exact_durable_poll_exhaustion(
                 .get("receipt")
                 .and_then(Value::as_object)
                 .is_some_and(|receipt| receipt.len() == 12);
-            *index
-                == accepted_index
-                    + usize::try_from(contract.max_poll_attempts).unwrap_or(usize::MAX)
-                    + 1
+            *index == accepted_index + usize::try_from(max_poll_attempts).unwrap_or(usize::MAX) + 1
                 && *index + 1 == checkpoints.len()
                 && checkpoint.get("step").and_then(Value::as_str)
                     == Some("poll_in_progress_exhausted")
@@ -18818,7 +19619,7 @@ fn exact_durable_poll_exhaustion(
                 && checkpoint
                     .pointer("/receipt/migration_id")
                     .and_then(Value::as_str)
-                    == Some(migration_id)
+                    == Some(migration_id.as_str())
                 && checkpoint.pointer("/receipt/target") == Some(&target)
                 && checkpoint
                     .pointer("/receipt/plan_input_hash")
@@ -18835,11 +19636,11 @@ fn exact_durable_poll_exhaustion(
                 && checkpoint
                     .pointer("/receipt/attempt_count")
                     .and_then(Value::as_u64)
-                    == Some(contract.max_poll_attempts)
+                    == Some(max_poll_attempts)
                 && checkpoint
                     .pointer("/receipt/attempt_bound")
                     .and_then(Value::as_u64)
-                    == Some(contract.max_poll_attempts)
+                    == Some(max_poll_attempts)
                 && checkpoint
                     .pointer("/receipt/outcome")
                     .and_then(Value::as_str)
@@ -18960,10 +19761,18 @@ fn exact_resume_poll_exhaustion(
         .d1_approved_mln_import_poll_resume
         .as_ref()
         .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
-    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let target = if plan.capability.id == "d1-resume-database-import-poll" {
+        authority
+            .get("target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("poll continuation target is missing".to_owned()))?
+    } else {
+        json!({"account_id":contract.account_id,"database_id":contract.database_id})
+    };
     let input_hash = hash_value(&plan.input)?;
     let migration_id = root_input
         .pointer("/body/migration_id")
+        .or_else(|| root_stage.get("migration_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
     let source_sha256 = root_stage
@@ -19173,6 +19982,10 @@ fn exact_resume_poll_exhaustion(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "resume completion validates one exact durable checkpoint and every root-to-child lineage field together"
+)]
 fn exact_durable_resume_provider_complete_boundary(
     store: &StateStore,
     plan: &PlanV1,
@@ -19194,13 +20007,21 @@ fn exact_durable_resume_provider_complete_boundary(
         .ok_or_else(|| CliError::Input("root stage is missing".to_owned()))?;
     let migration_id = root_input
         .pointer("/body/migration_id")
+        .or_else(|| root_stage.get("migration_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
     let accepted_bookmark = authority
         .get("accepted_bookmark")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("accepted bookmark is missing".to_owned()))?;
-    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let target = if plan.capability.id == "d1-resume-database-import-poll" {
+        authority
+            .get("target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("poll continuation target is missing".to_owned()))?
+    } else {
+        json!({"account_id":contract.account_id,"database_id":contract.database_id})
+    };
     let input_hash = hash_value(&plan.input)?;
     let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
     let completed = checkpoints
@@ -19330,6 +20151,28 @@ fn validate_and_derive_resume_poll_authority(
         ));
     };
     let parent = &parent_v2.plan;
+    let parent_target = if contract.root_capability_id == "d1-import-database" {
+        if parent.capability.id == contract.root_capability_id {
+            parent
+                .targets
+                .pointer("/adapter/approved_mln_import/target")
+        } else {
+            parent
+                .targets
+                .pointer("/adapter/approved_mln_import_poll_resume/target")
+        }
+        .cloned()
+        .ok_or_else(|| CliError::Input("poll parent target is missing".to_owned()))?
+    } else {
+        json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        })
+    };
+    let parent_account_id = parent_target
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll parent account target is missing".to_owned()))?;
     if parent.content_hash != field("parent_plan_hash")?
         || parent_v2.pins.catalog_hash != parent.catalog_hash
         || parent_v2.pins.credential_generation_id.is_empty()
@@ -19337,7 +20180,8 @@ fn validate_and_derive_resume_poll_authority(
         || parent.profile_id != profile_id
         || parent.catalog_hash != catalog_hash
         || parent_v2.pins.credential_generation_id != credential_generation_id.unwrap_or_default()
-        || parent.account_id != contract.account_id
+        || parent.account_id != parent_account_id
+        || input.selectors != parent_target
     {
         return Err(CliError::Input(
             "poll continuation parent PlanV2, chronology, profile, credential, account, or catalog drifted"
@@ -19463,7 +20307,7 @@ fn validate_and_derive_resume_poll_authority(
         "root_plan_hash":exhaustion.root_plan_hash,
         "root_input":exhaustion.root_input,
         "root_stage":exhaustion.root_stage,
-        "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+        "target":parent_target,
         "profile_id":profile_id,
         "credential_generation_id":credential_generation_id,
         "catalog_hash":catalog_hash,
@@ -19731,8 +20575,15 @@ async fn execute_approved_mln_import_plan(
             "the import boundary was crossed but exact durable provider completion was not proven",
         ));
     }
-    if plan.capability.id == "d1-import-approved-osint-research-migration" {
-        let subject = "OSINT Research";
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-approved-osint-research-migration" | "d1-import-database"
+    ) {
+        let subject = if plan.capability.id == "d1-import-database" {
+            "reviewed-Git D1"
+        } else {
+            "OSINT Research"
+        };
         let verification = match verify_api_plan(
             store,
             executor,
@@ -19823,6 +20674,9 @@ async fn execute_approved_mln_import_plan(
 }
 
 fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
+    if plan.capability.id == "d1-import-database" {
+        return validate_managed_reviewed_git_stage_authority(plan);
+    }
     let contract = plan
         .capability
         .d1_approved_mln_import
@@ -19909,6 +20763,167 @@ fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
     {
         return Err(CliError::Input(
             "managed import stage no longer matches the consumed reviewed source".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "execution-time authority revalidates Git, target, content, and private-stage identities as one fail-closed boundary"
+)]
+fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .filter(|contract| contract.repository_id.is_empty() && contract.migrations.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("provider-generic reviewed-Git import contract is missing".to_owned())
+        })?;
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("managed import stage binding is missing".to_owned()))?;
+    let authority = staged
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
+    let authority_hash = hash_value(authority)?;
+    let root = authority
+        .get("observed_worktree_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::Input("managed source worktree root is missing".to_owned()))?;
+    let common = authority
+        .get("observed_git_common_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input("managed source Git common directory is missing".to_owned())
+        })?;
+    let repository_id = authority
+        .get("repository_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("managed source repository identity is missing".to_owned())
+        })?;
+    let head = authority
+        .get("head")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source HEAD is missing".to_owned()))?;
+    let relative = authority
+        .get("repository_relative_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source relative path is missing".to_owned()))?;
+    let blob = authority
+        .get("git_blob_oid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source Git blob is missing".to_owned()))?;
+    let canonical_root = fs::canonicalize(&root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    let canonical_common = fs::canonicalize(&common).map_err(|source| CliError::Io {
+        path: common.display().to_string(),
+        source,
+    })?;
+    let remote = git_authority_output(&canonical_root, &["remote", "get-url", "origin"])?;
+    let blob_spec = format!("{head}:{relative}");
+    let observed_blob = git_authority_output(&canonical_root, &["rev-parse", &blob_spec])?;
+    let status = git_authority_output(
+        &canonical_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    let observed_common =
+        git_authority_output(&canonical_root, &["rev-parse", "--git-common-dir"])?;
+    let observed_common = if Path::new(&observed_common).is_absolute() {
+        PathBuf::from(observed_common)
+    } else {
+        canonical_root.join(observed_common)
+    };
+    let source_path = canonical_root.join(relative);
+    let source_bytes = git_authority_bytes(&canonical_root, &["cat-file", "blob", blob])?;
+    let worktree_bytes = fs::read(&source_path).map_err(|source| CliError::Io {
+        path: source_path.display().to_string(),
+        source,
+    })?;
+    if canonical_root != root
+        || fs::canonicalize(observed_common).ok().as_ref() != Some(&canonical_common)
+        || normalize_reviewed_git_repository_id(&remote)?.as_str() != repository_id
+        || git_authority_output(&canonical_root, &["rev-parse", "HEAD"])? != head
+        || observed_blob != blob
+        || !status.is_empty()
+        || source_bytes != worktree_bytes
+    {
+        return Err(CliError::Input(
+            "reviewed Git source authority changed after planning; do not execute the import"
+                .to_owned(),
+        ));
+    }
+    let bytes = staged
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .filter(|bytes| *bytes > 0 && *bytes <= contract.max_source_bytes)
+        .ok_or_else(|| CliError::Input("managed source size is outside its bound".to_owned()))?;
+    let sha256 = staged
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source SHA-256 is missing".to_owned()))?;
+    let md5 = staged
+        .get("md5")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source MD5 is missing".to_owned()))?;
+    let target = json!({
+        "account_id":plan.input.pointer("/selectors/account_id"),
+        "database_id":plan.input.pointer("/selectors/database_id"),
+    });
+    if authority.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || staged.get("source_authority_hash").and_then(Value::as_str)
+            != Some(authority_hash.as_str())
+        || staged.get("migration_id").and_then(Value::as_str) != Some(authority_hash.as_str())
+        || staged.get("target") != Some(&target)
+        || source_bytes.len() as u64 != bytes
+        || format!("sha256:{}", hex::encode(Sha256::digest(&source_bytes))) != sha256
+        || hex::encode(Md5::digest(&source_bytes)) != md5
+    {
+        return Err(CliError::Input(
+            "managed import stage lost its exact source, target, or byte identity".to_owned(),
+        ));
+    }
+    let stage_path = staged
+        .get("stage_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::Input("managed import stage path is missing".to_owned()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let mut staged_bytes = Vec::new();
+    file.read_to_end(&mut staged_bytes)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    #[cfg(unix)]
+    let private_mode = metadata.permissions().mode() & 0o777 == 0o600;
+    #[cfg(not(unix))]
+    let private_mode = true;
+    if !metadata.is_file()
+        || !private_mode
+        || metadata.len() != bytes
+        || staged_bytes != source_bytes
+    {
+        return Err(CliError::Input(
+            "private managed import stage no longer matches the reviewed source".to_owned(),
         ));
     }
     Ok(())
@@ -24771,6 +25786,21 @@ fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> 
     Ok(())
 }
 
+fn validate_worker_deployment_local_authority(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+) -> Result<()> {
+    let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if !worker_deployment::binds_live_state(&plan.capability)
+        && worker_deployment::target(adapter).is_none()
+    {
+        return Ok(());
+    }
+    let graph = discover_registered(store)?;
+    worker_deployment::validate_current_target(&graph, &plan.capability, input, adapter)
+}
+
 fn is_live_plan_precondition_hash(name: &str) -> bool {
     matches!(
         name,
@@ -24791,6 +25821,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION
             | OAUTH_CLIENT_UPDATE_STATE_PRECONDITION
             | worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION
+            | worker_deployment::STATE_PRECONDITION
             | R2_PARENT_TOKEN_PRECONDITION
     )
 }
@@ -26928,8 +27959,8 @@ mod tests {
         SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
         SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
         SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
-        SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
-        apply_cloudflare_tunnel_configuration_state_response,
+        SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, WranglerDeploymentStatusTarget,
+        admit_standing_plan, apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_entitlement_probe_response,
         apply_global_warp_override_state_response, apply_kv_empty_namespace_state_response,
@@ -26960,11 +27991,12 @@ mod tests {
         plan_requires_live_credential, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_secret_sink, preflight_standing_authority,
         prepare_r2_temporary_credentials_input, prepare_security_action_input,
-        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
-        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
-        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
-        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
+        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
+        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
+        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
+        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
+        repair_keychain_access_with_warning, request_body_contains_secret,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -26984,16 +28016,18 @@ mod tests {
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
-        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        validate_current_permission_groups, validate_current_worker_deployment_state,
+        validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
-        validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
-        validate_pages_project_absence_receipt, validate_pages_source_remote_receipt,
-        validate_permission_group_resource_scope, validate_plan_preconditions,
-        validate_request_contract, validate_selected_permission_groups,
-        validate_standing_authority_group_scopes, validate_standing_authority_permission_inventory,
-        validate_token_policy_body, validate_worker_script_secret_semantics,
-        validate_wrangler_worker_versions_input, validate_zone_account_receipt_precondition,
-        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        validate_managed_mln_stage_authority, validate_managed_reviewed_git_stage_authority,
+        validate_mln_0143_lineage_result, validate_pages_project_absence_receipt,
+        validate_pages_source_remote_receipt, validate_permission_group_resource_scope,
+        validate_plan_preconditions, validate_request_contract,
+        validate_selected_permission_groups, validate_standing_authority_group_scopes,
+        validate_standing_authority_permission_inventory, validate_token_policy_body,
+        validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
+        validate_zone_account_receipt_precondition, validate_zone_id,
+        validated_standing_lineage_token_id, verification_outcome,
         workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
         workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
@@ -28930,12 +29964,14 @@ mod tests {
             ..CallInput::default()
         };
         let result = json!({
-            "output_file":{
-                "sha256":format!("sha256:{}", "a".repeat(64)),
-                "complete":true,
-                "hash_matches":true,
-            },
-            "provider":{"at_bookmark":"bookmark-after-0142"},
+            "result": {
+                "output_file":{
+                    "sha256":format!("sha256:{}", "a".repeat(64)),
+                    "complete":true,
+                    "hash_matches":true,
+                },
+                "provider":{"at_bookmark":"bookmark-after-0142"},
+            }
         });
         let evidence = store
             .write_evidence(EvidenceClass::LiveRead, &result)
@@ -29167,6 +30203,133 @@ mod tests {
         assert!(
             validate_managed_mln_stage_authority(&plan).is_err(),
             "execution must reject a managed stage that drifted after planning"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one executable Git fixture proves generic source capture and execution-time drift gates"
+    )]
+    fn reviewed_git_d1_import_stages_one_exact_clean_head_and_fails_on_drift() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let repository = root.path().join("portable-import");
+        fs::create_dir_all(&repository).expect("repo directory");
+        let repository = fs::canonicalize(repository).expect("canonical repository");
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(arguments)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output")
+                .trim()
+                .to_owned()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/portable-import.git",
+        ]);
+        let relative = "migrations/0001_authority.sql";
+        let source = repository.join(relative);
+        fs::create_dir_all(source.parent().expect("source parent")).expect("migration directory");
+        let bytes = b"CREATE TABLE authority (id TEXT PRIMARY KEY);\n";
+        fs::write(&source, bytes).expect("migration source");
+        git(&["add", relative]);
+        git(&["commit", "-m", "fixture"]);
+
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("d1-import-database")
+            .expect("generic import")
+            .clone();
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "database_id":"11111111-1111-4111-8111-111111111111",
+            }),
+            body: Some(json!({
+                "pre_recovery_anchor_operation_id":"22222222-2222-4222-8222-222222222222",
+                "pre_recovery_anchor_evidence_hash":format!("sha256:{}", "a".repeat(64)),
+                "pre_recovery_anchor_output_sha256":format!("sha256:{}", "b".repeat(64)),
+                "pre_recovery_anchor_bookmark_hash":format!("sha256:{}", "c".repeat(64)),
+            })),
+            ..CallInput::default()
+        };
+        let state = tempfile::tempdir().expect("state root");
+        let store = StateStore::open(RuntimePaths::from_root(state.path())).expect("state store");
+        let staged = stage_approved_mln_migration(&store, &capability, &input, &source)
+            .expect("clean reviewed source stages");
+        assert_eq!(staged["bytes"], bytes.len());
+        assert_eq!(
+            staged["sha256"],
+            format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+        );
+        assert_eq!(staged["md5"], hex::encode(Md5::digest(bytes)));
+        assert_eq!(staged["target"], input.selectors);
+        assert_eq!(
+            staged.pointer("/source_authority/repository_id"),
+            Some(&json!("github.com/example/portable-import"))
+        );
+        let stage_path = PathBuf::from(staged["stage_path"].as_str().expect("stage path"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&stage_path)
+                .expect("stage metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "catalog-sha",
+            capability.clone(),
+            json!({"adapter":{"approved_mln_import":staged}}),
+        )
+        .expect("generic plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.refresh_hash().expect("plan hash");
+        validate_managed_reviewed_git_stage_authority(&plan)
+            .expect("exact source and stage remain executable");
+
+        fs::write(&source, b"CREATE TABLE drifted (id TEXT);\n").expect("dirty source");
+        assert!(
+            validate_managed_reviewed_git_stage_authority(&plan).is_err(),
+            "execution must fail after checkout drift"
+        );
+        assert!(
+            stage_approved_mln_migration(&store, &capability, &input, &source).is_err(),
+            "planning must reject a dirty repository"
+        );
+        git(&["checkout", "--", relative]);
+        fs::write(&stage_path, b"tampered stage\n").expect("tamper stage");
+        assert!(
+            validate_managed_reviewed_git_stage_authority(&plan).is_err(),
+            "execution must reject a changed private stage"
         );
     }
 
@@ -34023,6 +35186,7 @@ mod tests {
             oauth_client_secret_state: None,
             oauth_client_update_state: None,
             worker_custom_domain_state: None,
+            worker_deployment_state: None,
         };
 
         // Without a bound empty precondition, nothing changes.
@@ -34455,7 +35619,7 @@ mod tests {
             "required":["name"],
             "x-cfctl-body-required":true,
             "properties":{
-                "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+                "jurisdiction":{"type":"string","enum":["eu","fedramp","us"]},
                 "name":{"type":"string"},
                 "primary_location_hint":{
                     "type":"string",
@@ -35251,6 +36415,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: Some((receipt.clone(), evidence)),
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared OAuth update plan");
@@ -35638,6 +36803,7 @@ mod tests {
                 oauth_client_secret_state: Some((receipt.clone(), evidence)),
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared OAuth rotation plan");
@@ -36606,6 +37772,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -36698,6 +37865,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -36795,6 +37963,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -36888,6 +38057,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -36975,6 +38145,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -37078,6 +38249,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -42821,6 +43993,109 @@ mod tests {
         assert!(envelope.performed);
         assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn worker_deployment_identity_drift_stops_before_delegated_boundary() {
+        let planned = json!({
+            "schema_version": 1,
+            "source_capability_id": "worker-script-get-settings",
+            "source_path": "/accounts/{account_id}/workers/scripts/{script_name}/settings",
+            "deployment_source_capability_id": "worker-deployments-list-deployments",
+            "deployment_source_path": "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+            "account_id": "account-a",
+            "service_name": "cfctl-site",
+            "http_status": 200,
+            "deployment_http_status": 200,
+            "exists": true,
+            "redacted_settings_hash": "sha256:same-settings",
+            "redacted_deployments_hash": "sha256:deployment-a",
+        });
+        let mut current = planned.clone();
+        current["redacted_deployments_hash"] = json!("sha256:deployment-b");
+        let planned_hash = hash_value(&planned).expect("planned state hash");
+        let mut capability = CapabilityV1::new(
+            "wrangler.versions-deploy",
+            "Promote Worker version",
+            "CLI",
+            "wrangler versions deploy --yes",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "adapter": {
+                    "worker_deployment": {
+                        "schema_version": 1,
+                        "service_name": "cfctl-site",
+                        "source_sha": "1111111111111111111111111111111111111111",
+                        "promotion": {
+                            "version_id": "11111111-2222-4333-8444-555555555555",
+                            "traffic_percentage": 100,
+                        },
+                    },
+                },
+                "live_preconditions": {
+                    "worker_deployment_state": planned,
+                },
+            }),
+        )
+        .expect("promotion plan");
+        plan.precondition_hashes.insert(
+            super::worker_deployment::STATE_PRECONDITION.to_owned(),
+            planned_hash.clone(),
+        );
+        assert_eq!(
+            super::required_worker_deployment_state_precondition(&plan)
+                .expect("promotion state authority"),
+            Some(planned_hash.as_str())
+        );
+        let mut delegated_boundary_crossed = false;
+
+        let result = (|| -> std::result::Result<(), super::CliError> {
+            validate_current_worker_deployment_state(&planned_hash, &current)?;
+            delegated_boundary_crossed = true;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert!(!delegated_boundary_crossed);
+        assert_eq!(plan.status, PlanStatus::Draft);
+    }
+
+    #[test]
+    fn worker_promotion_readback_is_exact_service_and_configless() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let prepared = prepare_wrangler_deployment_status_command(
+            WranglerDeploymentStatusTarget::Service("cfctl-site"),
+            "account-a",
+            cache.path(),
+        )
+        .expect("exact-service readback command");
+        let args = prepared
+            .command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["deployments", "status", "--name", "cfctl-site", "--json"]
+        );
+        assert!(!args.iter().any(|argument| argument == "--config"));
+        assert_eq!(prepared.exact_service_name, Some("cfctl-site"));
+        let isolated = prepared
+            .isolated_directory
+            .as_ref()
+            .expect("private configless readback directory");
+        assert_eq!(
+            prepared.command.as_std().get_current_dir(),
+            Some(isolated.path())
+        );
     }
 
     #[test]
