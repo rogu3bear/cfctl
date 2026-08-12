@@ -2273,6 +2273,7 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
         d1_import_database_capability(),
+        d1_reviewed_schema_migration_capability(),
         d1_resume_database_import_poll_capability(),
         d1_import_approved_mln_migration_capability(),
         d1_import_approved_osint_research_migration_capability(),
@@ -2384,6 +2385,35 @@ fn d1_import_database_capability() -> CapabilityV1 {
         upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
         requires_create_new_mode_0600_stage: true,
     });
+    capability
+}
+
+fn d1_reviewed_schema_migration_capability() -> CapabilityV1 {
+    let mut capability = d1_import_database_capability();
+    "d1-apply-reviewed-schema-migration".clone_into(&mut capability.id);
+    "Apply one reviewed Git schema migration to D1".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Stage one clean tracked SQL file from an exact Git HEAD, prove a same-target governed full-export recovery anchor, and submit one authenticated D1 query batch. A local SQLite authorizer admits only `PRAGMA foreign_keys`, `CREATE TABLE`, and `CREATE INDEX`; caller SQL and data mutations are rejected. The provider response must report one successful result for every admitted statement, after which schema meaning remains a separate governed introspection receipt."
+            .to_owned(),
+    );
+    "cfctl native reviewed-Git D1 schema migration adapter".clone_into(&mut capability.source);
+    "/accounts/{account_id}/d1/database/{database_id}/query".clone_into(&mut capability.path);
+    capability.aliases = vec![
+        "apply reviewed D1 schema migration".to_owned(),
+        "create reviewed D1 tables and indexes".to_owned(),
+    ];
+    "d1_reviewed_schema_batch_reports_every_statement_success"
+        .clone_into(&mut capability.verification.strategy);
+    capability.cost.basis = Some(
+        "D1 schema execution has no separate operation charge; ordinary D1 rows-written accounting remains"
+            .to_owned(),
+    );
+    if let Some(contract) = capability.d1_approved_mln_import.as_mut() {
+        contract.import_path.clone_from(&capability.path);
+        contract.max_source_bytes = 1024 * 1024;
+        contract.max_poll_attempts = 0;
+        contract.upload_url_suffix.clear();
+    }
     capability
 }
 

@@ -47,7 +47,7 @@ memchr = "2.7.6"
 md-5 = "0.11.0"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls"] }
-rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
+rusqlite = { version = "0.40.1", features = ["backup", "bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }

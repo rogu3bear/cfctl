@@ -2015,6 +2015,15 @@ impl CapabilityV1 {
                     && (self.d1_approved_mln_import.is_some()
                         ^ self.d1_approved_mln_import_poll_resume.is_some())
             }
+            "d1_reviewed_schema_batch_reports_every_statement_success" => {
+                self.id == "d1-apply-reviewed-schema-migration"
+                    && self.method == "POST"
+                    && self.path == "/accounts/{account_id}/d1/database/{database_id}/query"
+                    && self.risk == RiskClass::Irreversible
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_approved_mln_import.is_some()
+                    && self.d1_approved_mln_import_poll_resume.is_none()
+            }
             "osint_research_migration_schema_marker_is_present" => {
                 self.id == "d1-import-approved-osint-research-migration"
                     && self.method == "POST"
@@ -3094,6 +3103,7 @@ fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) ->
             | "d1-import-approved-osint-research-migration"
             | "d1-resume-approved-mln-import-poll"
             | "d1-import-database"
+            | "d1-apply-reviewed-schema-migration"
             | "d1-resume-database-import-poll"
     ) && capability.method == "POST"
         && capability.risk == RiskClass::Irreversible
