@@ -669,7 +669,10 @@ cfctl call wrangler.versions-deploy \
 ```
 
 Promotion verification reads Wrangler's production deployment status and
-requires the planned version at 100 percent. Rolling back remains a separate
+requires the planned version at 100 percent. The promotion plan also binds the
+exact Worker settings and complete active-deployments state, then rereads both
+immediately before consumption; any intervening promotion leaves the approved
+plan unconsumed and requires a new plan. Rolling back remains a separate
 reviewed `wrangler.versions-deploy` plan targeting a known prior version.
 
 For a Cloudflare Pages direct upload, use the exact

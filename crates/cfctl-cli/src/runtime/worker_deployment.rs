@@ -30,6 +30,10 @@ pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
     )
 }
 
+pub(super) fn binds_live_state(capability: &CapabilityV1) -> bool {
+    binds_artifact(capability) || capability.id == "wrangler.versions-deploy"
+}
+
 pub(super) fn artifact_paths(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -88,7 +92,7 @@ pub(super) fn prepare_target(
     capability: &CapabilityV1,
     input: &CallInput,
 ) -> Result<Option<Value>, CliError> {
-    if !binds_artifact(capability) {
+    if !binds_live_state(capability) {
         return Ok(None);
     }
     let config = canonical_config(input)?;
@@ -122,26 +126,48 @@ pub(super) fn prepare_target(
             "Worker deployment source identity is not a full lowercase Git SHA".to_owned(),
         ));
     }
-    let artifacts = artifact_paths(capability, input)?;
-    if artifacts
-        .iter()
-        .any(|artifact| !artifact.starts_with(&repository.path))
-    {
-        return Err(CliError::Input(
-            "every Worker deployment artifact must be owned by the config repository".to_owned(),
-        ));
-    }
-    let config_directory = config.parent().ok_or_else(|| {
-        CliError::Input("Wrangler configuration has no containing directory".to_owned())
-    })?;
-    let artifact_sha256 = artifact_set_sha256(config_directory, &artifacts)?;
     let config_sha256 = hex::encode(Sha256::digest(fs::read(&config).map_err(|source| {
         CliError::Io {
             path: config.display().to_string(),
             source,
         }
     })?));
-    let expected_message = format!("source={source_sha} artifact-sha256={artifact_sha256}");
+    let (expected_message, operation) = if binds_artifact(capability) {
+        let artifacts = artifact_paths(capability, input)?;
+        if artifacts
+            .iter()
+            .any(|artifact| !artifact.starts_with(&repository.path))
+        {
+            return Err(CliError::Input(
+                "every Worker deployment artifact must be owned by the config repository"
+                    .to_owned(),
+            ));
+        }
+        let config_directory = config.parent().ok_or_else(|| {
+            CliError::Input("Wrangler configuration has no containing directory".to_owned())
+        })?;
+        let artifact_sha256 = artifact_set_sha256(config_directory, &artifacts)?;
+        (
+            format!("source={source_sha} artifact-sha256={artifact_sha256}"),
+            json!({
+                "artifact": {
+                    "roots": artifacts,
+                    "sha256": artifact_sha256,
+                },
+            }),
+        )
+    } else {
+        let version_id = versions_deploy_version_id(input)?;
+        (
+            format!("promote release {source_sha}"),
+            json!({
+                "promotion": {
+                    "version_id": version_id,
+                    "traffic_percentage": 100,
+                },
+            }),
+        )
+    };
     let message = input
         .query
         .get("message")
@@ -156,7 +182,7 @@ pub(super) fn prepare_target(
             "Worker deployment message must be exactly `{expected_message}`"
         )));
     }
-    Ok(Some(json!({
+    let mut target = json!({
         "schema_version": 1,
         "service_name": service_name,
         "source_sha": source_sha,
@@ -165,12 +191,40 @@ pub(super) fn prepare_target(
             "path": config,
             "sha256": config_sha256,
         },
-        "artifact": {
-            "roots": artifacts,
-            "sha256": artifact_sha256,
-        },
         "version_message": expected_message,
-    })))
+    });
+    let target_object = target
+        .as_object_mut()
+        .ok_or_else(|| CliError::Input("Worker deployment target is not an object".to_owned()))?;
+    let operation_object = operation.as_object().ok_or_else(|| {
+        CliError::Input("Worker deployment operation is not an object".to_owned())
+    })?;
+    target_object.extend(operation_object.clone());
+    Ok(Some(target))
+}
+
+fn versions_deploy_version_id(input: &CallInput) -> Result<&str, CliError> {
+    let spec = input
+        .query
+        .get("argument")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker Versions deployment requires exactly one UUID@100 target".to_owned(),
+            )
+        })?;
+    let (version_id, percentage) = spec.split_once('@').ok_or_else(|| {
+        CliError::Input("Worker Versions deployment target must be UUID@100".to_owned())
+    })?;
+    if percentage != "100"
+        || uuid::Uuid::parse_str(version_id).is_err()
+        || spec.matches('@').count() != 1
+    {
+        return Err(CliError::Input(
+            "Worker Versions deployment target must be exactly one UUID@100 value".to_owned(),
+        ));
+    }
+    Ok(version_id)
 }
 
 fn validated_service_name<'a>(
@@ -538,6 +592,28 @@ mod tests {
             projection["artifact"]["roots"],
             json!([build.canonicalize().unwrap(), site.canonicalize().unwrap()])
         );
+
+        let version_id = "11111111-2222-4333-8444-555555555555";
+        let mut promotion = capability.clone();
+        promotion.id = "wrangler.versions-deploy".to_owned();
+        let promotion_input = CallInput {
+            query: json!({
+                "argument": format!("{version_id}@100"),
+                "config": config.canonicalize().expect("canonical config"),
+                "name": "cfctl-site",
+                "message": format!("promote release {source_sha}"),
+            }),
+            ..CallInput::default()
+        };
+        let promotion_projection = prepare_target(&graph, &promotion, &promotion_input)
+            .expect("promotion projection")
+            .expect("Worker promotion projection");
+        assert_eq!(promotion_projection["service_name"], "cfctl-site");
+        assert_eq!(promotion_projection["source_sha"], source_sha);
+        assert_eq!(promotion_projection["promotion"]["version_id"], version_id);
+        assert_eq!(promotion_projection["promotion"]["traffic_percentage"], 100);
+        assert!(promotion_projection.get("artifact").is_none());
+        assert!(binds_live_state(&promotion));
 
         fs::write(site.join("index.html"), "drift\n").expect("artifact drift");
         let error = prepare_target(&graph, &capability, &input)

@@ -1433,7 +1433,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
     let mut adapter_targets = Map::new();
-    if worker_deployment::binds_artifact(&capability) {
+    if worker_deployment::binds_live_state(&capability) {
         let graph = discover_registered(store)?;
         let target = worker_deployment::prepare_target(&graph, &capability, &prepared.input)?
             .ok_or_else(|| {
@@ -12146,7 +12146,7 @@ async fn read_live_worker_deployment_state(
     account_id: &str,
     credential: &AuthCredential,
 ) -> Result<(Value, EvidenceV1)> {
-    if !worker_deployment::binds_artifact(capability) {
+    if !worker_deployment::binds_live_state(capability) {
         return Err(CliError::Input(
             "Worker deployment state read was requested for another capability".to_owned(),
         ));
@@ -15322,7 +15322,7 @@ fn required_worker_deployment_state_precondition(plan: &PlanV1) -> Result<Option
     if worker_deployment::target(adapter).is_none() {
         return Ok(None);
     }
-    if !worker_deployment::binds_artifact(&plan.capability) {
+    if !worker_deployment::binds_live_state(&plan.capability) {
         return Err(CliError::Input(
             "Worker deployment target is attached to an unrelated capability".to_owned(),
         ));
@@ -43903,6 +43903,46 @@ mod tests {
         let mut current = planned.clone();
         current["redacted_deployments_hash"] = json!("sha256:deployment-b");
         let planned_hash = hash_value(&planned).expect("planned state hash");
+        let mut capability = CapabilityV1::new(
+            "wrangler.versions-deploy",
+            "Promote Worker version",
+            "CLI",
+            "wrangler versions deploy --yes",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "adapter": {
+                    "worker_deployment": {
+                        "schema_version": 1,
+                        "service_name": "cfctl-site",
+                        "source_sha": "1111111111111111111111111111111111111111",
+                        "promotion": {
+                            "version_id": "11111111-2222-4333-8444-555555555555",
+                            "traffic_percentage": 100,
+                        },
+                    },
+                },
+                "live_preconditions": {
+                    "worker_deployment_state": planned,
+                },
+            }),
+        )
+        .expect("promotion plan");
+        plan.precondition_hashes.insert(
+            super::worker_deployment::STATE_PRECONDITION.to_owned(),
+            planned_hash.clone(),
+        );
+        assert_eq!(
+            super::required_worker_deployment_state_precondition(&plan)
+                .expect("promotion state authority"),
+            Some(planned_hash.as_str())
+        );
         let mut delegated_boundary_crossed = false;
 
         let result = (|| -> std::result::Result<(), super::CliError> {
@@ -43913,6 +43953,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!delegated_boundary_crossed);
+        assert_eq!(plan.status, PlanStatus::Draft);
     }
 
     #[test]
