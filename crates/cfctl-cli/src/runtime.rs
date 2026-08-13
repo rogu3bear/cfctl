@@ -1,6 +1,7 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
 mod event_batch;
+mod r2_private_upload;
 mod worker_custom_domain;
 mod worker_deployment;
 mod workspace_d1_migration;
@@ -36,8 +37,8 @@ use cfctl_catalog::{
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
-    OperationVerificationV1, R2LogRetrievalCredentials, validate_request_contract,
-    validate_reviewed_schema_migration_sql,
+    OperationVerificationV1, R2LogRetrievalCredentials, R2PrivateUploadPayload,
+    validate_request_contract, validate_reviewed_schema_migration_sql,
 };
 use cfctl_core::{
     AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
@@ -1290,12 +1291,14 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
     let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
+    let is_r2_private_file_upload = capability.r2_private_file_upload.is_some();
     let is_d1_approved_mln_import_poll_resume =
         capability.d1_approved_mln_import_poll_resume.is_some();
-    if (is_d1_approved_mln_import || is_workspace_d1_projection) != arguments.source_file.is_some()
+    if (is_d1_approved_mln_import || is_workspace_d1_projection || is_r2_private_file_upload)
+        != arguments.source_file.is_some()
     {
         return Err(CliError::Input(
-            "governed D1 imports and workspace policy projections require exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports, workspace policy projections, and create-only private R2 uploads require exactly one plan-creation-only `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -1379,11 +1382,15 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     if capability.mln_0142_post_import_schema.is_some() {
         validate_mln_0142_post_import_schema_input(store, &capability, &prepared.input)?;
     }
-    let import_stage = arguments
-        .source_file
-        .as_deref()
-        .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
-        .transpose()?;
+    let import_stage = if is_d1_approved_mln_import {
+        arguments
+            .source_file
+            .as_deref()
+            .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
+            .transpose()?
+    } else {
+        None
+    };
     let resume_poll_authority = if is_d1_approved_mln_import_poll_resume {
         let profiles = ProfilesConfig::load(store)?;
         let profile = profiles.selected(arguments.profile.as_deref())?;
@@ -1445,6 +1452,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     }
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
+    let mut r2_stage_ref = None;
     let mut adapter_targets = Map::new();
     if worker_deployment::binds_live_state(&capability) {
         let graph = discover_registered(store)?;
@@ -1540,6 +1548,27 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         })?;
         adapter_targets.insert("workspace_d1_policy_projection".to_owned(), target);
     }
+    if capability.r2_private_file_upload.is_some() {
+        let source = arguments
+            .source_file
+            .as_deref()
+            .ok_or_else(|| CliError::Input("private R2 upload source is missing".to_owned()))?;
+        let target = r2_private_upload::prepare_plan_target(
+            store,
+            &secrets,
+            &capability,
+            &prepared.input,
+            source,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("private R2 upload target could not be derived".to_owned())
+        })?;
+        r2_stage_ref = target
+            .get("stage_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        adapter_targets.insert("r2_private_file_upload".to_owned(), target);
+    }
     let result = Box::pin(create_plan(
         store,
         &catalog,
@@ -1554,6 +1583,11 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         && let Some(reference) = secret_ref
     {
         secrets.delete(&reference)?;
+    }
+    if result.is_err()
+        && let Some(reference) = r2_stage_ref
+    {
+        r2_private_upload::discard_reference(store, &reference, &secrets)?;
     }
     result
 }
@@ -17462,6 +17496,10 @@ fn validate_standing_authority_permission_inventory(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one consumed-plan executor keeps managed stage selection, durable provider boundary, verification, and cleanup in a single auditable state machine"
+)]
 async fn execute_api_plan(
     store: &StateStore,
     catalog_hash: &str,
@@ -17497,9 +17535,26 @@ async fn execute_api_plan(
         )
         .await;
     }
-    let response_result = executor
-        .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
-        .await;
+    let response_result = if plan.capability.r2_private_file_upload.is_some() {
+        let upload = r2_private_upload::load(store, plan, secrets)?;
+        executor
+            .execute_r2_private_file_upload(
+                plan,
+                catalog_hash,
+                credential,
+                execution_input,
+                R2PrivateUploadPayload {
+                    bytes: upload.bytes,
+                    expected_md5: upload.md5,
+                    content_type: upload.content_type,
+                },
+            )
+            .await
+    } else {
+        executor
+            .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
+            .await
+    };
     let response = match response_result {
         Ok(response) => response,
         Err(error) => {
@@ -17540,12 +17595,16 @@ async fn execute_api_plan(
             ));
         }
     };
-    let finalization: Result<()> =
+    let finalization: Result<()> = (|| {
+        if plan.status == PlanStatus::Verified && plan.capability.r2_private_file_upload.is_some() {
+            r2_private_upload::discard(store, plan, secrets)?;
+        }
         if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
             persist_transaction_stage(store, plan, TransactionStageV1::Closed)
         } else {
             store.save_plan(plan).map_err(CliError::from)
-        };
+        }
+    })();
     let finalization_error = finalization.err();
     Ok(api_plan_result_envelope(
         plan,
@@ -25945,6 +26004,7 @@ fn current_pages_source_remote_precondition(
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;
+    r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
     let local_artifact_paths = plan
         .precondition_hashes
         .keys()
@@ -44106,11 +44166,13 @@ mod tests {
             source_url: "test://workflow".to_owned(),
             source_hash: "sha256:source".to_owned(),
             schema_hash: String::new(),
-            capabilities: BTreeMap::from([
+            capabilities: vec![
                 (read.id.clone(), read),
                 (workflow.id.clone(), workflow.clone()),
                 (export.id.clone(), export.clone()),
-            ]),
+            ]
+            .into_iter()
+            .collect(),
         };
         catalog.refresh_hash().expect("catalog hashes");
         let evidence = store
@@ -44508,11 +44570,13 @@ mod tests {
             source_url: "test://workflow".to_owned(),
             source_hash: "sha256:source".to_owned(),
             schema_hash: String::new(),
-            capabilities: BTreeMap::from([
+            capabilities: vec![
                 (blocked.id.clone(), blocked),
                 (gapped.id.clone(), gapped),
                 (workflow.id.clone(), workflow.clone()),
-            ]),
+            ]
+            .into_iter()
+            .collect(),
         };
         catalog.refresh_hash().expect("catalog hashes");
 

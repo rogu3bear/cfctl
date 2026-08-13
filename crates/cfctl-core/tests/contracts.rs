@@ -94,6 +94,51 @@ fn d1_schema_introspection_contract_is_hash_bound_and_serializable() {
 }
 
 #[test]
+fn email_sending_subdomain_tag_is_an_exact_non_secret_resource_identity() {
+    let mut capability = CapabilityV1::new(
+        "email-sending-subdomains-create-sending-subdomain",
+        "Create sending subdomain",
+        "POST",
+        "/zones/{zone_id}/email/sending/subdomains",
+    );
+    capability.mutating = true;
+    capability.risk = RiskClass::ExternalCommunication;
+    capability.effect = EffectClass::ExternalCommunication;
+    capability.permissions = vec!["Email Sending Write".to_owned()];
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["name"],
+        "properties":{"name":{"type":"string"}},
+        "x-cfctl-body-required":true
+    }));
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}".to_owned(),
+        identity_selector: "subdomain_id".to_owned(),
+        response_result_identity_pointer: "/tag".to_owned(),
+        read_capability_id: "email-sending-subdomains-get-sending-subdomain".to_owned(),
+        delete_capability_id: "email-sending-subdomains-delete-sending-subdomain".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    capability.verification.required = true;
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some("separate exact delete".to_owned());
+
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_supported());
+}
+
+#[test]
 fn d1_full_export_contract_is_hash_bound_and_serializable() {
     let mut capability = CapabilityV1::new(
         "d1-full-export",

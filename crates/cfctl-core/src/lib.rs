@@ -1565,6 +1565,39 @@ pub struct WorkspaceD1PolicyProjectionContractV1 {
     pub rollback_capability_id: String,
 }
 
+/// A create-only private local file upload to one exact R2 object key. The
+/// bytes remain in a mode-0600 managed stage; plans and receipts carry only
+/// content identity and bounded metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R2PrivateFileUploadContractV1 {
+    pub max_source_bytes: u64,
+    pub allowed_content_types: Vec<String>,
+    pub require_if_none_match_star: bool,
+    pub read_capability_id: String,
+    pub delete_capability_id: String,
+    pub etag_algorithm: String,
+}
+
+/// Provider readback used after Email Sending DNS repair. The verifier reads
+/// the live DNS status endpoint and accepts only a conflict-free, complete
+/// configuration; it never treats the mutation response as final authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailSendingDnsRepairContractV1 {
+    pub status_read_capability_id: String,
+    pub status_read_path: String,
+}
+
+/// Provider readback used after enabling Email Routing for an explicit
+/// subdomain. The request body name is compiled into the read endpoint's
+/// subdomain query so an absent body can never silently target the apex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailRoutingSubdomainDnsContractV1 {
+    pub read_capability_id: String,
+    pub read_path: String,
+    pub request_name_field: String,
+    pub read_query_field: String,
+}
+
 /// Hash-bound coordinates for proving and compensating a newly created
 /// Cloudflare resource. The identity pointer is relative to the API response's
 /// `result` object; callers must not infer any of these values from mutable
@@ -1781,6 +1814,12 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_sending_dns_repair: Option<EmailSendingDnsRepairContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_routing_subdomain_dns: Option<EmailRoutingSubdomainDnsContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import: Option<D1ApprovedMlnImportContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import_poll_resume: Option<D1ApprovedMlnImportPollResumeContractV1>,
@@ -1893,6 +1932,9 @@ impl CapabilityV1 {
             d1_restore_exact_bookmark: None,
             workspace_d1_migration: None,
             workspace_d1_policy_projection: None,
+            r2_private_file_upload: None,
+            email_sending_dns_repair: None,
+            email_routing_subdomain_dns: None,
             d1_approved_mln_import: None,
             d1_approved_mln_import_poll_resume: None,
             r2_log_retrieval: None,
@@ -2122,6 +2164,75 @@ impl CapabilityV1 {
                                 && contract.recovery_max_age_seconds > 0
                                 && contract.recovery_max_age_seconds <= 600
                                 && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                        })
+            }
+            "r2_private_file_upload_etag_and_conditional_read" => {
+                self.id == "r2-put-object"
+                    && self.method == "PUT"
+                    && self.path
+                        == "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions == ["Workers R2 Storage Write"]
+                    && self.request_schema.is_none()
+                    && self
+                        .r2_private_file_upload
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.max_source_bytes > 0
+                                && contract.max_source_bytes <= 300_000_000
+                                && !contract.allowed_content_types.is_empty()
+                                && contract.require_if_none_match_star
+                                && contract.read_capability_id == "r2-get-object"
+                                && contract.delete_capability_id == "r2-delete-object"
+                                && contract.etag_algorithm == "md5"
+                        })
+            }
+            "email_sending_dns_status_reports_ready" => {
+                self.id == "email-sending-subdomains-fix-sending-subdomain-dns"
+                    && self.method == "POST"
+                    && self.path
+                        == "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions
+                        == ["DNS Write", "Email Sending Read", "Email Sending Write"]
+                    && self.request_schema.is_none()
+                    && self
+                        .email_sending_dns_repair
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.status_read_capability_id
+                                == "email-sending-subdomains-get-sending-subdomain-dns-status"
+                                && contract.status_read_path
+                                    == "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns/status"
+                        })
+            }
+            "email_routing_subdomain_dns_records_match" => {
+                self.id == "email-routing-settings-enable-email-routing-dns"
+                    && self.method == "POST"
+                    && self.path == "/zones/{zone_id}/email/routing/dns"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions == ["DNS Write", "Zone Settings Write"]
+                    && self
+                        .request_schema
+                        .as_ref()
+                        .is_some_and(|schema| {
+                            schema.get("nullable") != Some(&Value::Bool(true))
+                                && schema.get("x-cfctl-body-required") == Some(&Value::Bool(true))
+                                && schema.pointer("/required/0").and_then(Value::as_str)
+                                    == Some("name")
+                        })
+                    && self
+                        .email_routing_subdomain_dns
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.read_capability_id
+                                == "email-routing-settings-email-routing-dns-settings"
+                                && contract.read_path == "/zones/{zone_id}/email/routing/dns"
+                                && contract.request_name_field == "name"
+                                && contract.read_query_field == "subdomain"
                         })
             }
             "mln_import_requires_governed_post_import_proof" => {
@@ -3474,6 +3585,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "subdomain_id" && pointer == "/tag")
         || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()

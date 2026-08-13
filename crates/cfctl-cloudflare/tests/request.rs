@@ -11,12 +11,14 @@ use cfctl_core::{
     CreatedNestedResourceContractV1, CreatedResourceContractV1,
     D1ApprovedMlnImportPollResumeContractV1, D1FullExportContractV1,
     D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
-    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EventBatchContractV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass,
+    EmailRoutingSubdomainDnsContractV1, EmailSendingDnsRepairContractV1, EventBatchContractV1,
     GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
     PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
-    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
+    QuerySerializationV1, R2LogRetrievalContractV1, R2PrivateFileUploadContractV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1,
+    SelectorV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
+    UpdatedResourceContractV1,
 };
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
@@ -80,6 +82,365 @@ async fn single_raw_response_server(
             .expect("write response");
     });
     (address.to_string(), server)
+}
+
+async fn single_not_modified_server(etag: &str) -> (String, tokio::task::JoinHandle<String>) {
+    let etag = etag.to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept request");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let response =
+            format!("HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+        request
+    });
+    (address.to_string(), server)
+}
+
+fn r2_private_upload_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "r2-put-object",
+        "Upload Object",
+        "PUT",
+        "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}",
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.mutating = true;
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
+    capability.selectors = ["account_id", "bucket_name", "object_key"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    capability.r2_private_file_upload = Some(R2PrivateFileUploadContractV1 {
+        max_source_bytes: 300_000_000,
+        allowed_content_types: vec!["application/json".to_owned()],
+        require_if_none_match_star: true,
+        read_capability_id: "r2-get-object".to_owned(),
+        delete_capability_id: "r2-delete-object".to_owned(),
+        etag_algorithm: "md5".to_owned(),
+    });
+    capability
+}
+
+#[test]
+fn r2_object_keys_preserve_literal_slash_segments() {
+    let request = RequestBuilder::new("https://api.cloudflare.test/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &r2_private_upload_capability(),
+            &CallInput {
+                selectors: json!({
+                    "account_id":"account",
+                    "bucket_name":"bucket",
+                    "object_key":"config/policy/sha256.json"
+                }),
+                if_none_match: Some("*".to_owned()),
+                ..CallInput::default()
+            },
+        )
+        .expect("R2 request");
+    assert_eq!(
+        request.url.as_str(),
+        "https://api.cloudflare.test/client/v4/accounts/account/r2/buckets/bucket/objects/config/policy/sha256.json"
+    );
+    assert!(!request.url.as_str().contains("%2F"));
+}
+
+#[test]
+fn r2_object_keys_reject_empty_and_dot_segments() {
+    let capability = r2_private_upload_capability();
+    for object_key in ["/leading", "trailing/", "double//slash", "a/../b", "a/./b"] {
+        let error = RequestBuilder::new("https://api.cloudflare.test/client/v4")
+            .expect("builder")
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    selectors: json!({
+                        "account_id":"account",
+                        "bucket_name":"bucket",
+                        "object_key":object_key
+                    }),
+                    if_none_match: Some("*".to_owned()),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("unsafe object key must fail closed");
+        assert!(matches!(error, CloudflareError::InvalidSelector(name) if name == "object_key"));
+    }
+}
+
+#[tokio::test]
+async fn r2_private_upload_verifier_proves_etag_without_reading_object_bytes() {
+    let md5 = "0123456789abcdef0123456789abcdef";
+    let quoted_etag = format!("\"{md5}\"");
+    let (address, server) = single_not_modified_server(&quoted_etag).await;
+    let mut capability = r2_private_upload_capability();
+    capability.verification.required = true;
+    capability.verification.strategy =
+        "r2_private_file_upload_etag_and_conditional_read".to_owned();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"account",
+            "bucket_name":"bucket",
+            "object_key":"config/policy/digest.json"
+        }),
+        if_none_match: Some("*".to_owned()),
+        ..CallInput::default()
+    };
+    let mut plan =
+        PlanV1::draft("profile", "account", "catalog", capability, json!({})).expect("plan");
+    plan.input = serde_json::to_value(&input).expect("input");
+    plan.targets = json!({"adapter":{"r2_private_file_upload":{"source_md5":md5}}});
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"uploaded":true}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: Some(quoted_etag),
+        cf_ray: None,
+    };
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan_with_input(
+        &plan,
+        &apply,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("verification");
+    assert!(verification.passed);
+    assert_eq!(
+        verification.readback.result.get("object_identity_proven"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        verification.readback.result.get("body_read"),
+        None,
+        "body-read transport metadata is replaced by the body-free proof receipt"
+    );
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with(
+        "GET /client/v4/accounts/account/r2/buckets/bucket/objects/config/policy/digest.json "
+    ));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"0123456789abcdef0123456789abcdef\"")
+    );
+}
+
+fn path_selector(name: &str) -> SelectorV1 {
+    SelectorV1 {
+        name: name.to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }
+}
+
+#[tokio::test]
+async fn email_sending_dns_verifier_requires_ready_conflict_free_live_status() {
+    let response = json!({
+        "success":true,
+        "result":{
+            "status":"ready",
+            "errors":[],
+            "records":[{
+                "type":"TXT",
+                "name":"mail.example.com",
+                "content":"private-provider-record-content"
+            }]
+        },
+        "errors":[]
+    });
+    let (address, server) = json_response_sequence_server(vec![response.to_string()]).await;
+    let mut capability = CapabilityV1::new(
+        "email-sending-subdomains-fix-sending-subdomain-dns",
+        "Repair Email Sending DNS",
+        "POST",
+        "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns",
+    );
+    capability.mutating = true;
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.permissions = vec![
+        "DNS Write".to_owned(),
+        "Email Sending Read".to_owned(),
+        "Email Sending Write".to_owned(),
+    ];
+    capability.selectors = vec![path_selector("zone_id"), path_selector("subdomain_id")];
+    capability.verification.required = true;
+    capability.verification.strategy = "email_sending_dns_status_reports_ready".to_owned();
+    capability.email_sending_dns_repair = Some(EmailSendingDnsRepairContractV1 {
+        status_read_capability_id: "email-sending-subdomains-get-sending-subdomain-dns-status"
+            .to_owned(),
+        status_read_path: "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns/status"
+            .to_owned(),
+    });
+    let input = CallInput {
+        selectors: json!({"zone_id":"zone","subdomain_id":"sender-id"}),
+        ..CallInput::default()
+    };
+    let mut plan =
+        PlanV1::draft("profile", "account", "catalog", capability, json!({})).expect("plan");
+    plan.input = serde_json::to_value(&input).expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan_with_input(
+        &plan,
+        &apply,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("verification");
+    assert!(verification.passed);
+    assert_eq!(verification.readback.result["status_ready"], true);
+    assert_eq!(verification.readback.result["errors_empty"], true);
+    assert_eq!(verification.readback.result["records_present"], true);
+    assert!(
+        !verification
+            .readback
+            .result
+            .to_string()
+            .contains("private-provider-record-content")
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with(
+            "GET /client/v4/zones/zone/email/sending/subdomains/sender-id/dns/status "
+        )
+    );
+}
+
+#[tokio::test]
+async fn email_routing_subdomain_verifier_binds_exact_requested_name() {
+    let response = json!({
+        "success":true,
+        "result":{
+            "errors":[],
+            "record":[
+                {"type":"MX","name":"reply.maildesk.example.com","content":"mx.example.net"},
+                {"type":"TXT","name":"reply.maildesk.example.com","content":"provider-secret"}
+            ]
+        },
+        "errors":[]
+    });
+    let (address, server) = json_response_sequence_server(vec![response.to_string()]).await;
+    let mut capability = CapabilityV1::new(
+        "email-routing-settings-enable-email-routing-dns",
+        "Enable explicit Email Routing subdomain",
+        "POST",
+        "/zones/{zone_id}/email/routing/dns",
+    );
+    capability.mutating = true;
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.permissions = vec!["DNS Write".to_owned(), "Zone Settings Write".to_owned()];
+    capability.selectors = vec![path_selector("zone_id")];
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["name"],
+        "properties":{"name":{"type":"string","minLength":1,"maxLength":253}},
+        "x-cfctl-body-required":true
+    }));
+    capability.verification.required = true;
+    capability.verification.strategy = "email_routing_subdomain_dns_records_match".to_owned();
+    capability.email_routing_subdomain_dns = Some(EmailRoutingSubdomainDnsContractV1 {
+        read_capability_id: "email-routing-settings-email-routing-dns-settings".to_owned(),
+        read_path: "/zones/{zone_id}/email/routing/dns".to_owned(),
+        request_name_field: "name".to_owned(),
+        read_query_field: "subdomain".to_owned(),
+    });
+    let input = CallInput {
+        selectors: json!({"zone_id":"zone"}),
+        body: Some(json!({"name":"reply.maildesk.example.com"})),
+        ..CallInput::default()
+    };
+    let mut plan =
+        PlanV1::draft("profile", "account", "catalog", capability, json!({})).expect("plan");
+    plan.input = serde_json::to_value(&input).expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan_with_input(
+        &plan,
+        &apply,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("verification");
+    assert!(verification.passed);
+    assert_eq!(verification.readback.result["record_count"], 2);
+    assert_eq!(verification.readback.result["records_match"], true);
+    assert!(
+        !verification
+            .readback
+            .result
+            .to_string()
+            .contains("provider-secret")
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(
+        "GET /client/v4/zones/zone/email/routing/dns?subdomain=reply.maildesk.example.com "
+    ));
 }
 
 fn d1_approved_mln_import_poll_resume_fixture(

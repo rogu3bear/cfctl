@@ -11,14 +11,16 @@ use cfctl_core::{
     AsyncCollectionMutationContractV1, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1,
     CostExposureV1, CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
-    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass,
+    EmailRoutingSubdomainDnsContractV1, EmailSendingDnsRepairContractV1, EntitlementProbeV1,
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
     Maturity, Mln0142PostImportSchemaContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1,
-    PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1,
-    ResponseContractV1, RiskClass, SamePathReadContractV1, SecurityActionContractV1,
-    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
-    TimeRangeContractV1, TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1,
-    WorkflowStepV1, hash_value, request_header_is_reserved,
+    PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
+    R2PrivateFileUploadContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
+    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
+    request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -64,6 +66,245 @@ fn legacy_embedded_contract_matches(capability: &CapabilityV1) -> bool {
         "mln-0142-post-import-schema" => capability.mln_0142_post_import_schema.is_some(),
         "mln-0143-data-invariants" => capability.mln_0143_data_invariants.is_some(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod maildesk_provider_contract_tests {
+    use super::*;
+
+    fn blocked_mutation(id: &str, method: &str, path: &str, product: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, id, method, path);
+        product.clone_into(&mut capability.product);
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some("operation contract incomplete: fixture".to_owned());
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "post_change_read_or_operation_specific_verifier".to_owned();
+        capability.rollback.warning = Some("rollback semantics have not been declared".to_owned());
+        capability
+    }
+
+    fn read(id: &str, path: &str, product: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, id, "GET", path);
+        product.clone_into(&mut capability.product);
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability
+    }
+
+    fn object_key_selector(description: &str) -> SelectorV1 {
+        SelectorV1 {
+            name: "object_key".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(description.to_owned()),
+            contract: None,
+        }
+    }
+
+    #[test]
+    fn r2_private_upload_is_create_only_body_private_and_readback_bound() {
+        let mut capabilities = BTreeMap::new();
+        let mut upload = blocked_mutation("r2-put-object", "PUT", R2_OBJECT_PATH, "R2 Object");
+        upload.selectors = vec![
+            object_key_selector("Slashes MUST NOT be percent-encoded"),
+            SelectorV1 {
+                name: "Content-Type".to_owned(),
+                location: "header".to_owned(),
+                required: false,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+        ];
+        capabilities.insert(upload.id.clone(), upload);
+        capabilities.insert(
+            "r2-get-object".to_owned(),
+            read("r2-get-object", R2_OBJECT_PATH, "R2 Object"),
+        );
+        let mut delete =
+            blocked_mutation("r2-delete-object", "DELETE", R2_OBJECT_PATH, "R2 Object");
+        delete.permissions = vec!["Workers R2 Storage Write".to_owned()];
+        capabilities.insert(delete.id.clone(), delete);
+
+        finalize_r2_private_file_upload_contract(&mut capabilities);
+        let upload = &capabilities["r2-put-object"];
+        assert_eq!(
+            upload.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{:?}",
+            upload.blocked_reason
+        );
+        assert_eq!(
+            upload.verification.strategy,
+            "r2_private_file_upload_etag_and_conditional_read"
+        );
+        assert!(upload.request_schema.is_none());
+        assert!(
+            upload
+                .selectors
+                .iter()
+                .find(|selector| selector.name == "Content-Type")
+                .is_some_and(|selector| selector.required)
+        );
+        assert!(
+            upload
+                .r2_private_file_upload
+                .as_ref()
+                .is_some_and(|contract| {
+                    contract.require_if_none_match_star
+                        && contract.read_capability_id == "r2-get-object"
+                        && contract.delete_capability_id == "r2-delete-object"
+                })
+        );
+    }
+
+    #[test]
+    fn r2_lifecycle_is_destructive_full_snapshot_restorable() {
+        let mut lifecycle = blocked_mutation(
+            "r2-put-bucket-lifecycle-configuration",
+            "PUT",
+            R2_LIFECYCLE_PATH,
+            "R2 Bucket",
+        );
+        lifecycle.request_schema = Some(serde_json::json!({
+            "type":"object",
+            "properties":{"rules":{"type":"array"}},
+            "x-cfctl-body-required":true
+        }));
+        lifecycle.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        lifecycle.same_path_read = Some(SamePathReadContractV1 {
+            path: R2_LIFECYCLE_PATH.to_owned(),
+            read_capability_id: "r2-get-bucket-lifecycle-configuration".to_owned(),
+            verified_response_fields: vec!["rules".to_owned()],
+        });
+        let mut capabilities = BTreeMap::from([
+            (lifecycle.id.clone(), lifecycle),
+            (
+                "r2-get-bucket-lifecycle-configuration".to_owned(),
+                read(
+                    "r2-get-bucket-lifecycle-configuration",
+                    R2_LIFECYCLE_PATH,
+                    "R2 Bucket",
+                ),
+            ),
+        ]);
+        finalize_r2_lifecycle_contract(&mut capabilities);
+        let lifecycle = &capabilities["r2-put-bucket-lifecycle-configuration"];
+        assert_eq!(lifecycle.adapter_status, AdapterStatus::DynamicApi);
+        assert_eq!(lifecycle.risk, RiskClass::Destructive);
+        assert_eq!(lifecycle.effect, EffectClass::Destructive);
+        assert_eq!(
+            lifecycle.rollback.strategy.as_deref(),
+            Some("restore_same_path_prior_snapshot")
+        );
+        assert!(
+            lifecycle
+                .rollback
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("cannot be recovered"))
+        );
+    }
+
+    #[test]
+    fn email_preview_is_read_only_and_subdomain_enable_cannot_target_apex() {
+        let mut preview = blocked_mutation(
+            "email-sending-subdomains-preview-sending-subdomain",
+            "POST",
+            "/zones/{zone_id}/email/sending/subdomains/preview",
+            "Email Sending subdomains",
+        );
+        preview.description =
+            Some("This is a read-only dry-run — no records are created or modified.".to_owned());
+        preview.request_schema = Some(serde_json::json!({
+            "type":"object","required":["name"],"properties":{"name":{"type":"string"}},
+            "x-cfctl-body-required":true
+        }));
+        let mut enable = blocked_mutation(
+            "email-routing-settings-enable-email-routing-dns",
+            "POST",
+            EMAIL_ROUTING_DNS_PATH,
+            "Email Routing settings",
+        );
+        enable.request_schema = Some(serde_json::json!({
+            "type":"object","nullable":true,"properties":{"name":{"type":"string"}},
+            "x-cfctl-body-required":false
+        }));
+        enable.selectors = vec![SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        let mut dns_read = read(
+            "email-routing-settings-email-routing-dns-settings",
+            EMAIL_ROUTING_DNS_PATH,
+            "Email Routing settings",
+        );
+        dns_read.selectors = vec![SelectorV1 {
+            name: "subdomain".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        let mut capabilities = vec![
+            (preview.id.clone(), preview),
+            (enable.id.clone(), enable),
+            (dns_read.id.clone(), dns_read),
+        ]
+        .into_iter()
+        .collect();
+        finalize_email_sending_contracts(&mut capabilities);
+        finalize_email_routing_subdomain_contract(&mut capabilities);
+
+        let preview = &capabilities["email-sending-subdomains-preview-sending-subdomain"];
+        assert!(!preview.mutating);
+        assert_eq!(preview.risk, RiskClass::Read);
+        assert_eq!(preview.effect, EffectClass::ReadOnly);
+        assert_eq!(preview.permissions, ["Email Sending Read"]);
+
+        let enable = &capabilities["email-routing-settings-enable-email-routing-dns"];
+        assert_eq!(
+            enable.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{:?}",
+            enable.blocked_reason
+        );
+        assert_eq!(enable.permissions, ["DNS Write", "Zone Settings Write"]);
+        assert_eq!(
+            enable
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.get("additionalProperties")),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            enable
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.get("x-cfctl-body-required")),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            enable
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.get("nullable")),
+            None
+        );
     }
 }
 
@@ -7788,6 +8029,452 @@ fn official_reference(title: &str, url: &str) -> KnowledgeReferenceV1 {
     }
 }
 
+const R2_OBJECT_PATH: &str = "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}";
+const R2_LIFECYCLE_PATH: &str = "/accounts/{account_id}/r2/buckets/{bucket_name}/lifecycle";
+const EMAIL_SENDING_COLLECTION_PATH: &str = "/zones/{zone_id}/email/sending/subdomains";
+const EMAIL_SENDING_DETAIL_PATH: &str = "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}";
+const EMAIL_SENDING_DNS_PATH: &str = "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns";
+const EMAIL_SENDING_DNS_STATUS_PATH: &str =
+    "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns/status";
+const EMAIL_ROUTING_DNS_PATH: &str = "/zones/{zone_id}/email/routing/dns";
+
+fn zero_direct_usage_cost(
+    capability: &mut CapabilityV1,
+    basis: &str,
+    references: Vec<KnowledgeReferenceV1>,
+) {
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some(basis.to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references,
+    };
+}
+
+fn finalize_r2_private_file_upload_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let read_supported = capabilities
+        .get("r2-get-object")
+        .is_some_and(|capability| capability.method == "GET" && capability.path == R2_OBJECT_PATH);
+    let delete_supported = capabilities
+        .get("r2-delete-object")
+        .is_some_and(|capability| {
+            capability.method == "DELETE"
+                && capability.path == R2_OBJECT_PATH
+                && capability.permissions == ["Workers R2 Storage Write"]
+        });
+    let Some(capability) = capabilities.get_mut("r2-put-object") else {
+        return;
+    };
+    let operation_supported = capability.method == "PUT"
+        && capability.path == R2_OBJECT_PATH
+        && capability.product == "R2 Object"
+        && capability.request_schema.is_none()
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "object_key"
+                && selector.location == "path"
+                && selector.required
+                && selector
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains("MUST NOT be percent-encoded"))
+        });
+    if !operation_supported || !read_supported || !delete_supported {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "R2 create-only private-file upload, conditional readback, or exact delete contract drifted"
+                .to_owned(),
+        );
+        return;
+    }
+    let Some(content_type) = capability
+        .selectors
+        .iter_mut()
+        .find(|selector| selector.name == "Content-Type" && selector.location == "header")
+    else {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some("R2 upload Content-Type selector drifted".to_owned());
+        return;
+    };
+    content_type.required = true;
+    capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    zero_direct_usage_cost(
+        capability,
+        "the upload is one R2 Class A operation with no direct configuration charge; retained bytes and later reads incur ordinary R2 storage and operation usage",
+        vec![official_reference(
+            "R2 pricing",
+            "https://developers.cloudflare.com/r2/pricing/",
+        )],
+    );
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/r2/platform/limits/".to_owned());
+    capability.verification.required = true;
+    "r2_private_file_upload_etag_and_conditional_read"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "the immutable upload is create-only; rollback is a separately reviewed exact-object delete plan, while replacement requires a new digest-addressed key"
+            .to_owned(),
+    );
+    capability.r2_private_file_upload = Some(R2PrivateFileUploadContractV1 {
+        max_source_bytes: 300_000_000,
+        allowed_content_types: vec![
+            "application/json".to_owned(),
+            "application/octet-stream".to_owned(),
+        ],
+        require_if_none_match_star: true,
+        read_capability_id: "r2-get-object".to_owned(),
+        delete_capability_id: "r2-delete-object".to_owned(),
+        etag_algorithm: "md5".to_owned(),
+    });
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let read_supported = capabilities
+        .get("r2-get-bucket-lifecycle-configuration")
+        .is_some_and(|capability| {
+            capability.method == "GET" && capability.path == R2_LIFECYCLE_PATH
+        });
+    let Some(capability) = capabilities.get_mut("r2-put-bucket-lifecycle-configuration") else {
+        return;
+    };
+    let supported = read_supported
+        && capability.method == "PUT"
+        && capability.path == R2_LIFECYCLE_PATH
+        && capability.request_schema.as_ref().is_some_and(|schema| {
+            schema
+                .pointer("/properties/rules/type")
+                .and_then(Value::as_str)
+                == Some("array")
+        })
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == R2_LIFECYCLE_PATH
+                && read.read_capability_id == "r2-get-bucket-lifecycle-configuration"
+                && read.verified_response_fields == ["rules"]
+        });
+    if !supported {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "R2 lifecycle complete-replacement or same-path snapshot contract drifted".to_owned(),
+        );
+        return;
+    }
+    capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
+    capability.risk = RiskClass::Destructive;
+    capability.effect = EffectClass::Destructive;
+    zero_direct_usage_cost(
+        capability,
+        "replacing lifecycle configuration has no direct configuration charge; resulting storage duration and operations remain ordinary R2 usage",
+        vec![official_reference(
+            "R2 object lifecycles",
+            "https://developers.cloudflare.com/r2/buckets/object-lifecycles/",
+        )],
+    );
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "the plan binds the complete prior lifecycle snapshot for a separately approved restoration; objects already expired by the changed policy cannot be recovered"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn email_sending_cost(capability: &mut CapabilityV1, action: &str) {
+    zero_direct_usage_cost(
+        capability,
+        &format!(
+            "{action} has no direct configuration-operation charge; arbitrary-recipient Email Sending requires current Workers Paid entitlement and outbound volume beyond included usage is billed at the current Email Service rate"
+        ),
+        vec![official_reference(
+            "Email Service pricing",
+            "https://developers.cloudflare.com/email-service/platform/pricing/",
+        )],
+    );
+}
+
+fn attach_email_sending_entitlement(capability: &mut CapabilityV1) {
+    capability.entitlement.plans.clear();
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/email-service/platform/pricing/".to_owned());
+    attach_live_read_entitlement_probe(
+        capability,
+        "email-sending-subdomains-list-sending-subdomains",
+        EMAIL_SENDING_COLLECTION_PATH,
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Email Sending preview, lifecycle, DNS repair, permissions, cost, and live entitlement form one fail-closed provider contract"
+)]
+fn finalize_email_sending_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    for id in [
+        "email-sending-subdomains-list-sending-subdomains",
+        "email-sending-subdomains-get-sending-subdomain",
+        "email-sending-subdomains-get-sending-subdomain-dns",
+        "email-sending-subdomains-get-sending-subdomain-dns-status",
+    ] {
+        if let Some(capability) = capabilities.get_mut(id) {
+            capability.permissions = vec!["Email Sending Read".to_owned()];
+        }
+    }
+
+    if let Some(preview) =
+        capabilities.get_mut("email-sending-subdomains-preview-sending-subdomain")
+    {
+        let supported = preview.method == "POST"
+            && preview.path == "/zones/{zone_id}/email/sending/subdomains/preview"
+            && preview.request_schema.as_ref().is_some_and(|schema| {
+                schema.pointer("/required/0").and_then(Value::as_str) == Some("name")
+            })
+            && preview.description.as_deref().is_some_and(|description| {
+                description.contains("read-only dry-run")
+                    && description.contains("no records are created or modified")
+            });
+        if supported {
+            preview.mutating = false;
+            preview.risk = RiskClass::Read;
+            preview.effect = EffectClass::ReadOnly;
+            preview.permissions = vec!["Email Sending Read".to_owned()];
+            preview.cost = CostV1::default();
+            preview.verification.required = false;
+            "not_applicable".clone_into(&mut preview.verification.strategy);
+            preview.rollback.supported = false;
+            preview.rollback.strategy = None;
+            preview.rollback.warning = None;
+            preview.adapter_status = AdapterStatus::DynamicApi;
+            preview.blocked_reason = None;
+        } else {
+            preview.adapter_status = AdapterStatus::Blocked;
+            preview.blocked_reason =
+                Some("Email Sending DNS preview no longer proves read-only behavior".to_owned());
+        }
+    }
+
+    let detail_read_supported = capabilities
+        .get("email-sending-subdomains-get-sending-subdomain")
+        .is_some_and(|capability| {
+            capability.method == "GET" && capability.path == EMAIL_SENDING_DETAIL_PATH
+        });
+    let delete_supported = capabilities
+        .get("email-sending-subdomains-delete-sending-subdomain")
+        .is_some_and(|capability| {
+            capability.method == "DELETE" && capability.path == EMAIL_SENDING_DETAIL_PATH
+        });
+    if let Some(create) = capabilities.get_mut("email-sending-subdomains-create-sending-subdomain")
+    {
+        let supported = detail_read_supported
+            && delete_supported
+            && create.method == "POST"
+            && create.path == EMAIL_SENDING_COLLECTION_PATH
+            && create.request_schema.as_ref().is_some_and(|schema| {
+                schema.pointer("/required/0").and_then(Value::as_str) == Some("name")
+            });
+        if supported {
+            create.permissions = vec!["Email Sending Write".to_owned()];
+            create.risk = RiskClass::ExternalCommunication;
+            create.effect = EffectClass::ExternalCommunication;
+            email_sending_cost(create, "onboarding a sending subdomain");
+            attach_email_sending_entitlement(create);
+            create.created_resource = Some(CreatedResourceContractV1 {
+                detail_path: EMAIL_SENDING_DETAIL_PATH.to_owned(),
+                identity_selector: "subdomain_id".to_owned(),
+                response_result_identity_pointer: "/tag".to_owned(),
+                read_capability_id: "email-sending-subdomains-get-sending-subdomain".to_owned(),
+                delete_capability_id: "email-sending-subdomains-delete-sending-subdomain"
+                    .to_owned(),
+                verified_response_fields: vec!["name".to_owned()],
+            });
+            "created_resource_contains_planned_fields_by_returned_id"
+                .clone_into(&mut create.verification.strategy);
+            create.rollback.supported = true;
+            create.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+            create.rollback.warning = Some(
+                "rollback is a separately reviewed exact sending-subdomain delete; it removes provider-managed sending DNS records but cannot undo messages already delivered"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(create);
+        } else {
+            create.adapter_status = AdapterStatus::Blocked;
+            create.blocked_reason =
+                Some("Email Sending create/read/delete lifecycle contract drifted".to_owned());
+        }
+    }
+
+    if let Some(update) = capabilities.get_mut("email-sending-subdomains-update-sending-subdomain")
+    {
+        let supported = detail_read_supported
+            && update.method == "PATCH"
+            && update.path == EMAIL_SENDING_DETAIL_PATH
+            && update.request_schema.as_ref().is_some_and(|schema| {
+                schema.pointer("/required/0").and_then(Value::as_str) == Some("preview_enabled")
+            })
+            && update.same_path_read.as_ref().is_some_and(|read| {
+                read.read_capability_id == "email-sending-subdomains-get-sending-subdomain"
+                    && read.verified_response_fields == ["preview_enabled"]
+            });
+        if supported {
+            update.permissions = vec!["Email Sending Write".to_owned()];
+            update.risk = RiskClass::ScopedWrite;
+            update.effect = EffectClass::ReversibleWrite;
+            email_sending_cost(update, "changing Email preview preference");
+            attach_email_sending_entitlement(update);
+            update.rollback.supported = true;
+            update.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+            update.rollback.warning = Some(
+                "rollback is a separately reviewed restore of the exact prior preview_enabled value; content already retained while preview was enabled is not recalled"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(update);
+        } else {
+            update.adapter_status = AdapterStatus::Blocked;
+            update.blocked_reason = Some(
+                "Email Sending preview-preference update/readback contract drifted".to_owned(),
+            );
+        }
+    }
+
+    if let Some(delete) = capabilities.get_mut("email-sending-subdomains-delete-sending-subdomain")
+        && detail_read_supported
+        && delete.method == "DELETE"
+        && delete.path == EMAIL_SENDING_DETAIL_PATH
+    {
+        delete.permissions = vec!["Email Sending Write".to_owned()];
+        delete.risk = RiskClass::Destructive;
+        delete.effect = EffectClass::Destructive;
+        email_sending_cost(delete, "deleting a sending subdomain");
+        attach_email_sending_entitlement(delete);
+        delete.rollback.supported = false;
+        delete.rollback.strategy = None;
+        delete.rollback.warning = Some(
+            "deletion disables sending and removes provider-managed DNS records; recreation and any DNS restoration require separate reviewed operations, and delivered messages cannot be undone"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(delete);
+    }
+
+    let status_read_supported = capabilities
+        .get("email-sending-subdomains-get-sending-subdomain-dns-status")
+        .is_some_and(|capability| {
+            capability.method == "GET" && capability.path == EMAIL_SENDING_DNS_STATUS_PATH
+        });
+    if let Some(repair) = capabilities.get_mut("email-sending-subdomains-fix-sending-subdomain-dns")
+    {
+        if status_read_supported
+            && repair.method == "POST"
+            && repair.path == EMAIL_SENDING_DNS_PATH
+            && repair.request_schema.is_none()
+        {
+            repair.permissions = vec![
+                "DNS Write".to_owned(),
+                "Email Sending Read".to_owned(),
+                "Email Sending Write".to_owned(),
+            ];
+            repair.risk = RiskClass::ScopedWrite;
+            repair.effect = EffectClass::ReversibleWrite;
+            email_sending_cost(repair, "repairing provider-managed sending DNS records");
+            attach_email_sending_entitlement(repair);
+            repair.email_sending_dns_repair = Some(EmailSendingDnsRepairContractV1 {
+                status_read_capability_id:
+                    "email-sending-subdomains-get-sending-subdomain-dns-status".to_owned(),
+                status_read_path: EMAIL_SENDING_DNS_STATUS_PATH.to_owned(),
+            });
+            "email_sending_dns_status_reports_ready".clone_into(&mut repair.verification.strategy);
+            repair.rollback.supported = false;
+            repair.rollback.strategy = None;
+            repair.rollback.warning = Some(
+                "DNS repair is idempotent but not automatically reversible; provider-managed record removal or exact prior-record restoration requires separate reviewed DNS and sending-domain plans"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(repair);
+        } else {
+            repair.adapter_status = AdapterStatus::Blocked;
+            repair.blocked_reason =
+                Some("Email Sending DNS repair or live status-read contract drifted".to_owned());
+        }
+    }
+}
+
+fn finalize_email_routing_subdomain_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let read_supported = capabilities
+        .get("email-routing-settings-email-routing-dns-settings")
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == EMAIL_ROUTING_DNS_PATH
+                && capability.selectors.iter().any(|selector| {
+                    selector.name == "subdomain"
+                        && selector.location == "query"
+                        && !selector.required
+                })
+        });
+    let Some(enable) = capabilities.get_mut("email-routing-settings-enable-email-routing-dns")
+    else {
+        return;
+    };
+    if !read_supported
+        || enable.method != "POST"
+        || enable.path != EMAIL_ROUTING_DNS_PATH
+        || !enable.request_schema.as_ref().is_some_and(|schema| {
+            schema.pointer("/properties/name/type") == Some(&Value::String("string".to_owned()))
+        })
+    {
+        enable.adapter_status = AdapterStatus::Blocked;
+        enable.blocked_reason =
+            Some("Email Routing subdomain enable or DNS readback contract drifted".to_owned());
+        return;
+    }
+    enable.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["name"],
+        "properties":{
+            "name":{"type":"string","minLength":1,"maxLength":253}
+        },
+        "x-cfctl-body-required":true
+    }));
+    enable.permissions = vec!["DNS Write".to_owned(), "Zone Settings Write".to_owned()];
+    enable.risk = RiskClass::ScopedWrite;
+    enable.effect = EffectClass::ReversibleWrite;
+    zero_direct_usage_cost(
+        enable,
+        "enabling Email Routing for one explicit subdomain and creating its required DNS records has no direct operation charge; Email Routing is free",
+        vec![official_reference(
+            "Email Routing subdomains",
+            "https://developers.cloudflare.com/email-routing/setup/subdomains/",
+        )],
+    );
+    enable.entitlement.available = Some(true);
+    enable.entitlement.requires_live_resolution = false;
+    enable.email_routing_subdomain_dns = Some(EmailRoutingSubdomainDnsContractV1 {
+        read_capability_id: "email-routing-settings-email-routing-dns-settings".to_owned(),
+        read_path: EMAIL_ROUTING_DNS_PATH.to_owned(),
+        request_name_field: "name".to_owned(),
+        read_query_field: "subdomain".to_owned(),
+    });
+    "email_routing_subdomain_dns_records_match".clone_into(&mut enable.verification.strategy);
+    enable.rollback.supported = false;
+    enable.rollback.strategy = None;
+    enable.rollback.warning = Some(
+        "rollback is a separately reviewed disable/delete of only the subdomain routing DNS and rules, bound to the complete prior DNS snapshot; this contract cannot mutate apex MX because name is mandatory"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(enable);
+}
+
 fn apply_post_normalization_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
@@ -7823,6 +8510,10 @@ fn apply_post_normalization_contracts(
     finalize_dns_record_rollback_contract(document, capabilities);
     finalize_dns_record_delete_response_contract(capabilities);
     finalize_queue_consumer_contracts(document, capabilities);
+    finalize_r2_private_file_upload_contract(capabilities);
+    finalize_r2_lifecycle_contract(capabilities);
+    finalize_email_sending_contracts(capabilities);
+    finalize_email_routing_subdomain_contract(capabilities);
     finalize_worker_script_delete_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
     finalize_access_application_login_methods_contract(document, capabilities);
@@ -19848,7 +20539,7 @@ mod control_plane_overlay_tests {
             source_url: "test://reserved".to_owned(),
             source_hash: "sha256:test".to_owned(),
             schema_hash: String::new(),
-            capabilities: [pull, acknowledge, pipeline]
+            capabilities: vec![pull, acknowledge, pipeline]
                 .into_iter()
                 .map(|capability| (capability.id.clone(), capability))
                 .collect(),
