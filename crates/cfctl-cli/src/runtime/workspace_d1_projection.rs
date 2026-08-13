@@ -167,7 +167,7 @@ pub(super) async fn run(
     let database_name = target_string(target, "database_name")?;
     let config = target_string(target, "production_config")?;
     let stage = private_stage(target)?;
-    let stage_path = Path::new(target_string(stage, "path")?);
+    let stage_path = private_stage_path(store, stage)?;
 
     let version = workspace_d1_migration::run_wrangler(
         &["--version".to_owned()],
@@ -429,13 +429,18 @@ fn stage_private_projection(store: &StateStore, source: &Path) -> Result<Value> 
         .map_err(|error| cli_io(&stage_path, error))?;
     drop(staged);
     let digest = sha256(&bytes);
+    let stage_id = stage_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CliError::Input("workspace D1 private stage ID is invalid".to_owned()))?;
     let target = json!({
         "schema_version": 1,
-        "path": stage_path,
+        "stage_id": stage_id,
         "sha256": digest,
         "bytes": bytes.len(),
         "unix_mode": if cfg!(unix) { Value::String("0600".to_owned()) } else { Value::Null },
         "content_in_plan": false,
+        "path_in_plan": false,
     });
     let target_object = target.as_object().ok_or_else(|| {
         CliError::Input("workspace D1 private stage did not serialize as an object".to_owned())
@@ -452,29 +457,14 @@ fn validate_private_stage(store: &StateStore, target: &Map<String, Value>) -> Re
 fn validate_private_stage_object(store: &StateStore, stage: &Map<String, Value>) -> Result<()> {
     if stage.get("schema_version").and_then(Value::as_u64) != Some(1)
         || stage.get("content_in_plan").and_then(Value::as_bool) != Some(false)
+        || stage.get("path_in_plan").and_then(Value::as_bool) != Some(false)
+        || stage.get("path").is_some()
     {
         return Err(CliError::Input(
             "workspace D1 private stage contract is invalid".to_owned(),
         ));
     }
-    let path = Path::new(target_string(stage, "path")?);
-    let stage_root = store.paths().data_dir.join("private-operation-stages");
-    let stage_dir = path
-        .parent()
-        .ok_or_else(|| CliError::Input("workspace D1 private stage path is invalid".to_owned()))?;
-    if !path.is_absolute()
-        || path.file_name().and_then(|name| name.to_str()) != Some("d1-policy-projection.sql")
-        || stage_dir.parent() != Some(stage_root.as_path())
-        || stage_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| Uuid::parse_str(name).ok())
-            .is_none()
-    {
-        return Err(CliError::Input(
-            "workspace D1 private stage escaped its exact managed directory".to_owned(),
-        ));
-    }
+    let path = private_stage_path(store, stage)?;
     let expected_sha = target_string(stage, "sha256")?;
     if !is_sha256(expected_sha) {
         return Err(CliError::Input(
@@ -486,13 +476,30 @@ fn validate_private_stage_object(store: &StateStore, stage: &Map<String, Value>)
         .and_then(Value::as_u64)
         .filter(|value| *value > 0 && *value <= MAX_PROJECTION_BYTES)
         .ok_or_else(|| CliError::Input("workspace D1 private stage size is invalid".to_owned()))?;
-    let bytes = read_private_regular_file(path, MAX_PROJECTION_BYTES)?;
+    let bytes = read_private_regular_file(&path, MAX_PROJECTION_BYTES)?;
     if bytes.len() as u64 != expected_bytes || sha256(&bytes) != expected_sha {
         return Err(CliError::Input(
             "workspace D1 private stage digest drifted; create a new plan".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn private_stage_path(store: &StateStore, stage: &Map<String, Value>) -> Result<PathBuf> {
+    let stage_id = target_string(stage, "stage_id")?;
+    let parsed = Uuid::parse_str(stage_id)
+        .map_err(|_| CliError::Input("workspace D1 private stage ID is not a UUID".to_owned()))?;
+    if parsed.hyphenated().to_string() != stage_id {
+        return Err(CliError::Input(
+            "workspace D1 private stage ID is not canonical".to_owned(),
+        ));
+    }
+    Ok(store
+        .paths()
+        .data_dir
+        .join("private-operation-stages")
+        .join(stage_id)
+        .join("d1-policy-projection.sql"))
 }
 
 fn read_private_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
@@ -674,9 +681,18 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("mode");
         let staged = stage_private_projection(&store, &source).expect("stage");
         assert_eq!(staged["content_in_plan"], false);
+        assert_eq!(staged["path_in_plan"], false);
+        assert!(staged.get("path").is_none());
         assert!(!staged.to_string().contains("INSERT INTO"));
-        let path = Path::new(staged["path"].as_str().expect("path"));
-        let metadata = fs::metadata(path).expect("metadata");
+        assert!(
+            !staged
+                .to_string()
+                .contains(root.path().to_str().expect("root"))
+        );
+        let metadata = fs::metadata(
+            private_stage_path(&store, staged.as_object().expect("stage object")).expect("path"),
+        )
+        .expect("metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 
