@@ -3,6 +3,8 @@
 mod event_batch;
 mod worker_custom_domain;
 mod worker_deployment;
+mod workspace_d1_migration;
+mod workspace_d1_projection;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1079,12 +1081,15 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
         }
         CatalogCommand::Show(selector) => {
             let catalog = ensure_catalog(store).await?;
-            let capability = catalog
-                .get(&selector.capability_id)
-                .ok_or_else(|| capability_missing(&selector.capability_id))?;
+            let capability = if let Some(capability) = catalog.get(&selector.capability_id) {
+                capability.clone()
+            } else {
+                load_workspace_capability(store, &selector.capability_id)?
+                    .ok_or_else(|| capability_missing(&selector.capability_id))?
+            };
             Ok(ResultEnvelopeV2::success(
                 "catalog show",
-                serde_json::to_value(caller_facing_capability(capability))?,
+                serde_json::to_value(caller_facing_capability(&capability))?,
             ))
         }
         CatalogCommand::Changes => {
@@ -1240,12 +1245,15 @@ async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<Resu
         CliError::Input("guide requires one capability ID or `--topic`".to_owned())
     })?;
     let catalog = ensure_catalog(store).await?;
-    let capability = catalog
-        .get(capability_id)
-        .ok_or_else(|| capability_missing(capability_id))?;
+    let capability = if let Some(capability) = catalog.get(capability_id) {
+        capability.clone()
+    } else {
+        load_workspace_capability(store, capability_id)?
+            .ok_or_else(|| capability_missing(capability_id))?
+    };
     Ok(ResultEnvelopeV2::success(
         "guide",
-        serde_json::to_value(guide_document(capability))?,
+        serde_json::to_value(guide_document(&capability))?,
     ))
 }
 
@@ -1266,10 +1274,12 @@ fn guide_topic_envelope(topic: GuideTopicArg) -> Result<ResultEnvelopeV2> {
 )]
 async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultEnvelopeV2> {
     let catalog = ensure_catalog(store).await?;
-    let capability = catalog
-        .get(&arguments.capability_id)
-        .cloned()
-        .ok_or_else(|| capability_missing(&arguments.capability_id))?;
+    let capability = if let Some(capability) = catalog.get(&arguments.capability_id) {
+        capability.clone()
+    } else {
+        load_workspace_capability(store, &arguments.capability_id)?
+            .ok_or_else(|| capability_missing(&arguments.capability_id))?
+    };
     if is_secret_output_capability(&capability) && arguments.value_out.is_none() {
         return Err(CliError::Input(
             "secret-producing capabilities require `--value-out <new-path>`; the value is never written to stdout or evidence"
@@ -1279,11 +1289,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
+    let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
     let is_d1_approved_mln_import_poll_resume =
         capability.d1_approved_mln_import_poll_resume.is_some();
-    if is_d1_approved_mln_import != arguments.source_file.is_some() {
+    if (is_d1_approved_mln_import || is_workspace_d1_projection) != arguments.source_file.is_some()
+    {
         return Err(CliError::Input(
-            "governed D1 imports require exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports and workspace policy projections require exactly one plan-creation-only `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -1468,6 +1480,65 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     }
     if let Some(authority) = resume_poll_authority {
         adapter_targets.insert("approved_mln_import_poll_resume".to_owned(), authority);
+    }
+    if capability.workspace_d1_migration.is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace D1 migration requires an explicit account pin or --account".to_owned(),
+            )
+        })?;
+        let target = workspace_d1_migration::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("workspace D1 migration target could not be derived".to_owned())
+        })?;
+        adapter_targets.insert("workspace_d1_migration".to_owned(), target);
+    }
+    if capability.workspace_d1_policy_projection.is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace D1 policy projection requires an explicit account pin or --account"
+                    .to_owned(),
+            )
+        })?;
+        let source = arguments.source_file.as_deref().ok_or_else(|| {
+            CliError::Input("workspace D1 policy projection source is missing".to_owned())
+        })?;
+        let target = workspace_d1_projection::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+            source,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("workspace D1 policy projection target could not be derived".to_owned())
+        })?;
+        adapter_targets.insert("workspace_d1_policy_projection".to_owned(), target);
     }
     let result = Box::pin(create_plan(
         store,
@@ -6280,6 +6351,12 @@ async fn run_delegated_plan_boundary(
     input: &CallInput,
     credential: &AuthCredential,
 ) -> Result<Value> {
+    if plan.capability.workspace_d1_migration.is_some() {
+        return workspace_d1_migration::run(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_policy_projection.is_some() {
+        return workspace_d1_projection::run(store, plan, credential).await;
+    }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let delegated_input =
         worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
@@ -6327,6 +6404,10 @@ fn delegated_cli_failure_envelope(
     envelope
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the delegated verification dispatcher keeps every closed strategy explicit and fails unknown strategies without an implicit fallback"
+)]
 async fn verify_delegated_cli_plan(
     store: &StateStore,
     plan: &PlanV1,
@@ -6334,6 +6415,12 @@ async fn verify_delegated_cli_plan(
     receipt: &Value,
     credential: &AuthCredential,
 ) -> Value {
+    if plan.capability.workspace_d1_migration.is_some() {
+        return workspace_d1_migration::verify(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_policy_projection.is_some() {
+        return workspace_d1_projection::verify(store, plan, credential).await;
+    }
     if plan.capability.verification.strategy == "trycloudflare_https_url_reaches_reviewed_origin" {
         return verify_quick_tunnel_plan(input, receipt).await;
     }
@@ -14128,6 +14215,12 @@ fn append_local_artifact_diffs(
 }
 
 fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Result<Vec<PathBuf>> {
+    if let Some(paths) = workspace_d1_migration::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
+    if let Some(paths) = workspace_d1_projection::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
     if worker_deployment::binds_artifact(capability) {
         return worker_deployment::artifact_paths(capability, input);
     }
@@ -25850,6 +25943,8 @@ fn current_pages_source_remote_precondition(
 }
 
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    workspace_d1_migration::validate_bound_plan(store, plan)?;
+    workspace_d1_projection::validate_bound_plan(store, plan)?;
     let local_artifact_paths = plan
         .precondition_hashes
         .keys()
@@ -26206,7 +26301,11 @@ async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<R
         ));
     }
     let catalog = ensure_catalog(store).await?;
-    let ranked = catalog.search_scored(intent);
+    let workspace = load_workspace_capability(store, intent)?;
+    let ranked = workspace.as_ref().map_or_else(
+        || catalog.search_scored(intent),
+        |capability| vec![(capability, usize::MAX)],
+    );
     let (result, error) = resolve_result(
         intent,
         &ranked,
@@ -27992,6 +28091,16 @@ fn capability_missing(id: &str) -> CliError {
             "Find the correct id: `cfctl catalog search \"{id}\" --json` (or `cfctl resolve \"<what you want to do>\"`)."
         ),
     )
+}
+
+fn load_workspace_capability(
+    store: &StateStore,
+    capability_id: &str,
+) -> Result<Option<CapabilityV1>> {
+    if let Some(capability) = workspace_d1_migration::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
+    workspace_d1_projection::load(store, capability_id)
 }
 
 fn is_secret_path(path: &Path) -> bool {

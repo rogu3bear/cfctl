@@ -1494,6 +1494,77 @@ pub struct RollbackSpecV1 {
     pub warning: Option<String>,
 }
 
+/// One append-only migration file bound by a workspace-owned D1 operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1MigrationFileV1 {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// A compiler-owned post-migration assertion. Optional fields are validated
+/// against `kind`; callers cannot supply SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1SchemaAssertionV1 {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+}
+
+/// Exact repository authority serialized into a workspace-owned D1 migration
+/// plan. Provider identity and the fresh recovery proof are bound separately
+/// in the plan adapter target because they are just-in-time inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1MigrationContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub migrations_dir: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub migrations: Vec<WorkspaceD1MigrationFileV1>,
+    pub assertions: Vec<WorkspaceD1SchemaAssertionV1>,
+    pub recovery_capability_id: String,
+    pub recovery_max_age_seconds: u64,
+    pub rollback_capability_id: String,
+}
+
+/// A workspace-owned D1 policy projection. The private SQL projection is
+/// staged out of band; this contract contains only repository authority,
+/// compiler-owned readback identifiers, and recovery requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1PolicyProjectionContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub route_table: String,
+    pub route_policy_sha_column: String,
+    pub runtime_state_table: String,
+    pub runtime_state_key_column: String,
+    pub runtime_state_value_column: String,
+    pub active_policy_key: String,
+    pub desired_state_digest_key: String,
+    pub projection_digest_key: String,
+    pub recovery_capability_id: String,
+    pub recovery_max_age_seconds: u64,
+    pub rollback_capability_id: String,
+}
+
 /// Hash-bound coordinates for proving and compensating a newly created
 /// Cloudflare resource. The identity pointer is relative to the API response's
 /// `result` object; callers must not infer any of these values from mutable
@@ -1706,6 +1777,10 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_migration: Option<WorkspaceD1MigrationContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import: Option<D1ApprovedMlnImportContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import_poll_resume: Option<D1ApprovedMlnImportPollResumeContractV1>,
@@ -1816,6 +1891,8 @@ impl CapabilityV1 {
             mln_0143_data_invariants: None,
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
+            workspace_d1_migration: None,
+            workspace_d1_policy_projection: None,
             d1_approved_mln_import: None,
             d1_approved_mln_import_poll_resume: None,
             r2_log_retrieval: None,
@@ -1995,6 +2072,58 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "workspace_d1_migration_ledger_and_schema_assertions" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::DataWrite
+                    && self
+                        .workspace_d1_migration
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.operation_pack_sha256.is_empty()
+                                && !contract.config_template_sha256.is_empty()
+                                && !contract.wrangler_version.is_empty()
+                                && !contract.migrations.is_empty()
+                                && !contract.assertions.is_empty()
+                                && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+                                && contract.recovery_max_age_seconds > 0
+                                && contract.recovery_max_age_seconds <= 600
+                                && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                        })
+            }
+            "workspace_d1_policy_projection_count_and_digest" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::DataWrite
+                    && self
+                        .workspace_d1_policy_projection
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.operation_pack_sha256.is_empty()
+                                && !contract.config_template_sha256.is_empty()
+                                && !contract.wrangler_version.is_empty()
+                                && !contract.route_table.is_empty()
+                                && !contract.route_policy_sha_column.is_empty()
+                                && !contract.runtime_state_table.is_empty()
+                                && !contract.runtime_state_key_column.is_empty()
+                                && !contract.runtime_state_value_column.is_empty()
+                                && !contract.active_policy_key.is_empty()
+                                && !contract.desired_state_digest_key.is_empty()
+                                && !contract.projection_digest_key.is_empty()
+                                && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+                                && contract.recovery_max_age_seconds > 0
+                                && contract.recovery_max_age_seconds <= 600
+                                && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                        })
+            }
             "mln_import_requires_governed_post_import_proof" => {
                 matches!(
                     self.id.as_str(),

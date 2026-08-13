@@ -13,6 +13,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
+mod d1_operation;
+mod d1_policy_projection;
+
+pub use d1_operation::load_workspace_d1_migration_capability;
+pub use d1_policy_projection::load_workspace_d1_policy_projection_capability;
+
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
     #[error("registered root does not exist: {0}")]

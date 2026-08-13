@@ -3555,8 +3555,7 @@ impl Executor {
     ) -> Result<OperationVerificationV1> {
         let input: CallInput = serde_json::from_value(plan.input.clone())
             .map_err(cfctl_core::CoreError::Serialization)?;
-        self.verify_plan_with_input(plan, apply_response, &input, credential)
-            .await
+        Box::pin(self.verify_plan_with_input(plan, apply_response, &input, credential)).await
     }
 
     /// Runs the operation-specific verifier with the exact execution input
@@ -3627,9 +3626,13 @@ impl Executor {
         }
 
         if strategy.starts_with("async_list_operation_") {
-            return self
-                .verify_async_list_mutation(plan, apply_response, input, credential)
-                .await;
+            return Box::pin(self.verify_async_list_mutation(
+                plan,
+                apply_response,
+                input,
+                credential,
+            ))
+            .await;
         }
 
         if is_delete_verifier(strategy) {

@@ -354,6 +354,63 @@ parameters, arbitrary PRAGMAs, multiple statements, and database retargeting
 are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
 `wrangler.d1` capabilities remain blocked.
 
+### Repository-bound D1 changes
+
+Application repositories may declare ordered migration operations in
+`.cfctl/operations/d1-migrations.toml` and private policy projections in
+`.cfctl/operations/d1-policy-projections.toml`. The repository must already be
+an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
+the operation pack and tracked Wrangler template at that HEAD. Migration packs
+also close the ordered migration directory with exact per-file SHA-256 values.
+
+Both operations bind an exact Wrangler version, the ignored production-config
+path and D1 binding, a fresh pre-change bookmark, and a separately approved
+exact-bookmark recovery capability. The production config must be a regular
+mode-restricted file and may differ from its tracked template only in the
+allowed Worker and D1 identity fields.
+
+Prepare a migration by its repository-owned operation id:
+
+```sh
+cfctl call <repository-migration-operation-id> \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-uuid> \
+  --query config=/absolute/path/to/wrangler.production.toml \
+  --json
+```
+
+For a policy projection, the reviewed SQL is supplied only through a private
+mode-0600 source file. Its bytes are copied to a new mode-0600 managed stage;
+the plan and receipts retain the exact digest and size, but never the SQL or
+private policy rows:
+
+```sh
+cfctl call <repository-policy-projection-operation-id> \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-uuid> \
+  --query config=/absolute/path/to/wrangler.production.toml \
+  --query policy_sha256=sha256:<digest> \
+  --query desired_state_sha256=sha256:<digest> \
+  --query projection_sha256=sha256:<digest> \
+  --query expected_route_count=<count> \
+  --source-file /absolute/private/projection.sql \
+  --json
+```
+
+Planning requires exactly one successful `d1-time-travel-get-bookmark`
+operational proof from the preceding ten minutes, bound to the same catalog,
+profile, account, credential generation, and database target. Approval is
+one-use. Execution revalidates repository, config, stage, and recovery
+authority before invoking the pinned Wrangler. Migration verification requires
+the exact ledger plus compiler-owned schema assertions. Policy projection
+verification returns only the route count and the active policy,
+desired-state, and projection digests through compiler-owned queries.
+
+Do not substitute raw D1 query or direct Wrangler execution. If execution may
+have crossed the provider boundary but fails before verified readback, preserve
+the receipt and rectify. Recovery is a new, independently approved
+`d1-restore-exact-bookmark` plan using the captured pre-change bookmark.
+
 Use `d1-full-export` to capture a full schema-and-data SQL snapshot immediately
 before a separately governed migration:
 

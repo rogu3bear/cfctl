@@ -61,9 +61,28 @@ product's source or deployment policy. The provider-generic
 `d1-import-database` contract remains portable by deriving one clean tracked
 SQL blob and its exact repository identity at plan creation, binding an
 immutable target plus full-export recovery anchor, and leaving application
-semantics in the owning repository. Workspace-owned operations belong in a
-future typed, hash-bound operation pack loaded from an explicitly registered
-root; inserting one directly into the provider catalog fails closed.
+semantics in the owning repository. Workspace-owned D1 operations live in
+typed, hash-bound operation packs loaded from explicitly registered roots;
+inserting one directly into the provider catalog fails closed. The loader
+requires a clean canonical HEAD and origin, committed pack and Wrangler
+template, closed migration inputs where applicable, pinned Wrangler version,
+compiler-owned verification identifiers, and exact recovery capabilities.
+
+The D1 migration adapter delegates only the apply boundary to the operation
+pack's pinned Wrangler. cfctl binds the registered repository, clean HEAD,
+pack/template/migration hashes, account, database, mode-restricted production
+config, and a fresh pre-change bookmark. It requires the observed migration
+ledger to be an exact prefix before apply and an exact match after apply, then
+runs only compiler-owned schema assertions.
+
+Private D1 policy projection bytes enter through an exact mode-0600
+plan-creation source and are copied to a managed mode-0600 stage. SQL and
+private policy rows never enter the plan, receipt, evidence, or provider output
+projection. Authority is instead represented by the source size and SHA-256,
+policy/desired-state/projection digests, expected route count, and fresh
+bookmark. Post-write verification returns only compiler-owned route-count and
+digest readbacks. Recovery for either operation is a separately approved
+exact-bookmark restore, never an automatic compensating write.
 
 Five pre-operation-pack D1 contracts are acknowledged as frozen
 `legacy_embedded` migration debt: two MLNavigator schema proofs, its approved
@@ -72,9 +91,9 @@ The catalog validates their exact ids and contract shapes, reports the authority
 classes in `catalog coverage`, and rejects a new legacy id without an explicit
 allowlist change. This classification does not publish either application
 repository and does not grant new execution authority. The migration sequence
-is consumer-first: define and validate the workspace operation-pack format,
-adopt it in each owning repository, prove plan and receipt compatibility, then
-remove the compiled projection and its frozen exception.
+is consumer-first: adopt the operation pack in each owning repository, prove
+plan and receipt compatibility, then remove the compiled projection and its
+frozen exception.
 
 Most of the catalog is therefore inventory, not capability: the large majority
 of mutating operations are unexecutable because their contracts are
