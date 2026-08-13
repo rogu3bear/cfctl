@@ -204,6 +204,69 @@ Build, catalog, credential generation, active policy, authority, workspace,
 observation, and cost drift fail closed. Historical PlanV1 records remain
 readable, but pre-PlanV2 unconsumed mutations must be replanned.
 
+### Ordered deployment plan sets
+
+`plans bundle` compiles a body-free, immutable review receipt from child plans
+that already exist. It does not approve or run them. Each child keeps its own
+operation ID, explicit approval, consumption state, expiration, provider
+preconditions, and rollback transaction.
+
+Create the specification as a new absolute mode-`0600` JSON file outside every
+repository:
+
+```json
+{
+  "schema_version": 1,
+  "name": "isolated dark deployment",
+  "repositories": [
+    { "root": "/absolute/clean/provider-repository" },
+    { "root": "/absolute/clean/application-repository" }
+  ],
+  "children": [
+    {
+      "operation_id": "00000000-0000-4000-8000-000000000001",
+      "depends_on": []
+    },
+    {
+      "operation_id": "00000000-0000-4000-8000-000000000002",
+      "depends_on": ["00000000-0000-4000-8000-000000000001"]
+    }
+  ],
+  "explicit_exclusions": [
+    "credential minting",
+    "live email probes",
+    "production traffic promotion"
+  ]
+}
+```
+
+```bash
+cfctl plans bundle create \
+  --source-file /absolute/private/dark-deployment-plan-set.json --json
+cfctl plans bundle show <bundle-id> --json
+cfctl plans bundle verify <bundle-id> --json
+```
+
+The source file is read without following symlinks and is represented only by
+its SHA-256. Receipts replace repository roots with digests while retaining
+normalized repository identity, exact HEAD/tree, child plan and pin hashes,
+account and zone targets, permissions, known cost, risk/effect, provider
+snapshot hashes, dependency order, warnings, compensation steps, and rollback
+contracts. `verify` performs fresh provider reads but no write, approval, or
+execution. Any named source, build, catalog, profile, credential generation,
+admission policy, child plan, local artifact, or provider-precondition drift
+invalidates the set.
+
+A dependency edge is review ordering, not output interpolation. When an early
+create returns an identifier required to plan a later child—for example, a new
+D1 UUID needed by migrations and Worker bindings—the complete downstream set
+cannot honestly exist before that create is applied and read back. Prepare and
+approve a bootstrap plan set for the resource creates, apply it only under its
+own explicit approvals, generate the ignored private runtime configuration from
+the verified returned identifiers, and then compile a new dark-deployment plan
+set for migrations, projection, and deployments. Never put placeholders into a
+single bundle or treat bootstrap approval as authority for the later set.
+
 ## Event ledger and reconciliation
 
 ```bash
@@ -410,6 +473,102 @@ Do not substitute raw D1 query or direct Wrangler execution. If execution may
 have crossed the provider boundary but fails before verified readback, preserve
 the receipt and rectify. Recovery is a new, independently approved
 `d1-restore-exact-bookmark` plan using the captured pre-change bookmark.
+
+### Private R2 objects and lifecycle replacement
+
+Upload immutable private policy bytes only through the create-only R2 object
+contract. The source must be an absolute normalized mode-`0600` regular file;
+the plan persists its SHA-256, MD5, and size, not its path or bytes:
+
+```bash
+cfctl call r2-put-object \
+  --selector account_id=<account-id> \
+  --selector bucket_name=<policy-bucket> \
+  --selector object_key=config/policy/sha256-<digest>.json \
+  --selector Content-Type=application/json \
+  --if-none-match '*' \
+  --source-file /absolute/private/policy.json \
+  --json
+```
+
+Cloudflare readback must prove the exact object target, size, and digest without
+returning policy content. If the provider outcome is ambiguous, cfctl preserves
+the private stage for rectification and never retries the PUT automatically.
+Rollback of a new object is a separate exact-object delete plan; an existing
+immutable key is never overwritten.
+
+R2 lifecycle PUT is a destructive complete replacement, not a patch. Read the
+current complete lifecycle first, preserve its hash-bound snapshot, then plan
+the full replacement body returned by `cfctl guide`:
+
+```bash
+cfctl call r2-get-bucket-lifecycle-configuration \
+  --selector account_id=<account-id> \
+  --selector bucket_name=<spool-bucket> --json
+cfctl catalog show r2-put-bucket-lifecycle-configuration --json
+cfctl guide r2-put-bucket-lifecycle-configuration --json
+cfctl call r2-put-bucket-lifecycle-configuration \
+  --selector account_id=<account-id> \
+  --selector bucket_name=<spool-bucket> \
+  --body-json '<complete-reviewed-rules-object>' --json
+```
+
+Review the full `planned_after` and prior snapshot before approval. Restoration
+is a separate plan containing the complete prior configuration; objects already
+expired under the applied rule are unrecoverable.
+
+### Email Sending and Email Routing subdomains
+
+Start every email-provider transaction with read-only discovery and the exact
+current catalog contracts:
+
+```bash
+cfctl resolve "preview Email Sending DNS for example.com" --json
+cfctl catalog show email-sending-subdomains-preview-sending-subdomain --json
+cfctl guide email-sending-subdomains-preview-sending-subdomain --json
+cfctl call email-sending-subdomains-preview-sending-subdomain \
+  --selector zone_id=<zone-id> \
+  --body-json '{"name":"example.com"}' --json
+```
+
+Preview is a read-only dry run. It neither onboards the sending domain nor
+repairs DNS. Before planning create or repair, inspect the preview for foreign
+record conflicts and obtain a fresh live entitlement read proving the current
+Workers Paid availability, quota, and downstream Email Service pricing.
+
+The mutation sequence uses independent PlanV2 operations:
+
+1. `email-sending-subdomains-create-sending-subdomain` with the exact candidate
+   domain;
+2. provider readback by the returned `subdomain_id` (`tag` in the create
+   response);
+3. `email-sending-subdomains-fix-sending-subdomain-dns` only if the reviewed
+   preview requires it;
+4. `email-sending-subdomains-update-sending-subdomain` with
+   `{"preview_enabled":false}`;
+5. `email-sending-subdomains-get-sending-subdomain-dns-status` and detail
+   readback proving authentication ready and preview disabled.
+
+Creation, DNS repair, preview preference, and deletion have different rollback
+semantics. Deleting a sending domain or restoring DNS is never implied by the
+create approval, and provider acceptance does not prove inbox or external
+receipt.
+
+Enable routing for one explicit subdomain without touching apex MX:
+
+```bash
+cfctl catalog show email-routing-settings-enable-email-routing-dns --json
+cfctl guide email-routing-settings-enable-email-routing-dns --json
+cfctl call email-routing-settings-enable-email-routing-dns \
+  --selector zone_id=<zone-id> \
+  --body-json '{"name":"reply.maildesk.example.com"}' --json
+```
+
+The mandatory `name` is included in the plan and repeated as the `subdomain`
+query on DNS readback. An absent, empty, or apex target fails closed. Create or
+update the catch-all Worker rule only through its separately resolved Email
+Routing capability, bind the exact Worker target, and preserve the prior rule
+and subdomain DNS snapshots for separate rollback plans.
 
 Use `d1-full-export` to capture a full schema-and-data SQL snapshot immediately
 before a separately governed migration:
