@@ -1,6 +1,7 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
 mod event_batch;
+mod plan_set;
 mod r2_private_upload;
 mod worker_custom_domain;
 mod worker_deployment;
@@ -74,14 +75,14 @@ pub(crate) use crate::telemetry_product::{
 };
 use crate::{
     AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand,
-    Cli, CloudflarePolicyCommand, Command, DocsCommand, EventBridgeCommand, EventHistoryArgs,
-    EventReconcileArgs, EventsCommand, GuideArgs, GuideTopicArg, ImportApiTokenArgs,
-    ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs,
-    KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs,
-    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
-    PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand, RegistryDeclarationsCommand,
-    RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand,
-    ResolveArgs, SearchArgs, WorkspaceCommand,
+    Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
+    EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, GuideArgs,
+    GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
+    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector,
+    KeyRenewAnalyticsProfileArgs, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand,
+    PlanApproveArgs, PlanSelector, PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand,
+    RegistryDeclarationsCommand, RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg,
+    RegistryScopesCommand, ResolveArgs, SearchArgs, WorkspaceCommand,
     build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
@@ -14388,6 +14389,13 @@ async fn plans_command(store: &StateStore, command: PlansCommand) -> Result<Resu
         PlansCommand::Resume(selector) => Box::pin(resume_plan(store, &selector)).await,
         PlansCommand::Rectify(selector) => Box::pin(rectify_plan(store, &selector)).await,
         PlansCommand::Cancel(selector) => cancel_plan(store, &selector),
+        PlansCommand::Bundle(arguments) => match arguments.command {
+            DeploymentPlanSetCommand::Create(arguments) => plan_set::create(store, &arguments),
+            DeploymentPlanSetCommand::Show(selector) => plan_set::show(store, &selector),
+            DeploymentPlanSetCommand::Verify(selector) => {
+                Box::pin(plan_set::verify(store, &selector)).await
+            }
+        },
     }
 }
 
@@ -14496,6 +14504,17 @@ fn validate_plan_v2_runtime_pins(
         ));
     }
     let current_policy = active_admission_policy(store)?;
+    let compiled_policy_hash = if current_policy.is_none() {
+        let input: CallInput = serde_json::from_value(plan.input.clone())?;
+        let impact = plan_impact(store, &plan.capability, &input, &plan.account_id)?;
+        let compiled_policy = PolicyEngine.evaluate(&plan.capability, &impact.policy);
+        Some(format!(
+            "compiled:{}",
+            hash_value(&json!({"compiled_safety_floor": compiled_policy}))?
+        ))
+    } else {
+        None
+    };
     match current_policy {
         Some(bundle)
             if plan_v2.pins.admission_policy_hash != format!("bundle:{}", bundle.content_hash) =>
@@ -14509,14 +14528,12 @@ fn validate_plan_v2_runtime_pins(
                 ),
             ));
         }
-        None if !plan_v2
-            .pins
-            .admission_policy_hash
-            .starts_with("compiled:sha256:") =>
+        None if compiled_policy_hash.as_deref()
+            != Some(plan_v2.pins.admission_policy_hash.as_str()) =>
         {
             return Err(CliError::guided(
                 "CFCTL_PLAN_POLICY_DRIFT",
-                "the PlanV2 was created under an admission bundle that is no longer active",
+                "the current compiled safety floor no longer matches the PlanV2 policy pin",
                 format!(
                     "Re-run `cfctl call {}` under the compiled safety floor.",
                     plan.capability.id

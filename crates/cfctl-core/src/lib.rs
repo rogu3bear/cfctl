@@ -149,6 +149,14 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
         name: "plans",
         subcommands: &[
             CommandNodeV1::leaf("approve"),
+            CommandNodeV1 {
+                name: "bundle",
+                subcommands: &[
+                    CommandNodeV1::leaf("create"),
+                    CommandNodeV1::leaf("show"),
+                    CommandNodeV1::leaf("verify"),
+                ],
+            },
             CommandNodeV1::leaf("cancel"),
             CommandNodeV1::leaf("rectify"),
             CommandNodeV1::leaf("resume"),
@@ -780,6 +788,8 @@ pub enum CoreError {
     AdmissionPolicyBroadened(String),
     #[error("plan v2 is invalid: {0}")]
     InvalidPlanV2(String),
+    #[error("deployment plan set is invalid: {0}")]
+    InvalidDeploymentPlanSet(String),
     #[error("event envelope is invalid: {0}")]
     InvalidEventEnvelope(String),
     #[error("operational proof binding is invalid: {0}")]
@@ -5886,6 +5896,314 @@ impl PlanV2 {
         self.content_hash =
             canonical_hash_value(&json_value(&(self.schema_version, &self.plan, &self.pins))?)?;
         Ok(())
+    }
+}
+
+/// One clean registered repository whose exact source identity is part of a
+/// multi-resource deployment review. Local root paths are represented only by
+/// a digest; receipts never disclose the operator's filesystem layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentPlanSetRepositoryV1 {
+    pub repository_id: String,
+    pub root_sha256: String,
+    pub origin_identity: String,
+    pub head: String,
+    pub tree: String,
+}
+
+/// One independently approved child plan in an ordered deployment plan set.
+/// Approval and execution state are deliberately absent from the hash-bound
+/// child descriptor: those remain authoritative only in the child `PlanV2`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentPlanSetChildV1 {
+    pub sequence: u32,
+    pub operation_id: String,
+    pub plan_content_hash: String,
+    pub pins_hash: String,
+    pub capability_id: String,
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zone_ids: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+    pub initial_status: PlanStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_resources: Vec<String>,
+    pub permissions: Vec<String>,
+    pub risk: RiskClass,
+    pub effect: EffectClass,
+    pub cost: CostV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    pub rollback: RollbackSpecV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compensation_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_snapshot_hashes: BTreeMap<String, String>,
+}
+
+/// Immutable local review receipt for an ordered set of independently
+/// governed child plans. The plan set has no approve or run operation: it can
+/// prove coherence and staleness, but never propagates authority to children.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentPlanSetV1 {
+    pub schema_version: u8,
+    pub bundle_id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub source_spec_sha256: String,
+    pub profile_id: String,
+    pub account_ids: Vec<String>,
+    pub build_identity_hash: String,
+    pub catalog_hash: String,
+    pub credential_generation_id: String,
+    pub admission_policy_hash: String,
+    pub workspace_graph_hash: String,
+    pub repositories: Vec<DeploymentPlanSetRepositoryV1>,
+    pub children: Vec<DeploymentPlanSetChildV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_snapshot_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_exclusions: Vec<String>,
+    pub content_hash: String,
+}
+
+impl DeploymentPlanSetV1 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every top-level pin is explicit so a plan-set compiler cannot silently omit one authority dimension"
+    )]
+    pub fn new(
+        name: String,
+        source_spec_sha256: String,
+        profile_id: String,
+        account_ids: Vec<String>,
+        build_identity_hash: String,
+        catalog_hash: String,
+        credential_generation_id: String,
+        admission_policy_hash: String,
+        workspace_graph_hash: String,
+        repositories: Vec<DeploymentPlanSetRepositoryV1>,
+        children: Vec<DeploymentPlanSetChildV1>,
+        explicit_exclusions: Vec<String>,
+    ) -> Result<Self> {
+        let created_at = Utc::now();
+        let expires_at = children
+            .iter()
+            .map(|child| child.expires_at)
+            .min()
+            .ok_or_else(|| {
+                CoreError::InvalidDeploymentPlanSet(
+                    "at least one child plan is required".to_owned(),
+                )
+            })?;
+        let provider_snapshot_hashes = deployment_plan_set_provider_hashes(&children)?;
+        let mut document = Self {
+            schema_version: 1,
+            bundle_id: Uuid::new_v4().to_string(),
+            name,
+            created_at,
+            expires_at,
+            source_spec_sha256,
+            profile_id,
+            account_ids,
+            build_identity_hash,
+            catalog_hash,
+            credential_generation_id,
+            admission_policy_hash,
+            workspace_graph_hash,
+            repositories,
+            children,
+            provider_snapshot_hashes,
+            explicit_exclusions,
+            content_hash: String::new(),
+        };
+        document.refresh_hash()?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    pub fn refresh_hash(&mut self) -> Result<()> {
+        let mut hashable = self.clone();
+        hashable.content_hash.clear();
+        self.content_hash = hash_value(&json_value(&hashable)?)?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "all bundle, repository, child, dependency, and provider-hash invariants form one immutable review boundary"
+    )]
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |reason: &str| CoreError::InvalidDeploymentPlanSet(reason.to_owned());
+        if self.schema_version != 1
+            || Uuid::parse_str(&self.bundle_id)
+                .ok()
+                .is_none_or(|id| id.hyphenated().to_string() != self.bundle_id)
+            || self.name.trim().is_empty()
+            || self.name.len() > 128
+            || self.profile_id.trim().is_empty()
+            || self.credential_generation_id.trim().is_empty()
+            || self.created_at >= self.expires_at
+            || !valid_sha256_identity(&self.source_spec_sha256)
+            || !valid_sha256_identity(&self.build_identity_hash)
+            || !valid_sha256_identity(&self.catalog_hash)
+            || !valid_policy_identity(&self.admission_policy_hash)
+            || !valid_sha256_identity(&self.workspace_graph_hash)
+        {
+            return Err(invalid("bundle identity or top-level pins are malformed"));
+        }
+        if self.account_ids.is_empty()
+            || !sorted_unique_nonempty_values(&self.account_ids)
+            || self.repositories.is_empty()
+            || self.children.is_empty()
+            || self.explicit_exclusions.is_empty()
+            || !sorted_unique_nonempty_values(&self.explicit_exclusions)
+        {
+            return Err(invalid(
+                "accounts, repositories, children, or exclusions are empty or non-canonical",
+            ));
+        }
+        let repository_ids = self
+            .repositories
+            .iter()
+            .map(|repository| repository.repository_id.clone())
+            .collect::<Vec<_>>();
+        if !sorted_unique_nonempty_values(&repository_ids)
+            || self.repositories.iter().any(|repository| {
+                !valid_sha256_identity(&repository.root_sha256)
+                    || repository.origin_identity.trim().is_empty()
+                    || !valid_git_object_id(&repository.head)
+                    || !valid_git_object_id(&repository.tree)
+            })
+        {
+            return Err(invalid("repository pins are malformed or non-canonical"));
+        }
+        let mut prior_operations = BTreeSet::new();
+        for (index, child) in self.children.iter().enumerate() {
+            let expected_sequence = u32::try_from(index + 1)
+                .map_err(|_| invalid("child sequence exceeds supported range"))?;
+            if child.sequence != expected_sequence
+                || Uuid::parse_str(&child.operation_id)
+                    .ok()
+                    .is_none_or(|id| id.hyphenated().to_string() != child.operation_id)
+                || !valid_sha256_identity(&child.plan_content_hash)
+                || !valid_sha256_identity(&child.pins_hash)
+                || child.capability_id.trim().is_empty()
+                || child.account_id.trim().is_empty()
+                || !self.account_ids.contains(&child.account_id)
+                || child.expires_at < self.expires_at
+                || child.initial_status != PlanStatus::Draft
+                || child.risk == RiskClass::Unknown
+                || child.effect == EffectClass::Unknown
+                || !child.cost.known
+                || child.permissions.is_empty()
+                || !sorted_unique_nonempty_values(&child.permissions)
+                || !sorted_unique_nonempty_values(&child.zone_ids)
+                || !sorted_unique_nonempty_values(&child.affected_resources)
+                || !sorted_unique_nonempty_values(&child.warnings)
+                || !sorted_unique_nonempty_values(&child.depends_on)
+                || child
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !prior_operations.contains(dependency))
+                || !rollback_spec_is_explicit(&child.rollback)
+                || child
+                    .provider_snapshot_hashes
+                    .iter()
+                    .any(|(key, value)| key.trim().is_empty() || !valid_sha256_identity(value))
+            {
+                return Err(invalid(
+                    "a child plan, dependency, target, cost, permission, or rollback pin is malformed",
+                ));
+            }
+            if !prior_operations.insert(child.operation_id.clone()) {
+                return Err(invalid("child operation IDs must be unique"));
+            }
+        }
+        if self.expires_at
+            != self
+                .children
+                .iter()
+                .map(|child| child.expires_at)
+                .min()
+                .ok_or_else(|| invalid("bundle has no child expiration"))?
+            || self.provider_snapshot_hashes != deployment_plan_set_provider_hashes(&self.children)?
+        {
+            return Err(invalid(
+                "bundle expiration or provider snapshot union drifted from its children",
+            ));
+        }
+        let mut hashable = self.clone();
+        hashable.content_hash.clear();
+        if self.content_hash != hash_value(&json_value(&hashable)?)? {
+            return Err(invalid("content hash no longer matches the plan set"));
+        }
+        Ok(())
+    }
+}
+
+fn deployment_plan_set_provider_hashes(
+    children: &[DeploymentPlanSetChildV1],
+) -> Result<BTreeMap<String, String>> {
+    let mut union = BTreeMap::new();
+    for child in children {
+        for (key, value) in &child.provider_snapshot_hashes {
+            if let Some(existing) = union.insert(key.clone(), value.clone())
+                && existing != *value
+            {
+                return Err(CoreError::InvalidDeploymentPlanSet(format!(
+                    "provider snapshot `{key}` disagrees across child plans"
+                )));
+            }
+        }
+    }
+    Ok(union)
+}
+
+fn valid_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn valid_policy_identity(value: &str) -> bool {
+    ["bundle:", "compiled:"].iter().any(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(valid_sha256_identity)
+    })
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn sorted_unique_nonempty_values(values: &[String]) -> bool {
+    values.iter().all(|value| !value.trim().is_empty())
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn rollback_spec_is_explicit(rollback: &RollbackSpecV1) -> bool {
+    if rollback.supported {
+        rollback
+            .strategy
+            .as_deref()
+            .is_some_and(|strategy| !strategy.trim().is_empty())
+    } else {
+        rollback.strategy.is_none()
+            && rollback
+                .warning
+                .as_deref()
+                .is_some_and(|warning| !warning.trim().is_empty())
     }
 }
 

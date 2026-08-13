@@ -10,9 +10,9 @@ use std::{
 };
 
 use cfctl_core::{
-    AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, EvidenceClass, EvidenceV1,
-    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, hash_value,
-    redact_json, redact_json_schema,
+    AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, DeploymentPlanSetV1, EvidenceClass,
+    EvidenceV1, OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1,
+    hash_value, redact_json, redact_json_schema,
 };
 use cfctl_workspace::{
     WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
@@ -56,6 +56,12 @@ pub enum StorageError {
     PlanNotFound(String),
     #[error("plan v2 pins for `{0}` do not exist")]
     PlanV2NotFound(String),
+    #[error("deployment plan set `{0}` does not exist")]
+    DeploymentPlanSetNotFound(String),
+    #[error("deployment plan set `{0}` already exists")]
+    DeploymentPlanSetAlreadyExists(String),
+    #[error("deployment plan set identifier `{0}` is not a canonical lowercase hyphenated UUID")]
+    InvalidDeploymentPlanSetId(String),
     #[error(
         "plan `{0}` has a PlanV2 compatibility projection that disagrees with its canonical document"
     )]
@@ -256,6 +262,7 @@ impl StateStore {
             &paths.data_dir.join("evidence-index"),
             &paths.data_dir.join("plans"),
             &paths.data_dir.join("plans-v2"),
+            &paths.data_dir.join("plan-sets"),
             &paths.data_dir.join("locks"),
             &paths.data_dir.join("locks").join("authorities"),
             &paths
@@ -708,6 +715,43 @@ impl StateStore {
         }
     }
 
+    /// Persist one immutable multi-plan review receipt. Plan-set documents do
+    /// not carry approval or execution authority and therefore have no update
+    /// path; source or provider drift requires a new bundle ID.
+    pub fn create_deployment_plan_set(&self, plan_set: &DeploymentPlanSetV1) -> Result<()> {
+        plan_set.validate()?;
+        let path = self.deployment_plan_set_path(&plan_set.bundle_id)?;
+        if validate_existing_managed_file(&path)? {
+            return Err(StorageError::DeploymentPlanSetAlreadyExists(
+                plan_set.bundle_id.clone(),
+            ));
+        }
+        let value = serde_json::to_value(plan_set)?;
+        if redact_json(&value) != value {
+            return Err(StorageError::SensitiveData);
+        }
+        atomic_create(&path, &serde_json::to_vec_pretty(plan_set)?)
+    }
+
+    pub fn load_deployment_plan_set(&self, bundle_id: &str) -> Result<DeploymentPlanSetV1> {
+        let path = self.deployment_plan_set_path(bundle_id)?;
+        if !validate_existing_managed_file(&path)? {
+            return Err(StorageError::DeploymentPlanSetNotFound(
+                bundle_id.to_owned(),
+            ));
+        }
+        let plan_set: DeploymentPlanSetV1 = self.read_json(&path)?;
+        if plan_set.bundle_id != bundle_id {
+            return Err(StorageError::ManagedDocumentIdentityMismatch {
+                kind: "deployment plan set",
+                filename_id: bundle_id.to_owned(),
+                document_id: plan_set.bundle_id,
+            });
+        }
+        plan_set.validate()?;
+        Ok(plan_set)
+    }
+
     fn write_current_plan(&self, plan: &PlanV2) -> Result<()> {
         let value = serde_json::to_value(plan)?;
         if plan_document_contains_sensitive_data(value, "/plan/capability/request_schema") {
@@ -760,6 +804,15 @@ impl StateStore {
             .data_dir
             .join("plans-v2")
             .join(format!("{operation_id}.json")))
+    }
+
+    fn deployment_plan_set_path(&self, bundle_id: &str) -> Result<PathBuf> {
+        validate_deployment_plan_set_id(bundle_id)?;
+        Ok(self
+            .paths
+            .data_dir
+            .join("plan-sets")
+            .join(format!("{bundle_id}.json")))
     }
 
     /// Persists a new authority without replacing any existing document.
@@ -1258,6 +1311,17 @@ impl ManagedIdKind {
 
 fn validate_plan_id(operation_id: &str) -> Result<()> {
     validate_managed_id(operation_id, ManagedIdKind::Plan)
+}
+
+fn validate_deployment_plan_set_id(bundle_id: &str) -> Result<()> {
+    let parsed = Uuid::parse_str(bundle_id)
+        .map_err(|_| StorageError::InvalidDeploymentPlanSetId(bundle_id.to_owned()))?;
+    if parsed.hyphenated().to_string() != bundle_id {
+        return Err(StorageError::InvalidDeploymentPlanSetId(
+            bundle_id.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn plan_document_contains_sensitive_data(mut value: Value, request_schema_pointer: &str) -> bool {

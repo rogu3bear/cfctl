@@ -2,10 +2,12 @@
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
-    D1FullExportGovernedExecutionBindingV1, EvidenceClass, Mln0142GovernedExecutionBindingV1,
-    Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
-    OperationalProofV1, PlanStatus, PlanV1, PolicyDisposition, StandingAuthorityStatus,
-    StandingAuthorityV1, TransactionStageV1, hash_value,
+    CostV1, D1FullExportGovernedExecutionBindingV1, DeploymentPlanSetChildV1,
+    DeploymentPlanSetRepositoryV1, DeploymentPlanSetV1, EffectClass, EvidenceClass,
+    Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
+    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1,
+    PolicyDisposition, RiskClass, RollbackSpecV1, StandingAuthorityStatus, StandingAuthorityV1,
+    TransactionStageV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
@@ -59,6 +61,56 @@ fn pinned_plan_v2(plan: PlanV1) -> cfctl_core::PlanV2 {
         },
     )
     .expect("plan v2")
+}
+
+fn deployment_plan_set() -> DeploymentPlanSetV1 {
+    DeploymentPlanSetV1::new(
+        "isolated dark deployment".to_owned(),
+        sha256('1'),
+        "profile-a".to_owned(),
+        vec!["account-a".to_owned()],
+        sha256('2'),
+        sha256('3'),
+        GENERATION_A.to_owned(),
+        format!("compiled:{}", sha256('4')),
+        sha256('5'),
+        vec![DeploymentPlanSetRepositoryV1 {
+            repository_id: "example/provider".to_owned(),
+            root_sha256: sha256('6'),
+            origin_identity: "example.com/provider".to_owned(),
+            head: "a".repeat(40),
+            tree: "b".repeat(40),
+        }],
+        vec![DeploymentPlanSetChildV1 {
+            sequence: 1,
+            operation_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            plan_content_hash: sha256('7'),
+            pins_hash: sha256('8'),
+            capability_id: "workers-deploy-reviewed-artifact".to_owned(),
+            account_id: "account-a".to_owned(),
+            zone_ids: Vec::new(),
+            expires_at: Utc::now() + Duration::hours(2),
+            initial_status: PlanStatus::Draft,
+            depends_on: Vec::new(),
+            affected_resources: vec!["worker:example".to_owned()],
+            permissions: vec!["Workers Scripts Write".to_owned()],
+            risk: RiskClass::ScopedWrite,
+            effect: EffectClass::ReversibleWrite,
+            cost: CostV1::default(),
+            warnings: vec!["separate rollback approval required".to_owned()],
+            rollback: RollbackSpecV1 {
+                supported: true,
+                strategy: Some("restore_prior_version".to_owned()),
+                warning: Some("separate rollback approval required".to_owned()),
+            },
+            compensation_steps: vec!["restore_prior_version".to_owned()],
+            provider_snapshot_hashes: [("worker_state".to_owned(), sha256('9'))]
+                .into_iter()
+                .collect(),
+        }],
+        vec!["live mail probes".to_owned()],
+    )
+    .expect("deployment plan set")
 }
 
 fn draft_authority() -> StandingAuthorityV1 {
@@ -889,6 +941,32 @@ fn plans_are_atomic_and_raw_secret_material_is_rejected() {
     store.save_plan(&plan).expect("safe plan stores");
     let loaded = store.load_plan(&plan.operation_id).expect("plan loads");
     assert_eq!(loaded.content_hash, plan.content_hash);
+}
+
+#[test]
+fn deployment_plan_sets_are_immutable_redacted_documents() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let plan_set = deployment_plan_set();
+
+    store
+        .create_deployment_plan_set(&plan_set)
+        .expect("plan set persists");
+    assert_eq!(
+        store
+            .load_deployment_plan_set(&plan_set.bundle_id)
+            .expect("plan set reloads"),
+        plan_set
+    );
+    assert!(matches!(
+        store.create_deployment_plan_set(&plan_set),
+        Err(StorageError::DeploymentPlanSetAlreadyExists(ref bundle_id))
+            if bundle_id == &plan_set.bundle_id
+    ));
+    assert!(matches!(
+        store.load_deployment_plan_set("../escape"),
+        Err(StorageError::InvalidDeploymentPlanSetId(_))
+    ));
 }
 
 #[test]
