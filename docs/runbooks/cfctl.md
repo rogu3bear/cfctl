@@ -257,6 +257,13 @@ execution. Any named source, build, catalog, profile, credential generation,
 admission policy, child plan, local artifact, or provider-precondition drift
 invalidates the set.
 
+Children must share the selected profile, cfctl build, catalog, and credential
+generation. Compiled safety-floor decisions and impact-scoped workspace graphs
+may differ by capability; the bundle records deterministic aggregate hashes and
+retains each child's exact policy and workspace pins in the review receipt.
+Every child is revalidated against its own pins and live preconditions. Distinct
+active admission-policy bundles still fail closed.
+
 A dependency edge is review ordering, not output interpolation. When an early
 create returns an identifier required to plan a later child—for example, a new
 D1 UUID needed by migrations and Worker bindings—the complete downstream set
