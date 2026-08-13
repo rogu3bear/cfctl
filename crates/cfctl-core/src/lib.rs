@@ -149,6 +149,14 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
         name: "plans",
         subcommands: &[
             CommandNodeV1::leaf("approve"),
+            CommandNodeV1 {
+                name: "bundle",
+                subcommands: &[
+                    CommandNodeV1::leaf("create"),
+                    CommandNodeV1::leaf("show"),
+                    CommandNodeV1::leaf("verify"),
+                ],
+            },
             CommandNodeV1::leaf("cancel"),
             CommandNodeV1::leaf("rectify"),
             CommandNodeV1::leaf("resume"),
@@ -780,6 +788,8 @@ pub enum CoreError {
     AdmissionPolicyBroadened(String),
     #[error("plan v2 is invalid: {0}")]
     InvalidPlanV2(String),
+    #[error("deployment plan set is invalid: {0}")]
+    InvalidDeploymentPlanSet(String),
     #[error("event envelope is invalid: {0}")]
     InvalidEventEnvelope(String),
     #[error("operational proof binding is invalid: {0}")]
@@ -1494,6 +1504,110 @@ pub struct RollbackSpecV1 {
     pub warning: Option<String>,
 }
 
+/// One append-only migration file bound by a workspace-owned D1 operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1MigrationFileV1 {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// A compiler-owned post-migration assertion. Optional fields are validated
+/// against `kind`; callers cannot supply SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1SchemaAssertionV1 {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+}
+
+/// Exact repository authority serialized into a workspace-owned D1 migration
+/// plan. Provider identity and the fresh recovery proof are bound separately
+/// in the plan adapter target because they are just-in-time inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1MigrationContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub migrations_dir: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub migrations: Vec<WorkspaceD1MigrationFileV1>,
+    pub assertions: Vec<WorkspaceD1SchemaAssertionV1>,
+    pub recovery_capability_id: String,
+    pub recovery_max_age_seconds: u64,
+    pub rollback_capability_id: String,
+}
+
+/// A workspace-owned D1 policy projection. The private SQL projection is
+/// staged out of band; this contract contains only repository authority,
+/// compiler-owned readback identifiers, and recovery requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1PolicyProjectionContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub route_table: String,
+    pub route_policy_sha_column: String,
+    pub runtime_state_table: String,
+    pub runtime_state_key_column: String,
+    pub runtime_state_value_column: String,
+    pub active_policy_key: String,
+    pub desired_state_digest_key: String,
+    pub projection_digest_key: String,
+    pub recovery_capability_id: String,
+    pub recovery_max_age_seconds: u64,
+    pub rollback_capability_id: String,
+}
+
+/// A create-only private local file upload to one exact R2 object key. The
+/// bytes remain in a mode-0600 managed stage; plans and receipts carry only
+/// content identity and bounded metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R2PrivateFileUploadContractV1 {
+    pub max_source_bytes: u64,
+    pub allowed_content_types: Vec<String>,
+    pub require_if_none_match_star: bool,
+    pub read_capability_id: String,
+    pub delete_capability_id: String,
+    pub etag_algorithm: String,
+}
+
+/// Provider readback used after Email Sending DNS repair. The verifier reads
+/// the live DNS status endpoint and accepts only a conflict-free, complete
+/// configuration; it never treats the mutation response as final authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailSendingDnsRepairContractV1 {
+    pub status_read_capability_id: String,
+    pub status_read_path: String,
+}
+
+/// Provider readback used after enabling Email Routing for an explicit
+/// subdomain. The request body name is compiled into the read endpoint's
+/// subdomain query so an absent body can never silently target the apex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailRoutingSubdomainDnsContractV1 {
+    pub read_capability_id: String,
+    pub read_path: String,
+    pub request_name_field: String,
+    pub read_query_field: String,
+}
+
 /// Hash-bound coordinates for proving and compensating a newly created
 /// Cloudflare resource. The identity pointer is relative to the API response's
 /// `result` object; callers must not infer any of these values from mutable
@@ -1706,6 +1820,16 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_migration: Option<WorkspaceD1MigrationContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_sending_dns_repair: Option<EmailSendingDnsRepairContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_routing_subdomain_dns: Option<EmailRoutingSubdomainDnsContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import: Option<D1ApprovedMlnImportContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import_poll_resume: Option<D1ApprovedMlnImportPollResumeContractV1>,
@@ -1816,6 +1940,11 @@ impl CapabilityV1 {
             mln_0143_data_invariants: None,
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
+            workspace_d1_migration: None,
+            workspace_d1_policy_projection: None,
+            r2_private_file_upload: None,
+            email_sending_dns_repair: None,
+            email_routing_subdomain_dns: None,
             d1_approved_mln_import: None,
             d1_approved_mln_import_poll_resume: None,
             r2_log_retrieval: None,
@@ -1995,6 +2124,127 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "workspace_d1_migration_ledger_and_schema_assertions" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::DataWrite
+                    && self
+                        .workspace_d1_migration
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.operation_pack_sha256.is_empty()
+                                && !contract.config_template_sha256.is_empty()
+                                && !contract.wrangler_version.is_empty()
+                                && !contract.migrations.is_empty()
+                                && !contract.assertions.is_empty()
+                                && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+                                && contract.recovery_max_age_seconds > 0
+                                && contract.recovery_max_age_seconds <= 600
+                                && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                        })
+            }
+            "workspace_d1_policy_projection_count_and_digest" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::DataWrite
+                    && self
+                        .workspace_d1_policy_projection
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.operation_pack_sha256.is_empty()
+                                && !contract.config_template_sha256.is_empty()
+                                && !contract.wrangler_version.is_empty()
+                                && !contract.route_table.is_empty()
+                                && !contract.route_policy_sha_column.is_empty()
+                                && !contract.runtime_state_table.is_empty()
+                                && !contract.runtime_state_key_column.is_empty()
+                                && !contract.runtime_state_value_column.is_empty()
+                                && !contract.active_policy_key.is_empty()
+                                && !contract.desired_state_digest_key.is_empty()
+                                && !contract.projection_digest_key.is_empty()
+                                && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+                                && contract.recovery_max_age_seconds > 0
+                                && contract.recovery_max_age_seconds <= 600
+                                && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                        })
+            }
+            "r2_private_file_upload_etag_and_conditional_read" => {
+                self.id == "r2-put-object"
+                    && self.method == "PUT"
+                    && self.path
+                        == "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions == ["Workers R2 Storage Write"]
+                    && self.request_schema.is_none()
+                    && self
+                        .r2_private_file_upload
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.max_source_bytes > 0
+                                && contract.max_source_bytes <= 300_000_000
+                                && !contract.allowed_content_types.is_empty()
+                                && contract.require_if_none_match_star
+                                && contract.read_capability_id == "r2-get-object"
+                                && contract.delete_capability_id == "r2-delete-object"
+                                && contract.etag_algorithm == "md5"
+                        })
+            }
+            "email_sending_dns_status_reports_ready" => {
+                self.id == "email-sending-subdomains-fix-sending-subdomain-dns"
+                    && self.method == "POST"
+                    && self.path
+                        == "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions
+                        == ["DNS Write", "Email Sending Read", "Email Sending Write"]
+                    && self.request_schema.is_none()
+                    && self
+                        .email_sending_dns_repair
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.status_read_capability_id
+                                == "email-sending-subdomains-get-sending-subdomain-dns-status"
+                                && contract.status_read_path
+                                    == "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}/dns/status"
+                        })
+            }
+            "email_routing_subdomain_dns_records_match" => {
+                self.id == "email-routing-settings-enable-email-routing-dns"
+                    && self.method == "POST"
+                    && self.path == "/zones/{zone_id}/email/routing/dns"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions == ["DNS Write", "Zone Settings Write"]
+                    && self
+                        .request_schema
+                        .as_ref()
+                        .is_some_and(|schema| {
+                            schema.get("nullable") != Some(&Value::Bool(true))
+                                && schema.get("x-cfctl-body-required") == Some(&Value::Bool(true))
+                                && schema.pointer("/required/0").and_then(Value::as_str)
+                                    == Some("name")
+                        })
+                    && self
+                        .email_routing_subdomain_dns
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.read_capability_id
+                                == "email-routing-settings-email-routing-dns-settings"
+                                && contract.read_path == "/zones/{zone_id}/email/routing/dns"
+                                && contract.request_name_field == "name"
+                                && contract.read_query_field == "subdomain"
+                        })
+            }
             "mln_import_requires_governed_post_import_proof" => {
                 matches!(
                     self.id.as_str(),
@@ -3345,6 +3595,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "subdomain_id" && pointer == "/tag")
         || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()
@@ -5645,6 +5896,314 @@ impl PlanV2 {
         self.content_hash =
             canonical_hash_value(&json_value(&(self.schema_version, &self.plan, &self.pins))?)?;
         Ok(())
+    }
+}
+
+/// One clean registered repository whose exact source identity is part of a
+/// multi-resource deployment review. Local root paths are represented only by
+/// a digest; receipts never disclose the operator's filesystem layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentPlanSetRepositoryV1 {
+    pub repository_id: String,
+    pub root_sha256: String,
+    pub origin_identity: String,
+    pub head: String,
+    pub tree: String,
+}
+
+/// One independently approved child plan in an ordered deployment plan set.
+/// Approval and execution state are deliberately absent from the hash-bound
+/// child descriptor: those remain authoritative only in the child `PlanV2`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentPlanSetChildV1 {
+    pub sequence: u32,
+    pub operation_id: String,
+    pub plan_content_hash: String,
+    pub pins_hash: String,
+    pub capability_id: String,
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zone_ids: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+    pub initial_status: PlanStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_resources: Vec<String>,
+    pub permissions: Vec<String>,
+    pub risk: RiskClass,
+    pub effect: EffectClass,
+    pub cost: CostV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    pub rollback: RollbackSpecV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compensation_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_snapshot_hashes: BTreeMap<String, String>,
+}
+
+/// Immutable local review receipt for an ordered set of independently
+/// governed child plans. The plan set has no approve or run operation: it can
+/// prove coherence and staleness, but never propagates authority to children.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentPlanSetV1 {
+    pub schema_version: u8,
+    pub bundle_id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub source_spec_sha256: String,
+    pub profile_id: String,
+    pub account_ids: Vec<String>,
+    pub build_identity_hash: String,
+    pub catalog_hash: String,
+    pub credential_generation_id: String,
+    pub admission_policy_hash: String,
+    pub workspace_graph_hash: String,
+    pub repositories: Vec<DeploymentPlanSetRepositoryV1>,
+    pub children: Vec<DeploymentPlanSetChildV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_snapshot_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_exclusions: Vec<String>,
+    pub content_hash: String,
+}
+
+impl DeploymentPlanSetV1 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every top-level pin is explicit so a plan-set compiler cannot silently omit one authority dimension"
+    )]
+    pub fn new(
+        name: String,
+        source_spec_sha256: String,
+        profile_id: String,
+        account_ids: Vec<String>,
+        build_identity_hash: String,
+        catalog_hash: String,
+        credential_generation_id: String,
+        admission_policy_hash: String,
+        workspace_graph_hash: String,
+        repositories: Vec<DeploymentPlanSetRepositoryV1>,
+        children: Vec<DeploymentPlanSetChildV1>,
+        explicit_exclusions: Vec<String>,
+    ) -> Result<Self> {
+        let created_at = Utc::now();
+        let expires_at = children
+            .iter()
+            .map(|child| child.expires_at)
+            .min()
+            .ok_or_else(|| {
+                CoreError::InvalidDeploymentPlanSet(
+                    "at least one child plan is required".to_owned(),
+                )
+            })?;
+        let provider_snapshot_hashes = deployment_plan_set_provider_hashes(&children)?;
+        let mut document = Self {
+            schema_version: 1,
+            bundle_id: Uuid::new_v4().to_string(),
+            name,
+            created_at,
+            expires_at,
+            source_spec_sha256,
+            profile_id,
+            account_ids,
+            build_identity_hash,
+            catalog_hash,
+            credential_generation_id,
+            admission_policy_hash,
+            workspace_graph_hash,
+            repositories,
+            children,
+            provider_snapshot_hashes,
+            explicit_exclusions,
+            content_hash: String::new(),
+        };
+        document.refresh_hash()?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    pub fn refresh_hash(&mut self) -> Result<()> {
+        let mut hashable = self.clone();
+        hashable.content_hash.clear();
+        self.content_hash = hash_value(&json_value(&hashable)?)?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "all bundle, repository, child, dependency, and provider-hash invariants form one immutable review boundary"
+    )]
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |reason: &str| CoreError::InvalidDeploymentPlanSet(reason.to_owned());
+        if self.schema_version != 1
+            || Uuid::parse_str(&self.bundle_id)
+                .ok()
+                .is_none_or(|id| id.hyphenated().to_string() != self.bundle_id)
+            || self.name.trim().is_empty()
+            || self.name.len() > 128
+            || self.profile_id.trim().is_empty()
+            || self.credential_generation_id.trim().is_empty()
+            || self.created_at >= self.expires_at
+            || !valid_sha256_identity(&self.source_spec_sha256)
+            || !valid_sha256_identity(&self.build_identity_hash)
+            || !valid_sha256_identity(&self.catalog_hash)
+            || !valid_policy_identity(&self.admission_policy_hash)
+            || !valid_sha256_identity(&self.workspace_graph_hash)
+        {
+            return Err(invalid("bundle identity or top-level pins are malformed"));
+        }
+        if self.account_ids.is_empty()
+            || !sorted_unique_nonempty_values(&self.account_ids)
+            || self.repositories.is_empty()
+            || self.children.is_empty()
+            || self.explicit_exclusions.is_empty()
+            || !sorted_unique_nonempty_values(&self.explicit_exclusions)
+        {
+            return Err(invalid(
+                "accounts, repositories, children, or exclusions are empty or non-canonical",
+            ));
+        }
+        let repository_ids = self
+            .repositories
+            .iter()
+            .map(|repository| repository.repository_id.clone())
+            .collect::<Vec<_>>();
+        if !sorted_unique_nonempty_values(&repository_ids)
+            || self.repositories.iter().any(|repository| {
+                !valid_sha256_identity(&repository.root_sha256)
+                    || repository.origin_identity.trim().is_empty()
+                    || !valid_git_object_id(&repository.head)
+                    || !valid_git_object_id(&repository.tree)
+            })
+        {
+            return Err(invalid("repository pins are malformed or non-canonical"));
+        }
+        let mut prior_operations = BTreeSet::new();
+        for (index, child) in self.children.iter().enumerate() {
+            let expected_sequence = u32::try_from(index + 1)
+                .map_err(|_| invalid("child sequence exceeds supported range"))?;
+            if child.sequence != expected_sequence
+                || Uuid::parse_str(&child.operation_id)
+                    .ok()
+                    .is_none_or(|id| id.hyphenated().to_string() != child.operation_id)
+                || !valid_sha256_identity(&child.plan_content_hash)
+                || !valid_sha256_identity(&child.pins_hash)
+                || child.capability_id.trim().is_empty()
+                || child.account_id.trim().is_empty()
+                || !self.account_ids.contains(&child.account_id)
+                || child.expires_at < self.expires_at
+                || child.initial_status != PlanStatus::Draft
+                || child.risk == RiskClass::Unknown
+                || child.effect == EffectClass::Unknown
+                || !child.cost.known
+                || child.permissions.is_empty()
+                || !sorted_unique_nonempty_values(&child.permissions)
+                || !sorted_unique_nonempty_values(&child.zone_ids)
+                || !sorted_unique_nonempty_values(&child.affected_resources)
+                || !sorted_unique_nonempty_values(&child.warnings)
+                || !sorted_unique_nonempty_values(&child.depends_on)
+                || child
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !prior_operations.contains(dependency))
+                || !rollback_spec_is_explicit(&child.rollback)
+                || child
+                    .provider_snapshot_hashes
+                    .iter()
+                    .any(|(key, value)| key.trim().is_empty() || !valid_sha256_identity(value))
+            {
+                return Err(invalid(
+                    "a child plan, dependency, target, cost, permission, or rollback pin is malformed",
+                ));
+            }
+            if !prior_operations.insert(child.operation_id.clone()) {
+                return Err(invalid("child operation IDs must be unique"));
+            }
+        }
+        if self.expires_at
+            != self
+                .children
+                .iter()
+                .map(|child| child.expires_at)
+                .min()
+                .ok_or_else(|| invalid("bundle has no child expiration"))?
+            || self.provider_snapshot_hashes != deployment_plan_set_provider_hashes(&self.children)?
+        {
+            return Err(invalid(
+                "bundle expiration or provider snapshot union drifted from its children",
+            ));
+        }
+        let mut hashable = self.clone();
+        hashable.content_hash.clear();
+        if self.content_hash != hash_value(&json_value(&hashable)?)? {
+            return Err(invalid("content hash no longer matches the plan set"));
+        }
+        Ok(())
+    }
+}
+
+fn deployment_plan_set_provider_hashes(
+    children: &[DeploymentPlanSetChildV1],
+) -> Result<BTreeMap<String, String>> {
+    let mut union = BTreeMap::new();
+    for child in children {
+        for (key, value) in &child.provider_snapshot_hashes {
+            if let Some(existing) = union.insert(key.clone(), value.clone())
+                && existing != *value
+            {
+                return Err(CoreError::InvalidDeploymentPlanSet(format!(
+                    "provider snapshot `{key}` disagrees across child plans"
+                )));
+            }
+        }
+    }
+    Ok(union)
+}
+
+fn valid_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn valid_policy_identity(value: &str) -> bool {
+    ["bundle:", "compiled:"].iter().any(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(valid_sha256_identity)
+    })
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn sorted_unique_nonempty_values(values: &[String]) -> bool {
+    values.iter().all(|value| !value.trim().is_empty())
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn rollback_spec_is_explicit(rollback: &RollbackSpecV1) -> bool {
+    if rollback.supported {
+        rollback
+            .strategy
+            .as_deref()
+            .is_some_and(|strategy| !strategy.trim().is_empty())
+    } else {
+        rollback.strategy.is_none()
+            && rollback
+                .warning
+                .as_deref()
+                .is_some_and(|warning| !warning.trim().is_empty())
     }
 }
 

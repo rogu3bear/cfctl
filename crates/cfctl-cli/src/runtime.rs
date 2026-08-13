@@ -1,8 +1,12 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
 mod event_batch;
+mod plan_set;
+mod r2_private_upload;
 mod worker_custom_domain;
 mod worker_deployment;
+mod workspace_d1_migration;
+mod workspace_d1_projection;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,8 +38,8 @@ use cfctl_catalog::{
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
-    OperationVerificationV1, R2LogRetrievalCredentials, validate_request_contract,
-    validate_reviewed_schema_migration_sql,
+    OperationVerificationV1, R2LogRetrievalCredentials, R2PrivateUploadPayload,
+    validate_request_contract, validate_reviewed_schema_migration_sql,
 };
 use cfctl_core::{
     AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
@@ -71,14 +75,14 @@ pub(crate) use crate::telemetry_product::{
 };
 use crate::{
     AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand,
-    Cli, CloudflarePolicyCommand, Command, DocsCommand, EventBridgeCommand, EventHistoryArgs,
-    EventReconcileArgs, EventsCommand, GuideArgs, GuideTopicArg, ImportApiTokenArgs,
-    ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs,
-    KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs,
-    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
-    PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand, RegistryDeclarationsCommand,
-    RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand,
-    ResolveArgs, SearchArgs, WorkspaceCommand,
+    Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
+    EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, GuideArgs,
+    GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
+    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector,
+    KeyRenewAnalyticsProfileArgs, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand,
+    PlanApproveArgs, PlanSelector, PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand,
+    RegistryDeclarationsCommand, RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg,
+    RegistryScopesCommand, ResolveArgs, SearchArgs, WorkspaceCommand,
     build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
@@ -1079,12 +1083,15 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
         }
         CatalogCommand::Show(selector) => {
             let catalog = ensure_catalog(store).await?;
-            let capability = catalog
-                .get(&selector.capability_id)
-                .ok_or_else(|| capability_missing(&selector.capability_id))?;
+            let capability = if let Some(capability) = catalog.get(&selector.capability_id) {
+                capability.clone()
+            } else {
+                load_workspace_capability(store, &selector.capability_id)?
+                    .ok_or_else(|| capability_missing(&selector.capability_id))?
+            };
             Ok(ResultEnvelopeV2::success(
                 "catalog show",
-                serde_json::to_value(caller_facing_capability(capability))?,
+                serde_json::to_value(caller_facing_capability(&capability))?,
             ))
         }
         CatalogCommand::Changes => {
@@ -1240,12 +1247,15 @@ async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<Resu
         CliError::Input("guide requires one capability ID or `--topic`".to_owned())
     })?;
     let catalog = ensure_catalog(store).await?;
-    let capability = catalog
-        .get(capability_id)
-        .ok_or_else(|| capability_missing(capability_id))?;
+    let capability = if let Some(capability) = catalog.get(capability_id) {
+        capability.clone()
+    } else {
+        load_workspace_capability(store, capability_id)?
+            .ok_or_else(|| capability_missing(capability_id))?
+    };
     Ok(ResultEnvelopeV2::success(
         "guide",
-        serde_json::to_value(guide_document(capability))?,
+        serde_json::to_value(guide_document(&capability))?,
     ))
 }
 
@@ -1266,10 +1276,12 @@ fn guide_topic_envelope(topic: GuideTopicArg) -> Result<ResultEnvelopeV2> {
 )]
 async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultEnvelopeV2> {
     let catalog = ensure_catalog(store).await?;
-    let capability = catalog
-        .get(&arguments.capability_id)
-        .cloned()
-        .ok_or_else(|| capability_missing(&arguments.capability_id))?;
+    let capability = if let Some(capability) = catalog.get(&arguments.capability_id) {
+        capability.clone()
+    } else {
+        load_workspace_capability(store, &arguments.capability_id)?
+            .ok_or_else(|| capability_missing(&arguments.capability_id))?
+    };
     if is_secret_output_capability(&capability) && arguments.value_out.is_none() {
         return Err(CliError::Input(
             "secret-producing capabilities require `--value-out <new-path>`; the value is never written to stdout or evidence"
@@ -1279,11 +1291,15 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
+    let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
+    let is_r2_private_file_upload = capability.r2_private_file_upload.is_some();
     let is_d1_approved_mln_import_poll_resume =
         capability.d1_approved_mln_import_poll_resume.is_some();
-    if is_d1_approved_mln_import != arguments.source_file.is_some() {
+    if (is_d1_approved_mln_import || is_workspace_d1_projection || is_r2_private_file_upload)
+        != arguments.source_file.is_some()
+    {
         return Err(CliError::Input(
-            "governed D1 imports require exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports, workspace policy projections, and create-only private R2 uploads require exactly one plan-creation-only `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -1367,11 +1383,15 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     if capability.mln_0142_post_import_schema.is_some() {
         validate_mln_0142_post_import_schema_input(store, &capability, &prepared.input)?;
     }
-    let import_stage = arguments
-        .source_file
-        .as_deref()
-        .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
-        .transpose()?;
+    let import_stage = if is_d1_approved_mln_import {
+        arguments
+            .source_file
+            .as_deref()
+            .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
+            .transpose()?
+    } else {
+        None
+    };
     let resume_poll_authority = if is_d1_approved_mln_import_poll_resume {
         let profiles = ProfilesConfig::load(store)?;
         let profile = profiles.selected(arguments.profile.as_deref())?;
@@ -1433,6 +1453,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     }
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
+    let mut r2_stage_ref = None;
     let mut adapter_targets = Map::new();
     if worker_deployment::binds_live_state(&capability) {
         let graph = discover_registered(store)?;
@@ -1469,6 +1490,86 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     if let Some(authority) = resume_poll_authority {
         adapter_targets.insert("approved_mln_import_poll_resume".to_owned(), authority);
     }
+    if capability.workspace_d1_migration.is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace D1 migration requires an explicit account pin or --account".to_owned(),
+            )
+        })?;
+        let target = workspace_d1_migration::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("workspace D1 migration target could not be derived".to_owned())
+        })?;
+        adapter_targets.insert("workspace_d1_migration".to_owned(), target);
+    }
+    if capability.workspace_d1_policy_projection.is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace D1 policy projection requires an explicit account pin or --account"
+                    .to_owned(),
+            )
+        })?;
+        let source = arguments.source_file.as_deref().ok_or_else(|| {
+            CliError::Input("workspace D1 policy projection source is missing".to_owned())
+        })?;
+        let target = workspace_d1_projection::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+            source,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("workspace D1 policy projection target could not be derived".to_owned())
+        })?;
+        adapter_targets.insert("workspace_d1_policy_projection".to_owned(), target);
+    }
+    if capability.r2_private_file_upload.is_some() {
+        let source = arguments
+            .source_file
+            .as_deref()
+            .ok_or_else(|| CliError::Input("private R2 upload source is missing".to_owned()))?;
+        let target = r2_private_upload::prepare_plan_target(
+            store,
+            &secrets,
+            &capability,
+            &prepared.input,
+            source,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("private R2 upload target could not be derived".to_owned())
+        })?;
+        r2_stage_ref = target
+            .get("stage_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        adapter_targets.insert("r2_private_file_upload".to_owned(), target);
+    }
     let result = Box::pin(create_plan(
         store,
         &catalog,
@@ -1483,6 +1584,11 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         && let Some(reference) = secret_ref
     {
         secrets.delete(&reference)?;
+    }
+    if result.is_err()
+        && let Some(reference) = r2_stage_ref
+    {
+        r2_private_upload::discard_reference(store, &reference, &secrets)?;
     }
     result
 }
@@ -6280,6 +6386,12 @@ async fn run_delegated_plan_boundary(
     input: &CallInput,
     credential: &AuthCredential,
 ) -> Result<Value> {
+    if plan.capability.workspace_d1_migration.is_some() {
+        return workspace_d1_migration::run(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_policy_projection.is_some() {
+        return workspace_d1_projection::run(store, plan, credential).await;
+    }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let delegated_input =
         worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
@@ -6327,6 +6439,10 @@ fn delegated_cli_failure_envelope(
     envelope
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the delegated verification dispatcher keeps every closed strategy explicit and fails unknown strategies without an implicit fallback"
+)]
 async fn verify_delegated_cli_plan(
     store: &StateStore,
     plan: &PlanV1,
@@ -6334,6 +6450,12 @@ async fn verify_delegated_cli_plan(
     receipt: &Value,
     credential: &AuthCredential,
 ) -> Value {
+    if plan.capability.workspace_d1_migration.is_some() {
+        return workspace_d1_migration::verify(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_policy_projection.is_some() {
+        return workspace_d1_projection::verify(store, plan, credential).await;
+    }
     if plan.capability.verification.strategy == "trycloudflare_https_url_reaches_reviewed_origin" {
         return verify_quick_tunnel_plan(input, receipt).await;
     }
@@ -14128,6 +14250,12 @@ fn append_local_artifact_diffs(
 }
 
 fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Result<Vec<PathBuf>> {
+    if let Some(paths) = workspace_d1_migration::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
+    if let Some(paths) = workspace_d1_projection::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
     if worker_deployment::binds_artifact(capability) {
         return worker_deployment::artifact_paths(capability, input);
     }
@@ -14261,6 +14389,13 @@ async fn plans_command(store: &StateStore, command: PlansCommand) -> Result<Resu
         PlansCommand::Resume(selector) => Box::pin(resume_plan(store, &selector)).await,
         PlansCommand::Rectify(selector) => Box::pin(rectify_plan(store, &selector)).await,
         PlansCommand::Cancel(selector) => cancel_plan(store, &selector),
+        PlansCommand::Bundle(arguments) => match arguments.command {
+            DeploymentPlanSetCommand::Create(arguments) => plan_set::create(store, &arguments),
+            DeploymentPlanSetCommand::Show(selector) => plan_set::show(store, &selector),
+            DeploymentPlanSetCommand::Verify(selector) => {
+                Box::pin(plan_set::verify(store, &selector)).await
+            }
+        },
     }
 }
 
@@ -14369,6 +14504,17 @@ fn validate_plan_v2_runtime_pins(
         ));
     }
     let current_policy = active_admission_policy(store)?;
+    let compiled_policy_hash = if current_policy.is_none() {
+        let input: CallInput = serde_json::from_value(plan.input.clone())?;
+        let impact = plan_impact(store, &plan.capability, &input, &plan.account_id)?;
+        let compiled_policy = PolicyEngine.evaluate(&plan.capability, &impact.policy);
+        Some(format!(
+            "compiled:{}",
+            hash_value(&json!({"compiled_safety_floor": compiled_policy}))?
+        ))
+    } else {
+        None
+    };
     match current_policy {
         Some(bundle)
             if plan_v2.pins.admission_policy_hash != format!("bundle:{}", bundle.content_hash) =>
@@ -14382,14 +14528,12 @@ fn validate_plan_v2_runtime_pins(
                 ),
             ));
         }
-        None if !plan_v2
-            .pins
-            .admission_policy_hash
-            .starts_with("compiled:sha256:") =>
+        None if compiled_policy_hash.as_deref()
+            != Some(plan_v2.pins.admission_policy_hash.as_str()) =>
         {
             return Err(CliError::guided(
                 "CFCTL_PLAN_POLICY_DRIFT",
-                "the PlanV2 was created under an admission bundle that is no longer active",
+                "the current compiled safety floor no longer matches the PlanV2 policy pin",
                 format!(
                     "Re-run `cfctl call {}` under the compiled safety floor.",
                     plan.capability.id
@@ -17369,6 +17513,10 @@ fn validate_standing_authority_permission_inventory(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one consumed-plan executor keeps managed stage selection, durable provider boundary, verification, and cleanup in a single auditable state machine"
+)]
 async fn execute_api_plan(
     store: &StateStore,
     catalog_hash: &str,
@@ -17404,9 +17552,26 @@ async fn execute_api_plan(
         )
         .await;
     }
-    let response_result = executor
-        .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
-        .await;
+    let response_result = if plan.capability.r2_private_file_upload.is_some() {
+        let upload = r2_private_upload::load(store, plan, secrets)?;
+        executor
+            .execute_r2_private_file_upload(
+                plan,
+                catalog_hash,
+                credential,
+                execution_input,
+                R2PrivateUploadPayload {
+                    bytes: upload.bytes,
+                    expected_md5: upload.md5,
+                    content_type: upload.content_type,
+                },
+            )
+            .await
+    } else {
+        executor
+            .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
+            .await
+    };
     let response = match response_result {
         Ok(response) => response,
         Err(error) => {
@@ -17447,12 +17612,16 @@ async fn execute_api_plan(
             ));
         }
     };
-    let finalization: Result<()> =
+    let finalization: Result<()> = (|| {
+        if plan.status == PlanStatus::Verified && plan.capability.r2_private_file_upload.is_some() {
+            r2_private_upload::discard(store, plan, secrets)?;
+        }
         if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
             persist_transaction_stage(store, plan, TransactionStageV1::Closed)
         } else {
             store.save_plan(plan).map_err(CliError::from)
-        };
+        }
+    })();
     let finalization_error = finalization.err();
     Ok(api_plan_result_envelope(
         plan,
@@ -25850,6 +26019,9 @@ fn current_pages_source_remote_precondition(
 }
 
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    workspace_d1_migration::validate_bound_plan(store, plan)?;
+    workspace_d1_projection::validate_bound_plan(store, plan)?;
+    r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
     let local_artifact_paths = plan
         .precondition_hashes
         .keys()
@@ -26206,7 +26378,11 @@ async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<R
         ));
     }
     let catalog = ensure_catalog(store).await?;
-    let ranked = catalog.search_scored(intent);
+    let workspace = load_workspace_capability(store, intent)?;
+    let ranked = workspace.as_ref().map_or_else(
+        || catalog.search_scored(intent),
+        |capability| vec![(capability, usize::MAX)],
+    );
     let (result, error) = resolve_result(
         intent,
         &ranked,
@@ -27992,6 +28168,16 @@ fn capability_missing(id: &str) -> CliError {
             "Find the correct id: `cfctl catalog search \"{id}\" --json` (or `cfctl resolve \"<what you want to do>\"`)."
         ),
     )
+}
+
+fn load_workspace_capability(
+    store: &StateStore,
+    capability_id: &str,
+) -> Result<Option<CapabilityV1>> {
+    if let Some(capability) = workspace_d1_migration::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
+    workspace_d1_projection::load(store, capability_id)
 }
 
 fn is_secret_path(path: &Path) -> bool {
@@ -43997,11 +44183,13 @@ mod tests {
             source_url: "test://workflow".to_owned(),
             source_hash: "sha256:source".to_owned(),
             schema_hash: String::new(),
-            capabilities: BTreeMap::from([
+            capabilities: vec![
                 (read.id.clone(), read),
                 (workflow.id.clone(), workflow.clone()),
                 (export.id.clone(), export.clone()),
-            ]),
+            ]
+            .into_iter()
+            .collect(),
         };
         catalog.refresh_hash().expect("catalog hashes");
         let evidence = store
@@ -44399,11 +44587,13 @@ mod tests {
             source_url: "test://workflow".to_owned(),
             source_hash: "sha256:source".to_owned(),
             schema_hash: String::new(),
-            capabilities: BTreeMap::from([
+            capabilities: vec![
                 (blocked.id.clone(), blocked),
                 (gapped.id.clone(), gapped),
                 (workflow.id.clone(), workflow.clone()),
-            ]),
+            ]
+            .into_iter()
+            .collect(),
         };
         catalog.refresh_hash().expect("catalog hashes");
 

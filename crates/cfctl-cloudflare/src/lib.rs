@@ -236,6 +236,7 @@ pub struct PreparedRequest {
     pub headers: HeaderMap,
     pub body: Option<Value>,
     pub text_body: Option<String>,
+    pub binary_body: Option<Vec<u8>>,
     pub response_contract: Option<ResponseContractV1>,
     pub analytics_query: Option<AnalyticsQueryContractV1>,
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
@@ -249,6 +250,15 @@ pub struct PreparedRequest {
     pub max_bytes: u64,
     pub timeout_seconds: u64,
     pub query_receipt: Option<Value>,
+}
+
+/// Hash-bound bytes and derived request metadata loaded from the CLI's
+/// managed private stage. This value never enters the durable plan or receipt.
+#[derive(Debug)]
+pub struct R2PrivateUploadPayload {
+    pub bytes: Vec<u8>,
+    pub expected_md5: String,
+    pub content_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -294,7 +304,16 @@ impl RequestBuilder {
                         .ok_or_else(|| CloudflareError::MissingSelector(key.to_owned()))?;
                     let rendered = scalar(value)
                         .ok_or_else(|| CloudflareError::InvalidSelector(key.to_owned()))?;
-                    segments.push(&rendered);
+                    if key == "object_key"
+                        && capability.path
+                            == "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}"
+                    {
+                        for object_segment in r2_object_key_segments(&rendered)? {
+                            segments.push(object_segment);
+                        }
+                    } else {
+                        segments.push(&rendered);
+                    }
                 } else {
                     segments.push(segment);
                 }
@@ -426,6 +445,7 @@ impl RequestBuilder {
             headers,
             body,
             text_body,
+            binary_body: None,
             response_contract: capability.response_contract.clone(),
             analytics_query: capability.analytics_query.clone(),
             d1_schema_introspection: capability.d1_schema_introspection.clone(),
@@ -445,6 +465,27 @@ impl RequestBuilder {
                 .or_else(|| r2_log_retrieval_receipt(capability, input)),
         })
     }
+}
+
+fn r2_object_key_segments(value: &str) -> Result<Vec<&str>> {
+    let segments = value.split('/').collect::<Vec<_>>();
+    if segments.is_empty()
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || matches!(*segment, "." | "..")
+                || segment.chars().any(char::is_control)
+        })
+    {
+        return Err(CloudflareError::InvalidSelector("object_key".to_owned()));
+    }
+    Ok(segments)
+}
+
+fn normalize_md5_etag(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let value = value.strip_prefix("W/").unwrap_or(value).trim();
+    let value = value.strip_prefix('"')?.strip_suffix('"')?;
+    (value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())).then_some(value)
 }
 
 fn d1_full_export_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
@@ -1505,6 +1546,7 @@ mod mln_0143_invariant_tests {
             headers: HeaderMap::new(),
             body: None,
             text_body: None,
+            binary_body: None,
             response_contract: None,
             analytics_query: None,
             d1_schema_introspection: None,
@@ -2723,6 +2765,12 @@ impl Executor {
             ));
         }
         validate_verification_preconditions(&plan.capability, input)?;
+        if plan.capability.r2_private_file_upload.is_some() {
+            return Err(CloudflareError::InvalidRequestBody(
+                "private R2 upload requires the managed binary-stage executor; generic mutation execution is blocked"
+                    .to_owned(),
+            ));
+        }
         if plan.capability.d1_restore_exact_bookmark.is_some() {
             return self
                 .execute_d1_restore_exact_bookmark(plan, input, credential)
@@ -2747,6 +2795,91 @@ impl Executor {
             HeaderValue::from_str(&plan.operation_id)
                 .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
         );
+        match self.send(&request, credential).await {
+            Ok(response) => {
+                plan.status = if response.success {
+                    PlanStatus::Running
+                } else {
+                    PlanStatus::Failed
+                };
+                Ok(response)
+            }
+            Err(error) => {
+                plan.status = PlanStatus::Failed;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn execute_r2_private_file_upload(
+        &self,
+        plan: &mut PlanV1,
+        current_catalog_hash: &str,
+        credential: &AuthCredential,
+        input: &CallInput,
+        payload: R2PrivateUploadPayload,
+    ) -> Result<CloudflareResponseV1> {
+        if plan.catalog_hash != current_catalog_hash {
+            return Err(CloudflareError::CatalogDrift {
+                planned: plan.catalog_hash.clone(),
+                current: current_catalog_hash.to_owned(),
+            });
+        }
+        if plan.status != PlanStatus::Consumed {
+            return Err(CloudflareError::Plan(
+                cfctl_core::CoreError::InvalidPlanState {
+                    operation_id: plan.operation_id.clone(),
+                    actual: plan.status,
+                    expected: "durably persisted consumed plan",
+                },
+            ));
+        }
+        let contract = plan
+            .capability
+            .r2_private_file_upload
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "private R2 upload contract is missing".to_owned(),
+                )
+            })?;
+        if input.if_none_match.as_deref() != Some("*")
+            || !contract.require_if_none_match_star
+            || contract.etag_algorithm != "md5"
+            || payload.bytes.is_empty()
+            || payload.bytes.len() as u64 > contract.max_source_bytes
+            || hex::encode(Md5::digest(&payload.bytes)) != payload.expected_md5
+            || !contract
+                .allowed_content_types
+                .iter()
+                .any(|allowed| allowed == &payload.content_type)
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "private R2 upload managed-stage authority failed closed".to_owned(),
+            ));
+        }
+        let mut request = self.builder.build_unchecked(&plan.capability, input)?;
+        if request.body.is_some() || request.text_body.is_some() || request.binary_body.is_some() {
+            return Err(CloudflareError::InvalidRequestBody(
+                "private R2 upload unexpectedly compiled another request body".to_owned(),
+            ));
+        }
+        request.headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_str(&payload.content_type)
+                .map_err(|_| CloudflareError::InvalidHeaderSelector("Content-Type".to_owned()))?,
+        );
+        request.headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&payload.bytes.len().to_string())
+                .map_err(|_| CloudflareError::InvalidHeaderSelector("Content-Length".to_owned()))?,
+        );
+        request.headers.insert(
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_str(&plan.operation_id)
+                .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
+        );
+        request.binary_body = Some(payload.bytes);
         match self.send(&request, credential).await {
             Ok(response) => {
                 plan.status = if response.success {
@@ -3555,8 +3688,7 @@ impl Executor {
     ) -> Result<OperationVerificationV1> {
         let input: CallInput = serde_json::from_value(plan.input.clone())
             .map_err(cfctl_core::CoreError::Serialization)?;
-        self.verify_plan_with_input(plan, apply_response, &input, credential)
-            .await
+        Box::pin(self.verify_plan_with_input(plan, apply_response, &input, credential)).await
     }
 
     /// Runs the operation-specific verifier with the exact execution input
@@ -3626,10 +3758,32 @@ impl Executor {
             return self.verify_email_routing_settings(plan, apply_response);
         }
 
-        if strategy.starts_with("async_list_operation_") {
+        if strategy == "r2_private_file_upload_etag_and_conditional_read" {
             return self
-                .verify_async_list_mutation(plan, apply_response, input, credential)
+                .verify_r2_private_file_upload(plan, apply_response, input, credential)
                 .await;
+        }
+
+        if strategy == "email_sending_dns_status_reports_ready" {
+            return self
+                .verify_email_sending_dns_repair(plan, apply_response, input, credential)
+                .await;
+        }
+
+        if strategy == "email_routing_subdomain_dns_records_match" {
+            return self
+                .verify_email_routing_subdomain_dns(plan, apply_response, input, credential)
+                .await;
+        }
+
+        if strategy.starts_with("async_list_operation_") {
+            return Box::pin(self.verify_async_list_mutation(
+                plan,
+                apply_response,
+                input,
+                credential,
+            ))
+            .await;
         }
 
         if is_delete_verifier(strategy) {
@@ -3651,6 +3805,305 @@ impl Executor {
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    async fn verify_r2_private_file_upload(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let contract = plan
+            .capability
+            .r2_private_file_upload
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "private R2 upload verification contract is missing".to_owned(),
+                )
+            })?;
+        let expected_md5 = plan
+            .targets
+            .pointer("/adapter/r2_private_file_upload/source_md5")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "private R2 upload expected MD5 is missing".to_owned(),
+                )
+            })?;
+        let returned_etag = apply_response.etag.as_deref().and_then(normalize_md5_etag);
+        let mut read = CapabilityV1::new(
+            &contract.read_capability_id,
+            "Conditional private R2 object identity readback",
+            "GET",
+            &plan.capability.path,
+        );
+        read.selectors = plan
+            .capability
+            .selectors
+            .iter()
+            .filter(|selector| {
+                selector.location == "path"
+                    || (selector.location == "header" && selector.name == "cf-r2-jurisdiction")
+            })
+            .cloned()
+            .collect();
+        let selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "private R2 upload selectors are not an object".to_owned(),
+            )
+        })?;
+        let selectors = selectors
+            .into_iter()
+            .filter(|(name, _)| read.selectors.iter().any(|selector| selector.name == *name))
+            .collect();
+        let request = self.builder.build(
+            &read,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: serde_json::json!({}),
+                body: None,
+                if_none_match: apply_response.etag.clone(),
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self
+            .send_r2_conditional_identity_read(&request, credential)
+            .await?;
+        let passed =
+            apply_response.success && returned_etag == Some(expected_md5) && readback.status == 304;
+        let basis = if passed {
+            "the provider upload ETag equals the managed-stage MD5 and an exact conditional GET returned not-modified without reading private bytes"
+                .to_owned()
+        } else {
+            format!(
+                "private R2 upload identity was not proven (apply success={}, ETag matched={}, conditional status={})",
+                apply_response.success,
+                returned_etag == Some(expected_md5),
+                readback.status
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback: CloudflareResponseV1 {
+                result: serde_json::json!({
+                    "object_identity_proven":readback.status == 304,
+                    "etag_matches_managed_stage":returned_etag == Some(expected_md5),
+                }),
+                ..readback
+            },
+            correlated_resource_id: None,
+        })
+    }
+
+    async fn verify_email_sending_dns_repair(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let contract = plan
+            .capability
+            .email_sending_dns_repair
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "Email Sending DNS repair verification contract is missing".to_owned(),
+                )
+            })?;
+        let mut read = CapabilityV1::new(
+            &contract.status_read_capability_id,
+            "Read Email Sending DNS status",
+            "GET",
+            &contract.status_read_path,
+        );
+        read.selectors = plan.capability.selectors.clone();
+        read.response_contract = plan.capability.response_contract.clone();
+        let request = self.builder.build(
+            &read,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: serde_json::json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let status_ready = readback.result.get("status").and_then(Value::as_str) == Some("ready");
+        let errors_empty = readback
+            .result
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        let records_present = readback
+            .result
+            .get("records")
+            .and_then(Value::as_array)
+            .is_some_and(|records| !records.is_empty());
+        let passed = apply_response.success
+            && readback.success
+            && status_ready
+            && errors_empty
+            && records_present;
+        let basis = if passed {
+            "the live Email Sending DNS status reports ready, no conflicts, and a non-empty desired-record set"
+                .to_owned()
+        } else {
+            format!(
+                "Email Sending DNS repair was not proven (apply success={}, read success={}, ready={}, no errors={}, records present={})",
+                apply_response.success,
+                readback.success,
+                status_ready,
+                errors_empty,
+                records_present
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback: CloudflareResponseV1 {
+                result: serde_json::json!({
+                    "status_ready":status_ready,
+                    "errors_empty":errors_empty,
+                    "records_present":records_present,
+                }),
+                ..readback
+            },
+            correlated_resource_id: None,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exact approved subdomain compilation and body-free provider readback stay together as one auditable verification boundary"
+    )]
+    async fn verify_email_routing_subdomain_dns(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let contract = plan
+            .capability
+            .email_routing_subdomain_dns
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "Email Routing subdomain verification contract is missing".to_owned(),
+                )
+            })?;
+        let subdomain = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get(&contract.request_name_field))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "Email Routing subdomain request name is missing".to_owned(),
+                )
+            })?;
+        let mut read = CapabilityV1::new(
+            &contract.read_capability_id,
+            "Read explicit Email Routing subdomain DNS",
+            "GET",
+            &contract.read_path,
+        );
+        read.selectors = vec![
+            plan.capability
+                .selectors
+                .iter()
+                .find(|selector| selector.name == "zone_id" && selector.location == "path")
+                .cloned()
+                .ok_or_else(|| {
+                    CloudflareError::MissingVerificationTarget(
+                        "Email Routing zone selector is missing".to_owned(),
+                    )
+                })?,
+            SelectorV1 {
+                name: contract.read_query_field.clone(),
+                location: "query".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: Some("Exact subdomain compiled from the approved request".to_owned()),
+                contract: Some(SelectorContractV1 {
+                    schema: serde_json::json!({"type":"string","minLength":1,"maxLength":253}),
+                    query: Some(cfctl_core::QuerySerializationV1 {
+                        style: "form".to_owned(),
+                        explode: true,
+                        allow_reserved: false,
+                        allow_empty_value: false,
+                    }),
+                }),
+            },
+        ];
+        read.response_contract = plan.capability.response_contract.clone();
+        let zone_id = input.selectors.get("zone_id").cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "Email Routing zone selector value is missing".to_owned(),
+            )
+        })?;
+        let mut query = serde_json::Map::new();
+        query.insert(
+            contract.read_query_field.clone(),
+            Value::String(subdomain.to_owned()),
+        );
+        let request = self.builder.build(
+            &read,
+            &CallInput {
+                selectors: serde_json::json!({"zone_id":zone_id}),
+                query: Value::Object(query),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let errors_empty = readback
+            .result
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        let records = readback.result.get("record").and_then(Value::as_array);
+        let records_match = records.is_some_and(|records| {
+            !records.is_empty()
+                && records.iter().all(|record| {
+                    record.get("name").and_then(Value::as_str) == Some(subdomain)
+                        && record.get("type").and_then(Value::as_str).is_some()
+                        && record.get("content").and_then(Value::as_str).is_some()
+                })
+        });
+        let passed = apply_response.success && readback.success && errors_empty && records_match;
+        let basis = if passed {
+            "the exact approved subdomain query returned a non-empty, conflict-free DNS record set whose names all match the subdomain"
+                .to_owned()
+        } else {
+            format!(
+                "Email Routing subdomain DNS was not proven (apply success={}, read success={}, no errors={}, records match={})",
+                apply_response.success, readback.success, errors_empty, records_match
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback: CloudflareResponseV1 {
+                result: serde_json::json!({
+                    "subdomain":subdomain,
+                    "errors_empty":errors_empty,
+                    "records_match":records_match,
+                    "record_count":records.map_or(0, Vec::len),
+                }),
+                ..readback
+            },
+            correlated_resource_id: None,
+        })
     }
 
     async fn verify_d1_restore_exact_bookmark(
@@ -5552,6 +6005,49 @@ impl Executor {
         self.send_with_output(request, credential, None).await
     }
 
+    async fn send_r2_conditional_identity_read(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        if request.method != "GET"
+            || request.binary_body.is_some()
+            || request.text_body.is_some()
+            || request.body.is_some()
+            || request
+                .headers
+                .get(reqwest::header::IF_NONE_MATCH)
+                .is_none()
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "R2 identity read must be an exact conditional body-free GET".to_owned(),
+            ));
+        }
+        let mut outgoing = self
+            .client
+            .get(request.url.clone())
+            .headers(request.headers.clone())
+            .timeout(Duration::from_secs(request.timeout_seconds));
+        outgoing = apply_credential(outgoing, credential)?;
+        let response = outgoing.send().await?;
+        let status = response.status().as_u16();
+        let etag = header_text(response.headers(), reqwest::header::ETAG);
+        let cf_ray = response
+            .headers()
+            .get(HeaderName::from_static("cf-ray"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok(CloudflareResponseV1 {
+            status,
+            success: status == 304,
+            result: serde_json::json!({"body_read":false}),
+            errors: Vec::new(),
+            result_info: None,
+            etag,
+            cf_ray,
+        })
+    }
+
     async fn send_with_output(
         &self,
         request: &PreparedRequest,
@@ -5560,6 +6056,16 @@ impl Executor {
     ) -> Result<CloudflareResponseV1> {
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| CloudflareError::InvalidMethod(request.method.clone()))?;
+        let retry_limit = if request
+            .headers
+            .get(reqwest::header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            == Some("*")
+        {
+            0
+        } else {
+            self.max_retries
+        };
         let mut attempt = 0;
         loop {
             let mut outgoing = self
@@ -5568,7 +6074,9 @@ impl Executor {
                 .headers(request.headers.clone())
                 .timeout(Duration::from_secs(request.timeout_seconds));
             outgoing = apply_credential(outgoing, credential)?;
-            if let Some(body) = &request.text_body {
+            if let Some(body) = &request.binary_body {
+                outgoing = outgoing.body(body.clone());
+            } else if let Some(body) = &request.text_body {
                 outgoing = outgoing.body(body.clone());
             } else if let Some(body) = &request.body {
                 outgoing = outgoing.json(body);
@@ -5582,7 +6090,7 @@ impl Executor {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1)
                 .min(30);
-            if (status.as_u16() == 429 || status.is_server_error()) && attempt < self.max_retries {
+            if (status.as_u16() == 429 || status.is_server_error()) && attempt < retry_limit {
                 attempt += 1;
                 sleep(Duration::from_secs(retry_after)).await;
                 continue;

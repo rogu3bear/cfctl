@@ -5,16 +5,17 @@ use cfctl_core::{
     AsyncCollectionMutationContractV1, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1,
     CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
-    DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
+    DeletedNestedResourceContractV1, DeploymentPlanSetChildV1, DeploymentPlanSetRepositoryV1,
+    DeploymentPlanSetV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
     GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1,
     GuideStage, GuideTopicV1, OperationalProofFreshnessV1, OperationalProofOutcomeV1,
     OperationalProofScopeV1, OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanStatus,
-    PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
-    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-    TimeRangeContractV1, TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
-    guide_stages, guide_topic_document, hash_value, redact_json, redact_json_schema,
-    render_guide_topic_markdown,
+    PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, RollbackSpecV1,
+    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+    StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
+    UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
+    redact_json_schema, render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -91,6 +92,127 @@ fn d1_schema_introspection_contract_is_hash_bound_and_serializable() {
     let after = hash_value(&serde_json::to_value(&capability).expect("serialize drifted"))
         .expect("hash drifted");
     assert_ne!(before, after);
+}
+
+#[test]
+fn email_sending_subdomain_tag_is_an_exact_non_secret_resource_identity() {
+    let mut capability = CapabilityV1::new(
+        "email-sending-subdomains-create-sending-subdomain",
+        "Create sending subdomain",
+        "POST",
+        "/zones/{zone_id}/email/sending/subdomains",
+    );
+    capability.mutating = true;
+    capability.risk = RiskClass::ExternalCommunication;
+    capability.effect = EffectClass::ExternalCommunication;
+    capability.permissions = vec!["Email Sending Write".to_owned()];
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["name"],
+        "properties":{"name":{"type":"string"}},
+        "x-cfctl-body-required":true
+    }));
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/zones/{zone_id}/email/sending/subdomains/{subdomain_id}".to_owned(),
+        identity_selector: "subdomain_id".to_owned(),
+        response_result_identity_pointer: "/tag".to_owned(),
+        read_capability_id: "email-sending-subdomains-get-sending-subdomain".to_owned(),
+        delete_capability_id: "email-sending-subdomains-delete-sending-subdomain".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    capability.verification.required = true;
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some("separate exact delete".to_owned());
+
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_supported());
+}
+
+fn deployment_plan_set_child(
+    sequence: u32,
+    operation_id: &str,
+    depends_on: Vec<String>,
+    provider_hash: &str,
+) -> DeploymentPlanSetChildV1 {
+    DeploymentPlanSetChildV1 {
+        sequence,
+        operation_id: operation_id.to_owned(),
+        plan_content_hash: format!("sha256:{}", "1".repeat(64)),
+        pins_hash: format!("sha256:{}", "2".repeat(64)),
+        capability_id: format!("test-capability-{sequence}"),
+        account_id: "account-a".to_owned(),
+        zone_ids: vec!["zone-a".to_owned()],
+        expires_at: Utc::now() + Duration::hours(2),
+        initial_status: PlanStatus::Draft,
+        depends_on,
+        affected_resources: vec![format!("resource-{sequence}")],
+        permissions: vec!["Workers Scripts Write".to_owned()],
+        risk: RiskClass::ScopedWrite,
+        effect: EffectClass::ReversibleWrite,
+        cost: CostV1::default(),
+        warnings: vec!["separate exact rollback required".to_owned()],
+        rollback: RollbackSpecV1 {
+            supported: true,
+            strategy: Some("restore_prior_state".to_owned()),
+            warning: Some("separate exact rollback required".to_owned()),
+        },
+        compensation_steps: vec!["restore_prior_state".to_owned()],
+        provider_snapshot_hashes: [("provider_state".to_owned(), provider_hash.to_owned())]
+            .into_iter()
+            .collect(),
+    }
+}
+
+#[test]
+fn deployment_plan_set_binds_order_without_aggregating_approval() {
+    let first = "00000000-0000-4000-8000-000000000001";
+    let second = "00000000-0000-4000-8000-000000000002";
+    let provider_hash = format!("sha256:{}", "3".repeat(64));
+    let bundle = DeploymentPlanSetV1::new(
+        "dark deployment".to_owned(),
+        format!("sha256:{}", "4".repeat(64)),
+        "profile-a".to_owned(),
+        vec!["account-a".to_owned()],
+        format!("sha256:{}", "5".repeat(64)),
+        format!("sha256:{}", "6".repeat(64)),
+        "credential-generation-a".to_owned(),
+        format!("compiled:sha256:{}", "7".repeat(64)),
+        format!("sha256:{}", "8".repeat(64)),
+        vec![DeploymentPlanSetRepositoryV1 {
+            repository_id: "example/provider".to_owned(),
+            root_sha256: format!("sha256:{}", "9".repeat(64)),
+            origin_identity: "example.com/provider".to_owned(),
+            head: "a".repeat(40),
+            tree: "b".repeat(40),
+        }],
+        vec![
+            deployment_plan_set_child(1, first, Vec::new(), &provider_hash),
+            deployment_plan_set_child(2, second, vec![first.to_owned()], &provider_hash),
+        ],
+        vec!["live mutation".to_owned()],
+    )
+    .expect("valid plan set");
+    bundle.validate().expect("validates");
+    let encoded = serde_json::to_value(&bundle).expect("serialize plan set");
+    assert!(encoded.get("approval").is_none());
+    assert!(encoded.get("run_command").is_none());
+    assert_eq!(bundle.children[1].depends_on, [first]);
+
+    let mut drifted = bundle;
+    drifted.children[0].depends_on = vec![second.to_owned()];
+    drifted.refresh_hash().expect("rehash malformed set");
+    assert!(drifted.validate().is_err());
 }
 
 #[test]

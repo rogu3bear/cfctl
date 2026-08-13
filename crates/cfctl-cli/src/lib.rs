@@ -465,8 +465,8 @@ pub struct CallArgs {
     pub out: Option<PathBuf>,
     #[arg(
         long,
-        value_name = "REVIEWED_MIGRATION_SQL",
-        help = "Plan-creation-only source for a closed approved D1 migration import"
+        value_name = "MODE_0600_SOURCE_PATH",
+        help = "Plan-creation-only source for an approved D1 operation or create-only private R2 upload; bytes never enter plan JSON"
     )]
     pub source_file: Option<PathBuf>,
 }
@@ -487,6 +487,35 @@ pub enum PlansCommand {
     Rectify(PlanSelector),
     /// Retire a draft or approved plan immediately without consuming it
     Cancel(PlanSelector),
+    /// Compile and verify an immutable ordered set of independent child plans
+    Bundle(DeploymentPlanSetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DeploymentPlanSetArgs {
+    #[command(subcommand)]
+    pub command: DeploymentPlanSetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeploymentPlanSetCommand {
+    /// Compile a mode-0600 local specification into a body-free review receipt
+    Create(DeploymentPlanSetCreateArgs),
+    /// Show the immutable redacted bundle receipt and current child statuses
+    Show(DeploymentPlanSetSelector),
+    /// Revalidate source, pins, child plans, and live provider preconditions
+    Verify(DeploymentPlanSetSelector),
+}
+
+#[derive(Debug, Args)]
+pub struct DeploymentPlanSetCreateArgs {
+    #[arg(long, value_name = "ABSOLUTE_MODE_0600_JSON")]
+    pub source_file: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct DeploymentPlanSetSelector {
+    pub bundle_id: String,
 }
 
 #[derive(Debug, Args)]
