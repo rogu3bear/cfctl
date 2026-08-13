@@ -72,6 +72,8 @@ pub(super) fn create(
     let mut children = Vec::with_capacity(spec.children.len());
     let mut account_ids = BTreeSet::new();
     let mut shared: Option<PlanSetSharedPins> = None;
+    let mut admission_policy_hashes = Vec::with_capacity(spec.children.len());
+    let mut workspace_graph_hashes = Vec::with_capacity(spec.children.len());
     for (index, child_spec) in spec.children.iter().enumerate() {
         let plan_v2 = load_initial_child(store, &child_spec.operation_id)?;
         let profile = profiles.selected(Some(&plan_v2.plan.profile_id))?;
@@ -87,13 +89,15 @@ pub(super) fn create(
         if let Some(expected) = &shared {
             if expected != &current {
                 return Err(CliError::Input(
-                    "all deployment plan-set children must share one profile, build, catalog, credential generation, admission policy, and workspace graph"
+                    "all deployment plan-set children must share one profile, build, catalog, and credential generation"
                         .to_owned(),
                 ));
             }
         } else {
             shared = Some(current);
         }
+        admission_policy_hashes.push(plan_v2.pins.admission_policy_hash.clone());
+        workspace_graph_hashes.push(plan_v2.pins.workspace_graph_hash.clone());
         account_ids.insert(plan_v2.plan.account_id.clone());
         children.push(compile_child(
             u32::try_from(index + 1)
@@ -103,6 +107,9 @@ pub(super) fn create(
         )?);
     }
     let shared = shared.ok_or_else(|| CliError::Input("plan set has no children".to_owned()))?;
+    let admission_policy_hash = aggregate_admission_policy_hash(&admission_policy_hashes)?;
+    let workspace_graph_hash =
+        aggregate_sha256_pins("child_workspace_graph_hashes", &workspace_graph_hashes)?;
     let current_build_hash = hash_value(&serde_json::to_value(current_build_info())?)?;
     if current_build_hash != shared.build_identity_hash {
         return Err(CliError::Input(
@@ -120,8 +127,8 @@ pub(super) fn create(
         shared.build_identity_hash,
         shared.catalog_hash,
         shared.credential_generation_id,
-        shared.admission_policy_hash,
-        shared.workspace_graph_hash,
+        admission_policy_hash,
+        workspace_graph_hash,
         repositories,
         children,
         explicit_exclusions,
@@ -191,32 +198,22 @@ pub(super) async fn verify(
             "Re-authenticate and recreate the complete bundle from fresh child plans.",
         ));
     }
-    let current_policy_hash = active_admission_policy(store)?.map_or_else(
-        || None,
-        |bundle| Some(format!("bundle:{}", bundle.content_hash)),
-    );
-    if plan_set.admission_policy_hash.starts_with("bundle:")
-        && current_policy_hash.as_deref() != Some(plan_set.admission_policy_hash.as_str())
-    {
-        return Err(CliError::guided(
-            "CFCTL_PLAN_SET_POLICY_DRIFT",
-            "the active admission bundle no longer matches the deployment plan set",
-            "Recreate every child and the complete bundle under the current admission policy.",
-        ));
-    }
-    if plan_set.admission_policy_hash.starts_with("compiled:") && current_policy_hash.is_some() {
-        return Err(CliError::guided(
-            "CFCTL_PLAN_SET_POLICY_DRIFT",
-            "the deployment plan set used the compiled safety floor but an admission bundle is now active",
-            "Recreate every child and the complete bundle under the active admission policy.",
-        ));
-    }
+    validate_plan_set_policy_presence(store, &plan_set)?;
+    let mut child_admission_policy_hashes = Vec::with_capacity(plan_set.children.len());
+    let mut child_workspace_graph_hashes = Vec::with_capacity(plan_set.children.len());
     for child in &plan_set.children {
         let plan_v2 = store.load_plan_v2(&child.operation_id)?;
         validate_current_child(&plan_set, child, &plan_v2)?;
         validate_plan_v2_runtime_pins(store, &plan_v2.plan, profile)?;
         validate_plan_preconditions(store, &plan_v2.plan)?;
+        child_admission_policy_hashes.push(plan_v2.pins.admission_policy_hash.clone());
+        child_workspace_graph_hashes.push(plan_v2.pins.workspace_graph_hash.clone());
     }
+    validate_child_aggregate_pins(
+        &plan_set,
+        &child_admission_policy_hashes,
+        &child_workspace_graph_hashes,
+    )?;
     let secrets = platform_secrets(store);
     let credential = fresh_credential(profile, &secrets).await?;
     let mut evidence = Vec::new();
@@ -256,8 +253,6 @@ struct PlanSetSharedPins {
     build_identity_hash: String,
     catalog_hash: String,
     credential_generation_id: String,
-    admission_policy_hash: String,
-    workspace_graph_hash: String,
 }
 
 impl PlanSetSharedPins {
@@ -272,10 +267,89 @@ impl PlanSetSharedPins {
             build_identity_hash: plan.pins.build_identity_hash.clone(),
             catalog_hash: plan.pins.catalog_hash.clone(),
             credential_generation_id: plan.pins.credential_generation_id.clone(),
-            admission_policy_hash: plan.pins.admission_policy_hash.clone(),
-            workspace_graph_hash: plan.pins.workspace_graph_hash.clone(),
         })
     }
+}
+
+fn aggregate_admission_policy_hash(hashes: &[String]) -> Result<String> {
+    let canonical = canonical_pin_set(hashes, "admission policy")?;
+    if canonical.len() == 1 {
+        return Ok(canonical[0].clone());
+    }
+    if canonical.iter().all(|hash| hash.starts_with("compiled:")) {
+        return Ok(format!(
+            "compiled:{}",
+            hash_value(&json!({"child_admission_policy_hashes": canonical}))?
+        ));
+    }
+    Err(CliError::Input(
+        "deployment plan-set children disagree on the active admission policy bundle".to_owned(),
+    ))
+}
+
+fn aggregate_sha256_pins(label: &str, hashes: &[String]) -> Result<String> {
+    let canonical = canonical_pin_set(hashes, label)?;
+    if canonical.len() == 1 {
+        return Ok(canonical[0].clone());
+    }
+    hash_value(&json!({"pin_scope": label, "hashes": canonical})).map_err(Into::into)
+}
+
+fn canonical_pin_set(hashes: &[String], label: &str) -> Result<Vec<String>> {
+    if hashes.is_empty() || hashes.iter().any(|hash| hash.trim().is_empty()) {
+        return Err(CliError::Input(format!(
+            "deployment plan-set {label} pins must be non-empty"
+        )));
+    }
+    let mut canonical = hashes.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn validate_child_aggregate_pins(
+    plan_set: &DeploymentPlanSetV1,
+    admission_policy_hashes: &[String],
+    workspace_graph_hashes: &[String],
+) -> Result<()> {
+    if aggregate_admission_policy_hash(admission_policy_hashes)? == plan_set.admission_policy_hash
+        && aggregate_sha256_pins("child_workspace_graph_hashes", workspace_graph_hashes)?
+            == plan_set.workspace_graph_hash
+    {
+        return Ok(());
+    }
+    Err(CliError::guided(
+        "CFCTL_PLAN_SET_CHILD_DRIFT",
+        "the deployment plan-set aggregate pins no longer match its child plans",
+        "Cancel and recreate the complete deployment bundle from fresh child plans.",
+    ))
+}
+
+fn validate_plan_set_policy_presence(
+    store: &StateStore,
+    plan_set: &DeploymentPlanSetV1,
+) -> Result<()> {
+    let current_policy_hash = active_admission_policy(store)?.map_or_else(
+        || None,
+        |bundle| Some(format!("bundle:{}", bundle.content_hash)),
+    );
+    if plan_set.admission_policy_hash.starts_with("bundle:")
+        && current_policy_hash.as_deref() != Some(plan_set.admission_policy_hash.as_str())
+    {
+        return Err(CliError::guided(
+            "CFCTL_PLAN_SET_POLICY_DRIFT",
+            "the active admission bundle no longer matches the deployment plan set",
+            "Recreate every child and the complete bundle under the current admission policy.",
+        ));
+    }
+    if plan_set.admission_policy_hash.starts_with("compiled:") && current_policy_hash.is_some() {
+        return Err(CliError::guided(
+            "CFCTL_PLAN_SET_POLICY_DRIFT",
+            "the deployment plan set used the compiled safety floor but an admission bundle is now active",
+            "Recreate every child and the complete bundle under the active admission policy.",
+        ));
+    }
+    Ok(())
 }
 
 fn load_initial_child(store: &StateStore, operation_id: &str) -> Result<PlanV2> {
@@ -370,8 +444,6 @@ fn validate_current_child(
         || plan.pins.build_identity_hash != plan_set.build_identity_hash
         || plan.pins.catalog_hash != plan_set.catalog_hash
         || plan.pins.credential_generation_id != plan_set.credential_generation_id
-        || plan.pins.admission_policy_hash != plan_set.admission_policy_hash
-        || plan.pins.workspace_graph_hash != plan_set.workspace_graph_hash
     {
         return Err(CliError::guided(
             "CFCTL_PLAN_SET_CHILD_DRIFT",
@@ -488,11 +560,14 @@ fn receipt(store: &StateStore, plan_set: &DeploymentPlanSetV1, state: &str) -> V
                 |_| "unavailable".to_owned(),
                 |plan| format!("{:?}", plan.status).to_ascii_lowercase(),
             );
+            let current_pins = store.load_plan_v2(&child.operation_id).ok().map(|plan| plan.pins);
             json!({
                 "sequence":child.sequence,
                 "operation_id":child.operation_id,
                 "plan_content_hash":child.plan_content_hash,
                 "pins_hash":child.pins_hash,
+                "admission_policy_hash":current_pins.as_ref().map(|pins| &pins.admission_policy_hash),
+                "workspace_graph_hash":current_pins.as_ref().map(|pins| &pins.workspace_graph_hash),
                 "capability_id":child.capability_id,
                 "account_id":child.account_id,
                 "zone_ids":child.zone_ids,
@@ -635,6 +710,8 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
 mod tests {
     #![allow(clippy::expect_used)]
 
+    use super::{aggregate_admission_policy_hash, aggregate_sha256_pins};
+
     #[test]
     fn plan_set_cli_surface_has_no_bundle_approval_or_run_command() {
         let command = <crate::Cli as clap::CommandFactory>::command();
@@ -645,5 +722,50 @@ mod tests {
             .map(clap::Command::get_name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["create", "show", "verify"]);
+    }
+
+    #[test]
+    fn mixed_compiled_policy_and_workspace_pins_aggregate_deterministically() {
+        let policy_a =
+            "compiled:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let policy_b =
+            "compiled:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let graph_a = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let graph_b = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let forward_policy =
+            aggregate_admission_policy_hash(&[policy_a.to_owned(), policy_b.to_owned()])
+                .expect("mixed compiled policy pins");
+        let reverse_policy =
+            aggregate_admission_policy_hash(&[policy_b.to_owned(), policy_a.to_owned()])
+                .expect("reordered mixed compiled policy pins");
+        let forward_graph = aggregate_sha256_pins(
+            "child_workspace_graph_hashes",
+            &[graph_a.to_owned(), graph_b.to_owned()],
+        )
+        .expect("mixed workspace pins");
+        let reverse_graph = aggregate_sha256_pins(
+            "child_workspace_graph_hashes",
+            &[graph_b.to_owned(), graph_a.to_owned()],
+        )
+        .expect("reordered mixed workspace pins");
+
+        assert_eq!(forward_policy, reverse_policy);
+        assert!(forward_policy.starts_with("compiled:sha256:"));
+        assert_eq!(forward_graph, reverse_graph);
+        assert!(forward_graph.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn distinct_active_admission_bundles_fail_closed() {
+        let first =
+            "bundle:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second =
+            "bundle:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let error = aggregate_admission_policy_hash(&[first.to_owned(), second.to_owned()])
+            .expect_err("different active bundles must not aggregate");
+
+        assert!(error.to_string().contains("active admission policy bundle"));
     }
 }
