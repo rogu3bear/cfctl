@@ -73,7 +73,9 @@ pack's pinned Wrangler. cfctl binds the registered repository, clean HEAD,
 pack/template/migration hashes, account, database, mode-restricted production
 config, and a fresh pre-change bookmark. It requires the observed migration
 ledger to be an exact prefix before apply and an exact match after apply, then
-runs only compiler-owned schema assertions.
+runs only compiler-owned schema assertions. The assertion compiler returns one
+bounded `VALUES`-backed result set with stable assertion labels, avoiding
+provider compound-select limits without exposing repository-supplied SQL.
 
 Private D1 policy projection bytes enter through an exact mode-0600
 plan-creation source and are copied to a managed mode-0600 stage. SQL and

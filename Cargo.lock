@@ -413,6 +413,7 @@ dependencies = [
  "md-5",
  "processkit",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

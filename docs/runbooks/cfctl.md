@@ -472,8 +472,11 @@ operational proof from the preceding ten minutes, bound to the same catalog,
 profile, account, credential generation, and database target. Approval is
 one-use. Execution revalidates repository, config, stage, and recovery
 authority before invoking the pinned Wrangler. Migration verification requires
-the exact ledger plus compiler-owned schema assertions. Policy projection
-verification returns only the route count and the active policy,
+the exact ledger plus compiler-owned schema assertions returned through one
+bounded `VALUES`-backed result set. A failing readback reports only its exit
+status and content-addressed output hashes; inspect governed provider evidence
+rather than replaying a migration that may already have crossed the boundary.
+Policy projection verification returns only the route count and the active policy,
 desired-state, and projection digests through compiler-owned queries.
 
 Do not substitute raw D1 query or direct Wrangler execution. If execution may

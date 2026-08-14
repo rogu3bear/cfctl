@@ -678,18 +678,19 @@ pub(super) async fn execute_json_query(
     account_id: &str,
     cache_dir: &Path,
 ) -> Result<Vec<Map<String, Value>>> {
+    let arguments = [
+        "d1".to_owned(),
+        "execute".to_owned(),
+        database.to_owned(),
+        "--remote".to_owned(),
+        "--config".to_owned(),
+        config.to_owned(),
+        "--command".to_owned(),
+        sql.to_owned(),
+        "--json".to_owned(),
+    ];
     let output = run_wrangler(
-        &[
-            "d1".to_owned(),
-            "execute".to_owned(),
-            database.to_owned(),
-            "--remote".to_owned(),
-            "--config".to_owned(),
-            config.to_owned(),
-            "--command".to_owned(),
-            sql.to_owned(),
-            "--json".to_owned(),
-        ],
+        &arguments,
         root,
         credential,
         account_id,
@@ -697,12 +698,33 @@ pub(super) async fn execute_json_query(
         QUERY_TIMEOUT,
     )
     .await?;
-    if !output.success {
-        return Err(CliError::Input(
-            "fixed Wrangler D1 readback returned a failing exit status".to_owned(),
-        ));
+    if output.success {
+        return parse_query_rows(&output.stdout);
     }
-    parse_query_rows(&output.stdout)
+    let failure = QueryFailureDiagnostic::from(&output);
+    Err(CliError::Input(format!(
+        "fixed Wrangler D1 readback failed (exit_status={}, stdout_hash={}, stderr_hash={})",
+        failure.exit_status, failure.stdout_hash, failure.stderr_hash
+    )))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryFailureDiagnostic {
+    exit_status: String,
+    stdout_hash: String,
+    stderr_hash: String,
+}
+
+impl From<&WranglerOutput> for QueryFailureDiagnostic {
+    fn from(output: &WranglerOutput) -> Self {
+        Self {
+            exit_status: output
+                .exit_status
+                .map_or_else(|| "signal".to_owned(), |status| status.to_string()),
+            stdout_hash: sha256(output.stdout.as_bytes()),
+            stderr_hash: sha256(output.stderr.as_bytes()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -813,7 +835,7 @@ fn is_prefix(observed: &[String], declared: &[String]) -> bool {
 fn compile_assertion_sql(
     assertions: &[cfctl_core::WorkspaceD1SchemaAssertionV1],
 ) -> Result<String> {
-    let mut statements = Vec::new();
+    let mut values = Vec::new();
     for (index, assertion) in assertions.iter().enumerate() {
         let key = format!("assertion_{index}");
         let predicate = match assertion.kind.as_str() {
@@ -840,11 +862,12 @@ fn compile_assertion_sql(
                 ));
             }
         };
-        statements.push(format!(
-            "SELECT '{key}' AS assertion, CAST({predicate} AS INTEGER) AS passed"
-        ));
+        values.push(format!("('{key}', CAST({predicate} AS INTEGER))"));
     }
-    Ok(statements.join(" UNION ALL "))
+    Ok(format!(
+        "WITH assertions(assertion, passed) AS (VALUES {}) SELECT assertion, passed FROM assertions",
+        values.join(", ")
+    ))
 }
 
 fn identifier(value: Option<&str>) -> Result<&str> {
@@ -932,6 +955,23 @@ mod tests {
     }
 
     #[test]
+    fn query_failure_diagnostics_are_bounded_and_content_addressed() {
+        let failed = WranglerOutput {
+            success: false,
+            exit_status: Some(1),
+            stdout: "provider output".to_owned(),
+            stderr: "private diagnostic detail".to_owned(),
+        };
+        let diagnostic = QueryFailureDiagnostic::from(&failed);
+        assert_eq!(diagnostic.exit_status, "1");
+        assert_eq!(diagnostic.stdout_hash, sha256(b"provider output"));
+        assert_eq!(diagnostic.stderr_hash, sha256(b"private diagnostic detail"));
+        let rendered = format!("{diagnostic:?}");
+        assert!(!rendered.contains("provider output"));
+        assert!(!rendered.contains("private diagnostic detail"));
+    }
+
+    #[test]
     fn assertion_compiler_accepts_only_closed_identifiers() {
         let sql = compile_assertion_sql(&[
             WorkspaceD1SchemaAssertionV1 {
@@ -950,8 +990,84 @@ mod tests {
         .expect("SQL");
         assert!(sql.contains("pragma_table_info('todos')"));
         assert!(sql.contains("pragma_foreign_key_check"));
+        assert!(sql.starts_with("WITH assertions(assertion, passed) AS (VALUES "));
+        assert!(!sql.contains("UNION ALL"));
         assert!(!sql.contains(';'));
         assert!(identifier(Some("todos'; DROP TABLE todos;--")).is_err());
+    }
+
+    #[test]
+    fn assertion_compiler_executes_eleven_checks_without_compound_selects() {
+        let tables = [
+            "policy_revisions",
+            "runtime_state",
+            "policy_projection_state",
+            "reply_relays",
+            "relay_attempts",
+            "route_health",
+            "route_proofs",
+            "route_proof_coverage",
+            "inbound_deliveries",
+            "inbound_recipient_deliveries",
+        ];
+        let mut assertions = tables
+            .iter()
+            .map(|table| WorkspaceD1SchemaAssertionV1 {
+                kind: "table_exists".to_owned(),
+                table: Some((*table).to_owned()),
+                column: None,
+                index: None,
+            })
+            .collect::<Vec<_>>();
+        assertions.push(WorkspaceD1SchemaAssertionV1 {
+            kind: "foreign_key_check_empty".to_owned(),
+            table: None,
+            column: None,
+            index: None,
+        });
+        let sql = compile_assertion_sql(&assertions).expect("SQL");
+        assert!(!sql.contains("UNION ALL"));
+        for index in 0..11 {
+            assert!(sql.contains(&format!("'assertion_{index}'")));
+        }
+
+        let database = rusqlite::Connection::open_in_memory().expect("database");
+        for table in tables {
+            database
+                .execute(
+                    &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"),
+                    [],
+                )
+                .expect("create assertion fixture table");
+        }
+        let mut statement = database.prepare(&sql).expect("prepare assertions");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query assertions")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect assertion rows");
+        assert_eq!(rows.len(), 11);
+        assert!(rows.iter().all(|(_, passed)| *passed == 1));
+
+        database
+            .execute("DROP TABLE route_health", [])
+            .expect("drop one fixture table");
+        let mut statement = database.prepare(&sql).expect("prepare assertions");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query assertions")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect assertion rows");
+        assert_eq!(rows[5], ("assertion_5".to_owned(), 0));
+        assert!(
+            rows.iter()
+                .enumerate()
+                .all(|(index, (_, passed))| index == 5 || *passed == 1)
+        );
     }
 
     #[test]
