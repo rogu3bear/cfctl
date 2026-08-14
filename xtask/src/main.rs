@@ -450,14 +450,25 @@ fn verify_source_contract() -> Result<(), TaskError> {
 fn verify_local_only_ci_contract() -> Result<(), TaskError> {
     let workflow_root = Path::new(".github/workflows");
     let workflow_paths = if workflow_root.exists() {
-        fs::read_dir(workflow_root)
+        let entries = fs::read_dir(workflow_root)
             .map_err(|error| TaskError::Io {
                 path: workflow_root.display().to_string(),
                 source: error,
             })?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().display().to_string())
-            .filter(|path| path.ends_with(".yml") || path.ends_with(".yaml"))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| TaskError::Io {
+                path: workflow_root.display().to_string(),
+                source: error,
+            })?;
+        entries
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
+                })
+            })
+            .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
     } else {
         Vec::new()

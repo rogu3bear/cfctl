@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -257,12 +258,7 @@ async fn verify_inner(
         &store.paths().cache_dir,
     )
     .await?;
-    let assertions_passed = assertion_rows.len() == contract.assertions.len()
-        && assertion_rows.iter().all(|row| {
-            row.get("passed")
-                .and_then(Value::as_i64)
-                .is_some_and(|value| value == 1)
-        });
+    let assertions_passed = assertion_rows_pass(&assertion_rows, contract.assertions.len());
     let passed = ledger == declared && assertions_passed;
     Ok(json!({
         "passed": passed,
@@ -276,6 +272,27 @@ async fn verify_inner(
         "schema_assertions": assertion_rows,
         "recovery": target.get("recovery").cloned().unwrap_or(Value::Null),
     }))
+}
+
+fn assertion_rows_pass(rows: &[Map<String, Value>], expected_count: usize) -> bool {
+    if rows.len() != expected_count {
+        return false;
+    }
+    let mut observed = BTreeSet::new();
+    for row in rows {
+        let Some(label) = row.get("assertion").and_then(Value::as_str) else {
+            return false;
+        };
+        if row.get("passed").and_then(Value::as_i64) != Some(1)
+            || !observed.insert(label.to_owned())
+        {
+            return false;
+        }
+    }
+    observed
+        == (0..expected_count)
+            .map(|index| format!("assertion_{index}"))
+            .collect()
 }
 
 #[derive(Debug)]
@@ -952,6 +969,33 @@ mod tests {
                 .expect("rows");
         assert_eq!(rows[0]["name"], "0001.sql");
         assert!(parse_query_rows(r#"[{"results":[],"success":false}]"#).is_err());
+    }
+
+    #[test]
+    fn assertion_readback_requires_the_exact_unique_label_set() {
+        let valid = parse_query_rows(
+            r#"[{"results":[{"assertion":"assertion_0","passed":1},{"assertion":"assertion_1","passed":1}],"success":true}]"#,
+        )
+        .expect("valid assertion rows");
+        assert!(assertion_rows_pass(&valid, 2));
+
+        let duplicate = parse_query_rows(
+            r#"[{"results":[{"assertion":"assertion_0","passed":1},{"assertion":"assertion_0","passed":1}],"success":true}]"#,
+        )
+        .expect("duplicate assertion rows");
+        assert!(!assertion_rows_pass(&duplicate, 2));
+
+        let unknown = parse_query_rows(
+            r#"[{"results":[{"assertion":"assertion_0","passed":1},{"assertion":"assertion_2","passed":1}],"success":true}]"#,
+        )
+        .expect("unknown assertion rows");
+        assert!(!assertion_rows_pass(&unknown, 2));
+
+        let failed = parse_query_rows(
+            r#"[{"results":[{"assertion":"assertion_0","passed":1},{"assertion":"assertion_1","passed":0}],"success":true}]"#,
+        )
+        .expect("failed assertion rows");
+        assert!(!assertion_rows_pass(&failed, 2));
     }
 
     #[test]
