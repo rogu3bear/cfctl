@@ -449,30 +449,7 @@ fn verify_source_contract() -> Result<(), TaskError> {
 
 fn verify_local_only_ci_contract() -> Result<(), TaskError> {
     let workflow_root = Path::new(".github/workflows");
-    let workflow_paths = if workflow_root.exists() {
-        let entries = fs::read_dir(workflow_root)
-            .map_err(|error| TaskError::Io {
-                path: workflow_root.display().to_string(),
-                source: error,
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| TaskError::Io {
-                path: workflow_root.display().to_string(),
-                source: error,
-            })?;
-        entries
-            .into_iter()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
-                })
-            })
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let workflow_paths = collect_workflow_paths(fs::read_dir(workflow_root), workflow_root)?;
     let contributing = fs::read_to_string("CONTRIBUTING.md").map_err(|error| TaskError::Io {
         path: "CONTRIBUTING.md".to_owned(),
         source: error,
@@ -482,6 +459,41 @@ fn verify_local_only_ci_contract() -> Result<(), TaskError> {
         source: error,
     })?;
     validate_local_only_ci_contract(&workflow_paths, &contributing, &readme)
+}
+
+fn collect_workflow_paths(
+    entries: std::io::Result<fs::ReadDir>,
+    workflow_root: &Path,
+) -> Result<Vec<String>, TaskError> {
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(TaskError::Io {
+                path: workflow_root.display().to_string(),
+                source: error,
+            });
+        }
+    };
+    entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| TaskError::Io {
+            path: workflow_root.display().to_string(),
+            source: error,
+        })
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("yml")
+                            || extension.eq_ignore_ascii_case("yaml")
+                    })
+                })
+                .map(|path| path.display().to_string())
+                .collect()
+        })
 }
 
 fn validate_local_only_ci_contract(
@@ -2814,13 +2826,13 @@ mod tests {
 
     use super::{
         PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, classify_pre_push_registration,
-        expected_signed_release_file_names, extract_cfctl_command_references,
-        extract_cfctl_command_refs, extract_prose_command_refs, is_declared_quarantine_path,
-        is_forbidden_quarantine_consumer, is_linux_musl, parse_remote_tag_commit,
-        release_build_driver, release_build_subcommand, release_tag_is_exact_version,
-        render_linux_installer_text, repository_root, security_proof_commands,
-        validate_bootstrap_contract, validate_codesign_details, validate_command_refs,
-        validate_extracted_command_refs, validate_local_only_ci_contract,
+        collect_workflow_paths, expected_signed_release_file_names,
+        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_linux_musl,
+        parse_remote_tag_commit, release_build_driver, release_build_subcommand,
+        release_tag_is_exact_version, render_linux_installer_text, repository_root,
+        security_proof_commands, validate_bootstrap_contract, validate_codesign_details,
+        validate_command_refs, validate_extracted_command_refs, validate_local_only_ci_contract,
         validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
         verify_generated_guidance_section_text, verify_managed_agent_documents,
@@ -2867,6 +2879,30 @@ mod tests {
         let error = validate_local_only_ci_contract(&[], CONTRIBUTING, "hosted proof required")
             .expect_err("README guidance may not drift back to hosted authority");
         assert!(error.to_string().contains("README.md"));
+    }
+
+    #[test]
+    fn local_only_ci_distinguishes_absent_from_unobservable_workflow_roots() {
+        let root = Path::new(".github/workflows");
+        let absent = collect_workflow_paths(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "absent fixture",
+            )),
+            root,
+        )
+        .expect("an absent workflow root is the intended local-only state");
+        assert!(absent.is_empty());
+
+        let error = collect_workflow_paths(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unobservable fixture",
+            )),
+            root,
+        )
+        .expect_err("an unobservable workflow root must block proof");
+        assert!(error.to_string().contains(".github/workflows"));
     }
 
     #[test]
