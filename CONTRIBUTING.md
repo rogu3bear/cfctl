@@ -84,21 +84,19 @@ Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
 create a repository `.env` with Cloudflare credentials.
 
-### Hosted and pre-push gates
+### Local proof and pre-push gate
 
-GitHub runs two read-only hosted proofs for every pull request and `main` push.
-The Rust job runs formatting, workspace Clippy, workspace tests, and the
-Cloudflare request-contract test. The website job pins its Bun and Rust build
-tools, runs site formatting/Clippy/tests, and builds the complete edge artifact
-twice to reject nondeterminism. Hosted proof still does not replace the complete
-local lane: Bun bridge proof, dependency policy, full-history secret scanning,
-source/governance contracts, and the Linux musl cross-build remain in
-`cargo xtask verify`.
+`cargo xtask verify` is the authoritative source proof. It runs formatting,
+warnings-denied workspace Clippy, all workspace tests, the Cloudflare request
+contract, site formatting/Clippy/tests, two complete edge builds to reject
+nondeterminism, the Bun bridge proof, dependency policy, full-history secret
+scanning, source/governance contracts, and the Linux musl cross-build. The
+repository does not require GitHub Actions or another hosted CI service.
 
 `.githooks/pre-push` runs that complete local proof and refuses the push when
-it fails. This repository has previously shipped a red `main` when the local
-gate was not run; hosted Rust proof now supplies an independent baseline while
-the pre-push gate preserves the broader release-target contract.
+it fails. A review or merge must therefore cite a fresh `cargo xtask verify`
+receipt bound to the exact candidate commit or tree; repository state alone is
+not proof that the gate ran.
 
 The hook is tracked, but it does not run merely because you cloned the
 repository. It executes only where an agentOS-style delegate pins its digest in
@@ -178,8 +176,7 @@ releases are unsigned by operator decision**, with integrity from `SHA256SUMS`,
 reproducible double-builds, SPDX SBOMs, and commit-bound provenance. Because
 the rendered Linux installer verifies a Cosign identity and has no
 checksum-only fallback, it is deliberately not shipped with unsigned releases.
-The hosted Rust proof never assembles, signs, uploads, or publishes release
-artifacts.
+The local source proof never uploads or publishes release artifacts.
 
 An account-backed disposable token smoke test
 (`tests/account-backed-smoke.sh`) is kept out of the local proof lane because
