@@ -437,7 +437,7 @@ fn is_cloudflare_config(path: &Path) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "wrangler.toml" | "wrangler.json" | "wrangler.jsonc"
+        "wrangler.toml" | "wrangler.production.toml" | "wrangler.json" | "wrangler.jsonc"
     ) || path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("tf"))
@@ -453,7 +453,7 @@ fn config_kind(path: &Path) -> &'static str {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if lower == "wrangler.toml" {
+    if matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml") {
         "wrangler_toml"
     } else if matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc") {
         "wrangler_json"
@@ -493,7 +493,7 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
             ))
         }),
         _ => Err(WorkspaceError::DiscoveryInvariant(format!(
-            "deployment configuration `{}` is not wrangler.toml, wrangler.json, or wrangler.jsonc",
+            "deployment configuration `{}` is not wrangler.toml, wrangler.production.toml, wrangler.json, or wrangler.jsonc",
             path.display()
         ))),
     }

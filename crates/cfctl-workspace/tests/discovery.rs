@@ -2,7 +2,39 @@
 
 use std::{fs, path::Path, process::Command};
 
-use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
+use cfctl_workspace::{RegisteredRoot, WorkspaceGraph, load_wrangler_config};
+
+#[test]
+fn exact_production_wrangler_toml_is_supported_without_admitting_arbitrary_variants() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("production-app");
+    init_repo(
+        &repository,
+        "wrangler.production.toml",
+        "name = \"production-worker\"\n",
+    );
+    let production = repository.join("wrangler.production.toml");
+
+    let parsed = load_wrangler_config(&production).expect("exact production Wrangler TOML");
+    assert_eq!(parsed["name"], "production-worker");
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("production config discovery");
+    assert!(
+        graph
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:production-worker")
+    );
+
+    let arbitrary = repository.join("wrangler.unreviewed.toml");
+    fs::write(&arbitrary, "name = \"unreviewed-worker\"\n").expect("arbitrary config");
+    assert!(
+        load_wrangler_config(&arbitrary)
+            .expect_err("arbitrary Wrangler variants must remain outside the authority contract")
+            .to_string()
+            .contains("not wrangler.toml")
+    );
+}
 
 #[test]
 fn discovery_stays_inside_registered_roots_and_finds_cloudflare_configs() {
