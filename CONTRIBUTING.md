@@ -99,6 +99,11 @@ and site Clippy/tests natively on Linux. This is complementary platform proof,
 not a substitute for the broader local lane; the local macOS gate and Linux
 cross-build cannot substitute for Linux-native execution either.
 
+The `Hosted proof` workflow must remain enabled in the repository. A pull
+request with no reported hosted jobs is a blocked proof state, not a successful
+or inapplicable check; restore the workflow before treating that head as
+review- or merge-eligible.
+
 `.githooks/pre-push` runs that complete local proof and refuses the push when
 it fails. A review or merge must cite a fresh `cargo xtask verify` receipt bound
 to the exact candidate commit or tree and account for the exact-head hosted

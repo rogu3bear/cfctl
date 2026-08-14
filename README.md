@@ -342,7 +342,9 @@ contracts, and the Linux musl cross-build. It needs pinned Bun, cargo-leptos,
 and worker-build tools, `cargo-deny`, Gitleaks, Zig, `cargo-zigbuild`, and the
 Linux musl and WebAssembly targets. The tracked pre-push gate runs this local
 lane. Exact-candidate Ubuntu jobs independently add locked, Linux-native
-workspace and site proof; neither proof lane substitutes for the other. See
+workspace and site proof; neither proof lane substitutes for the other. No
+reported hosted jobs is a blocked proof state and must not be interpreted as
+green. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 
