@@ -203,6 +203,15 @@ mod maildesk_provider_contract_tests {
         assert_eq!(lifecycle.risk, RiskClass::Destructive);
         assert_eq!(lifecycle.effect, EffectClass::Destructive);
         assert_eq!(
+            lifecycle
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema
+                    .pointer("/properties/rules/x-cfctl-verification-array-identity"))
+                .and_then(Value::as_str),
+            Some("id")
+        );
+        assert_eq!(
             lifecycle.rollback.strategy.as_deref(),
             Some("restore_same_path_prior_snapshot")
         );
@@ -8178,6 +8187,13 @@ fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, Capability
             "R2 lifecycle complete-replacement or same-path snapshot contract drifted".to_owned(),
         );
         return;
+    }
+    if let Some(rules) = capability
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.pointer_mut("/properties/rules"))
+    {
+        rules["x-cfctl-verification-array-identity"] = Value::String("id".to_owned());
     }
     capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
     capability.risk = RiskClass::Destructive;

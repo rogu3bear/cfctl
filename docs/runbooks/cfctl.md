@@ -522,7 +522,10 @@ cfctl call r2-put-bucket-lifecycle-configuration \
 
 Review the full `planned_after` and prior snapshot before approval. Restoration
 is a separate plan containing the complete prior configuration; objects already
-expired under the applied rule are unrecoverable.
+expired under the applied rule are unrecoverable. Lifecycle verification binds
+the exact rule-ID set and recursively compares each rule; provider-controlled
+rule ordering is not drift, while duplicate, missing, extra, or changed rules
+fail closed.
 
 ### Email Sending and Email Routing subdomains
 

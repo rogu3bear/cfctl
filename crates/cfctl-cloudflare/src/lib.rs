@@ -9522,6 +9522,98 @@ mod access_application_projection_tests {
             vec!["tags"]
         );
     }
+
+    fn lifecycle_capability(identity_keyed: bool) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "r2-put-bucket-lifecycle-configuration",
+            "Put Object Lifecycle Rules",
+            "PUT",
+            "/accounts/{account_id}/r2/buckets/{bucket_name}/lifecycle",
+        );
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "properties":{
+                "rules":{
+                    "type":"array",
+                    "items":{"type":"object"}
+                }
+            }
+        }));
+        if identity_keyed && let Some(schema) = capability.request_schema.as_mut() {
+            schema["properties"]["rules"]["x-cfctl-verification-array-identity"] = json!("id");
+        }
+        capability
+    }
+
+    fn lifecycle_rules() -> Value {
+        json!([
+            {
+                "id":"expire-relay-spool-7d",
+                "enabled":true,
+                "conditions":{"prefix":"relay-spool/"},
+                "deleteObjectsTransition":{"condition":{"type":"Age","maxAge":604_800}}
+            },
+            {
+                "id":"Default Multipart Abort Rule",
+                "enabled":true,
+                "conditions":{"prefix":""},
+                "abortMultipartUploadsTransition":{"condition":{"type":"Age","maxAge":604_800}}
+            }
+        ])
+    }
+
+    #[test]
+    fn identity_keyed_lifecycle_rules_allow_provider_reordering_only() {
+        let capability = lifecycle_capability(true);
+        let planned = serde_json::Map::from_iter([("rules".to_owned(), lifecycle_rules())]);
+        let Some(mut reordered) = lifecycle_rules().as_array().cloned() else {
+            panic!("lifecycle rules fixture must be an array");
+        };
+        reordered.reverse();
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &capability,
+                &planned,
+                &json!({"rules":reordered})
+            )
+            .is_empty()
+        );
+
+        let mut drifted = reordered.clone();
+        drifted[0]["abortMultipartUploadsTransition"]["condition"]["maxAge"] = json!(86_400);
+        for actual in [
+            json!({"rules":drifted}),
+            json!({"rules":[reordered[0].clone()]}),
+            json!({"rules":[reordered[0].clone(),reordered[1].clone(),{"id":"extra","enabled":true}]}),
+            json!({"rules":[reordered[0].clone(),reordered[0].clone()]}),
+            json!({"rules":[reordered[0].clone(),{"enabled":true}]}),
+            json!({"rules":[reordered[0].clone(),{"id":"","enabled":true}]}),
+            json!({"rules":[reordered[0].clone(),{"id":7,"enabled":true}]}),
+        ] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&capability, &planned, &actual),
+                vec!["rules"]
+            );
+        }
+    }
+
+    #[test]
+    fn unannotated_arrays_remain_order_sensitive() {
+        let capability = lifecycle_capability(false);
+        let planned = serde_json::Map::from_iter([("rules".to_owned(), lifecycle_rules())]);
+        let Some(mut reordered) = lifecycle_rules().as_array().cloned() else {
+            panic!("lifecycle rules fixture must be an array");
+        };
+        reordered.reverse();
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(
+                &capability,
+                &planned,
+                &json!({"rules":reordered})
+            ),
+            vec!["rules"]
+        );
+    }
 }
 
 fn verification_response_field(capability: &CapabilityV1, request_field: &str) -> Option<String> {
@@ -9597,6 +9689,31 @@ fn contains_verifiable_planned_value(
             if actual.len() != planned.len() {
                 return false;
             }
+            if let Some(identity) = request_schema_path_array_identity(schema, path) {
+                let Some(actual) = identity_keyed_array(actual, &identity) else {
+                    return false;
+                };
+                let Some(planned_by_identity) = identity_keyed_array(planned, &identity) else {
+                    return false;
+                };
+                if actual.len() != planned_by_identity.len()
+                    || actual.keys().ne(planned_by_identity.keys())
+                {
+                    return false;
+                }
+                path.push(RequestSchemaPathStep::Item);
+                let matches = planned_by_identity.iter().all(|(identity, planned)| {
+                    contains_verifiable_planned_value(
+                        actual.get(identity).copied(),
+                        planned,
+                        schema,
+                        path,
+                        depth + 1,
+                    )
+                });
+                path.pop();
+                return matches;
+            }
             path.push(RequestSchemaPathStep::Item);
             let matches = actual.iter().zip(planned).all(|(actual, planned)| {
                 contains_verifiable_planned_value(Some(actual), planned, schema, path, depth + 1)
@@ -9606,6 +9723,47 @@ fn contains_verifiable_planned_value(
         }
         _ => actual == planned,
     }
+}
+
+fn request_schema_path_array_identity(
+    schema: Option<&Value>,
+    path: &[RequestSchemaPathStep],
+) -> Option<String> {
+    let schema = schema?;
+    let mut remaining_steps = MAX_REQUEST_SCHEMA_PROJECTION_STEPS;
+    let candidates = request_schema_path_candidates(schema, path, 0, &mut remaining_steps)?;
+    let identities = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .get("x-cfctl-verification-array-identity")
+                .and_then(Value::as_str)
+                .filter(|identity| !identity.is_empty())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let identity = identities.first()?;
+    identities
+        .iter()
+        .all(|candidate| candidate == identity)
+        .then(|| (*identity).to_owned())
+}
+
+fn identity_keyed_array<'a>(
+    values: &'a [Value],
+    identity: &str,
+) -> Option<std::collections::BTreeMap<&'a str, &'a Value>> {
+    let mut keyed = std::collections::BTreeMap::new();
+    for value in values {
+        let key = value
+            .as_object()?
+            .get(identity)?
+            .as_str()
+            .filter(|key| !key.is_empty())?;
+        if keyed.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    Some(keyed)
 }
 
 fn request_schema_path_is_verification_omitted(
