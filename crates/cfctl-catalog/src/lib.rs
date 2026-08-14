@@ -305,6 +305,12 @@ mod maildesk_provider_contract_tests {
                 .and_then(|schema| schema.get("nullable")),
             None
         );
+        assert!(enable.rollback.warning.as_deref().is_some_and(|warning| {
+            warning.contains("no subdomain-scoped provider delete is proven")
+                && warning.contains("exact DNS-record and routing-rule restoration")
+                && warning.contains("never use zone-wide Email Routing disable")
+                && warning.contains("apex MX and routing must remain untouched")
+        }));
     }
 }
 
@@ -8469,7 +8475,7 @@ fn finalize_email_routing_subdomain_contract(capabilities: &mut BTreeMap<String,
     enable.rollback.supported = false;
     enable.rollback.strategy = None;
     enable.rollback.warning = Some(
-        "rollback is a separately reviewed disable/delete of only the subdomain routing DNS and rules, bound to the complete prior DNS snapshot; this contract cannot mutate apex MX because name is mandatory"
+        "no subdomain-scoped provider delete is proven; rollback requires separately reviewed exact DNS-record and routing-rule restoration bound to the complete prior snapshots; never use zone-wide Email Routing disable as subdomain compensation, and apex MX and routing must remain untouched"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(enable);

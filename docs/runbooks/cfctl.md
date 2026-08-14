@@ -575,7 +575,10 @@ The mandatory `name` is included in the plan and repeated as the `subdomain`
 query on DNS readback. An absent, empty, or apex target fails closed. Create or
 update the catch-all Worker rule only through its separately resolved Email
 Routing capability, bind the exact Worker target, and preserve the prior rule
-and subdomain DNS snapshots for separate rollback plans.
+and subdomain DNS snapshots for separate rollback plans. Cloudflare exposes no
+proven subdomain-scoped provider delete here: rollback is exact DNS-record and
+routing-rule restoration, never zone-wide Email Routing disable. Apex MX and
+routing must remain untouched.
 
 Use `d1-full-export` to capture a full schema-and-data SQL snapshot immediately
 before a separately governed migration:

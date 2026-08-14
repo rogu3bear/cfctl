@@ -10081,12 +10081,13 @@ fn project_same_path_prior_state(
         })?;
         return Ok(prior);
     }
+    let normalized_result = normalize_same_path_prior_state(&capability.id, result.clone());
     let mut prior = serde_json::Map::new();
     for field in same_path_prior_state_fields(capability, input)? {
         let response_field = capability
             .request_object_field_verification_response_field(&field)
             .unwrap_or_else(|| field.clone());
-        let value = result.get(&response_field).cloned().ok_or_else(|| {
+        let value = normalized_result.get(&response_field).cloned().ok_or_else(|| {
             CliError::Input(format!(
                 "same-path state read omitted restorable field `{response_field}`; the mutation boundary was not crossed"
             ))
@@ -10103,6 +10104,40 @@ fn project_same_path_prior_state(
         ))
     })?;
     Ok(prior)
+}
+
+fn normalize_same_path_prior_state(capability_id: &str, mut result: Value) -> Value {
+    if capability_id != "r2-put-bucket-lifecycle-configuration" {
+        return result;
+    }
+    let Some(rules) = result.get_mut("rules").and_then(Value::as_array_mut) else {
+        return result;
+    };
+    for rule in rules {
+        let is_provider_default = rule.as_object().is_some_and(|rule| {
+            rule.len() == 4
+                && rule.get("id").and_then(Value::as_str) == Some("Default Multipart Abort Rule")
+                && rule.get("enabled").and_then(Value::as_bool) == Some(true)
+                && rule
+                    .get("conditions")
+                    .and_then(Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                && rule
+                    .get("abortMultipartUploadsTransition")
+                    .and_then(|transition| transition.pointer("/condition/maxAge"))
+                    == Some(&json!(604_800))
+        });
+        if !is_provider_default {
+            continue;
+        }
+        let Some(conditions) = rule.get_mut("conditions").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        conditions
+            .entry("prefix".to_owned())
+            .or_insert_with(|| Value::String(String::new()));
+    }
+    result
 }
 
 fn apply_same_path_prior_state_response(
@@ -28364,6 +28399,69 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn r2_lifecycle_prior_state_materializes_the_provider_default_empty_prefix() {
+        let live = json!({
+            "rules": [{
+                "id": "Default Multipart Abort Rule",
+                "enabled": true,
+                "conditions": {},
+                "abortMultipartUploadsTransition": {"condition": {"maxAge": 604_800}}
+            }]
+        });
+
+        let normalized =
+            super::normalize_same_path_prior_state("r2-put-bucket-lifecycle-configuration", live);
+        assert_eq!(normalized["rules"][0]["conditions"]["prefix"], "");
+
+        let custom_empty_conditions = json!({
+            "rules": [{
+                "id": "custom-abort-rule",
+                "enabled": true,
+                "conditions": {},
+                "abortMultipartUploadsTransition": {"condition": {"maxAge": 604_800}}
+            }]
+        });
+        assert_eq!(
+            super::normalize_same_path_prior_state(
+                "r2-put-bucket-lifecycle-configuration",
+                custom_empty_conditions.clone(),
+            ),
+            custom_empty_conditions
+        );
+
+        let drifted_default = json!({
+            "rules": [{
+                "id": "Default Multipart Abort Rule",
+                "enabled": true,
+                "conditions": {},
+                "abortMultipartUploadsTransition": {"condition": {"maxAge": 86_400}}
+            }]
+        });
+        assert_eq!(
+            super::normalize_same_path_prior_state(
+                "r2-put-bucket-lifecycle-configuration",
+                drifted_default.clone(),
+            ),
+            drifted_default
+        );
+
+        let malformed = json!({
+            "rules": [{
+                "id": "missing-conditions",
+                "enabled": true,
+                "abortMultipartUploadsTransition": {"condition": {"maxAge": 604_800}}
+            }]
+        });
+        assert_eq!(
+            super::normalize_same_path_prior_state(
+                "r2-put-bucket-lifecycle-configuration",
+                malformed.clone(),
+            ),
+            malformed
+        );
     }
 
     fn pages_source_test_input() -> CallInput {
