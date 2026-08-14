@@ -84,19 +84,25 @@ Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
 create a repository `.env` with Cloudflare credentials.
 
-### Local proof and pre-push gate
+### Hosted and pre-push proof
 
-`cargo xtask verify` is the authoritative source proof. It runs formatting,
-warnings-denied workspace Clippy, all workspace tests, the Cloudflare request
-contract, site formatting/Clippy/tests, two complete edge builds to reject
-nondeterminism, the Bun bridge proof, dependency policy, full-history secret
-scanning, source/governance contracts, and the Linux musl cross-build. The
-repository does not require GitHub Actions or another hosted CI service.
+`cargo xtask verify` is the authoritative complete local source proof. It runs
+formatting, warnings-denied workspace Clippy, all workspace tests, the
+Cloudflare request contract, site formatting/Clippy/tests, two complete edge
+builds to reject nondeterminism, the Bun bridge proof, dependency policy,
+full-history secret scanning, source/governance contracts, and the Linux musl
+cross-build.
+
+GitHub also runs two read-only Ubuntu proofs for every pull request and `main`
+push. They bind the exact event candidate, keep Cargo locked, and run workspace
+and site Clippy/tests natively on Linux. This is complementary platform proof,
+not a substitute for the broader local lane; the local macOS gate and Linux
+cross-build cannot substitute for Linux-native execution either.
 
 `.githooks/pre-push` runs that complete local proof and refuses the push when
-it fails. A review or merge must therefore cite a fresh `cargo xtask verify`
-receipt bound to the exact candidate commit or tree; repository state alone is
-not proof that the gate ran.
+it fails. A review or merge must cite a fresh `cargo xtask verify` receipt bound
+to the exact candidate commit or tree and account for the exact-head hosted
+proof state; repository state alone is not proof that either lane ran.
 
 The hook is tracked, but it does not run merely because you cloned the
 repository. It executes only where an agentOS-style delegate pins its digest in
@@ -176,7 +182,7 @@ releases are unsigned by operator decision**, with integrity from `SHA256SUMS`,
 reproducible double-builds, SPDX SBOMs, and commit-bound provenance. Because
 the rendered Linux installer verifies a Cosign identity and has no
 checksum-only fallback, it is deliberately not shipped with unsigned releases.
-The local source proof never uploads or publishes release artifacts.
+Neither local nor hosted source proof uploads or publishes release artifacts.
 
 An account-backed disposable token smoke test
 (`tests/account-backed-smoke.sh`) is kept out of the local proof lane because

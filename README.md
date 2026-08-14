@@ -334,14 +334,15 @@ catalog is managed under `CFCTL_HOME`.
 
 ## Development
 
-Rust 1.97 is pinned. The authoritative source proof is `cargo xtask verify`;
-it covers formatting, warnings-denied Clippy, all Rust tests, two complete edge
-builds with artifact-drift rejection, the Bun bridge, dependency policy,
-full-history secret scanning, source and governance contracts, and the Linux
-musl cross-build. It needs pinned Bun, cargo-leptos, and worker-build tools,
-`cargo-deny`, Gitleaks, Zig, `cargo-zigbuild`, and the Linux musl and WebAssembly
-targets. The tracked pre-push gate runs this same local lane; no GitHub Actions
-workflow or hosted CI service is required. See
+Rust 1.97 is pinned. The authoritative complete local source proof is
+`cargo xtask verify`; it covers formatting, warnings-denied Clippy, all Rust
+tests, two complete edge builds with artifact-drift rejection, the Bun bridge,
+dependency policy, full-history secret scanning, source and governance
+contracts, and the Linux musl cross-build. It needs pinned Bun, cargo-leptos,
+and worker-build tools, `cargo-deny`, Gitleaks, Zig, `cargo-zigbuild`, and the
+Linux musl and WebAssembly targets. The tracked pre-push gate runs this local
+lane. Exact-candidate Ubuntu jobs independently add locked, Linux-native
+workspace and site proof; neither proof lane substitutes for the other. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 
