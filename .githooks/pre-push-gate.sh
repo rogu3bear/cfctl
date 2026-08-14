@@ -2,9 +2,8 @@
 # Local pre-push gate: refuse to push what the local gate has not proven.
 #
 # This hook runs the complete local proof lane for Rust, site reproducibility,
-# Bun, policy, secret-scan, governance, and Linux cross-build checks. Hosted
-# proof independently covers locked, Linux-native Rust and site behavior; the
-# two lanes are complementary (see CONTRIBUTING.md).
+# Bun, policy, secret-scan, governance, and Linux cross-build checks (see
+# CONTRIBUTING.md). The repository does not require a hosted CI service.
 #
 # Invoked by .githooks/pre-push, which is SHA-256 pinned in
 # ~/.agent/repo-hook-allowlist. This file is deliberately NOT pinned so gate

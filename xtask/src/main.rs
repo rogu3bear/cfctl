@@ -440,10 +440,68 @@ fn verify_source_contract() -> Result<(), TaskError> {
     )?;
 
     verify_bootstrap_contract()?;
+    verify_local_only_ci_contract()?;
     verify_workspace_contract()?;
     verify_v1_cutover_contract()?;
     verify_managed_agent_documents()?;
     verify_documented_contracts()
+}
+
+fn verify_local_only_ci_contract() -> Result<(), TaskError> {
+    let workflow_root = Path::new(".github/workflows");
+    let workflow_paths = if workflow_root.exists() {
+        fs::read_dir(workflow_root)
+            .map_err(|error| TaskError::Io {
+                path: workflow_root.display().to_string(),
+                source: error,
+            })?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().display().to_string())
+            .filter(|path| path.ends_with(".yml") || path.ends_with(".yaml"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let contributing = fs::read_to_string("CONTRIBUTING.md").map_err(|error| TaskError::Io {
+        path: "CONTRIBUTING.md".to_owned(),
+        source: error,
+    })?;
+    let readme = fs::read_to_string("README.md").map_err(|error| TaskError::Io {
+        path: "README.md".to_owned(),
+        source: error,
+    })?;
+    validate_local_only_ci_contract(&workflow_paths, &contributing, &readme)
+}
+
+fn validate_local_only_ci_contract(
+    workflow_paths: &[String],
+    contributing: &str,
+    readme: &str,
+) -> Result<(), TaskError> {
+    if !workflow_paths.is_empty() {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "local-only CI forbids GitHub Actions workflows: {}",
+            workflow_paths.join(", ")
+        )));
+    }
+    let contributing = contributing
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !contributing
+        .contains("The repository does not require GitHub Actions or another hosted CI service.")
+    {
+        return Err(TaskError::InvalidSourceContract(
+            "CONTRIBUTING.md must declare the local-only CI authority".to_owned(),
+        ));
+    }
+    if !readme.contains("no GitHub Actions workflow or hosted CI service is required") {
+        return Err(TaskError::InvalidSourceContract(
+            "README.md must declare that hosted CI is not required".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_bootstrap_contract() -> Result<(), TaskError> {
@@ -2751,46 +2809,13 @@ mod tests {
         release_build_driver, release_build_subcommand, release_tag_is_exact_version,
         render_linux_installer_text, repository_root, security_proof_commands,
         validate_bootstrap_contract, validate_codesign_details, validate_command_refs,
-        validate_extracted_command_refs, validate_notary_receipt_value,
-        validate_signed_release_file_set, validated_release_targets,
+        validate_extracted_command_refs, validate_local_only_ci_contract,
+        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
         verify_generated_guidance_section_text, verify_managed_agent_documents,
         verify_quickstart_pins_the_release_version, verify_tracked_cfctl_command_references,
         verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
-
-    #[test]
-    fn hosted_proof_checks_out_and_verifies_the_exact_event_candidate() {
-        let workflow = include_str!("../../.github/workflows/hosted-proof.yml");
-        let selected_sha = "${{ github.event.pull_request.head.sha || github.sha }}";
-
-        assert_eq!(
-            workflow
-                .matches(&format!("PROOF_SHA: {selected_sha}"))
-                .count(),
-            1,
-            "the event-specific proof identity must be single-sourced"
-        );
-        assert_eq!(
-            workflow.matches("ref: ${{ env.PROOF_SHA }}").count(),
-            2,
-            "both hosted jobs must explicitly check out the selected source SHA"
-        );
-        assert_eq!(
-            workflow
-                .matches("test \"$(git rev-parse HEAD)\" = \"$PROOF_SHA\"")
-                .count(),
-            2,
-            "both hosted jobs must compare HEAD with that same selected source SHA"
-        );
-        assert!(
-            !workflow.contains("$GITHUB_SHA"),
-            "pull_request GITHUB_SHA names the synthetic merge commit, not the PR head"
-        );
-        assert!(workflow.contains("cargo clippy --workspace --all-targets --locked"));
-        assert!(workflow.contains("cargo test --workspace --all-targets --locked"));
-        assert!(workflow.contains("runs-on: ubuntu-24.04"));
-    }
 
     #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
@@ -2805,6 +2830,32 @@ mod tests {
             error.to_string().contains("must not hold a Cargo run gate"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn local_only_ci_rejects_hosted_workflows_and_policy_drift() {
+        const CONTRIBUTING: &str =
+            "The repository does not require GitHub Actions or another hosted CI service.";
+        const README: &str = "no GitHub Actions workflow or hosted CI service is required";
+
+        validate_local_only_ci_contract(&[], CONTRIBUTING, README)
+            .expect("the declared local-only contract is valid");
+
+        let error = validate_local_only_ci_contract(
+            &[".github/workflows/hosted-proof.yml".to_owned()],
+            CONTRIBUTING,
+            README,
+        )
+        .expect_err("a hosted workflow would reintroduce the forbidden purchase dependency");
+        assert!(error.to_string().contains("local-only CI forbids"));
+
+        let error = validate_local_only_ci_contract(&[], "hosted proof required", README)
+            .expect_err("contributor guidance may not drift back to hosted authority");
+        assert!(error.to_string().contains("CONTRIBUTING.md"));
+
+        let error = validate_local_only_ci_contract(&[], CONTRIBUTING, "hosted proof required")
+            .expect_err("README guidance may not drift back to hosted authority");
+        assert!(error.to_string().contains("README.md"));
     }
 
     #[test]
