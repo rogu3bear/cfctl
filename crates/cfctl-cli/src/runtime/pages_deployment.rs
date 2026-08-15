@@ -1363,18 +1363,19 @@ fn direct_deployment_evidence<'a>(
         return None;
     }
     let stages = deployment.get("stages")?.as_array()?;
-    let has_successful_deploy = stages.iter().any(|stage| {
-        stage.get("name").and_then(Value::as_str) == Some("deploy")
-            && stage.get("status").and_then(Value::as_str) == Some("success")
-    });
-    let has_repository_pipeline = stages.iter().any(|stage| {
-        stage
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| matches!(name, "clone_repo" | "build"))
-            && stage.get("status").and_then(Value::as_str) != Some("idle")
-    });
-    (has_successful_deploy && !has_repository_pipeline).then_some(id)
+    let has_exact_stage = |name: &str, status: &str| {
+        let mut matching = stages
+            .iter()
+            .filter(|stage| stage.get("name").and_then(Value::as_str) == Some(name));
+        matching
+            .next()
+            .is_some_and(|stage| stage.get("status").and_then(Value::as_str) == Some(status))
+            && matching.next().is_none()
+    };
+    (has_exact_stage("clone_repo", "idle")
+        && has_exact_stage("build", "idle")
+        && has_exact_stage("deploy", "success"))
+    .then_some(id)
 }
 
 pub(super) fn receipt_source_mode_is_bound(receipt: &Value, expected_mode: &str) -> bool {
@@ -2030,6 +2031,48 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             )
             .is_err(),
             "a repository pipeline cannot be normalized as direct upload"
+        );
+
+        for (missing_stage, retained_repository_stage) in
+            [("clone_repo", "build"), ("build", "clone_repo")]
+        {
+            let mut partial_stages = direct_deployment(id);
+            partial_stages["stages"] = json!([
+                {"name":"queued","status":"active"},
+                {"name":"initialize","status":"idle"},
+                {"name":retained_repository_stage,"status":"idle"},
+                {"name":"deploy","status":"success"}
+            ]);
+            let partial_evidence = omitted_source_project(partial_stages.clone(), partial_stages);
+            assert!(
+                apply_project_response(
+                    &direct_upload(),
+                    "acct",
+                    "aos-web",
+                    Some("main"),
+                    &partial_evidence
+                )
+                .is_err(),
+                "missing {missing_stage} stage evidence remains ambiguous"
+            );
+        }
+
+        let mut duplicate_build = direct_deployment(id);
+        duplicate_build["stages"]
+            .as_array_mut()
+            .expect("stages array")
+            .push(json!({"name":"build","status":"idle"}));
+        let duplicate_evidence = omitted_source_project(duplicate_build.clone(), duplicate_build);
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &duplicate_evidence
+            )
+            .is_err(),
+            "duplicate repository-stage evidence remains ambiguous"
         );
 
         let mut repository_build = exact.result.clone();
