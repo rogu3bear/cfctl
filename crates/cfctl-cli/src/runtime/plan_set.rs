@@ -395,6 +395,10 @@ fn compile_child(
     }
     warnings.sort();
     warnings.dedup();
+    let provider_snapshot_hashes = target_scoped_provider_snapshot_hashes(
+        &plan.plan.targets,
+        &plan.pins.resource_observation_hashes,
+    )?;
     Ok(DeploymentPlanSetChildV1 {
         sequence,
         operation_id: plan.plan.operation_id.clone(),
@@ -414,8 +418,43 @@ fn compile_child(
         warnings,
         rollback: plan.plan.capability.rollback.clone(),
         compensation_steps: plan.plan.compensation_steps.clone(),
-        provider_snapshot_hashes: plan.pins.resource_observation_hashes.clone(),
+        provider_snapshot_hashes,
     })
+}
+
+/// A Worker deployment observation is local to one exact Worker service, while
+/// the remaining observation keys intentionally retain their bundle-global
+/// identity. Without this projection, unrelated Worker children collide on the
+/// generic `worker_deployment_state` key even though they observed different
+/// resources. Same-service children still receive the same projected key, so
+/// contradictory snapshots continue to fail closed in the core union.
+fn target_scoped_provider_snapshot_hashes(
+    targets: &Value,
+    source: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut projected = source.clone();
+    let Some(worker_state) = projected.remove("worker_deployment_state") else {
+        return Ok(projected);
+    };
+    let Some(service_name) = targets
+        .pointer("/adapter/worker_deployment/service_name")
+        .and_then(Value::as_str)
+    else {
+        projected.insert("worker_deployment_state".to_owned(), worker_state);
+        return Ok(projected);
+    };
+    if service_name.is_empty() {
+        return Err(CliError::Input(
+            "Worker deployment snapshot has an empty service target".to_owned(),
+        ));
+    }
+    let scoped_key = format!("worker_deployment_state:{service_name}");
+    if projected.insert(scoped_key.clone(), worker_state).is_some() {
+        return Err(CliError::Input(format!(
+            "Worker deployment snapshot collides with target-scoped key `{scoped_key}`"
+        )));
+    }
+    Ok(projected)
 }
 
 fn validate_current_child(
@@ -710,7 +749,60 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{aggregate_admission_policy_hash, aggregate_sha256_pins};
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::{
+        aggregate_admission_policy_hash, aggregate_sha256_pins,
+        target_scoped_provider_snapshot_hashes,
+    };
+
+    fn provider_hash(value: char) -> String {
+        format!("sha256:{}", value.to_string().repeat(64))
+    }
+
+    #[test]
+    fn worker_state_snapshots_are_namespaced_by_exact_service_target() {
+        let source = BTreeMap::from([
+            ("source_config".to_owned(), provider_hash('a')),
+            ("worker_deployment_state".to_owned(), provider_hash('b')),
+        ]);
+
+        let router = target_scoped_provider_snapshot_hashes(
+            &json!({"adapter":{"worker_deployment":{"service_name":"relay-router"}}}),
+            &source,
+        )
+        .expect("router snapshot identity");
+        let outbound = target_scoped_provider_snapshot_hashes(
+            &json!({"adapter":{"worker_deployment":{"service_name":"relay-outbound"}}}),
+            &source,
+        )
+        .expect("outbound snapshot identity");
+
+        assert_eq!(router.get("source_config"), source.get("source_config"));
+        assert_eq!(outbound.get("source_config"), source.get("source_config"));
+        assert_eq!(
+            router.get("worker_deployment_state:relay-router"),
+            source.get("worker_deployment_state")
+        );
+        assert_eq!(
+            outbound.get("worker_deployment_state:relay-outbound"),
+            source.get("worker_deployment_state")
+        );
+        assert!(!router.contains_key("worker_deployment_state"));
+        assert!(!outbound.contains_key("worker_deployment_state"));
+    }
+
+    #[test]
+    fn non_worker_snapshot_keys_keep_global_conflict_identity() {
+        let source = BTreeMap::from([("provider_state".to_owned(), provider_hash('c'))]);
+
+        let normalized = target_scoped_provider_snapshot_hashes(&json!({}), &source)
+            .expect("ordinary snapshot identity");
+
+        assert_eq!(normalized, source);
+    }
 
     #[test]
     fn plan_set_cli_surface_has_no_bundle_approval_or_run_command() {
