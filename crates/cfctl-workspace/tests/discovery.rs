@@ -51,6 +51,20 @@ fn exact_and_role_specific_production_wrangler_toml_are_supported() {
         fs::write(&invalid, "name = \"invalid-worker\"\n").expect("invalid config");
         assert!(load_wrangler_config(&invalid).is_err(), "accepted {name}");
     }
+
+    let nested = repository
+        .join("nested")
+        .join("wrangler.mail-router.production.toml");
+    fs::create_dir_all(nested.parent().expect("nested parent")).expect("nested directory");
+    fs::write(&nested, "name = \"nested-role-worker\"\n").expect("nested role config");
+    assert!(
+        load_wrangler_config(&nested).is_err(),
+        "accepted nested role-specific config"
+    );
+    assert!(
+        WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).is_err(),
+        "discovered nested role-specific config as deployment authority"
+    );
 }
 
 #[test]

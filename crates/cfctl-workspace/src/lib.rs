@@ -344,6 +344,7 @@ fn discover_root(
             .path()
             .canonicalize()
             .map_err(|source| io_error(entry.path(), source))?;
+        require_role_config_at_repository_root(&config_path, &repo_path)?;
         let repository = repositories.get_mut(&repo_path).ok_or_else(|| {
             WorkspaceError::DiscoveryInvariant(format!(
                 "registered repository {} is unavailable",
@@ -487,10 +488,50 @@ fn is_wrangler_toml_name(name: &str) -> bool {
         })
 }
 
+fn is_role_specific_wrangler_toml_name(name: &str) -> bool {
+    is_wrangler_toml_name(name) && !matches!(name, "wrangler.toml" | "wrangler.production.toml")
+}
+
+fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !is_role_specific_wrangler_toml_name(&name) {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "role-specific Wrangler configuration `{}` has no repository parent",
+            path.display()
+        ))
+    })?;
+    if parent == repository {
+        return Ok(());
+    }
+    Err(WorkspaceError::DiscoveryInvariant(format!(
+        "role-specific Wrangler configuration `{}` must be located at repository root `{}`",
+        path.display(),
+        repository.display()
+    )))
+}
+
 /// Load one Wrangler configuration through the same TOML/JSON/JSONC parser
 /// used by workspace discovery. Deployment planning consumes this public
 /// projection so config interpretation cannot drift from resource discovery.
 pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+    let canonical_path = path.canonicalize().map_err(|source| WorkspaceError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if let Some(repository) = canonical_path
+        .ancestors()
+        .skip(1)
+        .find(|candidate| candidate.join(".git").exists())
+    {
+        require_role_config_at_repository_root(&canonical_path, repository)?;
+    }
     let content = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
         path: path.display().to_string(),
         source,
