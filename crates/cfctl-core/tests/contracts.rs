@@ -797,6 +797,29 @@ fn capability_contract_exposes_coverage_and_safety_metadata() {
 }
 
 #[test]
+fn historical_d1_import_contract_without_source_bound_is_readable_but_non_authorizing() {
+    let contract: cfctl_core::D1ApprovedMlnImportContractV1 = serde_json::from_value(json!({
+        "repository_id": "github.com/example/repository",
+        "repository_head": "0123456789abcdef0123456789abcdef01234567",
+        "pre_import_capability_version": 1,
+        "pre_import_validator_contract_hash": "sha256:validator",
+        "pre_import_fixed_query_sha256": "sha256:query",
+        "account_id": "account-a",
+        "database_id": "database-a",
+        "import_path": "/accounts/{account_id}/d1/database/{database_id}/import",
+        "migrations": [],
+        "max_response_bytes": 1_048_576,
+        "max_poll_attempts": 10,
+        "max_timeout_seconds": 30,
+        "upload_url_suffix": ".r2.cloudflarestorage.com",
+        "requires_create_new_mode_0600_stage": true
+    }))
+    .expect("historical import contract remains readable");
+
+    assert_eq!(contract.max_source_bytes, 0);
+}
+
+#[test]
 fn mutation_contract_gaps_name_every_missing_execution_guard() {
     let capability = CapabilityV1::new(
         "dns.records.create",

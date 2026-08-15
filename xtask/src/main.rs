@@ -1518,6 +1518,12 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
         ("CONTRIBUTING.md", "Do not reintroduce the archived v1"),
         ("docs/v2-security.md", "operation-specific verification"),
         ("docs/v2-architecture.md", "Wrangler TOML/JSONC, Terraform"),
+        ("docs/runbooks/cfctl.md", "## Launch support triage"),
+        (
+            "docs/runbooks/cfctl.md",
+            "request or accept credential values",
+        ),
+        ("docs/runbooks/cfctl.md", "Do not replay `plans run`"),
     ] {
         let absolute_path = repository_root.join(path);
         let content = fs::read_to_string(&absolute_path)
@@ -3416,6 +3422,34 @@ mod tests {
         let repository_root = repository_root().expect("repository root");
         verify_quickstart_pins_the_release_version(repository_root)
             .expect("QUICKSTART pins this version");
+    }
+
+    #[test]
+    fn quickstart_release_download_path_fails_closed_on_version_drift() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos();
+        let fixture_root = std::env::temp_dir().join(format!(
+            "cfctl-quickstart-version-drift-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&fixture_root).expect("fixture directory is created");
+        fs::write(
+            fixture_root.join("QUICKSTART.md"),
+            "Download https://github.com/rogu3bear/cfctl/releases/download/v0.0.0/cfctl\n",
+        )
+        .expect("drifted QUICKSTART fixture is written");
+
+        let error = verify_quickstart_pins_the_release_version(&fixture_root)
+            .expect_err("a stale release download path must fail closed");
+        let expected = format!("download/v{}/", env!("CARGO_PKG_VERSION"));
+        assert!(
+            error.to_string().contains(&expected),
+            "error must name the required release path: {error}"
+        );
+
+        fs::remove_dir_all(&fixture_root).expect("fixture directory is removed");
     }
 
     #[test]

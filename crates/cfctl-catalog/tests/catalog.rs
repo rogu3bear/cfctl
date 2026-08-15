@@ -399,6 +399,74 @@ fn pages_project_create_fixture() -> Value {
     document
 }
 
+fn pages_production_deployment_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in":"path","name":"account_id","required":true,
+        "schema":{"maxLength":32,"type":"string"}
+    });
+    let project = json!({
+        "in":"path","name":"project_name","required":true,
+        "schema":{"type":"string"}
+    });
+    let deployment = json!({
+        "in":"path","name":"deployment_id","required":true,
+        "schema":{"maxLength":32,"type":"string"}
+    });
+    let force = json!({
+        "in":"query","name":"force","required":false,
+        "schema":{"type":"boolean"}
+    });
+    let deployment_response = json!({
+        "200":{"description":"ok","content":{"application/json":{"schema":{
+            "type":"object",
+            "required":["success","result"],
+            "properties":{
+                "success":{"type":"boolean"},
+                "result":{"type":"object","required":["id","environment","project_name","latest_stage"],"properties":{
+                    "id":{"type":"string"},
+                    "environment":{"type":"string","enum":["preview","production"]},
+                    "project_name":{"type":"string"},
+                    "latest_stage":{"type":"object","required":["status"],"properties":{
+                        "status":{"type":"string","enum":["success","idle","active","failure","canceled"]}
+                    }}
+                }}
+            }
+        }}}}
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments"] = json!({
+        "post":{
+            "operationId":"pages-deployment-create-deployment",
+            "summary":"Create deployment",
+            "description":"Start a new deployment from production. The repository and account must have already been authorized on the Cloudflare Pages dashboard.",
+            "tags":["Pages Deployment"],
+            "x-api-token-group":["Pages Write"],
+            "x-fern-availability":"generally-available",
+            "parameters":[account.clone(),project.clone()],
+            "responses":deployment_response.clone()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"] = json!({
+        "get":{
+            "operationId":"pages-deployment-get-deployment-info",
+            "summary":"Get deployment info",
+            "tags":["Pages Deployment"],
+            "x-api-token-group":["Pages Read","Pages Write"],
+            "parameters":[account.clone(),project.clone(),deployment.clone()],
+            "responses":deployment_response
+        },
+        "delete":{
+            "operationId":"pages-deployment-delete-deployment",
+            "summary":"Delete deployment",
+            "tags":["Pages Deployment"],
+            "x-api-token-group":["Pages Write"],
+            "parameters":[account,project,deployment,force],
+            "responses":cloudflare_envelope_responses()
+        }
+    });
+    document
+}
+
 /// The response shape Cloudflare's `OpenAPI` actually declares for the DNS
 /// record delete: a bare `result` object with no top-level `success` boolean.
 /// The live API returns the full envelope (observed 2026-07-19); the schema
@@ -2839,6 +2907,105 @@ fn pages_project_create_is_bounded_to_git_integrated_static_pages() {
     assert!(create.verification_contract_supported());
     assert!(create.rollback_contract_supported());
     assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn pages_production_deployment_is_a_governed_exact_id_lifecycle() {
+    let snapshot = normalize_openapi(&pages_production_deployment_fixture())
+        .expect("Pages deployment catalog");
+    let create = snapshot
+        .get("pages-deployment-create-deployment")
+        .expect("Pages deployment create");
+
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        create.blocked_reason
+    );
+    assert_eq!(create.risk, RiskClass::CrossConfig);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.cost.known);
+    assert!(!create.cost.incremental);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(
+        create.verification.strategy,
+        "pages_production_deployment_succeeds_by_returned_id"
+    );
+    let target = create.created_resource.as_ref().expect("deployment target");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"
+    );
+    assert_eq!(target.identity_selector, "deployment_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(
+        target.read_capability_id,
+        "pages-deployment-get-deployment-info"
+    );
+    assert_eq!(
+        target.delete_capability_id,
+        "pages-deployment-delete-deployment"
+    );
+    assert_eq!(
+        target.verified_response_fields,
+        ["environment", "project_name"]
+    );
+    assert!(!create.rollback.supported);
+    assert!(create.rollback.strategy.is_none());
+    assert!(create.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("separate reviewed Pages rollback")
+            && warning.contains("does not erase the deployment")
+            && warning.contains("Functions side effects")
+            && warning.contains("refund usage")
+    }));
+    assert!(create.verification_contract_supported());
+    assert!(create.rollback_contract_supported());
+    assert!(create.mutation_contract_gaps().is_empty());
+    let delete = snapshot
+        .get("pages-deployment-delete-deployment")
+        .expect("Pages deployment delete");
+    assert!(
+        delete
+            .selectors
+            .iter()
+            .all(|selector| selector.name != "force")
+    );
+}
+
+#[test]
+fn pages_production_deployment_fails_closed_on_companion_or_status_drift() {
+    let assert_blocked = |document: Value| {
+        let snapshot = normalize_openapi(&document).expect("drifted Pages deployment catalog");
+        let create = snapshot
+            .get("pages-deployment-create-deployment")
+            .expect("Pages deployment create");
+        assert_eq!(create.adapter_status, AdapterStatus::Blocked);
+        assert_eq!(create.risk, RiskClass::Unknown);
+        assert!(create.created_resource.is_none());
+        assert!(!create.mutation_contract_gaps().is_empty());
+    };
+
+    let mut read_identity = pages_production_deployment_fixture();
+    read_identity["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"]
+        ["get"]["operationId"] = json!("pages-deployment-get-drifted");
+    assert_blocked(read_identity);
+
+    let mut status_shape = pages_production_deployment_fixture();
+    status_shape["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments"]
+        ["post"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+        ["result"]["properties"]["latest_stage"]["properties"]
+        .as_object_mut()
+        .expect("latest stage properties")
+        .remove("status");
+    assert_blocked(status_shape);
+
+    let mut force_shape = pages_production_deployment_fixture();
+    force_shape["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"]
+        ["delete"]["parameters"][3]["schema"]["type"] = json!("string");
+    assert_blocked(force_shape);
 }
 
 #[test]

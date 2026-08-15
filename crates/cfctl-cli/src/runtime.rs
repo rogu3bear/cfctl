@@ -29024,7 +29024,10 @@ mod tests {
             &timeout_probe,
             None,
             &[pid_file_argument],
-            Duration::from_secs(1),
+            // Match the bounded local Git configuration lane so a contended
+            // full-suite worker has time to start and record the process tree
+            // before the timeout verifies group termination.
+            super::PAGES_GIT_CONFIG_TIMEOUT,
         )
         .expect_err("timeout must fail closed");
         assert!(matches!(error, CliError::SubprocessTimeout(_)));
@@ -30841,6 +30844,37 @@ mod tests {
         plan.refresh_hash().expect("plan hash");
         validate_managed_reviewed_git_stage_authority(&plan)
             .expect("exact source and stage remain executable");
+
+        let mut zero_bound_capability = capability.clone();
+        zero_bound_capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("reviewed Git import contract")
+            .max_source_bytes = 0;
+        let planning_error =
+            stage_approved_mln_migration(&store, &zero_bound_capability, &input, &source)
+                .expect_err("a historical zero source bound cannot authorize planning");
+        assert!(matches!(
+            planning_error,
+            CliError::Input(message) if message.contains("no larger than 0 bytes")
+        ));
+
+        let mut zero_bound_plan = plan.clone();
+        zero_bound_plan
+            .capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("reviewed Git import contract")
+            .max_source_bytes = 0;
+        zero_bound_plan
+            .refresh_hash()
+            .expect("zero-bound plan hash");
+        let execution_error = validate_managed_reviewed_git_stage_authority(&zero_bound_plan)
+            .expect_err("a historical zero source bound cannot authorize execution");
+        assert!(matches!(
+            execution_error,
+            CliError::Input(message) if message == "managed source size is outside its bound"
+        ));
 
         let schema_capability = catalog
             .get("d1-apply-reviewed-schema-migration")

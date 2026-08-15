@@ -4960,6 +4960,10 @@ impl Executor {
                 self.verify_created_resource(plan, apply_response, input, credential)
                     .await
             }
+            "pages_production_deployment_succeeds_by_returned_id" => {
+                self.verify_pages_production_deployment(plan, apply_response, input, credential)
+                    .await
+            }
             "parent_collection_contains_created_resource_id_and_planned_fields"
             | "worker_tail_collection_contains_created_lease_id" => {
                 self.verify_created_collection_resource(plan, apply_response, input, credential)
@@ -5493,6 +5497,133 @@ impl Executor {
             readback,
             correlated_resource_id: None,
         })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bounded polling keeps exact deployment identity, terminal state, and failure evidence in one verification transaction"
+    )]
+    async fn verify_pages_production_deployment(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        const MAX_POLL_ATTEMPTS: usize = 120;
+        const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+        let target = plan.capability.created_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound Pages deployment readback contract is absent".to_owned(),
+            )
+        })?;
+        let deployment_id = apply_response
+            .result
+            .pointer(&target.response_result_identity_pointer)
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the successful Pages deployment response omitted its deployment ID".to_owned(),
+                )
+            })?;
+        let project_name = input
+            .selectors
+            .get("project_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the Pages deployment plan omitted its project_name selector".to_owned(),
+                )
+            })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned Pages deployment selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.insert(
+            target.identity_selector.clone(),
+            Value::String(deployment_id.to_owned()),
+        );
+        let mut details = CapabilityV1::new(
+            &target.read_capability_id,
+            "Pages production deployment verification readback",
+            "GET",
+            &target.detail_path,
+        );
+        details.selectors.clone_from(&plan.capability.selectors);
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+
+        for attempt in 0..MAX_POLL_ATTEMPTS {
+            let readback = self.send(&request, credential).await?;
+            let identity_matches =
+                readback.result.get("id").and_then(Value::as_str) == Some(deployment_id);
+            let project_matches =
+                readback.result.get("project_name").and_then(Value::as_str) == Some(project_name);
+            let production =
+                readback.result.get("environment").and_then(Value::as_str) == Some("production");
+            let stage = readback
+                .result
+                .pointer("/latest_stage/status")
+                .and_then(Value::as_str);
+            let invariant_matches = apply_response.status == 200
+                && apply_response.success
+                && readback.status == 200
+                && readback.success
+                && identity_matches
+                && project_matches
+                && production;
+            if invariant_matches && stage == Some("success") {
+                return Ok(OperationVerificationV1 {
+                    strategy: plan.capability.verification.strategy.clone(),
+                    passed: true,
+                    basis: format!(
+                        "the exact Pages production deployment {deployment_id} for project {project_name} reached terminal success"
+                    ),
+                    readback,
+                    correlated_resource_id: None,
+                });
+            }
+            let remains_active = invariant_matches && matches!(stage, Some("active" | "idle"));
+            if remains_active && attempt + 1 < MAX_POLL_ATTEMPTS {
+                sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            let basis = if remains_active {
+                format!(
+                    "the exact Pages production deployment {deployment_id} remained {stage:?} after {MAX_POLL_ATTEMPTS} bounded readback attempts"
+                )
+            } else {
+                format!(
+                    "Pages production deployment was not proven (apply HTTP {}, apply success={}, readback HTTP {}, readback success={}, identity match={}, project match={}, production environment={}, terminal stage={stage:?})",
+                    apply_response.status,
+                    apply_response.success,
+                    readback.status,
+                    readback.success,
+                    identity_matches,
+                    project_matches,
+                    production,
+                )
+            };
+            return Ok(OperationVerificationV1 {
+                strategy: plan.capability.verification.strategy.clone(),
+                passed: false,
+                basis,
+                readback,
+                correlated_resource_id: None,
+            });
+        }
+        unreachable!("Pages deployment verification loop always returns")
     }
 
     #[expect(
@@ -11258,6 +11389,7 @@ fn is_create_verifier(strategy: &str) -> bool {
         strategy,
         "created_resource_contains_planned_fields_by_returned_id"
             | "created_access_application_contains_planned_fields_by_returned_id"
+            | "pages_production_deployment_succeeds_by_returned_id"
             | "parent_collection_contains_created_resource_id_and_planned_fields"
             | "worker_tail_collection_contains_created_lease_id"
             | "parent_object_contains_created_nested_resource_by_correlation"

@@ -6864,6 +6864,137 @@ async fn created_resource_is_read_back_by_hash_bound_identity_and_planned_fields
     assert!(!request.contains("\"name\":\"created\""));
 }
 
+fn pages_production_deployment_plan() -> PlanV1 {
+    let mut plan = dns_record_plan(
+        "pages-deployment-create-deployment",
+        "POST",
+        "/accounts/{account_id}/pages/projects/{project_name}/deployments",
+        "pages_production_deployment_succeeds_by_returned_id",
+        json!({"account_id":"account-1","project_name":"aos-web"}),
+        None,
+    );
+    plan.capability.adapter_status = AdapterStatus::DynamicApi;
+    "Pages Deployment".clone_into(&mut plan.capability.product);
+    "account".clone_into(&mut plan.capability.account_scope);
+    plan.capability.permissions = vec!["Pages Write".to_owned()];
+    plan.capability.risk = RiskClass::CrossConfig;
+    plan.capability.effect = EffectClass::ReversibleWrite;
+    plan.capability.request_schema = None;
+    plan.capability.selectors = ["account_id", "project_name"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path:
+            "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"
+                .to_owned(),
+        identity_selector: "deployment_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "pages-deployment-get-deployment-info".to_owned(),
+        delete_capability_id: "pages-deployment-delete-deployment".to_owned(),
+        verified_response_fields: vec!["environment".to_owned(), "project_name".to_owned()],
+    });
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1","project_name":"aos-web"}),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
+#[tokio::test]
+async fn pages_production_deployment_polls_exact_returned_id_to_success() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"id":"f64788e9-fccd-4d4a-a28a-cb84f88f6","project_name":"aos-web","environment":"production","latest_stage":{"status":"active"}},"errors":[]}"#,
+        r#"{"success":true,"result":{"id":"f64788e9-fccd-4d4a-a28a-cb84f88f6","project_name":"aos-web","environment":"production","latest_stage":{"status":"success"}},"errors":[]}"#,
+    ])
+    .await;
+    let plan = pages_production_deployment_plan();
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"f64788e9-fccd-4d4a-a28a-cb84f88f6"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("Pages verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(
+        "GET /client/v4/accounts/account-1/pages/projects/aos-web/deployments/f64788e9-fccd-4d4a-a28a-cb84f88f6 "
+    ));
+}
+
+#[tokio::test]
+async fn pages_production_deployment_rejects_wrong_project_or_failed_stage() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"id":"f64788e9-fccd-4d4a-a28a-cb84f88f6","project_name":"different-project","environment":"production","latest_stage":{"status":"failure"}},"errors":[]}"#,
+    ])
+    .await;
+    let plan = pages_production_deployment_plan();
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"f64788e9-fccd-4d4a-a28a-cb84f88f6"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("Pages verification receipt");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("project match=false"));
+    assert!(
+        verification
+            .basis
+            .contains("terminal stage=Some(\"failure\")")
+    );
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
 fn oauth_client_create_plan() -> PlanV1 {
     let body = json!({
         "client_name":"cfctl",
