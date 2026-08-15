@@ -1,5 +1,27 @@
 # cfctl v2 operator runbook
 
+## Launch support triage
+
+Support starts from the operator's own redacted `ResultEnvelopeV2`. Never
+request or accept credential values, callback values, account identifiers, or
+private evidence in a support channel. Ask for the cfctl version, the error
+code, and the redacted `next_step`; keep source proof, provider reads, plans,
+applies, and verification receipts separate.
+
+| Symptom | Safe response | Stop condition |
+|---|---|---|
+| The installed command and the checkout behave differently | Run `cfctl version --json` and `cfctl doctor --json`; invoke each candidate executable directly and compare its self-reported path, version, commit, and identity source. Reinstall only from an exact release asset whose checksum matches `SHA256SUMS`. | Do not repair the mismatch with a symlink, PATH shim, unverified binary, or release override. Unknown or dirty identity remains unhealthy. |
+| No profile is selected, or the governed fallback store is active | Run `cfctl auth profiles --json`, select one existing account-pinned profile with `cfctl auth use <profile> --json`, then rerun `cfctl auth status --json`. An active fallback store is authoritative by design; use the explicit repair command only when the operator intentionally wants to test or restore the platform keyring. | Never ask the operator to paste a token, OAuth callback, global key, or fallback file. Do not broaden permissions merely to make the error disappear. |
+| Catalog sync, coverage, or a stored catalog fails | Run `cfctl catalog sync --json`, then `cfctl catalog coverage --json`. Preserve `previous_catalog` and the returned error code; a discarded invalid current catalog is evidence of safe replacement, not evidence that earlier plans are valid. | Never edit a catalog body or content hash, restore a stale snapshot as current, or reuse a plan whose catalog pin drifted. |
+| A capability or write is blocked | Run `cfctl guide <capability-id> --json` and follow the exact `next_action`. Report the capability ID and `blocking_gaps` when the guide cannot close the contract. | Never route around `CFCTL_CAPABILITY_BLOCKED` with raw HTTP, Wrangler, dashboard changes, a broader token, or hand-edited plan JSON. |
+| A run crashed, timed out, or may have crossed the provider boundary | Run `cfctl plans status <operation-id> --json`. Use `cfctl plans rectify <operation-id> --json` when verification is unsupported or the boundary outcome is uncertain; review any derived compensation as a new transaction. | Do not replay `plans run`, approve a replacement operation speculatively, or call the provider directly. A consumed or uncertain plan remains non-replayable. |
+
+These responses are safe defaults, not authority to inspect an account or run a
+mutation. Escalate a suspected credential disclosure, approval bypass, secret
+sink failure, or provenance mismatch through `SECURITY.md`; ordinary usage and
+product questions require the launch owner to name a public support channel
+and response owner before launch.
+
 ## Health and discovery
 
 ```bash
@@ -969,6 +991,30 @@ Wrangler cache plus the selected credential. Verification lists production
 deployments and requires the exact project, branch, commit hash, and a
 successful deployment stage. Automatic rollback is not implemented; restoring
 a prior artifact is a separate reviewed deployment plan.
+
+For an existing Git-integrated Pages project, the provider-native
+`pages-deployment-create-deployment` capability starts a build from the
+production branch without accepting an artifact body:
+
+```bash
+cfctl call pages-deployment-create-deployment \
+  --account <account-id> \
+  --selector project_name=example-web \
+  --json
+```
+
+The catalog exposes this mutation only while the exact Pages Write operation,
+returned deployment ID, terminal-stage response shape, and exact deployment
+GET and DELETE companions remain intact. The plan records a zero direct
+API-operation ceiling and separately names downstream build, Functions, and
+bandwidth exposure. After apply, verification polls only the returned
+deployment ID and requires the same project, the production environment, and
+terminal `success`. A failure, canceled deployment, identity drift, or unknown
+stage requires rectification and never authorizes replay. Automatic rollback
+is deliberately unsupported: restoring production traffic requires a separate
+reviewed Pages rollback to a known successful deployment, and that rollback
+does not erase the new deployment, reverse Pages Functions side effects, or
+refund usage.
 
 Custom-domain attachment is the separate `pages-domains-add-domain` dynamic
 API capability. Its verifier reads the returned domain by exact name; its

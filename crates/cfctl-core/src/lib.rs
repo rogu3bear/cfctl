@@ -1113,6 +1113,11 @@ pub struct D1ApprovedMlnImportContractV1 {
     pub database_id: String,
     pub import_path: String,
     pub migrations: Vec<D1ApprovedMlnMigrationV1>,
+    /// Historical plans predate this execution bound. Decode an absent field
+    /// as zero so read-only history and coverage remain available; zero cannot
+    /// authorize execution because every source must be non-empty and no
+    /// larger than this bound.
+    #[serde(default)]
     pub max_source_bytes: u64,
     pub max_response_bytes: u64,
     pub max_poll_attempts: u64,
@@ -2427,6 +2432,34 @@ impl CapabilityV1 {
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.created_resource_creation_method_supported()
                     && self.created_resource_contract_supported()
+            }
+            "pages_production_deployment_succeeds_by_returned_id" => {
+                self.id == "pages-deployment-create-deployment"
+                    && self.method == "POST"
+                    && self.path
+                        == "/accounts/{account_id}/pages/projects/{project_name}/deployments"
+                    && self.product == "Pages Deployment"
+                    && self.account_scope == "account"
+                    && self.permissions == ["Pages Write"]
+                    && self.request_schema.is_none()
+                    && self.risk == RiskClass::CrossConfig
+                    && self.effect == EffectClass::ReversibleWrite
+                    && matches!(
+                        self.adapter_status,
+                        AdapterStatus::Native | AdapterStatus::DynamicApi
+                    )
+                    && self.created_resource_contract_structurally_supported(|target| {
+                        target.detail_path
+                            == "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"
+                            && target.identity_selector == "deployment_id"
+                            && target.response_result_identity_pointer == "/id"
+                            && target.read_capability_id
+                                == "pages-deployment-get-deployment-info"
+                            && target.delete_capability_id
+                                == "pages-deployment-delete-deployment"
+                            && target.verified_response_fields
+                                == ["environment", "project_name"]
+                    })
             }
             // An Access application body is a 13-way `anyOf` over app types
             // with no universally-required field, so the generic binder — which

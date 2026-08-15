@@ -22,7 +22,7 @@ rm -rf -- "$SITE_ROOT/build" "$SITE_ROOT/target/site" "$SITE_ROOT/target/front"
 ./scripts/with-wasm-bindgen-cli.sh cargo leptos build --release
 bun ./scripts/hash-assets.mjs
 source "$SITE_ROOT/target/asset-hashes.env"
-worker-build --release --features ssr
+./scripts/with-wasm-bindgen-cli.sh worker-build --release --features ssr
 bun ./scripts/write-worker-shim.mjs
 bun ./scripts/verify-hashed-assets.mjs
 bun ./scripts/verify-worker-runtime.mjs

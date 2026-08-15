@@ -8502,6 +8502,7 @@ fn apply_post_normalization_contracts(
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
     finalize_pages_deployment_id_selector_contracts(capabilities);
+    finalize_pages_production_deployment_contract(document, capabilities);
     finalize_worker_script_secret_contracts(document, capabilities);
     classify_exact_resource_contracts(document, capabilities);
     finalize_singleton_resource_delete_contracts(document, capabilities);
@@ -8543,6 +8544,187 @@ fn apply_post_normalization_contracts(
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
+}
+
+const PAGES_DEPLOYMENT_CREATE_CAPABILITY_ID: &str = "pages-deployment-create-deployment";
+const PAGES_DEPLOYMENT_READ_CAPABILITY_ID: &str = "pages-deployment-get-deployment-info";
+const PAGES_DEPLOYMENT_DELETE_CAPABILITY_ID: &str = "pages-deployment-delete-deployment";
+const PAGES_DEPLOYMENT_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/pages/projects/{project_name}/deployments";
+const PAGES_DEPLOYMENT_DETAIL_PATH: &str =
+    "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}";
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact Pages create, companion, response, cost, verification, and rollback invariants form one fail-closed classifier"
+)]
+fn finalize_pages_production_deployment_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    // Cloudflare exposes `force` as an optional bypass for normal delete
+    // protections. It is not part of the governed deployment lifecycle and
+    // must remain unexpressable through cfctl.
+    let delete_force_safely_stripped = capabilities
+        .get_mut(PAGES_DEPLOYMENT_DELETE_CAPABILITY_ID)
+        .is_some_and(|delete| {
+            let force_is_exact_optional_boolean = delete.selectors.len() == 4
+                && delete
+                    .selectors
+                    .iter()
+                    .filter(|selector| selector.name == "force")
+                    .count()
+                    == 1
+                && delete.selectors.iter().any(|selector| {
+                    selector.name == "force"
+                        && selector.location == "query"
+                        && !selector.required
+                        && selector.value_type == "boolean"
+                })
+                && ["account_id", "project_name", "deployment_id"]
+                    .iter()
+                    .all(|name| {
+                        delete.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                                && selector.value_type == "string"
+                        })
+                    });
+            if !force_is_exact_optional_boolean {
+                return false;
+            }
+            delete.selectors.retain(|selector| selector.name != "force");
+            true
+        });
+    let companions_supported = delete_force_safely_stripped
+        && capabilities
+            .get(PAGES_DEPLOYMENT_READ_CAPABILITY_ID)
+            .is_some_and(|read| {
+                read.method == "GET"
+                    && read.path == PAGES_DEPLOYMENT_DETAIL_PATH
+                    && read.product == "Pages Deployment"
+                    && read.permissions == ["Pages Read", "Pages Write"]
+                    && read.request_schema.is_none()
+                    && read
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && read.response_contract.as_ref().is_some_and(|response| {
+                        response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                            && response.success_statuses == ["200"]
+                            && response.success_media_types == ["application/json"]
+                    })
+            })
+        && capabilities
+            .get(PAGES_DEPLOYMENT_DELETE_CAPABILITY_ID)
+            .is_some_and(|delete| {
+                delete.method == "DELETE"
+                    && delete.path == PAGES_DEPLOYMENT_DETAIL_PATH
+                    && delete.product == "Pages Deployment"
+                    && delete.permissions == ["Pages Write"]
+                    && delete.request_schema.is_none()
+                    && delete
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+            });
+    let Some(create_operation) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(PAGES_DEPLOYMENT_COLLECTION_PATH))
+        .and_then(|path| path.get("post"))
+    else {
+        return;
+    };
+    let Some(read_operation) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(PAGES_DEPLOYMENT_DETAIL_PATH))
+        .and_then(|path| path.get("get"))
+    else {
+        return;
+    };
+    let response_shape_supported = [create_operation, read_operation].iter().all(|operation| {
+        ["id", "environment", "project_name"]
+            .iter()
+            .all(|field| success_response_declares_result_string_field(document, operation, field))
+            && operation
+                .get("responses")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(status, _)| status.starts_with('2'))
+                .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+                .any(|schema| {
+                    schema_declares_string_path(
+                        document,
+                        schema,
+                        &["result", "latest_stage", "status"],
+                        0,
+                    )
+                })
+    });
+    let Some(create) = capabilities.get_mut(PAGES_DEPLOYMENT_CREATE_CAPABILITY_ID) else {
+        return;
+    };
+    let identity_supported = create.method == "POST"
+        && create.path == PAGES_DEPLOYMENT_COLLECTION_PATH
+        && create.product == "Pages Deployment"
+        && create.title == "Create deployment"
+        && create.description.as_deref()
+            == Some(
+                "Start a new deployment from production. The repository and account must have already been authorized on the Cloudflare Pages dashboard.",
+            )
+        && create.maturity == Maturity::GenerallyAvailable
+        && create.permissions == ["Pages Write"]
+        && create.request_schema.is_none()
+        && create
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path")
+        && create.response_contract.as_ref().is_some_and(|response| {
+            response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                && response.success_statuses == ["200"]
+                && response.success_media_types == ["application/json"]
+        });
+    if !(identity_supported && companions_supported && response_shape_supported) {
+        return;
+    }
+
+    create.risk = RiskClass::CrossConfig;
+    create.effect = EffectClass::ReversibleWrite;
+    create.cost.known = true;
+    create.cost.incremental = false;
+    create.cost.maximum = Some(0.0);
+    create.cost.billing_model = BillingModelV1::UsageBased;
+    create.cost.exposure = CostExposureV1::DownstreamUsage;
+    create.cost.basis = Some(
+        "starting a Pages production deployment has no direct API-operation charge; the build, Functions, and bandwidth can create plan-specific downstream usage"
+            .to_owned(),
+    );
+    create.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: PAGES_DEPLOYMENT_DETAIL_PATH.to_owned(),
+        identity_selector: "deployment_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: PAGES_DEPLOYMENT_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: PAGES_DEPLOYMENT_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec!["environment".to_owned(), "project_name".to_owned()],
+    });
+    "pages_production_deployment_succeeds_by_returned_id"
+        .clone_into(&mut create.verification.strategy);
+    create.rollback.supported = false;
+    create.rollback.strategy = None;
+    create.rollback.warning = Some(
+        "restoring production traffic requires a separate reviewed Pages rollback to a known successful deployment; rollback does not erase the deployment, reverse Pages Functions side effects, or refund usage"
+            .to_owned(),
+    );
+    // The exact operation, companions, and response shapes above have replaced
+    // the generic incomplete contract. Re-enter the dynamic adapter lane before
+    // recomputing gaps so core support is evaluated against its real carrier.
+    create.adapter_status = AdapterStatus::DynamicApi;
+    create.blocked_reason = None;
+    refresh_dynamic_mutation_contract(create);
 }
 
 const PAGES_DEPLOYMENT_DETAIL_PATH_PREFIX: &str =
