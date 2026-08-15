@@ -2819,9 +2819,12 @@ fn io_error(path: &Path, source: std::io::Error) -> TaskError {
 #[allow(clippy::expect_used)]
 mod tests {
     use std::{
+        fs,
         io::Write as _,
+        os::unix::fs::PermissionsExt as _,
         path::Path,
-        process::{Command, Stdio},
+        process::{Command, Output, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
@@ -2903,6 +2906,169 @@ mod tests {
         )
         .expect_err("an unobservable workflow root must block proof");
         assert!(error.to_string().contains(".github/workflows"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
+        fn git(repo: &Path, arguments: &[&str]) -> Output {
+            let output = Command::new("git")
+                .args(arguments)
+                .current_dir(repo)
+                .output()
+                .expect("git fixture command starts");
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn run_hook(repo: &Path, fake_bin: &Path, cargo_log: &Path, update: &str) -> Output {
+            let mut search_path = vec![fake_bin.to_path_buf()];
+            search_path.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let search_path = std::env::join_paths(search_path).expect("fixture PATH is valid");
+            let mut child = Command::new("bash")
+                .arg(".githooks/pre-push-gate.sh")
+                .current_dir(repo)
+                .env("PATH", search_path)
+                .env("FAKE_CARGO_LOG", cargo_log)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("pre-push fixture starts");
+            child
+                .stdin
+                .as_mut()
+                .expect("fixture stdin is piped")
+                .write_all(update.as_bytes())
+                .expect("fixture update is written");
+            child.wait_with_output().expect("pre-push fixture exits")
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos();
+        let fixture_root = std::env::temp_dir().join(format!(
+            "cfctl-pre-push-object-binding-{}-{nonce}",
+            std::process::id()
+        ));
+        let repo = fixture_root.join("repo");
+        let fake_bin = fixture_root.join("bin");
+        let cargo_log = fixture_root.join("cargo.log");
+        fs::create_dir_all(repo.join(".githooks")).expect("fixture hook directory is created");
+        fs::create_dir_all(&fake_bin).expect("fixture binary directory is created");
+
+        let hook = fs::read_to_string(
+            repository_root()
+                .expect("repository root is available")
+                .join(".githooks/pre-push-gate.sh"),
+        )
+        .expect("tracked pre-push gate is readable");
+        fs::write(repo.join(".githooks/pre-push-gate.sh"), hook)
+            .expect("fixture pre-push gate is written");
+        let fake_cargo = fake_bin.join("cargo");
+        fs::write(
+            &fake_cargo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CARGO_LOG\"\n",
+        )
+        .expect("fake cargo is written");
+        fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
+            .expect("fake cargo is executable");
+
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "cfctl test"]);
+        git(
+            &repo,
+            &["config", "user.email", "cfctl-test@example.invalid"],
+        );
+        fs::write(repo.join("tracked.txt"), "clean\n").expect("tracked fixture is written");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean fixture"]);
+        let clean_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+            .expect("fixture oid is UTF-8")
+            .trim()
+            .to_owned();
+        let zero_oid = "0".repeat(clean_oid.len());
+        let clean_update = format!("refs/heads/main {clean_oid} refs/heads/main {zero_oid}\n");
+        let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update);
+        assert!(
+            clean.status.success(),
+            "one clean checked-out branch object must pass: {}",
+            String::from_utf8_lossy(&clean.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&cargo_log).expect("fake cargo ran"),
+            "xtask verify\n"
+        );
+
+        fs::remove_file(&cargo_log).expect("fake cargo log is reset");
+        fs::create_dir_all(repo.join(".github/workflows"))
+            .expect("workflow fixture directory is created");
+        fs::write(
+            repo.join(".github/workflows/hosted.yml"),
+            "name: forbidden-hosted-proof\n",
+        )
+        .expect("workflow fixture is written");
+        git(&repo, &["add", ".github/workflows/hosted.yml"]);
+        git(&repo, &["commit", "-q", "-m", "workflow fixture"]);
+        let workflow_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+            .expect("fixture oid is UTF-8")
+            .trim()
+            .to_owned();
+        fs::remove_file(repo.join(".github/workflows/hosted.yml"))
+            .expect("workflow is deleted only from the worktree");
+        let dirty_update = format!("refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n");
+        let dirty = run_hook(&repo, &fake_bin, &cargo_log, &dirty_update);
+        assert!(!dirty.status.success(), "dirty deletion must fail closed");
+        assert!(
+            String::from_utf8_lossy(&dirty.stderr).contains("source must be clean"),
+            "unexpected dirty-tree error: {}",
+            String::from_utf8_lossy(&dirty.stderr)
+        );
+        assert!(!cargo_log.exists(), "dirty source must fail before cargo");
+
+        fs::write(
+            repo.join(".github/workflows/hosted.yml"),
+            "name: forbidden-hosted-proof\n",
+        )
+        .expect("workflow fixture is restored");
+        let non_head_update =
+            format!("refs/heads/other {workflow_oid} refs/heads/other {zero_oid}\n");
+        let non_head = run_hook(&repo, &fake_bin, &cargo_log, &non_head_update);
+        assert!(
+            !non_head.status.success(),
+            "non-HEAD refspec must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&non_head.stderr).contains("must equal the checked-out HEAD"),
+            "unexpected non-HEAD error: {}",
+            String::from_utf8_lossy(&non_head.stderr)
+        );
+        assert!(!cargo_log.exists(), "non-HEAD ref must fail before cargo");
+
+        let multiple_updates = format!(
+            "refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n\
+             refs/heads/other {clean_oid} refs/heads/other {zero_oid}\n"
+        );
+        let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates);
+        assert!(
+            !multiple.status.success(),
+            "multiple distinct pushed objects must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&multiple.stderr).contains("expected exactly one pushed ref"),
+            "unexpected multi-ref error: {}",
+            String::from_utf8_lossy(&multiple.stderr)
+        );
+        assert!(!cargo_log.exists(), "multiple refs must fail before cargo");
+
+        fs::remove_dir_all(&fixture_root).expect("fixture is removed");
     }
 
     #[test]

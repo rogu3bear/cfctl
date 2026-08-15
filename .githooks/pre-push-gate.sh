@@ -19,6 +19,11 @@
 
 set -euo pipefail
 
+updates=()
+while IFS= read -r update; do
+  [ -n "$update" ] && updates+=("$update")
+done
+
 GATE_MODE="${CFCTL_PRE_PUSH_GATE:-on}"
 
 case "$GATE_MODE" in
@@ -36,7 +41,38 @@ esac
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
 
-echo "pre-push: running cargo xtask verify for $(git rev-parse --short HEAD)..."
+# This gate proves the checked-out source tree, so bind that tree to the exact
+# object Git is about to publish. Multi-ref, detached-HEAD, non-HEAD, and dirty
+# pushes need a separate object-checkout proof lane; accepting them here would
+# let the gate inspect bytes other than the pushed commit.
+if [ "${#updates[@]}" -ne 1 ]; then
+  echo "pre-push REFUSED: expected exactly one pushed ref, got ${#updates[@]}" >&2
+  exit 1
+fi
+
+read -r local_ref local_oid remote_ref _remote_oid <<<"${updates[0]}"
+head_ref="$(git symbolic-ref -q HEAD || true)"
+head_oid="$(git rev-parse HEAD)"
+
+if [ -z "$head_ref" ] || [ "$local_ref" != "$head_ref" ] || [ "$local_oid" != "$head_oid" ]; then
+  echo "pre-push REFUSED: pushed ref/object must equal the checked-out HEAD" >&2
+  exit 1
+fi
+
+case "$remote_ref" in
+  refs/heads/*) ;;
+  *)
+    echo "pre-push REFUSED: this proof lane publishes exactly one branch" >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
+  echo "pre-push REFUSED: tracked and untracked source must be clean" >&2
+  exit 1
+fi
+
+echo "pre-push: running cargo xtask verify for ${head_oid:0:7}..."
 
 # Capture unpiped. Piping the gate through tail/head masks its exit status and
 # has produced a false green in this repo before.
