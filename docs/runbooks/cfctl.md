@@ -1002,10 +1002,20 @@ every resolved module is already inside the admitted artifact, and binds the
 closed bundle's size and SHA-256. Bare imports or ancestor `node_modules`
 resolution fail planning. A runtime `import(...)` that survives bundling also
 fails closed because esbuild does not report every non-literal dynamic import
-in its metafile. A live exact-project
-read must then report `source: null` and the requested branch must equal the
-project's production branch. Existing deployments are read before planning;
-the same project/branch/commit identity is treated as a replay and rejected.
+in its metafile. A live exact-project read must then establish direct-upload
+mode, and the requested branch must equal the project's production branch.
+Explicit `source: null` remains authoritative. A provider response that omits
+`source` is compatible only when the same response also carries matching
+canonical and latest production deployments with one exact UUID, project, and
+branch; a successful `ad_hoc` deployment whose repository clone/build stages
+remain idle; no nested Git source; and no configured repository build command
+or root. A direct-upload output directory such as `target/site` is retained as
+project configuration, not misclassified as repository-build evidence.
+Partial, contradictory, or Git-source evidence remains blocked before
+operation creation. The corroborating deployment ID and inference basis are
+hash-bound into the same project-mode receipt and must reproduce at the
+execution-boundary read. Existing deployments are read before planning; the
+same project/branch/commit identity is treated as a replay and rejected.
 
 Execution recomputes the repository, complete producer closure, exact
 interpreter, and complete artifact manifest before credential access and again

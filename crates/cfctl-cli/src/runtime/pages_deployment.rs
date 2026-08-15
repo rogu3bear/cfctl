@@ -1235,8 +1235,10 @@ pub(super) fn apply_project_response(
             )
         })?;
     let source = response.result.get("source");
-    let source_mode = if source.is_some_and(Value::is_null) {
-        "direct_upload"
+    let (source_mode, source_mode_basis, corroborating_deployment_id) = if source
+        .is_some_and(Value::is_null)
+    {
+        ("direct_upload", "explicit_null_source", None)
     } else if source
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str)
@@ -1245,7 +1247,24 @@ pub(super) fn apply_project_response(
             .and_then(|value| value.get("config"))
             .is_some_and(Value::is_object)
     {
-        "git_integrated"
+        ("git_integrated", "explicit_git_source", None)
+    } else if source.is_none() {
+        let deployment_id = omitted_source_direct_deployment_id(
+            &response.result,
+            project_name,
+            production_branch,
+        )
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages project admission read omitted its source without exact direct-upload deployment corroboration; the deployment boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+        (
+            "direct_upload",
+            "omitted_source_exact_direct_deployment",
+            Some(deployment_id),
+        )
     } else {
         return Err(CliError::Input(
             "Pages project admission read returned an unknown source mode; the deployment boundary was not crossed"
@@ -1273,7 +1292,7 @@ pub(super) fn apply_project_response(
             "Pages direct-upload branch does not match project production branch `{production_branch}`; the deployment boundary was not crossed"
         )));
     }
-    Ok(json!({
+    let mut receipt = json!({
         "schema_version": 1,
         "source_capability_id": PROJECT_READ_CAPABILITY_ID,
         "source_path": PROJECT_DETAIL_PATH,
@@ -1282,7 +1301,101 @@ pub(super) fn apply_project_response(
         "project_name": project_name,
         "production_branch": production_branch,
         "source_mode": source_mode,
-    }))
+        "source_mode_basis": source_mode_basis,
+    });
+    if let Some(deployment_id) = corroborating_deployment_id {
+        receipt["corroborating_deployment_id"] = json!(deployment_id);
+    }
+    Ok(receipt)
+}
+
+fn omitted_source_direct_deployment_id<'a>(
+    project: &'a Value,
+    project_name: &str,
+    production_branch: &str,
+) -> Option<&'a str> {
+    let build = project.get("build_config")?.as_object()?;
+    if ["build_command", "root_dir"].iter().any(|field| {
+        build.get(*field).is_some_and(|value| {
+            !value.is_null() && value.as_str().is_none_or(|value| !value.is_empty())
+        })
+    }) {
+        return None;
+    }
+    let canonical = project.get("canonical_deployment")?;
+    let latest = project.get("latest_deployment")?;
+    let canonical_id = direct_deployment_evidence(canonical, project_name, production_branch)?;
+    let latest_id = direct_deployment_evidence(latest, project_name, production_branch)?;
+    (canonical_id == latest_id).then_some(canonical_id)
+}
+
+fn direct_deployment_evidence<'a>(
+    deployment: &'a Value,
+    project_name: &str,
+    production_branch: &str,
+) -> Option<&'a str> {
+    let id = deployment
+        .get("id")?
+        .as_str()
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())?;
+    if deployment.get("project_name").and_then(Value::as_str) != Some(project_name)
+        || deployment.get("environment").and_then(Value::as_str) != Some("production")
+        || deployment
+            .pointer("/deployment_trigger/type")
+            .and_then(Value::as_str)
+            != Some("ad_hoc")
+        || deployment
+            .pointer("/deployment_trigger/metadata/branch")
+            .and_then(Value::as_str)
+            != Some(production_branch)
+        || deployment
+            .get("source")
+            .is_some_and(|source| !source.is_null())
+        || deployment
+            .pointer("/latest_stage/name")
+            .and_then(Value::as_str)
+            != Some("deploy")
+        || deployment
+            .pointer("/latest_stage/status")
+            .and_then(Value::as_str)
+            != Some("success")
+    {
+        return None;
+    }
+    let stages = deployment.get("stages")?.as_array()?;
+    let has_exact_stage = |name: &str, status: &str| {
+        let mut matching = stages
+            .iter()
+            .filter(|stage| stage.get("name").and_then(Value::as_str) == Some(name));
+        matching
+            .next()
+            .is_some_and(|stage| stage.get("status").and_then(Value::as_str) == Some(status))
+            && matching.next().is_none()
+    };
+    (has_exact_stage("clone_repo", "idle")
+        && has_exact_stage("build", "idle")
+        && has_exact_stage("deploy", "success"))
+    .then_some(id)
+}
+
+pub(super) fn receipt_source_mode_is_bound(receipt: &Value, expected_mode: &str) -> bool {
+    let mode = receipt.get("source_mode").and_then(Value::as_str);
+    let basis = receipt.get("source_mode_basis").and_then(Value::as_str);
+    let corroborating_id = receipt
+        .get("corroborating_deployment_id")
+        .and_then(Value::as_str);
+    match (mode, basis, corroborating_id) {
+        (Some("direct_upload"), Some("explicit_null_source"), None) => {
+            expected_mode == "direct_upload"
+        }
+        (Some("direct_upload"), Some("omitted_source_exact_direct_deployment"), Some(id)) => {
+            expected_mode == "direct_upload" && uuid::Uuid::parse_str(id).is_ok()
+        }
+        (Some("git_integrated"), Some("explicit_git_source"), None) => {
+            expected_mode == "git_integrated"
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn deployment_ids(value: &Value) -> BTreeSet<String> {
@@ -1741,10 +1854,14 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             etag: None,
             cf_ray: None,
         };
-        assert!(
+        let direct_receipt =
             apply_project_response(&direct_upload(), "acct", "aos-web", Some("main"), &response)
-                .is_ok()
-        );
+                .expect("explicit null remains direct upload");
+        assert_eq!(direct_receipt["source_mode_basis"], "explicit_null_source");
+        assert!(receipt_source_mode_is_bound(
+            &direct_receipt,
+            "direct_upload"
+        ));
         let mut bodyless = CapabilityV1::new(
             GIT_TRIGGER_CAPABILITY_ID,
             "trigger Git build",
@@ -1762,7 +1879,10 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             }),
             ..response.clone()
         };
-        assert!(apply_project_response(&bodyless, "acct", "aos-web", None, &git_project).is_ok());
+        let git_receipt = apply_project_response(&bodyless, "acct", "aos-web", None, &git_project)
+            .expect("populated Git source remains Git integrated");
+        assert_eq!(git_receipt["source_mode_basis"], "explicit_git_source");
+        assert!(receipt_source_mode_is_bound(&git_receipt, "git_integrated"));
         assert!(
             apply_project_response(
                 &direct_upload(),
@@ -1779,6 +1899,203 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             ..response
         };
         assert!(apply_project_response(&bodyless, "acct", "aos-web", None, &unknown).is_err());
+    }
+
+    fn omitted_source_project(canonical: Value, latest: Value) -> CloudflareResponseV1 {
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "name":"aos-web",
+                "production_branch":"main",
+                "build_config":{
+                    "build_command":null,
+                    "destination_dir":"target/site",
+                    "root_dir":null
+                },
+                "canonical_deployment":canonical,
+                "latest_deployment":latest
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    fn direct_deployment(id: &str) -> Value {
+        json!({
+            "id":id,
+            "project_name":"aos-web",
+            "environment":"production",
+            "deployment_trigger":{
+                "type":"ad_hoc",
+                "metadata":{
+                    "branch":"main",
+                    "commit_hash":"0a2c0165ab176f744539be371314dea086b80933"
+                }
+            },
+            "latest_stage":{"name":"deploy","status":"success"},
+            "stages":[
+                {"name":"queued","status":"success"},
+                {"name":"initialize","status":"success"},
+                {"name":"clone_repo","status":"idle"},
+                {"name":"build","status":"idle"},
+                {"name":"deploy","status":"success"}
+            ],
+            "url":"https://ff88ab4a.aos-web-183.pages.dev"
+        })
+    }
+
+    #[test]
+    fn omitted_project_source_requires_consistent_direct_deployment_evidence() {
+        let id = "ff88ab4a-f284-4f06-86e0-c8ae3b459b60";
+        let exact = omitted_source_project(direct_deployment(id), direct_deployment(id));
+        let receipt =
+            apply_project_response(&direct_upload(), "acct", "aos-web", Some("main"), &exact)
+                .expect(
+                    "omitted project source is compatible only with exact direct-upload evidence",
+                );
+        assert_eq!(receipt["source_mode"], "direct_upload");
+        assert_eq!(
+            receipt["source_mode_basis"],
+            "omitted_source_exact_direct_deployment"
+        );
+        assert_eq!(receipt["corroborating_deployment_id"], id);
+        assert!(receipt_source_mode_is_bound(&receipt, "direct_upload"));
+        let mut unbound = receipt.clone();
+        unbound["corroborating_deployment_id"] = json!("not-a-uuid");
+        assert!(!receipt_source_mode_is_bound(&unbound, "direct_upload"));
+
+        let only_one = omitted_source_project(direct_deployment(id), Value::Null);
+        assert!(
+            apply_project_response(&direct_upload(), "acct", "aos-web", Some("main"), &only_one)
+                .is_err(),
+            "one deployment projection cannot authorize an omitted project source"
+        );
+
+        let different = omitted_source_project(
+            direct_deployment(id),
+            direct_deployment("22222222-2222-4222-8222-222222222222"),
+        );
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &different
+            )
+            .is_err(),
+            "different canonical/latest identities remain ambiguous"
+        );
+
+        let mut manual_git_upload = direct_deployment(id);
+        manual_git_upload["source"] = json!({
+            "type":"github",
+            "config":{
+                "owner":"MLNavigator",
+                "repo_name":"aos-web",
+                "repo_id":"123456789",
+                "production_branch":"main",
+                "production_deployments_enabled":false,
+                "preview_deployment_setting":"none"
+            }
+        });
+        let git_evidence = omitted_source_project(manual_git_upload.clone(), manual_git_upload);
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &git_evidence
+            )
+            .is_err(),
+            "a manual Wrangler deployment to a Git project remains Git-integrated"
+        );
+
+        let mut clone_stage = direct_deployment(id);
+        clone_stage["stages"] = json!([
+            {"name":"clone_repo","status":"success"},
+            {"name":"deploy","status":"success"}
+        ]);
+        let git_pipeline = omitted_source_project(clone_stage.clone(), clone_stage);
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &git_pipeline
+            )
+            .is_err(),
+            "a repository pipeline cannot be normalized as direct upload"
+        );
+
+        let mut repository_build = exact.result.clone();
+        repository_build["build_config"]["build_command"] = json!("npm run build");
+        let repository_build = CloudflareResponseV1 {
+            result: repository_build,
+            ..exact
+        };
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &repository_build
+            )
+            .is_err(),
+            "a configured repository build cannot be normalized as direct upload"
+        );
+    }
+
+    #[test]
+    fn omitted_project_source_rejects_partial_or_duplicate_stage_evidence() {
+        let id = "ff88ab4a-f284-4f06-86e0-c8ae3b459b60";
+        for (missing_stage, retained_repository_stage) in
+            [("clone_repo", "build"), ("build", "clone_repo")]
+        {
+            let mut partial_stages = direct_deployment(id);
+            partial_stages["stages"] = json!([
+                {"name":"queued","status":"active"},
+                {"name":"initialize","status":"idle"},
+                {"name":retained_repository_stage,"status":"idle"},
+                {"name":"deploy","status":"success"}
+            ]);
+            let partial_evidence = omitted_source_project(partial_stages.clone(), partial_stages);
+            assert!(
+                apply_project_response(
+                    &direct_upload(),
+                    "acct",
+                    "aos-web",
+                    Some("main"),
+                    &partial_evidence
+                )
+                .is_err(),
+                "missing {missing_stage} stage evidence remains ambiguous"
+            );
+        }
+
+        let mut duplicate_build = direct_deployment(id);
+        duplicate_build["stages"]
+            .as_array_mut()
+            .expect("stages array")
+            .push(json!({"name":"build","status":"idle"}));
+        let duplicate_evidence = omitted_source_project(duplicate_build.clone(), duplicate_build);
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &duplicate_evidence
+            )
+            .is_err(),
+            "duplicate repository-stage evidence remains ambiguous"
+        );
     }
 
     #[test]
