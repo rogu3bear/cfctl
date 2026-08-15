@@ -1,6 +1,6 @@
 class Cfctl < Formula
   desc "Universal governed Cloudflare control plane"
-  homepage "https://cfctl.io"
+  homepage "https://cfctl.com"
   version "@VERSION@"
   license "MIT"
 

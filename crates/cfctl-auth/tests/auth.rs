@@ -20,6 +20,7 @@ fn cloudflare_cli_oauth_uses_pkce_s256_and_never_embeds_a_client_secret() {
     assert!(url.starts_with("https://dash.cloudflare.com/oauth2/auth?"));
     assert!(url.contains("code_challenge_method=S256"));
     assert!(url.contains("client_id=public-client-id"));
+    assert!(url.contains("redirect_uri=https%3A%2F%2Fcfctl.com%2Foauth%2Fcallback"));
     assert!(!url.contains("client_secret"));
     assert!(session.code_verifier.len() >= 43);
 }
@@ -268,7 +269,7 @@ async fn oauth_exchange_refresh_and_revoke_use_public_client_flows() {
         authorization_endpoint: format!("{endpoint}/auth"),
         token_endpoint: format!("{endpoint}/token"),
         revoke_endpoint: format!("{endpoint}/revoke"),
-        redirect_uri: "https://cfctl.io/oauth/callback".to_owned(),
+        redirect_uri: "https://cfctl.com/oauth/callback".to_owned(),
     };
     let client = reqwest::Client::new();
     let exchanged = exchange_authorization_code(&client, &config, "code-one", "verifier-one")
