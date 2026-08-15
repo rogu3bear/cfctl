@@ -986,11 +986,32 @@ cfctl call wrangler.pages-deploy \
   --json
 ```
 
-The governed subprocess receives only the selected account and cfctl's
-Wrangler cache plus the selected credential. Verification lists production
-deployments and requires the exact project, branch, commit hash, and a
-successful deployment stage. Automatic rollback is not implemented; restoring
-a prior artifact is a separate reviewed deployment plan.
+Planning first admits one regular, symlink-free artifact root owned by a clean,
+registered repository on a named branch. It records every uploadable and
+multipart-control file by normalized path, byte size, and SHA-256, rejects an
+empty tree, path ambiguity, Wrangler-ignored sources, more than 20,000 assets,
+and files above the 25 MiB provider limit, and binds the exact Wrangler
+executable hash/version that generated the catalog carrier. A live exact-project
+read must then report `source: null` and the requested branch must equal the
+project's production branch. Existing deployments are read before planning;
+the same project/branch/commit identity is treated as a replay and rejected.
+
+Execution recomputes the repository, producer, and complete manifest before
+credential access and again after the live concurrency read. Only then may the
+exact producer run from a private configless directory with the selected
+account, cfctl's Wrangler cache, and the selected credential. Wrangler remains
+the authoritative multipart producer: it performs the content-addressed asset
+upload and sends the provider-required `manifest` form field, without implicit
+`wrangler.toml`, Functions, dotenv, or current-directory inputs. Wrangler's
+governed structured-output file must return one canonical deployment ID with
+the exact project, production branch, environment, and commit. The verifier
+requires that ID to be absent from the pre-plan deployment set, waits for the
+same ID and identity to appear in the collection, and polls only that exact
+detail resource. Only terminal `success` passes; ambiguity,
+identity drift, provider error, timeout, failure, or cancellation requires
+rectification and never authorizes replay. Automatic rollback is not
+implemented. Restoring a prior artifact is a separate reviewed deployment and
+does not erase the failed deployment or Functions side effects or refund usage.
 
 For an existing Git-integrated Pages project, the provider-native
 `pages-deployment-create-deployment` capability starts a build from the
@@ -1015,6 +1036,11 @@ is deliberately unsupported: restoring production traffic requires a separate
 reviewed Pages rollback to a known successful deployment, and that rollback
 does not erase the new deployment, reverse Pages Functions side effects, or
 refund usage.
+
+Before a bodyless Git trigger can become a plan, cfctl reads the exact project
+and requires a Git source object. A direct-upload project (`source: null`) is
+rejected with guidance to use the artifact-bound `wrangler.pages-deploy`
+carrier; cfctl never sends the invalid bodyless request to such a project.
 
 Custom-domain attachment is the separate `pages-domains-add-domain` dynamic
 API capability. Its verifier reads the returned domain by exact name; its

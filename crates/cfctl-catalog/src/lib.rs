@@ -1961,11 +1961,19 @@ pub fn ingest_wrangler_pages_deploy_help(
         source: "official Cloudflare docs".to_owned(),
     }];
     capability.verification.required = true;
-    "wrangler_pages_production_deployment_reports_commit_hash"
+    "wrangler_pages_new_deployment_succeeds_by_returned_id"
         .clone_into(&mut capability.verification.strategy);
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: PAGES_DEPLOYMENT_DETAIL_PATH.to_owned(),
+        identity_selector: "deployment_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: PAGES_DEPLOYMENT_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: PAGES_DEPLOYMENT_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec!["environment".to_owned(), "project_name".to_owned()],
+    });
     capability.rollback.supported = false;
     capability.rollback.warning = Some(
-        "automatic rollback is not implemented; restoration requires a separate reviewed Pages deployment plan for a known prior artifact and commit"
+        "automatic rollback is not implemented; restoration requires a separate reviewed Pages deployment plan for a known prior artifact and commit, does not erase the failed deployment or Functions side effects, and cannot refund usage"
             .to_owned(),
     );
     capability.selectors = [
