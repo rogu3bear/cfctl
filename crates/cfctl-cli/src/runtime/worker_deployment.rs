@@ -623,6 +623,19 @@ mod tests {
             canonical_config(&parent_input).is_err(),
             "accepted selector that concealed a symlink behind `..`"
         );
+
+        let interior_dot = PathBuf::from(format!(
+            "{}/./wrangler.mail-router.production.toml",
+            root.path().display()
+        ));
+        let interior_dot_input = CallInput {
+            query: json!({"config": interior_dot}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&interior_dot_input).is_err(),
+            "accepted selector containing an interior `.` component"
+        );
     }
 
     #[test]

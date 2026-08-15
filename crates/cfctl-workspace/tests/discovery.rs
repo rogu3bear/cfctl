@@ -67,6 +67,16 @@ fn exact_and_role_specific_production_wrangler_toml_are_supported() {
         "discovered nested role-specific config as deployment authority"
     );
 
+    let interior_dot = Path::new(&format!(
+        "{}/./wrangler.mail-router.production.toml",
+        repository.display()
+    ))
+    .to_path_buf();
+    assert!(
+        load_wrangler_config(&interior_dot).is_err(),
+        "accepted a raw selector containing an interior `.` component"
+    );
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;

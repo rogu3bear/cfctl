@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -525,10 +525,16 @@ fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Res
 /// used by workspace discovery. Deployment planning consumes this public
 /// projection so config interpretation cannot drift from resource discovery.
 pub fn load_wrangler_config(path: &Path) -> Result<Value> {
-    if path
-        .components()
-        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    // `Path::components()` normalizes interior `.` segments away, which would
+    // erase part of the caller's raw selector before this authority check.
+    // Deployment selectors originate as UTF-8 CLI/JSON strings, so reject
+    // non-UTF-8 selectors and inspect both platform separator spellings
+    // lexically before any filesystem lookup or canonicalization.
+    let contains_lexical_dot_component = path.to_str().is_none_or(|raw| {
+        raw.split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+    });
+    if contains_lexical_dot_component {
         return Err(WorkspaceError::DiscoveryInvariant(format!(
             "deployment configuration path `{}` must not contain `.` or `..` components",
             path.display()
