@@ -30,8 +30,15 @@ if [ ! -x "$binary" ]; then
   cargo install --root "$install_root" wasm-bindgen-cli --version "$version" --locked
 fi
 
+installed_version="$("$binary" --version | awk '{print $2}')"
+if [ "$installed_version" != "$version" ]; then
+  printf '[wasm-bindgen] expected %s at %s, found %s\n' \
+    "$version" "$binary" "${installed_version:-unknown}" >&2
+  exit 1
+fi
+
 if [ $# -eq 0 ] || [[ "${1:-}" == -* ]]; then
   exec "$binary" "$@"
 fi
 
-PATH="$install_root/bin:$PATH" exec "$@"
+WASM_BINDGEN_BIN="$binary" PATH="$install_root/bin:$PATH" exec "$@"
