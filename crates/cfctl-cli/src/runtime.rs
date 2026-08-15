@@ -16114,7 +16114,7 @@ fn required_pages_deployment_project_state_precondition(plan: &PlanV1) -> Result
             != Some(plan.capability.id.as_str())
         || receipt.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str())
         || receipt.get("project_name").and_then(Value::as_str) != Some(project_name)
-        || receipt.get("source_mode").and_then(Value::as_str) != Some(expected_mode)
+        || !pages_deployment::receipt_source_mode_is_bound(receipt, expected_mode)
         || (pages_deployment::binds_artifact(&plan.capability)
             && receipt
                 .get("prior_exact_identity_count")
@@ -28874,7 +28874,7 @@ mod tests {
         matching_git_url_rewrite, mln_0142_terminal_import_state, mln_0143_parent_manifests,
         mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
         mln_0143_restore_anchor_matches, non_readback_verification_basis,
-        normalize_reviewed_mln_repository_id, operational_proof_coverage,
+        normalize_reviewed_mln_repository_id, operational_proof_coverage, pages_deployment,
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
@@ -28892,7 +28892,9 @@ mod tests {
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_oauth_client_secret_state_precondition,
-        required_oauth_client_update_state_precondition, required_r2_parent_token_precondition,
+        required_oauth_client_update_state_precondition,
+        required_pages_deployment_project_state_precondition,
+        required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         resolve_actionable, resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
@@ -35793,6 +35795,74 @@ mod tests {
                 "canonicalization must not erase Pages artifact symlink provenance"
             );
         }
+    }
+
+    #[test]
+    fn pages_omitted_source_admission_is_hash_bound_to_exact_direct_evidence() {
+        let mut capability = CapabilityV1::new(
+            "wrangler.pages-deploy",
+            "deploy Pages artifact",
+            "POST",
+            "wrangler pages deploy",
+        );
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let input = CallInput {
+            query: json!({
+                "project_name":"aos-web",
+                "branch":"main",
+                "commit_hash":"0a2c0165ab176f744539be371314dea086b80933"
+            }),
+            ..CallInput::default()
+        };
+        let deployment_id = "ff88ab4a-f284-4f06-86e0-c8ae3b459b60";
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":pages_deployment::PROJECT_READ_CAPABILITY_ID,
+            "source_path":pages_deployment::PROJECT_DETAIL_PATH,
+            "target_capability_id":"wrangler.pages-deploy",
+            "account_id":"account-a",
+            "project_name":"aos-web",
+            "production_branch":"main",
+            "source_mode":"direct_upload",
+            "source_mode_basis":"omitted_source_exact_direct_deployment",
+            "corroborating_deployment_id":deployment_id,
+            "prior_deployment_ids":[deployment_id],
+            "prior_exact_identity_count":0,
+            "deployment_list_source_capability_id":pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID,
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-a",
+            capability,
+            serde_json::to_value(&input).expect("input"),
+        )
+        .expect("Pages plan");
+        plan.input = serde_json::to_value(input).expect("plan input");
+        plan.targets = json!({
+            "live_preconditions":{
+                pages_deployment::PROJECT_STATE_PRECONDITION:receipt.clone()
+            }
+        });
+        plan.precondition_hashes.insert(
+            pages_deployment::PROJECT_STATE_PRECONDITION.to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_pages_deployment_project_state_precondition(&plan)
+                .expect("exact omitted-source receipt"),
+            plan.precondition_hashes
+                .get(pages_deployment::PROJECT_STATE_PRECONDITION)
+                .map(String::as_str)
+        );
+
+        plan.targets["live_preconditions"][pages_deployment::PROJECT_STATE_PRECONDITION]["corroborating_deployment_id"] =
+            Value::Null;
+        assert!(
+            required_pages_deployment_project_state_precondition(&plan).is_err(),
+            "the omitted-source basis cannot survive without its exact deployment identity"
+        );
     }
 
     #[cfg(unix)]
