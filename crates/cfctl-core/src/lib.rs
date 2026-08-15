@@ -2555,7 +2555,7 @@ impl CapabilityV1 {
                             && selector.value_type == "string"
                     })
             }
-            "wrangler_pages_production_deployment_reports_commit_hash" => {
+            "wrangler_pages_new_deployment_succeeds_by_returned_id" => {
                 self.id == "wrangler.pages-deploy"
                     && self.method == "CLI"
                     && self.path == "wrangler pages deploy"
@@ -2570,6 +2570,18 @@ impl CapabilityV1 {
                                     && selector.value_type == "string"
                             })
                         })
+                    && self.created_resource.as_ref().is_some_and(|target| {
+                        target.detail_path
+                            == "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}"
+                            && target.identity_selector == "deployment_id"
+                            && target.response_result_identity_pointer == "/id"
+                            && target.read_capability_id
+                                == "pages-deployment-get-deployment-info"
+                            && target.delete_capability_id
+                                == "pages-deployment-delete-deployment"
+                            && target.verified_response_fields
+                                == ["environment", "project_name"]
+                    })
             }
             "wrangler_worker_version_reports_expected_message" => {
                 self.id == "wrangler.versions-upload"

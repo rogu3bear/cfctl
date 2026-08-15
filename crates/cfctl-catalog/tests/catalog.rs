@@ -2540,10 +2540,25 @@ fn exact_wrangler_pages_deploy_help_becomes_a_governed_upload() {
     assert_eq!(deploy.cost.maximum, Some(0.0));
     assert_eq!(
         deploy.verification.strategy,
-        "wrangler_pages_production_deployment_reports_commit_hash"
+        "wrangler_pages_new_deployment_succeeds_by_returned_id"
+    );
+    let target = deploy
+        .created_resource
+        .as_ref()
+        .expect("returned deployment identity contract");
+    assert_eq!(target.identity_selector, "deployment_id");
+    assert_eq!(
+        target.read_capability_id,
+        "pages-deployment-get-deployment-info"
     );
     assert!(deploy.verification_contract_supported());
     assert!(deploy.mutation_contract_gaps().is_empty());
+    assert!(!deploy.rollback.supported);
+    assert!(deploy.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("does not erase the failed deployment")
+            && warning.contains("Functions side effects")
+            && warning.contains("cannot refund usage")
+    }));
     for name in ["argument", "project_name", "branch", "commit_hash"] {
         assert!(deploy.selectors.iter().any(|selector| {
             selector.name == name && selector.location == "query" && selector.required

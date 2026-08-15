@@ -1,6 +1,7 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
 mod event_batch;
+mod pages_deployment;
 mod plan_set;
 mod r2_private_upload;
 mod worker_custom_domain;
@@ -1455,6 +1456,14 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let mut secret_ref = None;
     let mut r2_stage_ref = None;
     let mut adapter_targets = Map::new();
+    if pages_deployment::binds_artifact(&capability) {
+        let graph = discover_registered(store)?;
+        let target = pages_deployment::prepare_target(&graph, &capability, &prepared.input)?
+            .ok_or_else(|| {
+                CliError::Input("Pages deployment target could not be derived".to_owned())
+            })?;
+        adapter_targets.insert("pages_deployment".to_owned(), target);
+    }
     if worker_deployment::binds_live_state(&capability) {
         let graph = discover_registered(store)?;
         let target = worker_deployment::prepare_target(&graph, &capability, &prepared.input)?
@@ -6157,6 +6166,8 @@ async fn execute_delegated_read(
         &credential,
         account_id.as_deref(),
         &store.paths().cache_dir,
+        None,
+        None,
     )
     .await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
@@ -6282,12 +6293,13 @@ fn execute_governed_ui_read(
 
 async fn execute_delegated_plan(
     store: &StateStore,
+    catalog: &CatalogSnapshot,
     plan: &mut PlanV1,
     input: &CallInput,
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let receipt = run_delegated_plan_boundary(store, plan, input, credential).await?;
+    let mut receipt = run_delegated_plan_boundary(store, plan, input, credential).await?;
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -6319,7 +6331,11 @@ async fn execute_delegated_plan(
         plan,
         TransactionStageV1::VerificationAttemptPersisted,
     )?;
-    let verification = verify_delegated_cli_plan(store, plan, input, &receipt, credential).await;
+    let verification =
+        verify_delegated_cli_plan(store, catalog, plan, input, &receipt, credential).await;
+    if let Some(deployment_id) = verification.get("deployment_id").and_then(Value::as_str) {
+        receipt["deployment_id"] = Value::String(deployment_id.to_owned());
+    }
     let verification_evidence =
         store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
@@ -6393,8 +6409,33 @@ async fn run_delegated_plan_boundary(
         return workspace_d1_projection::run(store, plan, credential).await;
     }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
-    let delegated_input =
+    let mut delegated_input =
         worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
+    let (bound_program, bound_interpreter) = if pages_deployment::binds_artifact(&plan.capability) {
+        (
+            Some(pages_deployment::bound_wrangler_executable(
+                adapter_targets,
+            )?),
+            pages_deployment::bound_wrangler_interpreter(adapter_targets)?,
+        )
+    } else {
+        (None, None)
+    };
+    let _staged_pages_artifact = if pages_deployment::binds_artifact(&plan.capability) {
+        Some(pages_deployment::stage_bound_artifact(
+            adapter_targets,
+            &mut delegated_input,
+        )?)
+    } else {
+        None
+    };
+    if pages_deployment::binds_artifact(&plan.capability) {
+        // Staging may be proportional to the admitted artifact. Recheck the
+        // private staged bytes first, then make the complete mutable producer
+        // closure the final check immediately before subprocess construction.
+        pages_deployment::validate_staged_artifact(adapter_targets, &delegated_input)?;
+        pages_deployment::validate_bound_producer(&plan.capability, adapter_targets)?;
+    }
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
         run_quick_tunnel(store, plan, input).await?
     } else {
@@ -6404,6 +6445,8 @@ async fn run_delegated_plan_boundary(
             credential,
             Some(&plan.account_id),
             &store.paths().cache_dir,
+            bound_program.as_deref(),
+            bound_interpreter.as_deref(),
         )
         .await?
     };
@@ -6445,6 +6488,7 @@ fn delegated_cli_failure_envelope(
 )]
 async fn verify_delegated_cli_plan(
     store: &StateStore,
+    catalog: &CatalogSnapshot,
     plan: &PlanV1,
     input: &CallInput,
     receipt: &Value,
@@ -6460,7 +6504,7 @@ async fn verify_delegated_cli_plan(
         return verify_quick_tunnel_plan(input, receipt).await;
     }
     if plan.capability.verification.strategy
-        == "wrangler_pages_production_deployment_reports_commit_hash"
+        == "wrangler_pages_new_deployment_succeeds_by_returned_id"
     {
         let Some(project_name) = input
             .query
@@ -6499,12 +6543,13 @@ async fn verify_delegated_cli_plan(
             });
         };
         return verify_wrangler_pages_production_deployment(
+            catalog,
+            plan,
             project_name,
             branch,
             commit_hash,
+            receipt,
             credential,
-            &plan.account_id,
-            &store.paths().cache_dir,
         )
         .await;
     }
@@ -6633,156 +6678,245 @@ async fn verify_wrangler_worker_versions_deploy_plan(
     .await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Pages verifier keeps returned identity, collection visibility, and exact terminal polling as one fail-closed lifecycle"
+)]
 async fn verify_wrangler_pages_production_deployment(
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
     project_name: &str,
     branch: &str,
     commit_hash: &str,
+    receipt: &Value,
     credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
 ) -> Value {
-    let mut command = ProcessCommand::new("wrangler");
-    command
-        .args([
-            "pages",
-            "deployment",
-            "list",
-            "--project-name",
-            project_name,
-            "--environment",
-            "production",
-            "--json",
-        ])
-        .env_clear()
-        .env("PATH", env::var_os("PATH").unwrap_or_default())
-        .env("HOME", env::var_os("HOME").unwrap_or_default())
-        .env("NO_COLOR", "1")
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
-        command.env(name, value);
-    }
-    match credential {
-        AuthCredential::Bearer { token } => {
-            command.env("CLOUDFLARE_API_TOKEN", token);
-        }
-        AuthCredential::GlobalKey { email, key } => {
-            command
-                .env("CLOUDFLARE_EMAIL", email)
-                .env("CLOUDFLARE_API_KEY", key);
-        }
-    }
-    let output = match tokio::time::timeout(Duration::from_mins(2), command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return json!({
-                "passed": false,
-                "basis": format!("Wrangler Pages deployment verification could not start: {error}"),
-                "project_name": project_name,
-                "branch": branch,
-                "commit_hash": commit_hash,
-            });
-        }
-        Err(_) => {
-            return json!({
-                "passed": false,
-                "basis": "Wrangler Pages deployment verification timed out",
-                "project_name": project_name,
-                "branch": branch,
-                "commit_hash": commit_hash,
-            });
-        }
-    };
-    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
-    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
-    if !output.status.success() {
+    const MAX_DISCOVERY_ATTEMPTS: usize = 30;
+    const MAX_POLL_ATTEMPTS: usize = 120;
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let Some(prior_ids) = plan
+        .targets
+        .pointer(&format!(
+            "/live_preconditions/{}/prior_deployment_ids",
+            pages_deployment::PROJECT_STATE_PRECONDITION
+        ))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+    else {
         return json!({
             "passed": false,
-            "basis": "Wrangler Pages deployment verification returned a failing exit status",
-            "project_name": project_name,
-            "branch": branch,
-            "commit_hash": commit_hash,
-            "exit_status": output.status.code(),
-            "stdout": stdout,
-            "stderr": stderr,
+            "basis": "the Pages direct-upload plan omitted its pre-bound deployment identity set",
+        });
+    };
+    let Some(deployment_id) = receipt
+        .pointer("/structured_output/deployment_id")
+        .and_then(Value::as_str)
+        .filter(|id| Uuid::parse_str(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == *id))
+        .map(str::to_owned)
+    else {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler did not return one canonical deployment ID in its governed structured output",
+        });
+    };
+    let structured = receipt.get("structured_output").unwrap_or(&Value::Null);
+    if !pages_deployment::structured_output_matches(structured, project_name, branch, commit_hash) {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler returned a deployment ID with a different project, environment, branch, or commit identity",
+            "deployment_id": deployment_id,
+            "structured_output": structured,
         });
     }
-    let deployments = match serde_json::from_str::<Value>(stdout.trim()) {
-        Ok(deployments) => deployments,
+    if prior_ids.contains(&deployment_id) {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler returned a deployment ID that existed before the upload boundary",
+            "deployment_id": deployment_id,
+        });
+    }
+    let Some(list) = catalog.get(pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID) else {
+        return json!({
+            "passed": false,
+            "basis": "the Pages deployment collection read is absent from the bound catalog",
+        });
+    };
+    let Some(details) = catalog.get(pages_deployment::DEPLOYMENT_READ_CAPABILITY_ID) else {
+        return json!({
+            "passed": false,
+            "basis": "the exact Pages deployment detail read is absent from the bound catalog",
+        });
+    };
+    if list.method != "GET"
+        || list.path != pages_deployment::DEPLOYMENT_LIST_PATH
+        || list.mutating
+        || details.method != "GET"
+        || details.path != pages_deployment::DEPLOYMENT_DETAIL_PATH
+        || details.mutating
+    {
+        return json!({
+            "passed": false,
+            "basis": "the Pages deployment verification read contracts drifted from their exact collection/detail identities",
+        });
+    }
+    let client = match http_client() {
+        Ok(client) => client,
         Err(error) => {
-            return json!({
-                "passed": false,
-                "basis": format!("Wrangler Pages deployment output was not JSON: {error}"),
-                "project_name": project_name,
-                "branch": branch,
-                "commit_hash": commit_hash,
-                "stdout": stdout,
-                "stderr": stderr,
-            });
+            return json!({"passed":false,"basis":format!("Pages verifier could not construct its HTTP client: {error}")});
         }
     };
-    let passed =
-        wrangler_pages_deployment_has_commit(&deployments, project_name, branch, commit_hash);
-    json!({
-        "passed": passed,
-        "basis": if passed {
-            format!("Wrangler Pages production deployment for {project_name} reports successful commit {commit_hash} on branch {branch}")
-        } else {
-            format!("Wrangler Pages production deployments for {project_name} do not report successful commit {commit_hash} on branch {branch}")
-        },
-        "project_name": project_name,
-        "branch": branch,
-        "commit_hash": commit_hash,
-        "readback": deployments,
-        "stderr": stderr,
-    })
-}
-
-fn wrangler_pages_deployment_has_commit(
-    value: &Value,
-    expected_project_name: &str,
-    expected_branch: &str,
-    expected_commit_hash: &str,
-) -> bool {
-    match value {
-        Value::Array(items) => items.iter().any(|item| {
-            wrangler_pages_deployment_has_commit(
-                item,
-                expected_project_name,
-                expected_branch,
-                expected_commit_hash,
-            )
-        }),
-        Value::Object(fields) => {
-            let matches = fields.get("project_name").and_then(Value::as_str)
-                == Some(expected_project_name)
-                && fields.get("environment").and_then(Value::as_str) == Some("production")
-                && value
-                    .pointer("/deployment_trigger/metadata/branch")
-                    .and_then(Value::as_str)
-                    == Some(expected_branch)
-                && value
-                    .pointer("/deployment_trigger/metadata/commit_hash")
-                    .and_then(Value::as_str)
-                    == Some(expected_commit_hash)
-                && value
-                    .pointer("/latest_stage/status")
-                    .and_then(Value::as_str)
-                    == Some("success");
-            matches
-                || fields.values().any(|nested| {
-                    wrangler_pages_deployment_has_commit(
-                        nested,
-                        expected_project_name,
-                        expected_branch,
-                        expected_commit_hash,
-                    )
-                })
+    let executor = match Executor::new(client, API_BASE_URL) {
+        Ok(executor) => executor,
+        Err(error) => {
+            return json!({"passed":false,"basis":format!("Pages verifier could not initialize: {error}")});
         }
-        _ => false,
+    };
+    let mut collection_readback = Value::Null;
+    let mut discovered = false;
+    for attempt in 0..MAX_DISCOVERY_ATTEMPTS {
+        let list_response = match executor
+            .execute_read(
+                list,
+                &CallInput {
+                    selectors: json!({
+                        "account_id": plan.account_id,
+                        "project_name": project_name,
+                    }),
+                    query: json!({}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await
+        {
+            Ok(response) if response.success && response.status == 200 => response,
+            Ok(response) => {
+                return json!({
+                    "passed": false,
+                    "basis": format!("Pages deployment collection read returned HTTP {} after the upload boundary", response.status),
+                    "deployment_id": deployment_id,
+                    "readback": response,
+                });
+            }
+            Err(error) => {
+                return json!({
+                    "passed": false,
+                    "basis": format!("Pages deployment collection read failed after the upload boundary: {error}"),
+                    "deployment_id": deployment_id,
+                });
+            }
+        };
+        discovered = pages_deployment::deployment_matches_returned_id(
+            &list_response.result,
+            &deployment_id,
+            project_name,
+            branch,
+            commit_hash,
+        );
+        collection_readback = json!(list_response);
+        if discovered {
+            break;
+        }
+        if attempt + 1 < MAX_DISCOVERY_ATTEMPTS {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
+    if !discovered {
+        return json!({
+            "passed": false,
+            "basis": format!("the provider-returned Pages deployment {deployment_id} was not visible with the exact reviewed project, branch, and commit after {MAX_DISCOVERY_ATTEMPTS} bounded attempts"),
+            "deployment_id": deployment_id,
+            "readback": collection_readback,
+        });
+    }
+    for attempt in 0..MAX_POLL_ATTEMPTS {
+        let readback = match executor
+            .execute_read(
+                details,
+                &CallInput {
+                    selectors: json!({
+                        "account_id": plan.account_id,
+                        "project_name": project_name,
+                        "deployment_id": deployment_id,
+                    }),
+                    query: json!({}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "passed": false,
+                    "basis": format!("exact Pages deployment read failed after the upload boundary: {error}"),
+                    "deployment_id": deployment_id,
+                });
+            }
+        };
+        let identity_matches =
+            readback.result.get("id").and_then(Value::as_str) == Some(deployment_id.as_str());
+        let project_matches =
+            readback.result.get("project_name").and_then(Value::as_str) == Some(project_name);
+        let production =
+            readback.result.get("environment").and_then(Value::as_str) == Some("production");
+        let observed_branch = readback
+            .result
+            .pointer("/deployment_trigger/metadata/branch")
+            .and_then(Value::as_str);
+        let observed_commit = readback
+            .result
+            .pointer("/deployment_trigger/metadata/commit_hash")
+            .and_then(Value::as_str);
+        let stage = readback
+            .result
+            .pointer("/latest_stage/status")
+            .and_then(Value::as_str);
+        let invariant_matches = readback.status == 200
+            && readback.success
+            && identity_matches
+            && project_matches
+            && production
+            && observed_branch == Some(branch)
+            && observed_commit == Some(commit_hash);
+        if invariant_matches && stage == Some("success") {
+            return json!({
+                "passed": true,
+                "basis": format!("the exact new Pages deployment {deployment_id} for project {project_name} reached terminal production success"),
+                "deployment_id": deployment_id,
+                "readback": readback,
+            });
+        }
+        let remains_active = invariant_matches && matches!(stage, Some("active" | "idle"));
+        if remains_active && attempt + 1 < MAX_POLL_ATTEMPTS {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        return json!({
+            "passed": false,
+            "basis": if remains_active {
+                format!("the exact new Pages deployment {deployment_id} remained {stage:?} after {MAX_POLL_ATTEMPTS} bounded attempts")
+            } else {
+                format!("the exact new Pages deployment was not proven (HTTP {}, success={}, identity={}, project={}, production={}, branch={observed_branch:?}, commit={observed_commit:?}, stage={stage:?})", readback.status, readback.success, identity_matches, project_matches, production)
+            },
+            "deployment_id": deployment_id,
+            "readback": readback,
+        });
+    }
+    json!({
+        "passed": false,
+        "basis": "the Pages deployment verifier exhausted its bounded poll loop without a terminal receipt",
+        "deployment_id": deployment_id,
+    })
 }
 
 /// Wrangler discovers dotenv credentials relative to its process working
@@ -7183,12 +7317,18 @@ fn execute_governed_ui_plan(
     Ok(envelope)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the subprocess boundary keeps governed environment, structured output, timeout, and redaction in one receipt-producing transaction"
+)]
 async fn run_delegated_cli(
     capability: &CapabilityV1,
     input: &CallInput,
     credential: &AuthCredential,
     account_id: Option<&str>,
     cache_dir: &Path,
+    program_override: Option<&Path>,
+    interpreter_override: Option<&Path>,
 ) -> Result<Value> {
     let mut path_parts = capability.path.split_whitespace();
     let program = path_parts
@@ -7199,13 +7339,22 @@ async fn run_delegated_cli(
             "delegated program `{program}` is not governed by cfctl"
         )));
     }
-    let mut command = ProcessCommand::new(program);
+    let selected_program = program_override.unwrap_or_else(|| Path::new(program));
+    let mut command = if let Some(interpreter) = interpreter_override {
+        let mut command = ProcessCommand::new(interpreter);
+        command.arg(selected_program);
+        command
+    } else {
+        ProcessCommand::new(selected_program)
+    };
     command.args(path_parts);
     let isolated_wrangler_directory =
-        if worker_deployment::requires_configless_working_directory(capability, input) {
+        if worker_deployment::requires_configless_working_directory(capability, input)
+            || pages_deployment::binds_artifact(capability)
+        {
             Some(
                 tempfile::Builder::new()
-                    .prefix("configless-worker-promotion-")
+                    .prefix("configless-governed-wrangler-")
                     .tempdir()
                     .map_err(|source| cli_io(cache_dir, source))?,
             )
@@ -7222,8 +7371,20 @@ async fn run_delegated_cli(
     } else if let Some(directory) = &isolated_wrangler_directory {
         command.current_dir(directory.path());
     }
+    let wrangler_output_path = if pages_deployment::binds_artifact(capability) {
+        isolated_wrangler_directory
+            .as_ref()
+            .map(|directory| directory.path().join("wrangler-output.jsonl"))
+    } else {
+        None
+    };
     append_cli_input(&mut command, &input.selectors)?;
     append_cli_input(&mut command, &input.query)?;
+    if pages_deployment::binds_artifact(capability) {
+        // cfctl already produced and hash-bound the closed worker bundle. A
+        // second Wrangler bundle would reopen ambient project resolution.
+        command.arg("--no-bundle");
+    }
     if input.body.is_some() {
         return Err(CliError::Input(
             "delegated CLI request bodies need a capability-specific native adapter".to_owned(),
@@ -7240,6 +7401,9 @@ async fn run_delegated_cli(
         .stderr(Stdio::piped());
     for (name, value) in governed_cli_workspace_env(program, account_id, cache_dir) {
         command.env(name, value);
+    }
+    if let Some(path) = &wrangler_output_path {
+        command.env("WRANGLER_OUTPUT_FILE_PATH", path);
     }
     match credential {
         AuthCredential::Bearer { token } => {
@@ -7258,13 +7422,24 @@ async fn run_delegated_cli(
         .map_err(|source| cli_io(Path::new(program), source))?;
     let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
     let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    let structured_output = if let Some(path) = &wrangler_output_path {
+        fs::read_to_string(path)
+            .map_err(|source| cli_io(path, source))
+            .and_then(|value| pages_deployment::parse_wrangler_output(&value))
+    } else {
+        Ok(Value::Null)
+    };
+    let success = output.status.success() && structured_output.is_ok();
+    let structured_output_error = structured_output.as_ref().err().map(ToString::to_string);
     Ok(json!({
         "adapter": "delegated_cli",
         "command": capability.path,
         "exit_status": output.status.code(),
-        "success": output.status.success(),
+        "success": success,
         "stdout": stdout,
         "stderr": stderr,
+        "structured_output": structured_output.unwrap_or(Value::Null),
+        "structured_output_error": structured_output_error,
         "credential_environment": match credential {
             AuthCredential::Bearer { .. } => ["CLOUDFLARE_API_TOKEN"].as_slice(),
             AuthCredential::GlobalKey { .. } => ["CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"].as_slice(),
@@ -11692,6 +11867,7 @@ async fn read_live_zone_account(
 
 fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
     should_bind_pages_project_absence(capability)
+        || pages_deployment::binds_project_state(capability)
         || worker_deployment::target(adapter_targets).is_some()
         || should_resolve_entitlement_probe(capability)
         || should_resolve_zone_entitlement(capability)
@@ -11884,6 +12060,158 @@ async fn prepare_pages_project_absence_precondition(
     read_live_pages_project_absence(store, catalog, capability, input, account_id, credential)
         .await
         .map(Some)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Pages admission binds exact project mode and the complete pre-write deployment identity set in one live receipt"
+)]
+async fn read_live_pages_deployment_project_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !pages_deployment::binds_project_state(capability) {
+        return Err(CliError::Input(
+            "Pages deployment project-state read was requested for an unrelated capability"
+                .to_owned(),
+        ));
+    }
+    let project_name = pages_deployment::project_name(capability, input)?;
+    let project_read = catalog
+        .get(pages_deployment::PROJECT_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(pages_deployment::PROJECT_READ_CAPABILITY_ID))?;
+    if project_read.method != "GET"
+        || project_read.path != pages_deployment::PROJECT_DETAIL_PATH
+        || project_read.mutating
+        || !matches!(
+            project_read.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "Pages deployment project-state source drifted from the exact project read".to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let project = executor
+        .execute_read(
+            project_read,
+            &CallInput {
+                selectors: json!({
+                    "account_id": account_id,
+                    "project_name": project_name,
+                }),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let expected_branch = pages_deployment::binds_artifact(capability)
+        .then(|| input.query.get("branch").and_then(Value::as_str))
+        .flatten();
+    let mut receipt = pages_deployment::apply_project_response(
+        capability,
+        account_id,
+        project_name,
+        expected_branch,
+        &project,
+    )?;
+    if pages_deployment::binds_artifact(capability) {
+        let list = catalog
+            .get(pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID)
+            .ok_or_else(|| capability_missing(pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID))?;
+        if list.method != "GET"
+            || list.path != pages_deployment::DEPLOYMENT_LIST_PATH
+            || list.mutating
+            || !matches!(
+                list.adapter_status,
+                AdapterStatus::Native | AdapterStatus::DynamicApi
+            )
+        {
+            return Err(CliError::Input(
+                "Pages deployment list source drifted from the exact project collection read"
+                    .to_owned(),
+            ));
+        }
+        let deployments = executor
+            .execute_read(
+                list,
+                &CallInput {
+                    selectors: json!({
+                        "account_id": account_id,
+                        "project_name": project_name,
+                    }),
+                    query: json!({}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await?;
+        if !deployments.success || deployments.status != 200 {
+            return Err(CliError::Input(format!(
+                "Pages deployment identity admission read returned HTTP {}; the deployment boundary was not crossed",
+                deployments.status
+            )));
+        }
+        let branch = expected_branch.ok_or_else(|| {
+            CliError::Input("Pages direct-upload plan omitted its branch identity".to_owned())
+        })?;
+        let commit_hash = input
+            .query
+            .get("commit_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("Pages direct-upload plan omitted its commit identity".to_owned())
+            })?;
+        let prior_ids = pages_deployment::deployment_ids(&deployments.result);
+        let prior_matches = pages_deployment::matching_deployment_ids(
+            &deployments.result,
+            &BTreeSet::new(),
+            project_name,
+            branch,
+            commit_hash,
+        );
+        if !prior_matches.is_empty() {
+            return Err(CliError::Input(
+                "Pages already contains a deployment with the reviewed project, branch, and commit identity; replay is blocked before planning"
+                    .to_owned(),
+            ));
+        }
+        receipt["prior_deployment_ids"] = serde_json::to_value(prior_ids)?;
+        receipt["prior_exact_identity_count"] = json!(0);
+        receipt["deployment_list_source_capability_id"] =
+            json!(pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID);
+    }
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+async fn prepare_pages_deployment_project_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !pages_deployment::binds_project_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("Pages deployment project-state credential was not resolved".to_owned())
+    })?;
+    read_live_pages_deployment_project_state(
+        store, catalog, capability, input, account_id, credential,
+    )
+    .await
+    .map(Some)
 }
 
 async fn prepare_global_warp_override_state_precondition(
@@ -12563,6 +12891,10 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        pages_deployment_project_state: prepare_pages_deployment_project_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
         r2_parent_token: None,
         global_warp_override_state: prepare_global_warp_override_state_precondition(
             store, catalog, capability, input, account_id, credential,
@@ -12657,6 +12989,7 @@ struct LivePlanPreconditions {
     entitlement: Option<(Value, EvidenceV1)>,
     zone_account: Option<(Value, EvidenceV1)>,
     pages_project_absence: Option<(Value, EvidenceV1)>,
+    pages_deployment_project_state: Option<(Value, EvidenceV1)>,
     r2_parent_token: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
@@ -12687,6 +13020,10 @@ fn plan_targets(
     });
     if let Some((receipt, _)) = &live_preconditions.pages_project_absence {
         targets["live_preconditions"][PAGES_PROJECT_ABSENCE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.pages_deployment_project_state {
+        targets["live_preconditions"][pages_deployment::PROJECT_STATE_PRECONDITION] =
+            receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.global_warp_override_state {
         targets["live_preconditions"]["global_warp_override_state"] = receipt.clone();
@@ -12749,6 +13086,10 @@ fn bind_live_plan_preconditions(
         (
             PAGES_PROJECT_ABSENCE_PRECONDITION,
             &live_preconditions.pages_project_absence,
+        ),
+        (
+            pages_deployment::PROJECT_STATE_PRECONDITION,
+            &live_preconditions.pages_deployment_project_state,
         ),
         (
             "global_warp_override_state",
@@ -14294,24 +14635,7 @@ fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Re
     if worker_deployment::binds_artifact(capability) {
         return worker_deployment::artifact_paths(capability, input);
     }
-    if capability.id != "wrangler.pages-deploy" {
-        return Ok(Vec::new());
-    }
-    let raw = input
-        .query
-        .get("argument")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("Pages deployment requires an artifact directory".to_owned())
-        })?;
-    let path = fs::canonicalize(raw).map_err(|source| cli_io(Path::new(raw), source))?;
-    if !path.is_dir() {
-        return Err(CliError::Input(format!(
-            "Pages deployment artifact `{}` is not a directory",
-            path.display()
-        )));
-    }
-    Ok(vec![path])
+    pages_deployment::artifact_paths(capability, input)
 }
 
 fn repository_owning_path<'a>(
@@ -14812,6 +15136,8 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         None,
     )
     .await?;
+    let graph = discover_registered(store)?;
+    pages_deployment::validate_bound_plan(&graph, &plan, &execution_input)?;
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
@@ -14897,6 +15223,8 @@ async fn run_plan_under_standing_authority(
         Some(&authority_snapshot),
     )
     .await?;
+    let graph = discover_registered(store)?;
+    pages_deployment::validate_bound_plan(&graph, &plan, &execution_input)?;
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     authorize_standing_execution(&authority_snapshot, &plan, &execution_input)?;
     let standing_evidence =
@@ -15246,6 +15574,7 @@ struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
     pages_project_absence: Option<EvidenceV1>,
+    pages_deployment_project_state: Option<EvidenceV1>,
     permission_inventory: Option<EvidenceV1>,
     global_warp_override_state: Option<EvidenceV1>,
     d1_read_replication_state: Option<EvidenceV1>,
@@ -15282,6 +15611,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         pages_project_absence: validate_live_pages_project_absence_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        pages_deployment_project_state: validate_live_pages_deployment_project_state_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -15376,7 +15709,8 @@ async fn execute_consumed_plan(
     }
     if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
         let mut result =
-            execute_delegated_plan(store, plan, execution_input, credential, secrets).await;
+            execute_delegated_plan(store, catalog, plan, execution_input, credential, secrets)
+                .await;
         if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
         {
             plan.status = PlanStatus::RectificationRequired;
@@ -15430,6 +15764,7 @@ fn prepend_live_precondition_evidence(
 ) {
     for item in [
         evidence.pages_project_absence,
+        evidence.pages_deployment_project_state,
         evidence.r2_parent_token,
         evidence.oauth_client_secret_state,
         evidence.oauth_client_update_state,
@@ -15733,6 +16068,95 @@ async fn validate_live_pages_project_absence_precondition(
     if hash_value(&receipt)? != expected_hash {
         return Err(CliError::Input(
             "live Pages project target state drifted after planning; the creation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn required_pages_deployment_project_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !pages_deployment::binds_project_state(&plan.capability) {
+        return Ok(None);
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(pages_deployment::PROJECT_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages deployment plan predates exact project-mode admission; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer(&format!(
+            "/live_preconditions/{}",
+            pages_deployment::PROJECT_STATE_PRECONDITION
+        ))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages deployment plan omitted its hash-bound project-mode receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let project_name = pages_deployment::project_name(&plan.capability, &input)?;
+    let expected_mode = if pages_deployment::binds_artifact(&plan.capability) {
+        "direct_upload"
+    } else {
+        "git_integrated"
+    };
+    if receipt.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || receipt.get("source_capability_id").and_then(Value::as_str)
+            != Some(pages_deployment::PROJECT_READ_CAPABILITY_ID)
+        || receipt.get("target_capability_id").and_then(Value::as_str)
+            != Some(plan.capability.id.as_str())
+        || receipt.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str())
+        || receipt.get("project_name").and_then(Value::as_str) != Some(project_name)
+        || receipt.get("source_mode").and_then(Value::as_str) != Some(expected_mode)
+        || (pages_deployment::binds_artifact(&plan.capability)
+            && receipt
+                .get("prior_exact_identity_count")
+                .and_then(Value::as_u64)
+                != Some(0))
+    {
+        return Err(CliError::Input(
+            "Pages deployment project-mode receipt has an invalid identity or replay shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "Pages deployment project-mode receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_pages_deployment_project_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_pages_deployment_project_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_pages_deployment_project_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Pages project mode or deployment identity set drifted after planning; the provider boundary was not crossed and a new plan is required"
                 .to_owned(),
         ));
     }
@@ -26207,6 +26631,9 @@ fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> 
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;
     r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let graph = discover_registered(store)?;
+    pages_deployment::validate_bound_plan(&graph, plan, &input)?;
     let local_artifact_paths = plan
         .precondition_hashes
         .keys()
@@ -26257,6 +26684,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | "entitlement"
             | "zone_account"
             | PAGES_PROJECT_ABSENCE_PRECONDITION
+            | pages_deployment::PROJECT_STATE_PRECONDITION
             | "global_warp_override_state"
             | D1_READ_REPLICATION_PRECONDITION
             | D1_EMPTY_DATABASE_PRECONDITION
@@ -28450,15 +28878,16 @@ mod tests {
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        persist_workspace_d1_rectification_result, plan_impact, plan_requires_live_credential,
-        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
-        preflight_standing_authority, prepare_r2_temporary_credentials_input,
-        prepare_security_action_input, prepare_wrangler_deployment_status_command,
-        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
-        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
-        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
-        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
+        persist_workspace_d1_rectification_result, plan_impact, plan_local_artifact_paths,
+        plan_requires_live_credential, plan_state_next_step, plan_status_label,
+        preflight_call_input, preflight_secret_sink, preflight_standing_authority,
+        prepare_r2_temporary_credentials_input, prepare_security_action_input,
+        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
+        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
+        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
+        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
+        repair_keychain_access_with_warning, request_body_contains_secret,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -28493,9 +28922,8 @@ mod tests {
         workspace_d1_migration_rectification_eligible, workspace_operational_proof_posture,
         workspace_precondition_hashes_for_scope, workspace_resource_keys,
         wrangler_config_directory, wrangler_deploy_version_id,
-        wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
-        wrangler_version_readback_matches, wrangler_versions_deploy_version_id,
-        wrangler_worker_version_id, zone_target,
+        wrangler_status_has_promoted_version, wrangler_version_readback_matches,
+        wrangler_versions_deploy_version_id, wrangler_worker_version_id, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::telemetry_product::record_operational_proof;
@@ -35330,49 +35758,119 @@ mod tests {
     }
 
     #[test]
-    fn wrangler_pages_readback_binds_project_branch_commit_and_success() {
-        let deployment = json!([{
-            "project_name": "mlxread-web",
-            "environment": "production",
-            "deployment_trigger": {"metadata": {
-                "branch": "main",
-                "commit_hash": "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
-            }},
-            "latest_stage": {"status": "success"}
-        }]);
-        assert!(wrangler_pages_deployment_has_commit(
-            &deployment,
-            "mlxread-web",
-            "main",
-            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
-        ));
-        assert!(!wrangler_pages_deployment_has_commit(
-            &deployment,
-            "other-project",
-            "main",
-            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
-        ));
-        assert!(!wrangler_pages_deployment_has_commit(
-            &deployment,
-            "mlxread-web",
-            "preview",
-            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
-        ));
-        let failed = json!([{
-            "project_name": "mlxread-web",
-            "environment": "production",
-            "deployment_trigger": {"metadata": {
-                "branch": "main",
-                "commit_hash": "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
-            }},
-            "latest_stage": {"status": "failure"}
-        }]);
-        assert!(!wrangler_pages_deployment_has_commit(
-            &failed,
-            "mlxread-web",
-            "main",
-            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
-        ));
+    fn wrangler_pages_artifact_admission_rejects_empty_and_symlinked_roots() {
+        let mut capability = CapabilityV1::new(
+            "wrangler.pages-deploy",
+            "deploy Pages artifact",
+            "POST",
+            "wrangler pages deploy",
+        );
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let root = tempfile::tempdir().expect("artifact parent");
+        let artifact = root.path().join("site");
+        std::fs::create_dir(&artifact).expect("empty artifact");
+        let input = CallInput {
+            query: json!({"argument": artifact}),
+            ..CallInput::default()
+        };
+        assert!(
+            plan_local_artifact_paths(&capability, &input).is_err(),
+            "an empty Pages root cannot construct the required provider manifest"
+        );
+
+        std::fs::write(artifact.join("index.html"), b"ok").expect("artifact file");
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("site-alias");
+            std::os::unix::fs::symlink(&artifact, &alias).expect("artifact root symlink");
+            let input = CallInput {
+                query: json!({"argument": alias}),
+                ..CallInput::default()
+            };
+            assert!(
+                plan_local_artifact_paths(&capability, &input).is_err(),
+                "canonicalization must not erase Pages artifact symlink provenance"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrangler_pages_boundary_requires_governed_structured_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("boundary root");
+        let program = root.path().join("wrangler");
+        let id = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"pages-deploy\",\"version\":1,\"pages_project\":\"aos-web\",\"deployment_id\":\"{id}\",\"url\":\"https://example.pages.dev\"}}' '{{\"type\":\"pages-deploy-detailed\",\"version\":1,\"pages_project\":\"aos-web\",\"deployment_id\":\"{id}\",\"url\":\"https://example.pages.dev\",\"environment\":\"production\",\"production_branch\":\"main\",\"deployment_trigger\":{{\"metadata\":{{\"commit_hash\":\"{}\"}}}}}}' > \"$WRANGLER_OUTPUT_FILE_PATH\"\n",
+                "a".repeat(40)
+            ),
+        )
+        .expect("fake Wrangler");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("fake Wrangler metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).expect("fake Wrangler mode");
+        let cache = root.path().join("cache");
+        std::fs::create_dir(&cache).expect("cache");
+        let mut capability = CapabilityV1::new(
+            "wrangler.pages-deploy",
+            "deploy Pages artifact",
+            "POST",
+            "wrangler pages deploy",
+        );
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let receipt = super::run_delegated_cli(
+            &capability,
+            &CallInput {
+                selectors: json!({}),
+                query: json!({"argument": root.path(), "project_name":"aos-web", "branch":"main", "commit_hash":"a".repeat(40)}),
+                ..CallInput::default()
+            },
+            &cfctl_auth::AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            Some("fixture-account"),
+            &cache,
+            Some(&program),
+            Some(Path::new("/bin/sh")),
+        )
+        .await
+        .expect("governed boundary receipt");
+        assert_eq!(receipt["success"], true);
+        assert_eq!(receipt["structured_output"]["deployment_id"], id);
+
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("missing-output Wrangler");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("missing-output metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).expect("missing-output mode");
+        let receipt = super::run_delegated_cli(
+            &capability,
+            &CallInput {
+                selectors: json!({}),
+                query: json!({"argument": root.path()}),
+                ..CallInput::default()
+            },
+            &cfctl_auth::AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            Some("fixture-account"),
+            &cache,
+            Some(&program),
+            Some(Path::new("/bin/sh")),
+        )
+        .await
+        .expect("missing output remains a truthful receipt");
+        assert_eq!(receipt["success"], false);
+        assert!(receipt["structured_output_error"].is_string());
     }
 
     #[test]
@@ -35818,6 +36316,7 @@ mod tests {
             entitlement: None,
             zone_account: None,
             pages_project_absence: None,
+            pages_deployment_project_state: None,
             r2_parent_token: None,
             global_warp_override_state: None,
             d1_read_replication_state: None,
@@ -37047,6 +37546,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -37435,6 +37935,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -38404,6 +38905,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
@@ -38497,6 +38999,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
@@ -38595,6 +39098,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -38689,6 +39193,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -38777,6 +39282,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -38881,6 +39387,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 pages_project_absence: None,
+                pages_deployment_project_state: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
