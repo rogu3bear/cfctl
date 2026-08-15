@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -319,72 +319,90 @@ fn package_metadata(root: &Path) -> Result<Value, CliError> {
     })
 }
 
-fn esbuild_closure_roots(wrangler_root: &Path) -> Result<Vec<(String, PathBuf)>, CliError> {
-    let wrangler = package_metadata(wrangler_root)?;
-    let expected_version = wrangler
-        .pointer("/dependencies/esbuild")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+fn common_node_modules(package_root: &Path) -> Result<&Path, CliError> {
+    package_root
+        .ancestors()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("node_modules"))
         .ok_or_else(|| {
-            CliError::Input(
-                "Wrangler producer does not declare its required esbuild version".to_owned(),
-            )
-        })?;
-    let node_modules = wrangler_root
-        .parent()
-        .ok_or_else(|| CliError::Input("Wrangler package has no node_modules parent".to_owned()))?;
-    let esbuild_root = node_modules.join("esbuild");
-    let esbuild = package_metadata(&esbuild_root)?;
-    if esbuild.get("name").and_then(Value::as_str) != Some("esbuild")
-        || esbuild.get("version").and_then(Value::as_str) != Some(expected_version)
-    {
-        return Err(CliError::Input(format!(
-            "Wrangler requires esbuild {expected_version}, but the resolved package identity differs"
-        )));
+            CliError::Input("Wrangler package is not inside one node_modules closure".to_owned())
+        })
+}
+
+fn resolve_dependency_root(
+    package_root: &Path,
+    node_modules: &Path,
+    name: &str,
+) -> Option<PathBuf> {
+    let nested = package_root.join("node_modules").join(name);
+    if nested.join("package.json").is_file() {
+        return Some(nested);
     }
-    let platform_parent = node_modules.join("@esbuild");
-    let mut platforms = fs::read_dir(&platform_parent)
-        .map_err(|source| CliError::Io {
-            path: platform_parent.display().to_string(),
-            source,
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| CliError::Io {
-            path: platform_parent.display().to_string(),
+    let shared = node_modules.join(name);
+    shared.join("package.json").is_file().then_some(shared)
+}
+
+fn declared_dependencies(metadata: &Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|dependencies| dependencies.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn producer_package_roots(wrangler_root: &Path) -> Result<Vec<(String, PathBuf)>, CliError> {
+    let node_modules = common_node_modules(wrangler_root)?;
+    let mut pending = vec![wrangler_root.to_path_buf()];
+    let mut roots = BTreeMap::<PathBuf, String>::new();
+    while let Some(root) = pending.pop() {
+        let canonical = fs::canonicalize(&root).map_err(|source| CliError::Io {
+            path: root.display().to_string(),
             source,
         })?;
-    platforms.sort_by_key(std::fs::DirEntry::file_name);
-    let mut selected = Vec::new();
-    for entry in platforms {
-        let path = entry.path();
-        if !entry
-            .file_type()
-            .map_err(|source| CliError::Io {
-                path: path.display().to_string(),
-                source,
-            })?
-            .is_dir()
-        {
+        if !canonical.starts_with(node_modules) {
+            return Err(CliError::Input(format!(
+                "Wrangler dependency `{}` escaped its node_modules closure",
+                canonical.display()
+            )));
+        }
+        if roots.contains_key(&canonical) {
             continue;
         }
-        let metadata = package_metadata(&path)?;
-        let name = metadata.get("name").and_then(Value::as_str).unwrap_or("");
-        if name.starts_with("@esbuild/")
-            && metadata.get("version").and_then(Value::as_str) == Some(expected_version)
-        {
-            selected.push((name.to_owned(), path));
+        let metadata = package_metadata(&canonical)?;
+        let name = metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "Wrangler dependency `{}` has no package name",
+                    canonical.display()
+                ))
+            })?
+            .to_owned();
+        let required = declared_dependencies(&metadata, "dependencies");
+        let optional = declared_dependencies(&metadata, "optionalDependencies");
+        roots.insert(canonical.clone(), name);
+        for dependency in required {
+            let resolved = resolve_dependency_root(&canonical, node_modules, &dependency)
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "Wrangler producer dependency `{dependency}` is not installed"
+                    ))
+                })?;
+            pending.push(resolved);
+        }
+        for dependency in optional {
+            if let Some(resolved) = resolve_dependency_root(&canonical, node_modules, &dependency) {
+                pending.push(resolved);
+            }
         }
     }
-    let [(platform_name, platform_root)] = selected.as_slice() else {
-        return Err(CliError::Input(format!(
-            "Wrangler producer requires exactly one installed esbuild {expected_version} platform package"
-        )));
-    };
-    Ok(vec![
-        ("wrangler".to_owned(), wrangler_root.to_path_buf()),
-        ("esbuild".to_owned(), esbuild_root),
-        (platform_name.clone(), platform_root.clone()),
-    ])
+    let mut roots = roots
+        .into_iter()
+        .map(|(root, name)| (name, root))
+        .collect::<Vec<_>>();
+    roots.sort();
+    Ok(roots)
 }
 
 fn producer_closure(executable: &Path) -> Result<Value, CliError> {
@@ -393,7 +411,7 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
         .parent()
         .ok_or_else(|| CliError::Input("Wrangler executable has no package parent".to_owned()))?;
     let roots = if let Some(root) = &package_root {
-        esbuild_closure_roots(root)?
+        producer_package_roots(root)?
     } else {
         vec![("executable".to_owned(), executable_parent.to_path_buf())]
     };
@@ -465,7 +483,7 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
         ))
     })?;
     Ok(json!({
-        "kind": if package_root.is_some() { "wrangler_with_esbuild" } else { "single_file" },
+        "kind": if package_root.is_some() { "node_dependency_graph" } else { "single_file" },
         "roots": roots.iter().map(|(component, root)| json!({"component": component, "root": root})).collect::<Vec<_>>(),
         "file_count": files.len(),
         "total_bytes": total_bytes,
@@ -1257,18 +1275,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn producer_identity_rejects_unchanged_launcher_with_drifted_external_builder() {
+    fn producer_identity_rejects_unchanged_launcher_with_drifted_asset_hasher() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().expect("producer root");
-        let package = root.path().join("wrangler");
+        let node_modules = root.path().join("node_modules");
+        let package = node_modules.join("wrangler");
         let bin = package.join("bin");
         let distribution = package.join("wrangler-dist");
         fs::create_dir_all(&bin).expect("bin");
         fs::create_dir_all(&distribution).expect("distribution");
         fs::write(
             package.join("package.json"),
-            r#"{"name":"wrangler","version":"4.107.0","dependencies":{"esbuild":"0.28.1"}}"#,
+            r#"{"name":"wrangler","version":"4.107.0","dependencies":{"blake3-wasm":"2.1.5","esbuild":"0.28.1"}}"#,
         )
         .expect("package metadata");
         let executable = bin.join("wrangler.js");
@@ -1278,16 +1297,29 @@ mod tests {
             .permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).expect("launcher mode");
-        fs::write(distribution.join("cli.js"), "require('esbuild')").expect("payload");
-        let esbuild = root.path().join("esbuild");
+        fs::write(
+            distribution.join("cli.js"),
+            "require('blake3-wasm'); require('esbuild')",
+        )
+        .expect("payload");
+        let blake3 = node_modules.join("blake3-wasm");
+        fs::create_dir_all(blake3.join("dist")).expect("hasher package");
+        fs::write(
+            blake3.join("package.json"),
+            r#"{"name":"blake3-wasm","version":"2.1.5"}"#,
+        )
+        .expect("hasher metadata");
+        let hasher = blake3.join("dist/index.js");
+        fs::write(&hasher, "hash-v1").expect("asset hasher");
+        let esbuild = node_modules.join("esbuild");
         fs::create_dir_all(esbuild.join("lib")).expect("esbuild package");
         fs::write(
             esbuild.join("package.json"),
-            r#"{"name":"esbuild","version":"0.28.1"}"#,
+            r#"{"name":"esbuild","version":"0.28.1","optionalDependencies":{"@esbuild/darwin-arm64":"0.28.1"}}"#,
         )
         .expect("esbuild metadata");
         fs::write(esbuild.join("lib/main.js"), "builder-v1").expect("esbuild runtime");
-        let platform = root.path().join("@esbuild/darwin-arm64");
+        let platform = node_modules.join("@esbuild/darwin-arm64");
         fs::create_dir_all(platform.join("bin")).expect("platform package");
         fs::write(
             platform.join("package.json"),
@@ -1300,12 +1332,22 @@ mod tests {
         let mut capability = direct_upload();
         capability.source = "wrangler 4.107.0 pages deploy help".to_owned();
         let planned = wrangler_producer_at(&capability, &executable).expect("planned producer");
-        fs::write(&native, "native-v2").expect("drifted external builder");
+        let components = planned["execution_closure"]["files"]
+            .as_array()
+            .expect("closure files")
+            .iter()
+            .filter_map(|file| file.get("component").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        assert!(components.contains("wrangler"));
+        assert!(components.contains("blake3-wasm"));
+        assert!(components.contains("esbuild"));
+        assert!(components.contains("@esbuild/darwin-arm64"));
+        fs::write(&hasher, "hash-v2").expect("drifted asset hasher");
         let current = wrangler_producer_at(&capability, &executable).expect("current producer");
 
         assert_ne!(
             planned, current,
-            "the bound producer must change when an unmodified Wrangler package delegates to drifted external builder bytes"
+            "the bound producer must change when an unmodified Wrangler package delegates Pages asset hashing to drifted external bytes"
         );
         assert_eq!(planned["executable_sha256"], current["executable_sha256"]);
         assert_ne!(

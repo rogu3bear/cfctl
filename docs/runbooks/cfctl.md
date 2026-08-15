@@ -992,9 +992,10 @@ multipart-control file by normalized path, byte size, and SHA-256, rejects an
 empty tree, path ambiguity, Wrangler-ignored sources, more than 20,000 assets,
 and files above the 25 MiB provider limit. It also binds the canonical Wrangler
 launcher, its exact interpreter, and a deterministic path/size/SHA-256 manifest
-of the Wrangler package, resolved `esbuild` package, and exact installed
-platform package/native binary. This includes both `wrangler-dist/cli.js` and
-the external builder used for `_worker.js`, along with the version that
+of Wrangler's complete installed production/optional dependency graph. The
+bounded graph includes `wrangler-dist/cli.js`, the `blake3-wasm` implementation
+that determines provider asset hashes, `esbuild`, and the selected
+platform-native builder used for `_worker.js`, along with the version that
 generated the catalog carrier. A live exact-project
 read must then report `source: null` and the requested branch must equal the
 project's production branch. Existing deployments are read before planning;
