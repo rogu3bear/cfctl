@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -518,6 +519,11 @@ fn repository_owning_path<'a>(
         .max_by_key(|repository| repository.path.components().count())
 }
 
+fn is_git_metadata_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|value| value.eq_ignore_ascii_case(".git"))
+}
+
 fn validate_artifact_tree_ownership(
     graph: &WorkspaceGraph,
     repository: &Path,
@@ -532,7 +538,7 @@ fn validate_artifact_tree_ownership(
                     root.display()
                 ))
             })?;
-            if entry.file_name() == ".git" {
+            if is_git_metadata_name(entry.file_name()) {
                 if entry.path().parent() != Some(repository) {
                     return Err(CliError::Input(format!(
                         "Worker deployment artifact contains nested Git repository metadata `{}`",
@@ -569,7 +575,7 @@ fn artifact_set_sha256(repository: &Path, roots: &[PathBuf]) -> Result<String, C
                     root.display()
                 ))
             })?;
-            if entry.file_name() == ".git" {
+            if is_git_metadata_name(entry.file_name()) {
                 if entry.path().parent() != Some(repository) {
                     return Err(CliError::Input(format!(
                         "Worker deployment artifact contains nested Git repository metadata `{}`",
@@ -1180,6 +1186,11 @@ mod tests {
         )
         .expect("config");
         fs::write(root.path().join(".gitignore"), "dist/\n").expect("ignore generated artifacts");
+        let nested_git = nested.join(".git");
+        let intermediate_git = nested.join(".git-case-rename");
+        fs::rename(&nested_git, &intermediate_git).expect("stage nested Git metadata rename");
+        fs::rename(&intermediate_git, nested.join(".GIT"))
+            .expect("use a case-variant nested Git metadata marker");
         assert!(
             Command::new("git")
                 .args(["init", "--quiet", "--initial-branch=main"])
