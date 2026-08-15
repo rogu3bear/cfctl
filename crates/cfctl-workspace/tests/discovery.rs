@@ -46,6 +46,7 @@ fn exact_and_role_specific_production_wrangler_toml_are_supported() {
         "wrangler.-role.toml",
         "wrangler.role-.production.toml",
         "wrangler.unreviewed.extra.toml",
+        "Wrangler.mail-router.production.toml",
     ] {
         let invalid = repository.join(name);
         fs::write(&invalid, "name = \"invalid-worker\"\n").expect("invalid config");
@@ -65,6 +66,22 @@ fn exact_and_role_specific_production_wrangler_toml_are_supported() {
         WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).is_err(),
         "discovered nested role-specific config as deployment authority"
     );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(&nested).expect("remove nested regular config");
+        symlink(
+            repository.join("wrangler.mail-router.production.toml"),
+            &nested,
+        )
+        .expect("nested role symlink");
+        assert!(
+            load_wrangler_config(&nested).is_err(),
+            "accepted nested symlink to root role config"
+        );
+    }
 }
 
 #[test]

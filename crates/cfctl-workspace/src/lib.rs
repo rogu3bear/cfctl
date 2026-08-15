@@ -436,7 +436,8 @@ fn is_cloudflare_config(path: &Path) -> bool {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
     let lower = name.to_ascii_lowercase();
-    is_wrangler_toml_name(&lower)
+    matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml")
+        || is_role_specific_wrangler_toml_name(name)
         || matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc")
         || path
             .extension()
@@ -448,12 +449,14 @@ fn is_cloudflare_config(path: &Path) -> bool {
 }
 
 fn config_kind(path: &Path) -> &'static str {
-    let lower = path
+    let name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if is_wrangler_toml_name(&lower) {
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml")
+        || is_role_specific_wrangler_toml_name(name)
+    {
         "wrangler_toml"
     } else if matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc") {
         "wrangler_json"
@@ -489,16 +492,17 @@ fn is_wrangler_toml_name(name: &str) -> bool {
 }
 
 fn is_role_specific_wrangler_toml_name(name: &str) -> bool {
-    is_wrangler_toml_name(name) && !matches!(name, "wrangler.toml" | "wrangler.production.toml")
+    name == name.to_ascii_lowercase()
+        && is_wrangler_toml_name(name)
+        && !matches!(name, "wrangler.toml" | "wrangler.production.toml")
 }
 
 fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Result<()> {
     let name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !is_role_specific_wrangler_toml_name(&name) {
+        .unwrap_or_default();
+    if !is_role_specific_wrangler_toml_name(name) {
         return Ok(());
     }
     let parent = path.parent().ok_or_else(|| {
@@ -521,6 +525,29 @@ fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Res
 /// used by workspace discovery. Deployment planning consumes this public
 /// projection so config interpretation cannot drift from resource discovery.
 pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+    let lexical_repository = path
+        .ancestors()
+        .skip(1)
+        .find(|candidate| candidate.join(".git").exists());
+    for component in path
+        .ancestors()
+        .filter(|component| !component.as_os_str().is_empty())
+    {
+        let metadata = fs::symlink_metadata(component).map_err(|source| WorkspaceError::Io {
+            path: component.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::DiscoveryInvariant(format!(
+                "deployment configuration path `{}` contains symlink component `{}`",
+                path.display(),
+                component.display()
+            )));
+        }
+        if lexical_repository.is_none_or(|repository| component == repository) {
+            break;
+        }
+    }
     let canonical_path = path.canonicalize().map_err(|source| WorkspaceError::Io {
         path: path.display().to_string(),
         source,
