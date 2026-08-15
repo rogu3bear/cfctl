@@ -6429,6 +6429,13 @@ async fn run_delegated_plan_boundary(
     } else {
         None
     };
+    if pages_deployment::binds_artifact(&plan.capability) {
+        // Staging may be proportional to the admitted artifact. Recheck the
+        // private staged bytes first, then make the complete mutable producer
+        // closure the final check immediately before subprocess construction.
+        pages_deployment::validate_staged_artifact(adapter_targets, &delegated_input)?;
+        pages_deployment::validate_bound_producer(&plan.capability, adapter_targets)?;
+    }
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
         run_quick_tunnel(store, plan, input).await?
     } else {

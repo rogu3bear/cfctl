@@ -1000,6 +1000,41 @@ pub(super) fn bound_wrangler_interpreter(
         })
 }
 
+pub(super) fn validate_bound_producer(
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+) -> Result<(), CliError> {
+    let discovered = which::which("wrangler").map_err(|error| {
+        CliError::Input(format!(
+            "Pages direct upload requires Wrangler at the execution boundary: {error}"
+        ))
+    })?;
+    validate_bound_producer_at(capability, adapter_targets, &discovered)
+}
+
+fn validate_bound_producer_at(
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+    discovered: &Path,
+) -> Result<(), CliError> {
+    let expected = target(adapter_targets)
+        .and_then(|value| value.pointer("/provider_request/producer"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages direct-upload plan omitted its exact Wrangler producer; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let current = wrangler_producer_at(capability, discovered)?;
+    if &current != expected {
+        return Err(CliError::Input(
+            "Pages producer drifted at the execution boundary; no provider process was started and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn target(adapter_targets: &Value) -> Option<&Value> {
     adapter_targets.get("pages_deployment")
 }
@@ -1093,6 +1128,53 @@ pub(super) fn stage_bound_artifact(
     }
     input.query["argument"] = json!(staged_root);
     Ok(stage)
+}
+
+pub(super) fn validate_staged_artifact(
+    adapter_targets: &Value,
+    input: &CallInput,
+) -> Result<(), CliError> {
+    let expected = target(adapter_targets)
+        .and_then(|value| value.pointer("/provider_request/transport_manifest"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages direct-upload plan omitted its staged transport manifest; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let raw = input
+        .query
+        .get("argument")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("Pages direct upload omitted its private staged directory".to_owned())
+        })?;
+    let root = fs::canonicalize(raw).map_err(|source| CliError::Io {
+        path: raw.to_owned(),
+        source,
+    })?;
+    let metadata = fs::symlink_metadata(&root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(CliError::Input(
+            "Pages private staged artifact is not one regular directory".to_owned(),
+        ));
+    }
+    let staged = manifest(&root)?;
+    if staged["asset_count"] != expected["asset_count"]
+        || staged["entry_count"] != expected["entry_count"]
+        || staged["content_hash"] != expected["content_hash"]
+        || staged["entries"] != expected["entries"]
+    {
+        return Err(CliError::Input(
+            "Pages staged transport drifted at the execution boundary; no provider process was started"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_bound_plan(
@@ -1612,6 +1694,7 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]},"worker-support.j
             fs::read(Path::new(staged).join("worker-support.js")).expect("staged support"),
             b"export const ok = true;"
         );
+        assert_staged_transport_drift_rejected(&targets, &input, Path::new(staged));
 
         fs::write(
             &esbuild,
@@ -1632,6 +1715,18 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
                 .expect_err("metafile omission cannot admit a runtime import")
                 .to_string()
                 .contains("runtime dynamic import")
+        );
+    }
+
+    fn assert_staged_transport_drift_rejected(targets: &Value, input: &CallInput, staged: &Path) {
+        validate_staged_artifact(targets, input).expect("exact staged transport");
+        fs::write(staged.join("index.html"), b"drifted").expect("drift staged asset");
+        let error = validate_staged_artifact(targets, input)
+            .expect_err("staged drift must fail before the provider process");
+        assert!(
+            error
+                .to_string()
+                .contains("no provider process was started")
         );
     }
 
@@ -1848,6 +1943,13 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
         let mut capability = direct_upload();
         capability.source = "wrangler 4.107.0 pages deploy help".to_owned();
         let planned = wrangler_producer_at(&capability, &executable).expect("planned producer");
+        let targets = json!({
+            "pages_deployment": {
+                "provider_request": {"producer": planned.clone()}
+            }
+        });
+        validate_bound_producer_at(&capability, &targets, &executable)
+            .expect("unchanged producer at execution boundary");
         let components = planned["execution_closure"]["files"]
             .as_array()
             .expect("closure files")
@@ -1859,6 +1961,13 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
         assert!(components.contains("esbuild"));
         assert!(components.contains("@esbuild/darwin-arm64"));
         fs::write(&hasher, "hash-v2").expect("drifted asset hasher");
+        let boundary_error = validate_bound_producer_at(&capability, &targets, &executable)
+            .expect_err("post-admission producer drift must stop before subprocess creation");
+        assert!(
+            boundary_error
+                .to_string()
+                .contains("no provider process was started")
+        );
         let current = wrangler_producer_at(&capability, &executable).expect("current producer");
 
         assert_ne!(

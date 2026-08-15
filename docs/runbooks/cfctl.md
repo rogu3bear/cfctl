@@ -1009,8 +1009,11 @@ the same project/branch/commit identity is treated as a replay and rejected.
 
 Execution recomputes the repository, complete producer closure, exact
 interpreter, and complete artifact manifest before credential access and again
-after the live concurrency read. Only then may the bound interpreter and
-producer run from a private configless directory with the selected
+after the live concurrency read. Because private staging can take time, cfctl
+then hashes the staged transport and recomputes the complete mutable producer
+closure once more, in that order, immediately before subprocess construction.
+Any drift stops before a provider process starts. Only then may the bound
+interpreter and producer run from a private configless directory with the selected
 account, cfctl's Wrangler cache, and the selected credential. Wrangler remains
 the authoritative multipart producer: it performs the content-addressed asset
 upload and sends the provider-required `manifest` form field. cfctl stages
