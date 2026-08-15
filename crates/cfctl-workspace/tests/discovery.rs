@@ -106,6 +106,55 @@ fn exact_and_role_specific_production_wrangler_toml_are_supported() {
 }
 
 #[test]
+#[cfg(unix)]
+fn nested_git_marker_cannot_spoof_the_actual_repository_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("parent-repository");
+    let nested = repository.join("nested");
+    fs::create_dir_all(&nested).expect("nested directory");
+    run_git(&repository, &["init", "--quiet"]);
+    run_git(&repository, &["config", "user.name", "cfctl fixture"]);
+    run_git(
+        &repository,
+        &["config", "user.email", "cfctl@example.invalid"],
+    );
+    let config = nested.join("wrangler.mail-router.production.toml");
+    fs::write(&config, "name = \"nested-worker\"\n").expect("nested role config");
+    run_git(&repository, &["add", "."]);
+    run_git(&repository, &["commit", "--quiet", "-m", "fixture"]);
+    run_git(
+        &repository,
+        &[
+            "config",
+            "core.worktree",
+            repository.to_str().expect("UTF-8 repository"),
+        ],
+    );
+    symlink("../.git", nested.join(".git")).expect("nested Git marker alias");
+
+    let top_level = Command::new("git")
+        .current_dir(&nested)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .expect("nested Git top level");
+    assert!(top_level.status.success());
+    assert_eq!(
+        Path::new(String::from_utf8_lossy(&top_level.stdout).trim()),
+        repository.canonicalize().expect("canonical repository")
+    );
+    assert!(
+        load_wrangler_config(&config).is_err(),
+        "accepted a nested role config through a spoofed Git marker"
+    );
+    assert!(
+        WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).is_err(),
+        "discovered a nested role config through a spoofed Git marker"
+    );
+}
+
+#[test]
 fn discovery_stays_inside_registered_roots_and_finds_cloudflare_configs() {
     let root = tempfile::tempdir().expect("temp root");
     let outside = tempfile::tempdir().expect("outside root");

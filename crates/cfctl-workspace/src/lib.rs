@@ -336,7 +336,7 @@ fn discover_root(
         if !entry.file_type().is_file() || !is_cloudflare_config(entry.path()) {
             continue;
         }
-        let Some(repo_path) = find_repository_root(entry.path(), &root.path) else {
+        let Some(repo_path) = find_repository_root(entry.path(), &root.path)? else {
             continue;
         };
         let repo_path = register_repository(&repo_path, repositories)?;
@@ -380,9 +380,12 @@ fn register_repository(
     path: &Path,
     repositories: &mut BTreeMap<PathBuf, RepositoryNode>,
 ) -> Result<PathBuf> {
-    let repo_path = path
-        .canonicalize()
-        .map_err(|source| io_error(path, source))?;
+    let repo_path = git_repository_root(path)?.ok_or_else(|| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "repository marker at `{}` is not backed by a readable Git worktree",
+            path.display()
+        ))
+    })?;
     if !repositories.contains_key(&repo_path) {
         let name = repo_path
             .file_name()
@@ -521,10 +524,7 @@ fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Res
     )))
 }
 
-/// Load one Wrangler configuration through the same TOML/JSON/JSONC parser
-/// used by workspace discovery. Deployment planning consumes this public
-/// projection so config interpretation cannot drift from resource discovery.
-pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+fn validate_deployment_config_path(path: &Path) -> Result<()> {
     // `Path::components()` normalizes interior `.` segments away, which would
     // erase part of the caller's raw selector before this authority check.
     // Deployment selectors originate as UTF-8 CLI/JSON strings, so reject
@@ -550,10 +550,20 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
             path.display()
         )));
     }
-    let lexical_repository = path
-        .ancestors()
-        .skip(1)
-        .find(|candidate| candidate.join(".git").exists());
+    let actual_repository = path
+        .parent()
+        .map(git_repository_root)
+        .transpose()?
+        .flatten();
+    let lexical_repository = actual_repository.as_ref().and_then(|actual| {
+        path.ancestors().skip(1).find_map(|candidate| {
+            candidate
+                .canonicalize()
+                .ok()
+                .filter(|canonical| canonical == actual)
+                .map(|_| candidate.to_path_buf())
+        })
+    });
     for component in path
         .ancestors()
         .filter(|component| !component.as_os_str().is_empty())
@@ -569,7 +579,10 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
                 component.display()
             )));
         }
-        if lexical_repository.is_none_or(|repository| component == repository) {
+        if lexical_repository
+            .as_ref()
+            .is_none_or(|repository| component == repository)
+        {
             break;
         }
     }
@@ -577,13 +590,33 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
         path: path.display().to_string(),
         source,
     })?;
-    if let Some(repository) = canonical_path
-        .ancestors()
-        .skip(1)
-        .find(|candidate| candidate.join(".git").exists())
+    if let Some(repository) = actual_repository {
+        if !canonical_path.starts_with(&repository) {
+            return Err(WorkspaceError::DiscoveryInvariant(format!(
+                "deployment configuration `{}` escapes Git repository `{}`",
+                canonical_path.display(),
+                repository.display()
+            )));
+        }
+        require_role_config_at_repository_root(&canonical_path, &repository)?;
+    } else if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(is_role_specific_wrangler_toml_name)
     {
-        require_role_config_at_repository_root(&canonical_path, repository)?;
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "role-specific Wrangler configuration `{}` is not owned by a readable Git worktree",
+            path.display()
+        )));
     }
+    Ok(())
+}
+
+/// Load one Wrangler configuration through the same TOML/JSON/JSONC parser
+/// used by workspace discovery. Deployment planning consumes this public
+/// projection so config interpretation cannot drift from resource discovery.
+pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+    validate_deployment_config_path(path)?;
     let content = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
         path: path.display().to_string(),
         source,
@@ -611,14 +644,65 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
     }
 }
 
-fn find_repository_root(path: &Path, boundary: &Path) -> Option<PathBuf> {
-    path.ancestors()
-        .take_while(|candidate| candidate.starts_with(boundary))
-        .find(|candidate| candidate.join(".git").exists())
-        .map(Path::to_path_buf)
+fn find_repository_root(path: &Path, boundary: &Path) -> Result<Option<PathBuf>> {
+    let Some(directory) = path.parent() else {
+        return Ok(None);
+    };
+    let Some(repository) = git_repository_root(directory)? else {
+        return Ok(None);
+    };
+    let boundary = boundary
+        .canonicalize()
+        .map_err(|source| io_error(boundary, source))?;
+    Ok(repository.starts_with(boundary).then_some(repository))
+}
+
+fn git_repository_root(path: &Path) -> Result<Option<PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|source| io_error(path, source))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8(output.stdout).map_err(|_| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "Git repository root for `{}` is not UTF-8",
+            path.display()
+        ))
+    })?;
+    let root = raw.trim();
+    if root.is_empty() {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "Git returned an empty repository root for `{}`",
+            path.display()
+        )));
+    }
+    Path::new(root)
+        .canonicalize()
+        .map(Some)
+        .map_err(|source| io_error(Path::new(root), source))
 }
 
 fn inspect_git(repository: &Path) -> Result<GitStateV1> {
+    let canonical_repository = repository
+        .canonicalize()
+        .map_err(|source| io_error(repository, source))?;
+    let actual_repository = git_repository_root(repository)?.ok_or_else(|| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "repository `{}` has no readable Git top level",
+            repository.display()
+        ))
+    })?;
+    if actual_repository != canonical_repository {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "repository `{}` resolves through Git to different top level `{}`",
+            canonical_repository.display(),
+            actual_repository.display()
+        )));
+    }
     let head = git_optional(repository, &["rev-parse", "HEAD"])?;
     let branch = git_optional(repository, &["branch", "--show-current"])?
         .filter(|branch| !branch.is_empty());

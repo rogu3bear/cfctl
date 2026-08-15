@@ -119,6 +119,22 @@ pub(super) fn prepare_target(
             repository.path.display()
         )));
     }
+    let config_source = repository
+        .configs
+        .iter()
+        .find(|source| source.path == config)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "Wrangler configuration `{}` is absent from its repository source graph",
+                config.display()
+            ))
+        })?;
+    if config_source.head_content_hash.as_deref() != Some(config_source.content_hash.as_str()) {
+        return Err(CliError::Input(format!(
+            "Wrangler configuration `{}` does not match an exact Git HEAD blob",
+            config.display()
+        )));
+    }
     let source_sha = repository.git.head.as_deref().ok_or_else(|| {
         CliError::Input(format!(
             "Worker deployment repository `{}` has no readable Git HEAD",
@@ -569,6 +585,14 @@ mod tests {
         let config = root.path().join("wrangler.mail-router.production.toml");
         fs::write(&config, "name = \"root-worker\"\nmain = \"worker.js\"\n")
             .expect("root role config");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
         let ordinary = CallInput {
             query: json!({"config": config}),
             ..CallInput::default()
@@ -746,6 +770,19 @@ mod tests {
             projection["artifact"]["roots"],
             json!([build.canonicalize().unwrap(), site.canonicalize().unwrap()])
         );
+
+        let mut missing_blob_graph = graph.clone();
+        let config_source = missing_blob_graph
+            .repositories
+            .iter_mut()
+            .flat_map(|repository| repository.configs.iter_mut())
+            .find(|source| source.path == config.canonicalize().unwrap())
+            .expect("config source");
+        config_source.head_content_hash = None;
+        let missing_blob = prepare_target(&missing_blob_graph, &capability, &input)
+            .expect_err("config without an exact HEAD blob must fail")
+            .to_string();
+        assert!(missing_blob.contains("does not match an exact Git HEAD blob"));
 
         let version_id = "11111111-2222-4333-8444-555555555555";
         let mut promotion = capability.clone();
