@@ -47,6 +47,7 @@ cfctl-auth = { workspace = true }
 cfctl-catalog = { workspace = true }
 cfctl-core = { workspace = true }
 chrono.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 
 [lints]

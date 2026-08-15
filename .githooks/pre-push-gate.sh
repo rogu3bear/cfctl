@@ -1,10 +1,9 @@
 #!/bin/bash
 # Local pre-push gate: refuse to push what the local gate has not proven.
 #
-# Hosted proof covers the native Rust baseline, while this hook remains the
-# complete lane for Bun, policy, secret-scan, governance, and Linux cross-build
-# checks (see CONTRIBUTING.md). PR #75 merged two clippy failures before either
-# independent gate protected `main`; these gates are the response.
+# This hook runs the complete local proof lane for Rust, site reproducibility,
+# Bun, policy, secret-scan, governance, and Linux cross-build checks (see
+# CONTRIBUTING.md). The repository does not require a hosted CI service.
 #
 # Invoked by .githooks/pre-push, which is SHA-256 pinned in
 # ~/.agent/repo-hook-allowlist. This file is deliberately NOT pinned so gate
@@ -19,6 +18,11 @@
 # running even when this gate is skipped.
 
 set -euo pipefail
+
+updates=()
+while IFS= read -r update; do
+  [ -n "$update" ] && updates+=("$update")
+done
 
 GATE_MODE="${CFCTL_PRE_PUSH_GATE:-on}"
 
@@ -37,11 +41,59 @@ esac
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
 
-echo "pre-push: running cargo xtask verify for $(git rev-parse --short HEAD)..."
+# This gate proves the checked-out source tree, so bind that tree to the exact
+# object Git is about to publish. Multi-ref, detached-HEAD, non-HEAD, and dirty
+# pushes need a separate object-checkout proof lane; accepting them here would
+# let the gate inspect bytes other than the pushed commit.
+if [ "${#updates[@]}" -ne 1 ]; then
+  echo "pre-push REFUSED: expected exactly one pushed ref, got ${#updates[@]}" >&2
+  exit 1
+fi
+
+read -r local_ref local_oid remote_ref _remote_oid <<<"${updates[0]}"
+head_ref="$(git symbolic-ref -q HEAD || true)"
+head_oid="$(git rev-parse HEAD)"
+
+if [ -z "$head_ref" ] || [ "$local_ref" != "$head_ref" ] || [ "$local_oid" != "$head_oid" ]; then
+  echo "pre-push REFUSED: pushed ref/object must equal the checked-out HEAD" >&2
+  exit 1
+fi
+
+case "$remote_ref" in
+  refs/heads/*) ;;
+  *)
+    echo "pre-push REFUSED: this proof lane publishes exactly one branch" >&2
+    exit 1
+    ;;
+esac
+
+if ! initial_status="$(git status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe checked-out source cleanliness" >&2
+  exit 1
+fi
+if [ -n "$initial_status" ]; then
+  echo "pre-push REFUSED: tracked and untracked source must be clean" >&2
+  exit 1
+fi
+
+echo "pre-push: running cargo xtask verify for ${head_oid:0:7}..."
 
 # Capture unpiped. Piping the gate through tail/head masks its exit status and
 # has produced a false green in this repo before.
 log="$(mktemp -t cfctl-pre-push-gate)"
+proof_parent="$(mktemp -d -t cfctl-pre-push-proof)"
+proof_root="$proof_parent/checkout"
+cleanup() {
+  git worktree remove --force "$proof_root" >/dev/null 2>&1 || true
+  rm -rf "$proof_parent"
+}
+trap cleanup EXIT
+
+# Verify an immutable detached checkout of the exact object supplied by Git's
+# pre-push protocol. The operator's working checkout may change while this
+# long-running proof executes; those bytes must never become proof for the
+# object Git selected before invoking the hook.
+git worktree add --detach --quiet "$proof_root" "$local_oid"
 set +e
 # Git exports GIT_DIR and friends into hooks. Left in place they reach every
 # subprocess the gate starts, including tests that create their own throwaway
@@ -50,10 +102,11 @@ set +e
 # exported path shares the main repository's config file, so that mistake marks
 # the real repository bare. The gate resolved its own root above; nothing past
 # this point should inherit the hook's git context.
-env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-  -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-  -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
-  cargo xtask verify >"$log" 2>&1
+(cd "$proof_root" && \
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
+    cargo xtask verify) >"$log" 2>&1
 verify_exit=$?
 set -e
 
@@ -67,5 +120,28 @@ if [ "$verify_exit" -ne 0 ]; then
   exit 1
 fi
 
+proof_oid="$(git -C "$proof_root" rev-parse HEAD)"
+current_head_ref="$(git symbolic-ref -q HEAD || true)"
+current_head_oid="$(git rev-parse HEAD)"
+if ! proof_status="$(git -C "$proof_root" status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe exact-object proof checkout cleanliness" >&2
+  exit 1
+fi
+if ! current_status="$(git status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe checked-out source cleanliness after verification" >&2
+  exit 1
+fi
+if [ "$proof_oid" != "$local_oid" ] || [ -n "$proof_status" ]; then
+  echo "pre-push REFUSED: exact-object proof checkout drifted during verification" >&2
+  exit 1
+fi
+if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$local_oid" ] || \
+   [ -n "$current_status" ]; then
+  echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
+  exit 1
+fi
+
 rm -f "$log"
+trap - EXIT
+cleanup
 echo "pre-push: verify passed."

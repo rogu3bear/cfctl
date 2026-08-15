@@ -440,10 +440,91 @@ fn verify_source_contract() -> Result<(), TaskError> {
     )?;
 
     verify_bootstrap_contract()?;
+    verify_local_only_ci_contract()?;
     verify_workspace_contract()?;
     verify_v1_cutover_contract()?;
     verify_managed_agent_documents()?;
     verify_documented_contracts()
+}
+
+fn verify_local_only_ci_contract() -> Result<(), TaskError> {
+    let workflow_root = Path::new(".github/workflows");
+    let workflow_paths = collect_workflow_paths(fs::read_dir(workflow_root), workflow_root)?;
+    let contributing = fs::read_to_string("CONTRIBUTING.md").map_err(|error| TaskError::Io {
+        path: "CONTRIBUTING.md".to_owned(),
+        source: error,
+    })?;
+    let readme = fs::read_to_string("README.md").map_err(|error| TaskError::Io {
+        path: "README.md".to_owned(),
+        source: error,
+    })?;
+    validate_local_only_ci_contract(&workflow_paths, &contributing, &readme)
+}
+
+fn collect_workflow_paths(
+    entries: std::io::Result<fs::ReadDir>,
+    workflow_root: &Path,
+) -> Result<Vec<String>, TaskError> {
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(TaskError::Io {
+                path: workflow_root.display().to_string(),
+                source: error,
+            });
+        }
+    };
+    entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| TaskError::Io {
+            path: workflow_root.display().to_string(),
+            source: error,
+        })
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("yml")
+                            || extension.eq_ignore_ascii_case("yaml")
+                    })
+                })
+                .map(|path| path.display().to_string())
+                .collect()
+        })
+}
+
+fn validate_local_only_ci_contract(
+    workflow_paths: &[String],
+    contributing: &str,
+    readme: &str,
+) -> Result<(), TaskError> {
+    if !workflow_paths.is_empty() {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "local-only CI forbids GitHub Actions workflows: {}",
+            workflow_paths.join(", ")
+        )));
+    }
+    let contributing = contributing
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !contributing
+        .contains("The repository does not require GitHub Actions or another hosted CI service.")
+    {
+        return Err(TaskError::InvalidSourceContract(
+            "CONTRIBUTING.md must declare the local-only CI authority".to_owned(),
+        ));
+    }
+    if !readme.contains("no GitHub Actions workflow or hosted CI service is required") {
+        return Err(TaskError::InvalidSourceContract(
+            "README.md must declare that hosted CI is not required".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_bootstrap_contract() -> Result<(), TaskError> {
@@ -2738,56 +2819,29 @@ fn io_error(path: &Path, source: std::io::Error) -> TaskError {
 #[allow(clippy::expect_used)]
 mod tests {
     use std::{
+        fs,
         io::Write as _,
+        os::unix::fs::PermissionsExt as _,
         path::Path,
-        process::{Command, Stdio},
+        process::{Command, Output, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
         PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, classify_pre_push_registration,
-        expected_signed_release_file_names, extract_cfctl_command_references,
-        extract_cfctl_command_refs, extract_prose_command_refs, is_declared_quarantine_path,
-        is_forbidden_quarantine_consumer, is_linux_musl, parse_remote_tag_commit,
-        release_build_driver, release_build_subcommand, release_tag_is_exact_version,
-        render_linux_installer_text, repository_root, security_proof_commands,
-        validate_bootstrap_contract, validate_codesign_details, validate_command_refs,
-        validate_extracted_command_refs, validate_notary_receipt_value,
-        validate_signed_release_file_set, validated_release_targets,
+        collect_workflow_paths, expected_signed_release_file_names,
+        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_linux_musl,
+        parse_remote_tag_commit, release_build_driver, release_build_subcommand,
+        release_tag_is_exact_version, render_linux_installer_text, repository_root,
+        security_proof_commands, validate_bootstrap_contract, validate_codesign_details,
+        validate_command_refs, validate_extracted_command_refs, validate_local_only_ci_contract,
+        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
         verify_generated_guidance_section_text, verify_managed_agent_documents,
         verify_quickstart_pins_the_release_version, verify_tracked_cfctl_command_references,
         verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
-
-    #[test]
-    fn hosted_proof_checks_out_and_verifies_the_exact_event_candidate() {
-        let workflow = include_str!("../../.github/workflows/hosted-proof.yml");
-        let selected_sha = "${{ github.event.pull_request.head.sha || github.sha }}";
-
-        assert_eq!(
-            workflow
-                .matches(&format!("PROOF_SHA: {selected_sha}"))
-                .count(),
-            1,
-            "the event-specific proof identity must be single-sourced"
-        );
-        assert_eq!(
-            workflow.matches("ref: ${{ env.PROOF_SHA }}").count(),
-            2,
-            "both hosted jobs must explicitly check out the selected source SHA"
-        );
-        assert_eq!(
-            workflow
-                .matches("test \"$(git rev-parse HEAD)\" = \"$PROOF_SHA\"")
-                .count(),
-            2,
-            "both hosted jobs must compare HEAD with that same selected source SHA"
-        );
-        assert!(
-            !workflow.contains("$GITHUB_SHA"),
-            "pull_request GITHUB_SHA names the synthetic merge commit, not the PR head"
-        );
-    }
 
     #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
@@ -2802,6 +2856,293 @@ mod tests {
             error.to_string().contains("must not hold a Cargo run gate"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn local_only_ci_rejects_hosted_workflows_and_policy_drift() {
+        const CONTRIBUTING: &str =
+            "The repository does not require GitHub Actions or another hosted CI service.";
+        const README: &str = "no GitHub Actions workflow or hosted CI service is required";
+
+        validate_local_only_ci_contract(&[], CONTRIBUTING, README)
+            .expect("the declared local-only contract is valid");
+
+        let error = validate_local_only_ci_contract(
+            &[".github/workflows/hosted-proof.yml".to_owned()],
+            CONTRIBUTING,
+            README,
+        )
+        .expect_err("a hosted workflow would reintroduce the forbidden purchase dependency");
+        assert!(error.to_string().contains("local-only CI forbids"));
+
+        let error = validate_local_only_ci_contract(&[], "hosted proof required", README)
+            .expect_err("contributor guidance may not drift back to hosted authority");
+        assert!(error.to_string().contains("CONTRIBUTING.md"));
+
+        let error = validate_local_only_ci_contract(&[], CONTRIBUTING, "hosted proof required")
+            .expect_err("README guidance may not drift back to hosted authority");
+        assert!(error.to_string().contains("README.md"));
+    }
+
+    #[test]
+    fn local_only_ci_distinguishes_absent_from_unobservable_workflow_roots() {
+        let root = Path::new(".github/workflows");
+        let absent = collect_workflow_paths(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "absent fixture",
+            )),
+            root,
+        )
+        .expect("an absent workflow root is the intended local-only state");
+        assert!(absent.is_empty());
+
+        let error = collect_workflow_paths(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unobservable fixture",
+            )),
+            root,
+        )
+        .expect_err("an unobservable workflow root must block proof");
+        assert!(error.to_string().contains(".github/workflows"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
+        fn git(repo: &Path, arguments: &[&str]) -> Output {
+            let output = Command::new("git")
+                .args(arguments)
+                .current_dir(repo)
+                .output()
+                .expect("git fixture command starts");
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn run_hook(
+            repo: &Path,
+            fake_bin: &Path,
+            cargo_log: &Path,
+            update: &str,
+            mutation_path: Option<&Path>,
+            fail_git_status: bool,
+        ) -> Output {
+            let mut search_path = vec![fake_bin.to_path_buf()];
+            search_path.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let search_path = std::env::join_paths(search_path).expect("fixture PATH is valid");
+            let mut command = Command::new("bash");
+            command
+                .arg(".githooks/pre-push-gate.sh")
+                .current_dir(repo)
+                .env("PATH", search_path)
+                .env("FAKE_CARGO_LOG", cargo_log)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(path) = mutation_path {
+                command.env("FAKE_CARGO_MUTATE_PATH", path);
+            }
+            if fail_git_status {
+                command.env("FAKE_GIT_STATUS_FAIL", "1");
+            }
+            let mut child = command.spawn().expect("pre-push fixture starts");
+            child
+                .stdin
+                .as_mut()
+                .expect("fixture stdin is piped")
+                .write_all(update.as_bytes())
+                .expect("fixture update is written");
+            child.wait_with_output().expect("pre-push fixture exits")
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos();
+        let fixture_root = std::env::temp_dir().join(format!(
+            "cfctl-pre-push-object-binding-{}-{nonce}",
+            std::process::id()
+        ));
+        let repo = fixture_root.join("repo");
+        let fake_bin = fixture_root.join("bin");
+        let cargo_log = fixture_root.join("cargo.log");
+        fs::create_dir_all(repo.join(".githooks")).expect("fixture hook directory is created");
+        fs::create_dir_all(&fake_bin).expect("fixture binary directory is created");
+
+        let hook = fs::read_to_string(
+            repository_root()
+                .expect("repository root is available")
+                .join(".githooks/pre-push-gate.sh"),
+        )
+        .expect("tracked pre-push gate is readable");
+        fs::write(repo.join(".githooks/pre-push-gate.sh"), hook)
+            .expect("fixture pre-push gate is written");
+        let fake_cargo = fake_bin.join("cargo");
+        fs::write(
+            &fake_cargo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CARGO_LOG\"\n\
+             if [ -n \"${FAKE_CARGO_MUTATE_PATH:-}\" ]; then\n\
+               printf 'mutated\\n' > \"$FAKE_CARGO_MUTATE_PATH\"\n\
+             fi\n",
+        )
+        .expect("fake cargo is written");
+        fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
+            .expect("fake cargo is executable");
+        let fake_git = fake_bin.join("git");
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+             if [ \"${FAKE_GIT_STATUS_FAIL:-}\" = 1 ]; then\n\
+               case \" $* \" in\n\
+                 *' status --porcelain=v1 --untracked-files=all '*)\n\
+                   echo 'fixture status observation failed' >&2\n\
+                   exit 73\n\
+                   ;;\n\
+               esac\n\
+             fi\n\
+             PATH=${PATH#*:} exec git \"$@\"\n",
+        )
+        .expect("fake git is written");
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
+            .expect("fake git is executable");
+
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "cfctl test"]);
+        git(
+            &repo,
+            &["config", "user.email", "cfctl-test@example.invalid"],
+        );
+        fs::write(repo.join("tracked.txt"), "clean\n").expect("tracked fixture is written");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean fixture"]);
+        let clean_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+            .expect("fixture oid is UTF-8")
+            .trim()
+            .to_owned();
+        let zero_oid = "0".repeat(clean_oid.len());
+        let clean_update = format!("refs/heads/main {clean_oid} refs/heads/main {zero_oid}\n");
+        let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, false);
+        assert!(
+            clean.status.success(),
+            "one clean checked-out branch object must pass: {}",
+            String::from_utf8_lossy(&clean.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&cargo_log).expect("fake cargo ran"),
+            "xtask verify\n"
+        );
+
+        fs::remove_file(&cargo_log).expect("fake cargo log is reset");
+        let unobservable = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, true);
+        assert!(
+            !unobservable.status.success(),
+            "a failed cleanliness observation must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&unobservable.stderr)
+                .contains("could not observe checked-out source cleanliness"),
+            "unexpected status-observation error: {}",
+            String::from_utf8_lossy(&unobservable.stderr)
+        );
+        assert!(
+            !cargo_log.exists(),
+            "an initial status failure must stop before cargo"
+        );
+
+        let tracked_path = repo.join("tracked.txt");
+        let raced = run_hook(
+            &repo,
+            &fake_bin,
+            &cargo_log,
+            &clean_update,
+            Some(&tracked_path),
+            false,
+        );
+        assert!(
+            !raced.status.success(),
+            "source mutation during verification must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&raced.stderr).contains("source changed during verification"),
+            "unexpected verification-race error: {}",
+            String::from_utf8_lossy(&raced.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&cargo_log).expect("fake cargo ran before final rebind"),
+            "xtask verify\n"
+        );
+        fs::write(&tracked_path, "clean\n").expect("raced fixture is restored");
+
+        fs::remove_file(&cargo_log).expect("fake cargo log is reset");
+        fs::create_dir_all(repo.join(".github/workflows"))
+            .expect("workflow fixture directory is created");
+        fs::write(
+            repo.join(".github/workflows/hosted.yml"),
+            "name: forbidden-hosted-proof\n",
+        )
+        .expect("workflow fixture is written");
+        git(&repo, &["add", ".github/workflows/hosted.yml"]);
+        git(&repo, &["commit", "-q", "-m", "workflow fixture"]);
+        let workflow_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+            .expect("fixture oid is UTF-8")
+            .trim()
+            .to_owned();
+        fs::remove_file(repo.join(".github/workflows/hosted.yml"))
+            .expect("workflow is deleted only from the worktree");
+        let dirty_update = format!("refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n");
+        let dirty = run_hook(&repo, &fake_bin, &cargo_log, &dirty_update, None, false);
+        assert!(!dirty.status.success(), "dirty deletion must fail closed");
+        assert!(
+            String::from_utf8_lossy(&dirty.stderr).contains("source must be clean"),
+            "unexpected dirty-tree error: {}",
+            String::from_utf8_lossy(&dirty.stderr)
+        );
+        assert!(!cargo_log.exists(), "dirty source must fail before cargo");
+
+        fs::write(
+            repo.join(".github/workflows/hosted.yml"),
+            "name: forbidden-hosted-proof\n",
+        )
+        .expect("workflow fixture is restored");
+        let non_head_update =
+            format!("refs/heads/other {workflow_oid} refs/heads/other {zero_oid}\n");
+        let non_head = run_hook(&repo, &fake_bin, &cargo_log, &non_head_update, None, false);
+        assert!(
+            !non_head.status.success(),
+            "non-HEAD refspec must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&non_head.stderr).contains("must equal the checked-out HEAD"),
+            "unexpected non-HEAD error: {}",
+            String::from_utf8_lossy(&non_head.stderr)
+        );
+        assert!(!cargo_log.exists(), "non-HEAD ref must fail before cargo");
+
+        let multiple_updates = format!(
+            "refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n\
+             refs/heads/other {clean_oid} refs/heads/other {zero_oid}\n"
+        );
+        let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates, None, false);
+        assert!(
+            !multiple.status.success(),
+            "multiple distinct pushed objects must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&multiple.stderr).contains("expected exactly one pushed ref"),
+            "unexpected multi-ref error: {}",
+            String::from_utf8_lossy(&multiple.stderr)
+        );
+        assert!(!cargo_log.exists(), "multiple refs must fail before cargo");
+
+        fs::remove_dir_all(&fixture_root).expect("fixture is removed");
     }
 
     #[test]
