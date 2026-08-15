@@ -1,12 +1,12 @@
 ---
 artifact: launch-checklist
-version: "2.1"
+version: "2.2"
 created: 2026-08-15
 status: in-progress
 launch_candidate: cfctl 1.2.x public-launch closure
-baseline_source_commit: ad2c71795952a8400d1d6ba128b3bac75e5e588a
-baseline_source_tree: 6cdb6607330ba922d4e3a3a546d8c8cd4a7117ab
-observed_installed_commit: ad2c71795952a8400d1d6ba128b3bac75e5e588a
+baseline_source_commit: a2951d8f76085b9fa98034b38c1d037b047fd295
+baseline_source_tree: 4b11afc0017883ccba7dc6eaed9b2b1c77b67165
+observed_installed_commit: a2951d8f76085b9fa98034b38c1d037b047fd295
 candidate_binding: enclosing-clean-git-head-plus-terminal-receipt
 ---
 
@@ -33,7 +33,7 @@ scope.
 | Launch owner | Operator |
 | Delivery coordinator | Codex |
 | Go/no-go decision maker | Operator |
-| Current source and installed baseline | Observed 2026-08-15: remote `main` is exact merge `ad2c71795952a8400d1d6ba128b3bac75e5e588a`, tree `6cdb6607330ba922d4e3a3a546d8c8cd4a7117ab`, with ordered parents `ba1afa3658c381abf75563b67a57d09db6ca5cda` and `05c3b19a77f16aa3f403bf267cacff4b02a9d87a`. `/Users/star/.local/bin/cfctl` resolves to the same commit and reports v1.2.1. The exact baseline passed the repository's uncached local proof during canonical bootstrap, both doctors are green, historical-catalog compatibility is installed-adopted, and the refreshed installed catalog exposes the prior Pages deployment adapter. The enclosing clean Git object containing this checklist is the direct-upload repair candidate and needs its own proof/review/integration/install receipts. Public release, `cfctl.com` custom-domain closure, OAuth promotion, real provider mutation, platform/human acceptance, and release artifacts remain open |
+| Current source and installed baseline | Observed 2026-08-15: remote `main` is exact merge `a2951d8f76085b9fa98034b38c1d037b047fd295`, tree `4b11afc0017883ccba7dc6eaed9b2b1c77b67165`, with ordered parents `ad2c71795952a8400d1d6ba128b3bac75e5e588a` and `9bc8a0bc7f3822288fa2b912ad70c4a5ea5c2f7a`. `/Users/star/.local/bin/cfctl` resolves to the same commit and reports v1.2.1. The exact baseline passed the repository's uncached local proof during canonical bootstrap, its independent exact-object review is green, both doctors are green, historical-catalog compatibility and direct-upload admission are installed-adopted, and the refreshed installed catalog exposes both Git-integrated and direct-upload Pages carriers. This checklist reconciliation is the only new candidate object and needs its own exact diff review, full gate, independent review, PR, and merge/readback. Public release, `cfctl.com` custom-domain closure, OAuth promotion, real provider mutation, platform/human acceptance, and release artifacts remain open |
 | Current public release | Observed 2026-08-15: v1.2.1, published 2026-07-20; non-draft, non-prerelease, and unsigned by the repository's recorded operator decision |
 | Explicitly separate protected actions | Merge, release publication, `cfctl.com` deployment/domain verification, permanent OAuth promotion, external announcements, and paid/provider mutations |
 
@@ -52,14 +52,14 @@ scope.
 
 | Priority | Item | Owner | Due | Status | Exit evidence / dependency |
 |---|---|---|---|---|---|
-| Blocker | Resolve `cfctl catalog coverage --json` failure after a successful catalog sync | Codex | 2026-08-16 | Done through installed adoption | Exact remote and installed build `ad2c717…` loads authentic pre-field producer bytes without rewriting them, hydrates absent `max_source_bytes` to non-authorizing zero, rejects nonempty planning and execution at zero, and keeps explicit positive bounds hash-strict. Poisoned-network fresh-store reads preserved digest, size, mtime, and file set; stale, missing, malformed, and tampered stores fail closed |
+| Blocker | Resolve `cfctl catalog coverage --json` failure after a successful catalog sync | Codex | 2026-08-16 | Done through installed adoption | Exact remote and installed build `a2951d8…` loads authentic pre-field producer bytes without rewriting them, hydrates absent `max_source_bytes` to non-authorizing zero, rejects nonempty planning and execution at zero, and keeps explicit positive bounds hash-strict. Poisoned-network fresh-store reads preserved digest, size, mtime, and file set; stale, missing, malformed, and tampered stores fail closed |
 | Blocker | Govern the native Git-integrated Pages production deployment through its real consumers | Codex | 2026-08-18 | Done through installed catalog adoption; provider proof open | Installed `catalog show` exposes `dynamic_api`, `cross_config`, `reversible_write`, bounded direct cost zero with downstream usage, exact returned-ID readback, required terminal verification, and unsupported automatic rollback. Installed `guide` is `available` with non-null bodyless `call` argv. Plan/run still consumes once and polls only the returned ID; failure or ambiguity requires rectification without replay. No real Pages plan, approval, write, or provider readback has occurred |
-| Blocker | Repair direct-upload Pages admission and exact deployment verification | Codex + Independent reviewer | 2026-08-18 | Observed 2026-08-15: installed repair absent; this checklist candidate carries the source repair, later planes open | Installed `ad2c717…` allowed a bodyless POST for the AOS direct-upload project; operation `dc8c34c3-9791-484a-a175-c431349d78a5` failed before creation with Cloudflare HTTP 400/code 8000096 (`manifest` required), `performed:false`, no deployment ID or compensation, and production unchanged. The successor binds a deterministic artifact manifest plus the Wrangler interpreter and complete installed dependency graph, including the Pages asset hasher and platform-native builder. A worker is prebundled only when its resolved metafile inputs are all admitted artifact files and no runtime dynamic import survives; the staged bundle is hash-bound and Wrangler cannot rebundle it from ambient project dependencies. Immediately before subprocess construction, cfctl rehashes the private staged transport and then the complete mutable producer closure; either drift stops before a provider process starts. The carrier rejects bodyless/direct project mismatches before write, consumes once, and verifies only the provider-returned deployment ID. Source/full-gate/review/integration/install adoption must all be green before AOS creates a new operation |
-| Blocker | Reconcile or close PR #136 without bypassing review/proof | PR #136 owner + Independent reviewer | 2026-08-17 | Done through final-main proof/adoption | PR #136 merged as `45e967bd…`; its code is an ancestor of exact final main `ad2c717…`, whose clean canonical bootstrap/full gate and installed adoption are green. GitHub's absent hosted review/check objects remain an evidence limitation, not a substitute for the repository's required local proof |
-| Blocker | Run authoritative source proof on the final candidate | Codex | 2026-08-18 | Done on exact remote main | Canonical bootstrap ran `CARGO_GATE_RESULT_TTL_SECS=0 cargo xtask verify` on clean `ad2c717…` / `6cdb6607…` and exited 0, covering formatting, warnings-denied Clippy, workspace/request/catalog tests, two edge builds, policy/security scans, governance contracts, and the Linux musl cross-build |
+| Blocker | Repair direct-upload Pages admission and exact deployment verification | Codex + Independent reviewer | 2026-08-18 | Done through installed adoption; provider proof open | PR #142 merged the reviewed repair as `a2951d8…`, and exact merged bytes are installed. The carrier binds a deterministic artifact manifest plus the Wrangler interpreter and complete installed dependency graph, including the Pages asset hasher and platform-native builder. A worker is prebundled only when its resolved metafile inputs are admitted artifact files and no runtime dynamic import survives; the staged bundle is hash-bound and Wrangler cannot rebundle it from ambient project dependencies. Immediately before subprocess construction, cfctl rehashes the private staged transport and complete mutable producer closure; either drift stops before a provider process starts. Installed poisoned-network admission rejects a missing artifact before profile, account, credentials, operation creation, or provider access. Bodyless/direct project mismatches fail closed, plans consume once, and verification binds only the provider-returned deployment ID. A fresh AOS plan/apply/readback remains a separate provider proof; operation `dc8c34c3-9791-484a-a175-c431349d78a5` stays closed and must never replay |
+| Blocker | Reconcile or close PR #136 without bypassing review/proof | PR #136 owner + Independent reviewer | 2026-08-17 | Done through final-main proof/adoption | PR #136 merged as `45e967bd…`; its code is an ancestor of exact final main `a2951d8…`, whose clean canonical bootstrap/full gate and installed adoption are green. GitHub's absent hosted review/check objects remain an evidence limitation, not a substitute for the repository's required local proof |
+| Blocker | Run authoritative source proof on the final candidate | Codex | 2026-08-18 | Done on exact remote main; checklist child pending | Canonical bootstrap ran `CARGO_GATE_RESULT_TTL_SECS=0 cargo xtask verify` on clean `a2951d8…` / `4b11afc0…` and exited 0, covering formatting, warnings-denied Clippy, workspace/request/catalog tests, two edge builds, policy/security scans, governance contracts, and the Linux musl cross-build. This documentation-only child must earn its own exact diff review and uncached current-object gate |
 | Blocker | Prove keyring 4 on a real Linux Secret Service host and close issue #108 | Linux verifier | 2026-08-18 | Blocked | Observed 2026-08-15: issue #108 is open, unassigned, and has no comments; real-host evidence is absent and macOS fallback-file proof is insufficient |
-| Blocker | Obtain independent exact-object review after the final proof run | Independent reviewer | 2026-08-19 | Partially proven; one composite review remains | Independent reviews covered the Pages/reproducibility candidate, the authentic historical-catalog repair, and actual-main commit-sensitive adoption. Final `ad2c717…` ancestry, repair-owned file equality, installed bytes, and focused tests are bound, but one concise adversarial review of the complete final checklist claim remains required before release assembly |
-| Blocker | Keep running, PATH, and source build identities aligned | Codex | 2026-08-19 | Done | `command -v`, realpath, version, doctor, and agents doctor all bind `/Users/star/.local/bin/cfctl` to v1.2.1 at exact remote-main `ad2c717…`; installed SHA-256 is `be13d74ffda19bb8259f9a035a295977bc662edd97a23b52384002dc2cb4bacc` and instruction drift is zero |
+| Blocker | Obtain independent exact-object review after the final proof run | Independent reviewer | 2026-08-19 | Exact main reviewed; checklist child pending | Independent reviews covered the Pages/reproducibility candidate, authentic historical-catalog repair, actual-main commit-sensitive adoption, and exact direct-upload source object. Final `a2951d8…` ancestry, installed bytes, and focused tests are bound. The checklist-bearing child still needs one concise adversarial review before merge |
+| Blocker | Keep running, PATH, and source build identities aligned | Codex | 2026-08-19 | Done | `command -v`, realpath, version, doctor, and agents doctor all bind `/Users/star/.local/bin/cfctl` to v1.2.1 at exact remote-main `a2951d8…`; installed SHA-256 is `403e25d8dde856436d611f6f5daa8dc7672c3a63e0bcfe3b7665c5b1a95bdf27` and instruction drift is zero |
 | Blocker | Make version/install copy single-sourced and drift-tested | Codex | 2026-08-18 | Done on remote main | Source proof enforces exact workspace-version pins and the current version in `QUICKSTART.md`; the negative drift contract intentionally pins v0.0.0 and requires the gate to reject it |
 | Should | Assemble the four-platform unsigned release set reproducibly | Codex | 2026-08-20 | Not started | `cargo xtask assemble`; two builds per target, SPDX SBOMs, provenance, checksums, Homebrew formula; no upload |
 | Blocker | Reconcile unsigned release policy with the executable publication lane | Codex + Operator | 2026-08-19 | Blocked on product/security decision | README, QUICKSTART, SECURITY, and CONTRIBUTING say published releases are unsigned by operator decision, but `cargo xtask publish` calls `verify_signed_release` and accepts only the signed artifact inventory. Choose signed publication, or implement and independently prove a checksum-only unsigned draft-upload lane that excludes the identity-verifying Linux installer; do not publish manually around the mismatch |
@@ -69,11 +69,11 @@ scope.
 
 | Priority | Item | Owner | Due | Status | Exit evidence / dependency |
 |---|---|---|---|---|---|
-| Blocker | Complete formatting, warnings-denied Clippy, Rust tests, request contract, site proof, bridge proof, security/source contracts, secret scan, dependency policy, and Linux musl cross-build | Codex | 2026-08-18 | Done on exact remote main; checklist reconciliation reproof required | Canonical exact-main bootstrap completed the repository's uncached authoritative verification lane. Any commit that changes this checklist must rerun its focused documentation contract and the current-object gate before publication |
-| Blocker | Add and pass a persistence-compatibility regression for the `max_source_bytes` catalog failure | Codex | 2026-08-16 | Done on exact remote main and installed consumer | A full `CatalogSnapshot::load` regression uses producer-authentic missing-field bytes and historical hash, preserves bytes without migration, hydrates zero, rejects positive-bound tampering and malformed input, and is joined to planning/execution zero-bound counterexamples. Exact `ad2c717…` focused tests passed 1/1 in catalog, core, and CLI suites |
+| Blocker | Complete formatting, warnings-denied Clippy, Rust tests, request contract, site proof, bridge proof, security/source contracts, secret scan, dependency policy, and Linux musl cross-build | Codex | 2026-08-18 | Done on exact remote main; checklist reconciliation reproof required | Canonical exact-main bootstrap completed the repository's uncached authoritative verification lane on `a2951d8…`. Any commit that changes this checklist must receive exact diff review and rerun the current-object gate before publication; no narrow test is represented as directly parsing this checklist |
+| Blocker | Add and pass a persistence-compatibility regression for the `max_source_bytes` catalog failure | Codex | 2026-08-16 | Done on exact remote main and installed consumer | A full `CatalogSnapshot::load` regression uses producer-authentic missing-field bytes and historical hash, preserves bytes without migration, hydrates zero, rejects positive-bound tampering and malformed input, and is joined to planning/execution zero-bound counterexamples. Exact `a2951d8…` inherits and passed the catalog, core, and CLI regressions |
 | Blocker | Exercise OAuth callback missing, duplicate, empty, oversized, error, inert-rendering, clipboard-denial, expiry, background, bfcache, and no-JS states | Codex | 2026-08-18 | Partially proven | Rendered QA proves success/query scrubbing, missing, duplicate, oversized, provider error, inert markup, clipboard denial, two-minute expiry, pagehide, pageshow restoration, back-navigation clearing, and no-JS SSR non-rendering with zero console errors. Empty input remains unit-proven; a genuine hidden-tab transition and live edge-log/config readback remain open |
 | Blocker | Complete keyboard, visible-focus, 320 px, 200% zoom, and reduced-motion review | Codex | 2026-08-18 | Partially proven | Rendered QA proves a visible focus ring, effective 355 px narrow reflow with no overflow, and reduced-motion clamping to `0.00001s`; source contracts cover 320 px, forced colors, and status regions. Retesting confirmed click focus reaches the Copy button, but the in-app backend does not advance Tab focus, its visibility override remains hidden, and raw CDP keyboard dispatch is unsupported. Full sequential keyboard order and native 200% zoom therefore remain unverified |
-| Blocker | Run dependency and full-history secret scans on the final release tree | Codex | 2026-08-18 | Done on exact remote main; next candidate reproof required | Exact-main canonical verification passed advisories, bans, licenses, sources, and full-history Gitleaks. The checklist reconciliation creates a new object and must repeat the gate before it can become a release candidate |
+| Blocker | Run dependency and full-history secret scans on the final release tree | Codex | 2026-08-18 | Done on exact remote main; next candidate reproof required | Exact `a2951d8…` canonical verification passed advisories, bans, licenses, sources, and full-history Gitleaks. The checklist reconciliation creates a new object and must repeat the gate before it can become a release candidate |
 | Should | Run account-backed token lifecycle smoke test in an explicitly disposable account | Operator + Codex | 2026-08-20 | Not started | Separate acknowledgement, reviewed permissions, mint/rotate/revoke/readback receipts; never part of automatic local proof |
 | Should | Verify install paths on clean macOS arm64/x86_64 and Linux arm64/x86_64 environments | Platform verifiers | 2026-08-20 | macOS arm64 source/bootstrap proven; three targets open | Exact merged bytes are installed and both doctors pass on macOS arm64. Clean macOS x86_64 and Linux arm64/x86_64 direct-checksum/Homebrew or source paths remain unproven; the Linux installer remains intentionally unshipped while releases are unsigned |
 
@@ -83,7 +83,7 @@ scope.
 |---|---|---|---|---|---|
 | Blocker | Confirm all public routes render useful SSR/no-JS content and honest blocked states | Codex | 2026-08-18 | Done for current rendered tree | Production-hash preview rendered `/`, `/start`, `/security`, `/privacy`, `/terms`, `/oauth/callback/`, and a real 404 with meaningful content, correct status behavior, no horizontal overflow, and no console errors; callback query values were absent from raw SSR and no-JS recovery was present |
 | Blocker | Complete wide/narrow visual QA and interaction-state QA | Codex | 2026-08-18 | Partially proven | Desktop, effective 355 px narrow, focus, copy success, OAuth ready, clipboard denial, expiry, recovery, and 404 behavior were inspected; no clipping or runtime errors were found. Native 320 px, 200% zoom, complete keyboard traversal, copy-payload readback, and a second browser remain open |
-| Blocker | Verify public copy against the exact CLI command tree and current capability semantics | Codex | 2026-08-18 | Done on exact main; checklist contract pending | Exact-main source contracts validate public examples, version pins, support stop conditions, and plan/apply/verification language. This checklist-bearing child must rerun the focused documentation contract and current-object gate |
+| Blocker | Verify public copy against the exact CLI command tree and current capability semantics | Codex | 2026-08-18 | Done on exact main; checklist diff review pending | Exact `a2951d8…` source contracts validate public examples, version pins, support stop conditions, and plan/apply/verification language. This checklist child changes no public command example; its factual references still require exact diff review and the current-object gate |
 | Should | Confirm favicon, metadata, social preview, and accessible naming | Codex | 2026-08-19 | Partially proven | Source/build contains favicon, manifest, title, description, theme color, landmark/heading labels, and accessible wordmark naming; social-card metadata and browser/live readback remain open |
 | Nice | Produce a short product walkthrough | Product/Design owner | 2026-08-26 | Deferred | Does not delay launch; must show only shipped behavior |
 
@@ -121,7 +121,7 @@ scope.
 
 | Priority | Item | Owner | Due | Status | Exit evidence / dependency |
 |---|---|---|---|---|---|
-| Blocker | Resolve and authenticate the exact Cloudflare account/site/Worker/domain target | Operator + Codex | 2026-08-20 | Historical Worker target proven; current launch identity open | A separately governed transaction previously bootstrapped `cfctl-site`, promoted one exact Worker version to 100%, and read back its `workers.dev` routes. Rebind the current service/version/account before reuse; that historical receipt does not identify a deployment of `ad2c717…` or the checklist successor |
+| Blocker | Resolve and authenticate the exact Cloudflare account/site/Worker/domain target | Operator + Codex | 2026-08-20 | Historical Worker target proven; current launch identity open | A separately governed transaction previously bootstrapped `cfctl-site`, promoted one exact Worker version to 100%, and read back its `workers.dev` routes. Rebind the current service/version/account before reuse; that historical receipt does not identify a deployment of `a2951d8…` or the checklist successor |
 | Blocker | Produce and review the exact site mutation plan | Codex + Operator | 2026-08-20 | Not started for current source | The previous Worker plan is consumed historical evidence. A current-source site launch needs a new plan with exact artifact, operation ID, account/targets, cost, permissions, verification, compensation, and warnings |
 | Blocker | Approve and run only the reviewed operation ID if site launch is selected | Operator | 2026-08-21 | Blocked on scope decision and new plan | `plans approve --yes` then `plans run`; approval does not cover OAuth or release publication and no prior consumed operation may be replayed |
 | Blocker | Perform authenticated post-deployment readback | Codex | 2026-08-21 | Historical workers.dev readback only | The prior deployed artifact returned HTTP 200 for `/`, `/start`, and `/oauth/callback`. Current-source route, source marker, security/cache headers, critical copy, 404, and callback policies remain unverified |
@@ -144,11 +144,11 @@ scope.
 
 ### Must have — launch blockers
 
-- [x] Exact remote main `ad2c717…` / `6cdb6607…` is clean, uncached full-gate green, remotely read back, and installed with byte/build identity proof.
-- [ ] This factual checklist reconciliation is a separate exact object; before merge it needs its focused documentation contract, uncached current-object gate, independent adversarial review, ordinary PR publication, and remote merge/readback. The repository deliberately has no hosted CI requirement, so absent GitHub checks are not substituted for or added to the local proof contract.
+- [x] Exact remote main `a2951d8…` / `4b11afc0…` is clean, uncached full-gate green, independently reviewed, remotely read back, and installed with byte/build identity proof.
+- [ ] This factual checklist reconciliation is a separate exact object; before merge it needs exact diff review, an uncached current-object gate, independent adversarial review, ordinary PR publication, and remote merge/readback. No narrow test is claimed to parse the checklist directly. The repository deliberately has no hosted CI requirement, so absent GitHub checks are not substituted for or added to the local proof contract.
 - [x] PR #136 is merged and its exact merge commit is identified; its unreviewed code remains inside the final-tree review scope.
 - [x] The final installed candidate's historical persisted-catalog coverage/read path passes without hidden sync, and a controlled official refresh leaves Pages show/guide available.
-- [ ] Before publication, attach an uncached `cargo xtask verify` receipt for the exact clean checklist-bearing candidate with no weakened gate or skipped assertion; the `ad2c717…` receipt becomes historical for any changed tree.
+- [ ] Before publication, attach an uncached `cargo xtask verify` receipt for the exact clean checklist-bearing candidate with no weakened gate or skipped assertion; the `a2951d8…` receipt becomes historical for any changed tree.
 - [ ] Issue #108 has current real-Linux Secret Service evidence or the release is explicitly held.
 - [ ] All public commands/copy, OAuth callback security cases, keyboard/zoom/reduced-motion cases, and dependency/secret scans pass.
 - [ ] Privacy, terms, security, license, accessibility, support, and incident ownership are accepted by named owners.
@@ -156,7 +156,7 @@ scope.
 - [ ] The operator resolves the unsigned-policy/publish-command mismatch: either approve signed release posture and identities, or merge a proven checksum-only unsigned draft-upload lane before creating release assets.
 - [ ] Every selected protected action has exact authorization, successful execution evidence, and its own readback.
 - [ ] No P0/P1 defect remains open; accepted lower-severity deferrals have owner, consequence, and closure date.
-- [ ] The Pages direct-upload P0 is merged and installed with artifact, producer, project-mode, replay, exact-ID, terminal polling, and rectification proofs; only then may the AOS owner prepare a brand-new provider operation.
+- [x] The Pages direct-upload P0 is merged and installed with artifact, producer, project-mode, replay, exact-ID, terminal polling, and rectification proofs. Only a separately authorized brand-new AOS provider operation remains; the closed failed operation cannot replay.
 
 ### Should have
 
@@ -173,19 +173,20 @@ scope.
 
 ## Critical path to release readiness
 
-Each edge starts only after its dependency is terminal. Passing one edge grants
-no authority for the next protected action.
+Each edge starts only after its named dependency is terminal. Independent lanes
+run in parallel when their entry conditions permit; passing one edge grants no
+authority for a protected action in another lane.
 
 | Order | Edge | Entry condition | Exit evidence | Authority / non-effects |
 |---|---|---|---|---|
-| 1 | Close, publish, integrate, and install the current CLI repairs | Historical source candidate green | **Done:** PRs #139, #141, and #140 merged; remote main is `ad2c717…`; canonical exact-main bootstrap/full gate passed; installed bytes and both doctors bind the same commit; historical-catalog and Pages installed consumers are green | No provider write, release publication, site update, or OAuth promotion occurred |
-| 2 | Integrate and install the direct-upload repair plus current checklist | Exact `ad2c717…` baseline; failed operation preserved and closed | Clean logical commits, focused direct-upload/checklist contracts, uncached `cargo xtask verify`, independent exact-object `REVIEW_GREEN`, ordinary PR/merge readback, exact-byte installation, catalog refresh, both doctors, and installed no-write admission proof | No AOS deployment, provider write, release publication, site update, or OAuth promotion |
+| 1 | Close, publish, integrate, and install the historical-catalog and Pages governance repairs | Historical source candidate green | **Done:** PRs #139, #141, and #140 merged; their exact merged behavior is an ancestor of current main; historical-catalog and Pages installed consumers are green | No provider write, release publication, site update, or OAuth promotion occurred |
+| 2 | Integrate and install the direct-upload repair | Exact `ad2c717…` baseline; failed operation preserved and closed | **Done:** PR #142 merged as `a2951d8…`; focused direct-upload regressions, checklist exact diff review, uncached full gate, independent exact-object `REVIEW_GREEN`, merge readback, exact-byte installation, catalog refresh, both doctors, and installed no-write admission proof are green | No AOS deployment, provider write, release publication, site update, or OAuth promotion occurred |
 | 3 | Prove one fresh AOS direct upload through the installed governed path | Edge 2 green; AOS owner separately dispatches a brand-new exact operation | Artifact and producer manifest, direct-project admission, approval/run receipt, provider-returned deployment ID, exact terminal production readback, unchanged custom-domain/DNS/secret state, and no replay of `dc8c34c3…` | One exact AOS Pages deployment only; no raw Wrangler/API/dashboard bypass |
-| 4 | Close platform and human launch blockers | Edge 3 green | Real Linux Secret Service receipt closes or explicitly holds issue #108; remaining three platform install checks; native keyboard/320 px/200% zoom/reduced-motion acceptance; named security/privacy/legal/support/incident owners; OAuth and site scope decisions | Human acceptance is recorded, not inferred from source tests |
-| 5 | Resolve release-distribution posture | Edge 4 disposition | Operator selects signed or unsigned posture. Signed posture supplies exact signing/notary/Sigstore identities; unsigned posture first gains a reviewed executable checksum-only upload lane consistent with README/QUICKSTART/SECURITY and excludes `install.sh` | No asset upload or draft publication |
-| 6 | Assemble release evidence | Exact merged/adopted source and edge 5 posture | `cargo xtask assemble` produces two-build reproducibility, four target binaries, SPDX SBOMs, provenance, checksums, and Homebrew formula; artifact inventory review passes | No signing or upload; unsigned releases do not ship the identity-verifying Linux installer |
+| 4 | Close platform and human launch blockers | Edge 2 green; may run in parallel with edge 3 | Real Linux Secret Service receipt closes or explicitly holds issue #108; remaining three platform install checks; native keyboard/320 px/200% zoom/reduced-motion acceptance; named security/privacy/legal/support/incident owners; OAuth and site scope decisions | Human acceptance is recorded, not inferred from source tests |
+| 5 | Resolve release-distribution posture | Edge 2 green; may run in parallel with edges 3 and 4 | Operator selects signed or unsigned posture. Signed posture supplies exact signing/notary/Sigstore identities; unsigned posture first gains a reviewed executable checksum-only upload lane consistent with README/QUICKSTART/SECURITY and excludes `install.sh` | No asset upload or draft publication |
+| 6 | Assemble release evidence | Checklist reconciliation merged and edge 5 posture implemented | `cargo xtask assemble` produces two-build reproducibility, four target binaries, SPDX SBOMs, provenance, checksums, and Homebrew formula; artifact inventory review passes | No signing or upload; unsigned releases do not ship the identity-verifying Linux installer |
 | 7 | Sign only if selected | Edge 6 green and explicit signing/notarization authority plus identities | If signed posture is selected, `cargo xtask release` binds signatures, notarization, provenance, checksums, and the exact four-platform set. If unsigned posture is selected, this edge is recorded N/A by the operator | No GitHub publication or announcement |
-| 8 | Publish the CLI release | Edge 6 and any selected edge 7 green; explicit release-publication authority | Exact tag and empty draft bind the release commit; only the posture-appropriate immutable assets upload; checksum/provenance readback and clean-environment install verification pass before the operator makes the draft public | Does not publish the website or promote OAuth |
+| 8 | Publish the CLI release | Edges 3, 4, 6, and any selected edge 7 green; explicit release-publication authority | Exact tag and empty draft bind the release commit; only the posture-appropriate immutable assets upload; checksum/provenance readback and clean-environment install verification pass before the operator makes the draft public | Does not publish the website or promote OAuth |
 | 9 | Publish `cfctl.com` if selected | Site scope selected; exact account/service/domain reads and reviewed plan exist | Exact plan approval/run receipts, authenticated route/source/header/content/404/callback readback, DNS/TLS/domain verification, and timed rollback rehearsal | Site transaction only; OAuth remains separate |
 | 10 | Promote OAuth if selected | OAuth scope selected and security/privacy acceptance complete | Separately reviewed promotion plan, callback/provider configuration readback, redacted log verification, and tested revoke/disable compensation | Does not alter CLI release or site beyond the exact OAuth plan |
 | 11 | Go live and observe | All selected blocker edges green; operator records go | Go/no-go decision, announcement identity, monitoring/on-call activation, T+1/T+7 schedule, and content-free health/support receipts | Any failed readback invokes the rollback plan and freezes announcements |
@@ -235,10 +236,10 @@ Operator (decision and approval) with Codex (evidence, plan preparation, and ver
 
 | Issue | Owner | Due | Status | Impact / next action |
 |---|---|---|---|---|
-| Historical D1-import plans lacked the later `max_source_bytes` field | Codex | 2026-08-16 | DONE THROUGH INSTALLED ADOPTION | PR #141 merged the authentic-producer-hash repair; exact remote/installed `ad2c717…` reads the pre-field store without rewrite, hydrates zero, rejects nonempty zero-bound use, and preserves current positive-bound hash strictness |
-| AOS direct-upload project received a bodyless Pages deployment request | Codex + Independent reviewer | 2026-08-18 | Observed 2026-08-15: P0 repair not yet installed; source candidate present | The closed operation reached no creation boundary and left production unchanged, but proves the installed carrier admitted the wrong project/request combination. Finish the deterministic artifact/producer and project-kind repair, exact-object proof/review, merge/install adoption, then hand the exact installed identity back for a fresh AOS operation; never replay the closed operation |
+| Historical D1-import plans lacked the later `max_source_bytes` field | Codex | 2026-08-16 | DONE THROUGH INSTALLED ADOPTION | PR #141 merged the authentic-producer-hash repair; exact remote/installed `a2951d8…` reads the pre-field store without rewrite, hydrates zero, rejects nonempty zero-bound use, and preserves current positive-bound hash strictness |
+| AOS direct-upload project received a bodyless Pages deployment request | AOS deployment owner | 2026-08-18 | SOURCE/INSTALL DEFECT CLOSED; PROVIDER ACCEPTANCE OPEN | PR #142 merged the deterministic artifact/producer and project-kind repair as `a2951d8…`; exact bytes are installed, both doctors are green, and missing-artifact admission stops before credentials/provider access. The next proof is one separately authorized fresh AOS operation and exact returned-ID readback. Never replay `dc8c34c3…` |
 | Sandbox cannot connect to the peer-owned configured `sccache` daemon | Codex + environment owner | 2026-08-16 | Environment limitation; proof path established | One restricted focused rerun hit `sccache: Operation not permitted`; the pinned raw toolchain then ran the exact named tests without source or assertion changes. Canonical exact-main bootstrap separately ran the repository gate successfully |
-| GitHub records no hosted checks or review objects on PRs #139-#141 | Independent reviewer | 2026-08-17 | Not a repository CI blocker; evidence-plane limitation retained | README states the tracked local pre-push proof is authoritative and no hosted CI service is required. Exact local gates, independent reviews, merge/readback, and installed adoption are recorded separately; GitHub mergeability alone is never treated as review |
+| GitHub records no hosted checks or formal review objects on PRs #139-#142 | Independent reviewer | 2026-08-17 | Not a repository CI blocker; evidence-plane limitation retained | README states the tracked local pre-push proof is authoritative and no hosted CI service is required. Exact local gates, independent reviews, merge/readback, and installed adoption are recorded separately; GitHub mergeability alone is never treated as review |
 | GitHub issue #108: real Linux Secret Service proof | Linux verifier | 2026-08-18 | BLOCKER | Run the isolated security-layer verification on a real host and attach exact evidence |
 | Public OAuth is disabled and no current profile is selected | Operator | 2026-08-19 | Decision blocker only if OAuth is launch scope | Choose scoped-token-only launch or authorize a separate permanent OAuth promotion campaign |
 | Current `cfctl.com` custom-domain state is unresolved | Codex + Operator | 2026-08-20 | BLOCKER if site is launch scope | Historical `workers.dev` publication is verified, but the prior domain inventory returned zero custom domains and lacked DNS Read. Current DNS/HTTPS resolution still fails. Obtain a credential-correct governed domain/DNS read before a site launch claim |
@@ -248,20 +249,23 @@ Operator (decision and approval) with Codex (evidence, plan preparation, and ver
 ## Current evidence snapshot
 
 - **Source and ancestry:** observed remote `main` is clean merge
-  `ad2c71795952a8400d1d6ba128b3bac75e5e588a`, tree
-  `6cdb6607330ba922d4e3a3a546d8c8cd4a7117ab`, with ordered parents
-  `ba1afa3658c381abf75563b67a57d09db6ca5cda` and
-  `05c3b19a77f16aa3f403bf267cacff4b02a9d87a`. PR #139 merged Pages governance
+  `a2951d8f76085b9fa98034b38c1d037b047fd295`, tree
+  `4b11afc0017883ccba7dc6eaed9b2b1c77b67165`, with ordered parents
+  `ad2c71795952a8400d1d6ba128b3bac75e5e588a` and
+  `9bc8a0bc7f3822288fa2b912ad70c4a5ea5c2f7a`. PR #139 merged Pages governance
   and reproducible edge-tool selection; PR #141 merged authentic historical
-  catalog hash compatibility; PR #140 merged Worker plan-set snapshot identity.
+  catalog hash compatibility; PR #140 merged Worker plan-set snapshot identity;
+  PR #142 merged direct-upload artifact/producer admission and exact-ID verification.
   The reviewed historical repair head `ce21bf7815b987d73e79f1e2e46b53a4a06be400`
-  is an ancestor, and its two repair-owned files are byte-identical in final
-  main. The peer-owned canonical checkout remains separately at `e584eaee…`
+  is an ancestor. Later direct-upload work changed both repair-owned files, so
+  whole-file byte identity is not claimed; the historical compatibility behavior
+  remains covered by current-main regressions and installed-consumer proof. The
+  peer-owned canonical checkout remains separately at `e584eaee…`
   with the same six modified files and was not normalized.
 - **Installed runtime:** `command -v` and realpath both resolve
   `/Users/star/.local/bin/cfctl`; SHA-256 is
-  `be13d74ffda19bb8259f9a035a295977bc662edd97a23b52384002dc2cb4bacc`.
-  Version, doctor, and agents doctor bind v1.2.1 to exact `ad2c717…` with
+  `403e25d8dde856436d611f6f5daa8dc7672c3a63e0bcfe3b7665c5b1a95bdf27`.
+  Version, doctor, and agents doctor bind v1.2.1 to exact `a2951d8…` with
   healthy self/PATH identity and zero instruction drift.
 - **Historical catalog consumer:** an authentic pre-field fixture with 3,440
   capabilities, recursively absent material `max_source_bytes`, and digest
@@ -272,26 +276,25 @@ Operator (decision and approval) with Codex (evidence, plan preparation, and ver
   positive-bound tampering fail content-hash validation; stale and missing
   stores attempt the official refresh and fail against the poisoned proxy
   without rewriting or creating a catalog.
-- **Current installed catalog:** the pre-refresh real store was preserved as
-  `catalog-v1.previous.json` at exact digest
-  `fa4ad3100e9a0435ffd594fdd4c6239a8c9f7658fb9f086548735515e9fba7a8`.
-  A separately authorized official refresh produced schema
-  `sha256:d0ff1c7f24a8aa532675acbc99c45c2bd8e565f3184c3b1f013c1e36b2926598`
-  and 3,387 capabilities; the count changed from the earlier upstream snapshot
-  and is recorded rather than normalized away. Subsequent poisoned-network reads
-  preserve the refreshed digest and expose Pages as `dynamic_api`/`available`
-  with exact returned-ID verification and non-null call argv. Current D1 keeps
-  explicit `max_source_bytes=67108864`.
+- **Current installed catalog:** a separately authorized official refresh now reports schema
+  `sha256:6b00bd408787042ae7a1c7dd25385308643a31f2ac0048ae0e4dc1050fddd4a9`
+  and 3,440 capabilities, `stale=false`. Installed `catalog show` and `guide`
+  expose Git-integrated Pages as `dynamic_api`/`available` with non-null call
+  argv, and direct upload as `delegated_cli`/`available` with exact artifact,
+  project, branch, and commit selectors. Both bind returned-ID verification and
+  truthful unsupported automatic rollback. Current D1 keeps explicit
+  `max_source_bytes=67108864`. The mutable `catalog-v1.previous.json` backup is
+  not used as current proof of the earlier pre-refresh digest.
 - **Local proof and review:** canonical bootstrap ran the uncached full source
-  lane on exact clean `ad2c717…` before installing it. Focused exact-main catalog,
-  core, and CLI regressions each passed 1/1 after installation. Independent
-  adversarial reviews separately confirmed the Pages/reproducibility candidate,
-  actual-main commit-sensitive provenance and plan drift, and the authentic
-  historical repair. This checklist changes the tree and therefore needs its
-  own current-object gate and one composite review; prior receipts remain
-  historical for the new object.
-- **Hosted source:** observed 2026-08-15, remote `main` is `ad2c717…`; PRs #139,
-  #140, and #141 are merged. GitHub records no review objects or hosted checks
+  lane on exact clean `a2951d8…` before installing it. Focused direct-upload and
+  historical-catalog regressions passed, and installed no-write admission fails
+  before profile, account, credential, operation, or provider access. Independent
+  adversarial review confirmed the exact direct-upload object and its producer
+  closure. This checklist changes the tree and therefore needs its own
+  current-object gate and one composite review; prior receipts remain historical
+  for the new object.
+- **Hosted source:** observed 2026-08-15, remote `main` is `a2951d8…`; PRs #139,
+  #140, #141, and #142 are merged. GitHub records no formal review objects or hosted checks
   on those PRs. That is retained as a hosted evidence limitation, while README's
   repository doctrine explicitly makes the tracked local pre-push lane
   authoritative and does not require GitHub Actions. The latest public release
