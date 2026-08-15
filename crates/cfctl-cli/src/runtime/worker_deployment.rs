@@ -75,15 +75,6 @@ pub(super) fn artifact_paths(
             "Worker deployment configuration must declare `main` or `assets.directory`".to_owned(),
         ));
     }
-    for root in &roots {
-        if !root.starts_with(directory) {
-            return Err(CliError::Input(format!(
-                "deployment artifact `{}` escapes reviewed config directory `{}`",
-                root.display(),
-                directory.display()
-            )));
-        }
-    }
     Ok(roots.into_iter().collect())
 }
 
@@ -102,17 +93,12 @@ pub(super) fn prepare_target(
     let config = canonical_config(input)?;
     let document = load_wrangler_config(&config)?;
     let service_name = validated_service_name(&document, input)?;
-    let repository = graph
-        .repositories
-        .iter()
-        .filter(|repository| config.starts_with(&repository.path))
-        .max_by_key(|repository| repository.path.components().count())
-        .ok_or_else(|| {
-            CliError::Input(format!(
-                "Wrangler configuration `{}` is not owned by a registered repository",
-                config.display()
-            ))
-        })?;
+    let repository = repository_owning_path(graph, &config).ok_or_else(|| {
+        CliError::Input(format!(
+            "Wrangler configuration `{}` is not owned by a registered repository",
+            config.display()
+        ))
+    })?;
     if repository.git.dirty {
         return Err(CliError::Input(format!(
             "Worker deployment repository `{}` is dirty; commit the reviewed source before planning",
@@ -138,19 +124,17 @@ pub(super) fn prepare_target(
     })?));
     let (expected_message, operation) = if binds_artifact(capability) {
         let artifacts = artifact_paths(capability, input)?;
-        if artifacts
-            .iter()
-            .any(|artifact| !artifact.starts_with(&repository.path))
-        {
+        if artifacts.iter().any(|artifact| {
+            repository_owning_path(graph, artifact)
+                .is_none_or(|owner| owner.path != repository.path)
+        }) {
             return Err(CliError::Input(
                 "every Worker deployment artifact must be owned by the config repository"
                     .to_owned(),
             ));
         }
-        let config_directory = config.parent().ok_or_else(|| {
-            CliError::Input("Wrangler configuration has no containing directory".to_owned())
-        })?;
-        let artifact_sha256 = artifact_set_sha256(config_directory, &artifacts)?;
+        validate_artifact_tree_ownership(graph, &repository.path, &artifacts)?;
+        let artifact_sha256 = artifact_set_sha256(&repository.path, &artifacts)?;
         (
             format!("source={source_sha} artifact-sha256={artifact_sha256}"),
             json!({
@@ -493,7 +477,45 @@ fn canonical_artifact_path(directory: &Path, raw: &str) -> Result<PathBuf, CliEr
     })
 }
 
-fn artifact_set_sha256(config_directory: &Path, roots: &[PathBuf]) -> Result<String, CliError> {
+fn repository_owning_path<'a>(
+    graph: &'a WorkspaceGraph,
+    path: &Path,
+) -> Option<&'a cfctl_workspace::RepositoryNode> {
+    graph
+        .repositories
+        .iter()
+        .filter(|repository| path.starts_with(&repository.path))
+        .max_by_key(|repository| repository.path.components().count())
+}
+
+fn validate_artifact_tree_ownership(
+    graph: &WorkspaceGraph,
+    repository: &Path,
+    roots: &[PathBuf],
+) -> Result<(), CliError> {
+    for root in roots {
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|error| {
+                CliError::Input(format!(
+                    "failed to inspect Worker deployment artifact `{}`: {error}",
+                    root.display()
+                ))
+            })?;
+            if repository_owning_path(graph, entry.path())
+                .is_none_or(|owner| owner.path != repository)
+            {
+                return Err(CliError::Input(format!(
+                    "Worker deployment artifact `{}` is not owned by config repository `{}`",
+                    entry.path().display(),
+                    repository.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn artifact_set_sha256(repository: &Path, roots: &[PathBuf]) -> Result<String, CliError> {
     let mut entries = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).follow_links(false) {
@@ -512,11 +534,11 @@ fn artifact_set_sha256(config_directory: &Path, roots: &[PathBuf]) -> Result<Str
                     entry.path().display()
                 )));
             }
-            let relative = entry.path().strip_prefix(config_directory).map_err(|_| {
+            let relative = entry.path().strip_prefix(repository).map_err(|_| {
                 CliError::Input(format!(
-                    "Worker deployment artifact `{}` escaped config directory `{}`",
+                    "Worker deployment artifact `{}` escaped repository `{}`",
                     entry.path().display(),
-                    config_directory.display()
+                    repository.display()
                 ))
             })?;
             let bytes = fs::read(entry.path()).map_err(|source| CliError::Io {
@@ -583,17 +605,18 @@ mod tests {
     )]
     fn target_binds_clean_source_config_service_and_complete_artifact() {
         let root = tempfile::tempdir().expect("repository root");
-        let build = root.path().join("build");
+        let worker = root.path().join("cloudflare/site");
+        let build = worker.join("build");
         let site = root.path().join("target/site");
         fs::create_dir_all(&build).expect("build directory");
         fs::create_dir_all(&site).expect("site directory");
         fs::write(build.join("_worker.js"), "worker\n").expect("worker");
         fs::write(build.join("index.wasm"), b"wasm").expect("wasm");
         fs::write(site.join("index.html"), "site\n").expect("site");
-        let config = root.path().join("wrangler.toml");
+        let config = worker.join("wrangler.toml");
         fs::write(
             &config,
-            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
+            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n",
         )
         .expect("config");
         assert!(
@@ -717,7 +740,7 @@ mod tests {
         ));
         fs::write(
             &config,
-            "name = \"retargeted-service\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
+            "name = \"retargeted-service\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n",
         )
         .expect("retarget config after approval");
         let mut delegated_boundary_crossed = false;
@@ -741,7 +764,7 @@ mod tests {
         assert!(configless_input.query.get("config").is_none());
         fs::write(
             &config,
-            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
+            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n",
         )
         .expect("restore config for artifact drift proof");
 
@@ -750,6 +773,195 @@ mod tests {
             .expect_err("stale artifact identity must fail")
             .to_string();
         assert!(error.contains("message must be exactly"));
+    }
+
+    #[test]
+    fn target_rejects_artifact_that_canonicalizes_outside_registered_repository() {
+        let root = tempfile::tempdir().expect("repository root");
+        let outside = tempfile::tempdir().expect("outside artifact root");
+        let worker = root.path().join("cloudflare/site");
+        let build = worker.join("build");
+        fs::create_dir_all(&build).expect("build directory");
+        fs::write(build.join("_worker.js"), "worker\n").expect("worker");
+        fs::write(outside.path().join("index.html"), "outside\n").expect("outside artifact");
+        let config = worker.join("wrangler.toml");
+        fs::write(
+            &config,
+            format!(
+                "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = {:?}\n",
+                outside.path()
+            ),
+        )
+        .expect("config");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(root.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(root.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        let graph =
+            WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("workspace graph");
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        let input = CallInput {
+            query: json!({
+                "config": config.canonicalize().expect("canonical config"),
+                "name": "cfctl-site",
+                "message": "untrusted",
+            }),
+            ..CallInput::default()
+        };
+        let error = prepare_target(&graph, &capability, &input)
+            .expect_err("outside artifact must fail before planning")
+            .to_string();
+        assert!(error.contains("must be owned by the config repository"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two independently committed repository fixtures prove deepest-owner rejection"
+    )]
+    fn target_rejects_artifact_tree_containing_nested_registered_repository() {
+        let root = tempfile::tempdir().expect("repository root");
+        let worker = root.path().join("cloudflare/site");
+        let build = worker.join("build");
+        let shared = root.path().join("shared");
+        let nested = shared.join("child-repo");
+        let nested_dist = nested.join("dist");
+        fs::create_dir_all(&build).expect("build directory");
+        fs::create_dir_all(&nested_dist).expect("nested artifact directory");
+        fs::write(build.join("_worker.js"), "worker\n").expect("worker");
+        fs::write(shared.join("outer.txt"), "outer\n").expect("outer artifact");
+        fs::write(nested_dist.join("index.html"), "nested\n").expect("nested artifact");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "nested fixture",
+                ])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git commit")
+                .success()
+        );
+        let config = worker.join("wrangler.toml");
+        fs::write(
+            &config,
+            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../shared\"\n",
+        )
+        .expect("config");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "outer fixture",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git commit")
+                .success()
+        );
+        let graph =
+            WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("workspace graph");
+        assert_eq!(
+            graph.repositories.len(),
+            2,
+            "nested repository must be registered"
+        );
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        let input = CallInput {
+            query: json!({
+                "config": config.canonicalize().expect("canonical config"),
+                "name": "cfctl-site",
+                "message": "untrusted",
+            }),
+            ..CallInput::default()
+        };
+        let error = prepare_target(&graph, &capability, &input)
+            .expect_err("artifact tree containing a nested repository must fail before planning")
+            .to_string();
+        assert!(error.contains("is not owned by config repository"));
     }
 
     #[test]
