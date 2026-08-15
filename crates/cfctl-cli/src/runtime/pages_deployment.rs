@@ -2033,6 +2033,28 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             "a repository pipeline cannot be normalized as direct upload"
         );
 
+        let mut repository_build = exact.result.clone();
+        repository_build["build_config"]["build_command"] = json!("npm run build");
+        let repository_build = CloudflareResponseV1 {
+            result: repository_build,
+            ..exact
+        };
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &repository_build
+            )
+            .is_err(),
+            "a configured repository build cannot be normalized as direct upload"
+        );
+    }
+
+    #[test]
+    fn omitted_project_source_rejects_partial_or_duplicate_stage_evidence() {
+        let id = "ff88ab4a-f284-4f06-86e0-c8ae3b459b60";
         for (missing_stage, retained_repository_stage) in
             [("clone_repo", "build"), ("build", "clone_repo")]
         {
@@ -2073,24 +2095,6 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             )
             .is_err(),
             "duplicate repository-stage evidence remains ambiguous"
-        );
-
-        let mut repository_build = exact.result.clone();
-        repository_build["build_config"]["build_command"] = json!("npm run build");
-        let repository_build = CloudflareResponseV1 {
-            result: repository_build,
-            ..exact
-        };
-        assert!(
-            apply_project_response(
-                &direct_upload(),
-                "acct",
-                "aos-web",
-                Some("main"),
-                &repository_build
-            )
-            .is_err(),
-            "a configured repository build cannot be normalized as direct upload"
         );
     }
 
