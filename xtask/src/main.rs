@@ -2931,6 +2931,7 @@ mod tests {
             cargo_log: &Path,
             update: &str,
             mutation_path: Option<&Path>,
+            fail_git_status: bool,
         ) -> Output {
             let mut search_path = vec![fake_bin.to_path_buf()];
             search_path.extend(std::env::split_paths(
@@ -2948,6 +2949,9 @@ mod tests {
                 .stderr(Stdio::piped());
             if let Some(path) = mutation_path {
                 command.env("FAKE_CARGO_MUTATE_PATH", path);
+            }
+            if fail_git_status {
+                command.env("FAKE_GIT_STATUS_FAIL", "1");
             }
             let mut child = command.spawn().expect("pre-push fixture starts");
             child
@@ -2992,6 +2996,23 @@ mod tests {
         .expect("fake cargo is written");
         fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
             .expect("fake cargo is executable");
+        let fake_git = fake_bin.join("git");
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+             if [ \"${FAKE_GIT_STATUS_FAIL:-}\" = 1 ]; then\n\
+               case \" $* \" in\n\
+                 *' status --porcelain=v1 --untracked-files=all '*)\n\
+                   echo 'fixture status observation failed' >&2\n\
+                   exit 73\n\
+                   ;;\n\
+               esac\n\
+             fi\n\
+             PATH=${PATH#*:} exec git \"$@\"\n",
+        )
+        .expect("fake git is written");
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
+            .expect("fake git is executable");
 
         git(&repo, &["init", "-q", "-b", "main"]);
         git(&repo, &["config", "user.name", "cfctl test"]);
@@ -3008,7 +3029,7 @@ mod tests {
             .to_owned();
         let zero_oid = "0".repeat(clean_oid.len());
         let clean_update = format!("refs/heads/main {clean_oid} refs/heads/main {zero_oid}\n");
-        let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None);
+        let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, false);
         assert!(
             clean.status.success(),
             "one clean checked-out branch object must pass: {}",
@@ -3020,6 +3041,22 @@ mod tests {
         );
 
         fs::remove_file(&cargo_log).expect("fake cargo log is reset");
+        let unobservable = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, true);
+        assert!(
+            !unobservable.status.success(),
+            "a failed cleanliness observation must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&unobservable.stderr)
+                .contains("could not observe checked-out source cleanliness"),
+            "unexpected status-observation error: {}",
+            String::from_utf8_lossy(&unobservable.stderr)
+        );
+        assert!(
+            !cargo_log.exists(),
+            "an initial status failure must stop before cargo"
+        );
+
         let tracked_path = repo.join("tracked.txt");
         let raced = run_hook(
             &repo,
@@ -3027,6 +3064,7 @@ mod tests {
             &cargo_log,
             &clean_update,
             Some(&tracked_path),
+            false,
         );
         assert!(
             !raced.status.success(),
@@ -3060,7 +3098,7 @@ mod tests {
         fs::remove_file(repo.join(".github/workflows/hosted.yml"))
             .expect("workflow is deleted only from the worktree");
         let dirty_update = format!("refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n");
-        let dirty = run_hook(&repo, &fake_bin, &cargo_log, &dirty_update, None);
+        let dirty = run_hook(&repo, &fake_bin, &cargo_log, &dirty_update, None, false);
         assert!(!dirty.status.success(), "dirty deletion must fail closed");
         assert!(
             String::from_utf8_lossy(&dirty.stderr).contains("source must be clean"),
@@ -3076,7 +3114,7 @@ mod tests {
         .expect("workflow fixture is restored");
         let non_head_update =
             format!("refs/heads/other {workflow_oid} refs/heads/other {zero_oid}\n");
-        let non_head = run_hook(&repo, &fake_bin, &cargo_log, &non_head_update, None);
+        let non_head = run_hook(&repo, &fake_bin, &cargo_log, &non_head_update, None, false);
         assert!(
             !non_head.status.success(),
             "non-HEAD refspec must fail closed"
@@ -3092,7 +3130,7 @@ mod tests {
             "refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n\
              refs/heads/other {clean_oid} refs/heads/other {zero_oid}\n"
         );
-        let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates, None);
+        let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates, None, false);
         assert!(
             !multiple.status.success(),
             "multiple distinct pushed objects must fail closed"

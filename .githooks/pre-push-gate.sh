@@ -67,7 +67,11 @@ case "$remote_ref" in
     ;;
 esac
 
-if [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
+if ! initial_status="$(git status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe checked-out source cleanliness" >&2
+  exit 1
+fi
+if [ -n "$initial_status" ]; then
   echo "pre-push REFUSED: tracked and untracked source must be clean" >&2
   exit 1
 fi
@@ -119,12 +123,20 @@ fi
 proof_oid="$(git -C "$proof_root" rev-parse HEAD)"
 current_head_ref="$(git symbolic-ref -q HEAD || true)"
 current_head_oid="$(git rev-parse HEAD)"
-if [ "$proof_oid" != "$local_oid" ] || [ -n "$(git -C "$proof_root" status --porcelain=v1 --untracked-files=all)" ]; then
+if ! proof_status="$(git -C "$proof_root" status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe exact-object proof checkout cleanliness" >&2
+  exit 1
+fi
+if ! current_status="$(git status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe checked-out source cleanliness after verification" >&2
+  exit 1
+fi
+if [ "$proof_oid" != "$local_oid" ] || [ -n "$proof_status" ]; then
   echo "pre-push REFUSED: exact-object proof checkout drifted during verification" >&2
   exit 1
 fi
 if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$local_oid" ] || \
-   [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
+   [ -n "$current_status" ]; then
   echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
   exit 1
 fi
