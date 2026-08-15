@@ -1008,7 +1008,9 @@ Explicit `source: null` remains authoritative. A provider response that omits
 `source` is compatible only when the same response also carries matching
 canonical and latest production deployments with one exact UUID, project, and
 branch; a successful `ad_hoc` deployment whose repository clone/build stages
-remain idle; no nested Git source; and an empty project build configuration.
+remain idle; no nested Git source; and no configured repository build command
+or root. A direct-upload output directory such as `target/site` is retained as
+project configuration, not misclassified as repository-build evidence.
 Partial, contradictory, or Git-source evidence remains blocked before
 operation creation. The corroborating deployment ID and inference basis are
 hash-bound into the same project-mode receipt and must reproduce at the

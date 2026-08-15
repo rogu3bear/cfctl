@@ -1315,14 +1315,11 @@ fn omitted_source_direct_deployment_id<'a>(
     production_branch: &str,
 ) -> Option<&'a str> {
     let build = project.get("build_config")?.as_object()?;
-    if ["build_command", "destination_dir", "root_dir"]
-        .iter()
-        .any(|field| {
-            build.get(*field).is_some_and(|value| {
-                !value.is_null() && value.as_str().is_none_or(|value| !value.is_empty())
-            })
+    if ["build_command", "root_dir"].iter().any(|field| {
+        build.get(*field).is_some_and(|value| {
+            !value.is_null() && value.as_str().is_none_or(|value| !value.is_empty())
         })
-    {
+    }) {
         return None;
     }
     let canonical = project.get("canonical_deployment")?;
@@ -1912,7 +1909,7 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
                 "production_branch":"main",
                 "build_config":{
                     "build_command":null,
-                    "destination_dir":null,
+                    "destination_dir":"target/site",
                     "root_dir":null
                 },
                 "canonical_deployment":canonical,
@@ -1992,9 +1989,19 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             "different canonical/latest identities remain ambiguous"
         );
 
-        let mut git_source = direct_deployment(id);
-        git_source["source"] = json!({"type":"github","config":{}});
-        let git_evidence = omitted_source_project(git_source.clone(), git_source);
+        let mut manual_git_upload = direct_deployment(id);
+        manual_git_upload["source"] = json!({
+            "type":"github",
+            "config":{
+                "owner":"MLNavigator",
+                "repo_name":"aos-web",
+                "repo_id":"123456789",
+                "production_branch":"main",
+                "production_deployments_enabled":false,
+                "preview_deployment_setting":"none"
+            }
+        });
+        let git_evidence = omitted_source_project(manual_git_upload.clone(), manual_git_upload);
         assert!(
             apply_project_response(
                 &direct_upload(),
@@ -2004,7 +2011,7 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
                 &git_evidence
             )
             .is_err(),
-            "nested Git source evidence overrides project-field omission"
+            "a manual Wrangler deployment to a Git project remains Git-integrated"
         );
 
         let mut clone_stage = direct_deployment(id);
@@ -2023,6 +2030,24 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bund
             )
             .is_err(),
             "a repository pipeline cannot be normalized as direct upload"
+        );
+
+        let mut repository_build = exact.result.clone();
+        repository_build["build_config"]["build_command"] = json!("npm run build");
+        let repository_build = CloudflareResponseV1 {
+            result: repository_build,
+            ..exact
+        };
+        assert!(
+            apply_project_response(
+                &direct_upload(),
+                "acct",
+                "aos-web",
+                Some("main"),
+                &repository_build
+            )
+            .is_err(),
+            "a configured repository build cannot be normalized as direct upload"
         );
     }
 
