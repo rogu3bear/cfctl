@@ -22607,6 +22607,7 @@ fn workspace_d1_migration_rectification_eligible(plan: &PlanV1) -> bool {
         && matches!(
             plan.transaction_stage,
             TransactionStageV1::BoundaryResponsePersisted
+                | TransactionStageV1::SecretSinkPersisted
                 | TransactionStageV1::VerificationAttemptPersisted
                 | TransactionStageV1::VerificationResponsePersisted
         )
@@ -22632,7 +22633,10 @@ async fn rectify_workspace_d1_migration(
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let retrying_after_verification_response =
         plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted;
-    if plan.transaction_stage == TransactionStageV1::BoundaryResponsePersisted {
+    if matches!(
+        plan.transaction_stage,
+        TransactionStageV1::BoundaryResponsePersisted | TransactionStageV1::SecretSinkPersisted
+    ) {
         persist_transaction_stage(
             store,
             plan,
@@ -42486,6 +42490,16 @@ mod tests {
         .expect("durable boundary response");
         plan.status = PlanStatus::RectificationRequired;
         assert!(workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::SecretSinkPersisted,
+            json!({"sink":"private","success":true}),
+        )
+        .expect("durable secret sink receipt");
+        assert!(
+            workspace_d1_migration_rectification_eligible(&plan),
+            "a crossed migration whose private receipt persisted before verification must remain retryable"
+        );
 
         plan.status = PlanStatus::Draft;
         assert!(!workspace_d1_migration_rectification_eligible(&plan));
