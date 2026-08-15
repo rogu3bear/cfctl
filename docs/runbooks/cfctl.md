@@ -869,6 +869,12 @@ working directory. `cfctl doctor --json` projects this boundary under
 `result.delegated_cli_environment` so deploy wrappers can fail closed when an
 older cfctl build does not preserve it.
 
+Artifact roots may be shared directories outside the config directory only
+when their canonical paths remain inside the same registered repository as the
+config. Hash manifests are repository-relative, so identical repository
+artifacts retain one identity regardless of config nesting. Canonical paths
+that escape the registered repository remain blocked before planning.
+
 For Worker code-only publication, keep artifact creation and production
 traffic promotion as two independently reviewed plans. The upload verifier
 reads the returned Worker version and requires both its exact ID and reviewed
