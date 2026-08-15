@@ -5,7 +5,7 @@ use std::{fs, path::Path, process::Command};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph, load_wrangler_config};
 
 #[test]
-fn exact_production_wrangler_toml_is_supported_without_admitting_arbitrary_variants() {
+fn exact_and_role_specific_production_wrangler_toml_are_supported() {
     let root = tempfile::tempdir().expect("workspace root");
     let repository = root.path().join("production-app");
     init_repo(
@@ -26,14 +26,31 @@ fn exact_production_wrangler_toml_is_supported_without_admitting_arbitrary_varia
             .any(|resource| resource.key == "worker:production-worker")
     );
 
-    let arbitrary = repository.join("wrangler.unreviewed.toml");
-    fs::write(&arbitrary, "name = \"unreviewed-worker\"\n").expect("arbitrary config");
-    assert!(
-        load_wrangler_config(&arbitrary)
-            .expect_err("arbitrary Wrangler variants must remain outside the authority contract")
-            .to_string()
-            .contains("not wrangler.toml")
-    );
+    for name in [
+        "wrangler.mail-router.toml",
+        "wrangler.mail-router.production.toml",
+        "wrangler.mail-outbound.production.toml",
+        "wrangler.routing-health.production.toml",
+    ] {
+        let role = repository.join(name);
+        fs::write(&role, "name = \"role-worker\"\n").expect("role config");
+        assert_eq!(
+            load_wrangler_config(&role).expect("role-specific Wrangler TOML")["name"],
+            "role-worker"
+        );
+    }
+
+    for name in [
+        "wrangler..toml",
+        "wrangler.role_name.toml",
+        "wrangler.-role.toml",
+        "wrangler.role-.production.toml",
+        "wrangler.unreviewed.extra.toml",
+    ] {
+        let invalid = repository.join(name);
+        fs::write(&invalid, "name = \"invalid-worker\"\n").expect("invalid config");
+        assert!(load_wrangler_config(&invalid).is_err(), "accepted {name}");
+    }
 }
 
 #[test]

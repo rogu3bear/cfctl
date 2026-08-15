@@ -435,12 +435,11 @@ fn is_cloudflare_config(path: &Path) -> bool {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
     let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "wrangler.toml" | "wrangler.production.toml" | "wrangler.json" | "wrangler.jsonc"
-    ) || path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("tf"))
+    is_wrangler_toml_name(&lower)
+        || matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc")
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("tf"))
         || lower.strip_suffix(".tf.json").is_some()
         || (path.extension().is_some_and(|extension| {
             extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
@@ -453,7 +452,7 @@ fn config_kind(path: &Path) -> &'static str {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml") {
+    if is_wrangler_toml_name(&lower) {
         "wrangler_toml"
     } else if matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc") {
         "wrangler_json"
@@ -466,6 +465,26 @@ fn config_kind(path: &Path) -> &'static str {
     } else {
         "pulumi"
     }
+}
+
+fn is_wrangler_toml_name(name: &str) -> bool {
+    if matches!(name, "wrangler.toml" | "wrangler.production.toml") {
+        return true;
+    }
+    let Some(stem) = name
+        .strip_prefix("wrangler.")
+        .and_then(|value| value.strip_suffix(".toml"))
+    else {
+        return false;
+    };
+    let role = stem.strip_suffix(".production").unwrap_or(stem);
+    !role.is_empty()
+        && role.len() <= 63
+        && role.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'-' => index > 0 && index + 1 < role.len(),
+            _ => false,
+        })
 }
 
 /// Load one Wrangler configuration through the same TOML/JSON/JSONC parser
@@ -493,7 +512,7 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
             ))
         }),
         _ => Err(WorkspaceError::DiscoveryInvariant(format!(
-            "deployment configuration `{}` is not wrangler.toml, wrangler.production.toml, wrangler.json, or wrangler.jsonc",
+            "deployment configuration `{}` is not a canonical Wrangler TOML/JSON configuration name",
             path.display()
         ))),
     }

@@ -413,16 +413,19 @@ fn production_identity(config: &toml::Value, binding: &str) -> Result<(String, S
         .and_then(toml::Value::as_str)
         .filter(|value| canonical_uuid(value))
         .ok_or_else(|| CliError::Input("production D1 database id is invalid".to_owned()))?;
-    let preview = matches[0]
-        .get("preview_database_id")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("production preview D1 database id is missing".to_owned())
-        })?;
-    if preview != id {
-        return Err(CliError::Input(
-            "production and preview D1 database ids must be identical".to_owned(),
-        ));
+    if let Some(preview) = matches[0].get("preview_database_id") {
+        let preview = preview
+            .as_str()
+            .filter(|value| canonical_uuid(value))
+            .ok_or_else(|| {
+                CliError::Input("production preview D1 database id is invalid".to_owned())
+            })?;
+        if preview != id {
+            return Err(CliError::Input(
+                "a production config that declares preview_database_id must bind it to the same D1 database; use a separate governed preview config for an isolated preview database"
+                    .to_owned(),
+            ));
+        }
     }
     Ok((name.to_owned(), id.to_owned()))
 }
@@ -1194,5 +1197,50 @@ preview_database_id = "11111111-1111-4111-8111-111111111111"
         production["main"] = toml::Value::String("other.js".to_owned());
         normalize_production_identity(&mut production, &template, "DB").expect("normalize");
         assert_ne!(production, template);
+    }
+
+    #[test]
+    fn production_identity_accepts_a_preview_free_production_binding() {
+        let production: toml::Value = toml::from_str(
+            r#"
+name = "production-worker"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "production-db"
+database_id = "11111111-1111-4111-8111-111111111111"
+"#,
+        )
+        .expect("production");
+
+        assert_eq!(
+            production_identity(&production, "DB").expect("preview-free identity"),
+            (
+                "production-db".to_owned(),
+                "11111111-1111-4111-8111-111111111111".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn production_identity_rejects_a_distinct_or_malformed_inline_preview_binding() {
+        for preview in [
+            "22222222-2222-4222-8222-222222222222",
+            "not-a-canonical-uuid",
+        ] {
+            let production: toml::Value = toml::from_str(&format!(
+                r#"
+name = "production-worker"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "production-db"
+database_id = "11111111-1111-4111-8111-111111111111"
+preview_database_id = "{preview}"
+"#
+            ))
+            .expect("production");
+            assert!(production_identity(&production, "DB").is_err());
+        }
     }
 }
