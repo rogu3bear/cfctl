@@ -712,6 +712,55 @@ fn validate_worker_metafile(
     Ok(Value::Array(bound_inputs))
 }
 
+fn contains_runtime_dynamic_import(bytes: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    while cursor.saturating_add(6) <= bytes.len() {
+        let Some(offset) = bytes[cursor..]
+            .windows(6)
+            .position(|window| window == b"import")
+        else {
+            return false;
+        };
+        let start = cursor + offset;
+        let previous_is_identifier = start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[start - 1], b'_' | b'$'));
+        let mut next = start + 6;
+        let next_is_identifier = next < bytes.len()
+            && (bytes[next].is_ascii_alphanumeric() || matches!(bytes[next], b'_' | b'$'));
+        if !previous_is_identifier && !next_is_identifier {
+            loop {
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if bytes.get(next..next.saturating_add(2)) == Some(b"/*") {
+                    let Some(end) = bytes[next + 2..]
+                        .windows(2)
+                        .position(|window| window == b"*/")
+                    else {
+                        return true;
+                    };
+                    next += end + 4;
+                    continue;
+                }
+                if bytes.get(next..next.saturating_add(2)) == Some(b"//") {
+                    next = bytes[next + 2..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(bytes.len(), |end| next + end + 3);
+                    continue;
+                }
+                break;
+            }
+            if bytes.get(next) == Some(&b'(') {
+                return true;
+            }
+        }
+        cursor = start + 6;
+    }
+    false
+}
+
 fn build_worker_bundle(
     root: &Path,
     artifact: &Value,
@@ -772,6 +821,12 @@ fn build_worker_bundle(
         path: output_path.display().to_string(),
         source,
     })?;
+    if contains_runtime_dynamic_import(&bytes) {
+        return Err(CliError::Input(
+            "Pages worker bundle retained a runtime dynamic import that is absent from esbuild's closed input graph"
+                .to_owned(),
+        ));
+    }
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES {
         return Err(CliError::Input(
             "Pages worker bundle exceeds the 25 MiB provider limit".to_owned(),
@@ -789,6 +844,7 @@ fn build_worker_bundle(
                 "size": bytes.len(),
                 "sha256": hex::encode(Sha256::digest(&bytes)),
             },
+            "runtime_dynamic_imports": false,
             "wrangler_bundle": false,
         }),
         bytes,
@@ -1555,6 +1611,27 @@ printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]},"worker-support.j
         assert_eq!(
             fs::read(Path::new(staged).join("worker-support.js")).expect("staged support"),
             b"export const ok = true;"
+        );
+
+        fs::write(
+            &esbuild,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    --metafile=*) metafile="${arg#--metafile=}" ;;
+    --outfile=*) outfile="${arg#--outfile=}" ;;
+  esac
+done
+printf 'var p="./worker-support.js"; export default {fetch(){return import(p)}}' > "$outfile"
+printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]}},"outputs":{"bundle":{"imports":[]}}}' > "$metafile"
+"#,
+        )
+        .expect("dynamic-import esbuild");
+        assert!(
+            build_worker_bundle(&artifact_root, &artifact, &producer)
+                .expect_err("metafile omission cannot admit a runtime import")
+                .to_string()
+                .contains("runtime dynamic import")
         );
     }
 

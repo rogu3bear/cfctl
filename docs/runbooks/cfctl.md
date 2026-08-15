@@ -1000,7 +1000,9 @@ generated the catalog carrier. When `_worker.js` is present, cfctl uses that
 bound builder before the provider boundary, requires its metafile to show that
 every resolved module is already inside the admitted artifact, and binds the
 closed bundle's size and SHA-256. Bare imports or ancestor `node_modules`
-resolution fail planning. A live exact-project
+resolution fail planning. A runtime `import(...)` that survives bundling also
+fails closed because esbuild does not report every non-literal dynamic import
+in its metafile. A live exact-project
 read must then report `source: null` and the requested branch must equal the
 project's production branch. Existing deployments are read before planning;
 the same project/branch/commit identity is treated as a replay and rejected.
