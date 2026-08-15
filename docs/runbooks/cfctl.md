@@ -437,7 +437,14 @@ Both operations bind an exact Wrangler version, the ignored production-config
 path and D1 binding, a fresh pre-change bookmark, and a separately approved
 exact-bookmark recovery capability. The production config must be a regular
 mode-restricted file and may differ from its tracked template only in the
-allowed Worker and D1 identity fields.
+allowed Worker and D1 identity fields. A deployable production Worker binding
+may omit `preview_database_id`; an isolated preview database belongs in its own
+repository-declared Wrangler config and operation. If a production binding
+does declare `preview_database_id`, cfctl requires a canonical UUID equal to
+that binding's `database_id` and never treats it as authority for a different
+preview database. Repository operations may bind canonical role-specific root
+names such as `wrangler.mail-router.production.toml` in addition to the
+conventional `wrangler.production.toml`.
 
 Prepare a migration by its repository-owned operation id:
 
@@ -476,6 +483,11 @@ the exact ledger plus compiler-owned schema assertions returned through one
 bounded `VALUES`-backed result set. A failing readback reports only its exit
 status and content-addressed output hashes; inspect governed provider evidence
 rather than replaying a migration that may already have crossed the boundary.
+When a durable workspace-migration boundary response exists,
+`cfctl plans rectify <operation-id>` performs only the exact migration-ledger
+and compiler-owned schema assertion reads. It never invokes `wrangler d1
+migrations apply`; a matching readback closes the original plan and a mismatch
+leaves it `rectification_required`.
 Policy projection verification returns only the route count and the active policy,
 desired-state, and projection digests through compiler-owned queries.
 
@@ -584,7 +596,11 @@ Routing capability, bind the exact Worker target, and preserve the prior rule
 and subdomain DNS snapshots for separate rollback plans. Cloudflare exposes no
 proven subdomain-scoped provider delete here: rollback is exact DNS-record and
 routing-rule restoration, never zone-wide Email Routing disable. Apex MX and
-routing must remain untouched.
+routing must remain untouched. The public catch-all REST path is zone-scoped
+and does not document a subdomain selector; cfctl must not use that path for a
+subdomain merely because the subdomain DNS setup succeeded. Until a catalog
+contract can bind the subdomain on both mutation and readback, the scoped
+catch-all remains blocked rather than silently targeting the apex.
 
 Use `d1-full-export` to capture a full schema-and-data SQL snapshot immediately
 before a separately governed migration:

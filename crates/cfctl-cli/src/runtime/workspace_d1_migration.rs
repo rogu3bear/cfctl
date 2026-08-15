@@ -84,6 +84,21 @@ pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<V
 }
 
 pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    validate_bound_plan_inner(store, plan, true)
+}
+
+pub(super) fn validate_bound_plan_for_rectification(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<()> {
+    validate_bound_plan_inner(store, plan, false)
+}
+
+fn validate_bound_plan_inner(
+    store: &StateStore,
+    plan: &PlanV1,
+    require_fresh_recovery: bool,
+) -> Result<()> {
     let Some(contract) = plan.capability.workspace_d1_migration.as_ref() else {
         return Ok(());
     };
@@ -112,13 +127,17 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
     require_target_string(target, "database_name", &config.database_name)?;
     require_target_string(target, "database_id", &config.database_id)?;
     require_target_string(target, "account_id", &plan.account_id)?;
-    validate_recovery_target(
-        store,
-        target,
-        &plan.catalog_hash,
-        contract.recovery_max_age_seconds,
-        Utc::now(),
-    )
+    if require_fresh_recovery {
+        validate_recovery_target(
+            store,
+            target,
+            &plan.catalog_hash,
+            contract.recovery_max_age_seconds,
+            Utc::now(),
+        )
+    } else {
+        validate_recovery_target_identity(store, target, &plan.catalog_hash, Utc::now()).map(|_| ())
+    }
 }
 
 pub(super) async fn run(
@@ -222,12 +241,39 @@ pub(super) async fn verify(
     }
 }
 
+pub(super) async fn verify_rectification(
+    store: &StateStore,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+) -> Value {
+    match verify_inner_with_authority(store, plan, credential, false).await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "passed": false,
+            "basis": format!("workspace D1 migration rectification readback failed closed: {error}"),
+        }),
+    }
+}
+
 async fn verify_inner(
     store: &StateStore,
     plan: &PlanV1,
     credential: &AuthCredential,
 ) -> Result<Value> {
-    validate_bound_plan(store, plan)?;
+    verify_inner_with_authority(store, plan, credential, true).await
+}
+
+async fn verify_inner_with_authority(
+    store: &StateStore,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+    require_fresh_recovery: bool,
+) -> Result<Value> {
+    if require_fresh_recovery {
+        validate_bound_plan(store, plan)?;
+    } else {
+        validate_bound_plan_for_rectification(store, plan)?;
+    }
     let contract = plan
         .capability
         .workspace_d1_migration
@@ -567,6 +613,28 @@ pub(super) fn validate_recovery_target(
     max_age_seconds: u64,
     now: chrono::DateTime<Utc>,
 ) -> Result<()> {
+    let recovery = validate_recovery_target_identity(store, target, catalog_hash, now)?;
+    let observed_at = recovery
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("workspace D1 recovery time is missing".to_owned()))?
+        .parse::<chrono::DateTime<Utc>>()
+        .map_err(|_| CliError::Input("workspace D1 recovery time is invalid".to_owned()))?;
+    let age = now.signed_duration_since(observed_at);
+    if age > ChronoDuration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX)) {
+        return Err(CliError::Input(
+            "workspace D1 recovery bookmark is no longer fresh; create a new plan".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_target_identity<'a>(
+    store: &StateStore,
+    target: &'a Map<String, Value>,
+    catalog_hash: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<&'a Map<String, Value>> {
     let recovery = target
         .get("recovery")
         .and_then(Value::as_object)
@@ -579,12 +647,9 @@ pub(super) fn validate_recovery_target(
         .ok_or_else(|| CliError::Input("workspace D1 recovery time is missing".to_owned()))?
         .parse::<chrono::DateTime<Utc>>()
         .map_err(|_| CliError::Input("workspace D1 recovery time is invalid".to_owned()))?;
-    let age = now.signed_duration_since(observed_at);
-    if age < ChronoDuration::zero()
-        || age > ChronoDuration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX))
-    {
+    if now.signed_duration_since(observed_at) < ChronoDuration::zero() {
         return Err(CliError::Input(
-            "workspace D1 recovery bookmark is no longer fresh; create a new plan".to_owned(),
+            "workspace D1 recovery bookmark observation is in the future".to_owned(),
         ));
     }
     let evidence_hash = recovery_string(recovery, "evidence_hash")?;
@@ -607,7 +672,7 @@ pub(super) fn validate_recovery_target(
         "bookmark_hash",
         &hash_value(&Value::String(bookmark.to_owned()))?,
     )?;
-    Ok(())
+    Ok(recovery)
 }
 
 fn target(plan: &PlanV1) -> Result<&Map<String, Value>> {
@@ -947,7 +1012,8 @@ pub(super) fn sha256(bytes: &[u8]) -> String {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use cfctl_core::{WorkspaceD1MigrationFileV1, WorkspaceD1SchemaAssertionV1};
+    use cfctl_core::{EvidenceClass, WorkspaceD1MigrationFileV1, WorkspaceD1SchemaAssertionV1};
+    use cfctl_storage::RuntimePaths;
 
     #[test]
     fn ledger_must_be_an_exact_prefix() {
@@ -999,6 +1065,49 @@ mod tests {
         )
         .expect("failed assertion rows");
         assert!(!assertion_rows_pass(&failed, 2));
+    }
+
+    #[test]
+    fn rectification_preserves_recovery_identity_without_weakening_fresh_plan_admission() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let evidence = json!({
+            "status":200,
+            "success":true,
+            "result":{"bookmark":"bookmark-a"}
+        });
+        let receipt = store
+            .write_evidence(EvidenceClass::LiveRead, &evidence)
+            .expect("bookmark evidence");
+        let now = Utc::now();
+        let observed_at = now - ChronoDuration::hours(2);
+        let target = json!({
+            "profile_id":"profile-a",
+            "account_id":"account-a",
+            "credential_generation_id":"generation-a",
+            "recovery":{
+                "capability_id":"d1-time-travel-get-bookmark",
+                "observed_at":observed_at,
+                "evidence_hash":receipt.content_hash,
+                "bookmark":"bookmark-a",
+                "bookmark_hash":hash_value(&json!("bookmark-a")).expect("bookmark hash"),
+                "catalog_hash":"catalog-a",
+                "input_hash":format!("sha256:{}", "a".repeat(64)),
+                "profile_id":"profile-a",
+                "account_id":"account-a",
+                "credential_generation_id":"generation-a"
+            }
+        });
+        let target = target.as_object().expect("target");
+
+        assert!(
+            validate_recovery_target(&store, target, "catalog-a", 600, now).is_err(),
+            "ordinary plan admission must reject an aged recovery bookmark"
+        );
+        assert!(
+            validate_recovery_target_identity(&store, target, "catalog-a", now).is_ok(),
+            "rectification may reuse only the still-exact immutable bookmark identity"
+        );
     }
 
     #[test]

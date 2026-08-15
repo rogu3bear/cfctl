@@ -22619,7 +22619,7 @@ async fn rectify_workspace_d1_migration(
     store: &StateStore,
     plan: &mut PlanV1,
 ) -> Result<ResultEnvelopeV2> {
-    workspace_d1_migration::validate_bound_plan(store, plan)?;
+    workspace_d1_migration::validate_bound_plan_for_rectification(store, plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
     if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
@@ -22636,7 +22636,7 @@ async fn rectify_workspace_d1_migration(
             TransactionStageV1::VerificationAttemptPersisted,
         )?;
     }
-    let verification = workspace_d1_migration::verify(store, plan, &credential).await;
+    let verification = workspace_d1_migration::verify_rectification(store, plan, &credential).await;
     let verification_evidence =
         store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
