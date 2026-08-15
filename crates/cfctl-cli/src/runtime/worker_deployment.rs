@@ -125,12 +125,8 @@ pub(super) fn prepare_target(
                 config.display()
             ))
         })?;
-    if config_source.head_content_hash.as_deref() != Some(snapshot.content_hash.as_str()) {
-        return Err(CliError::Input(format!(
-            "Wrangler configuration `{}` does not match an exact Git HEAD blob",
-            config.display()
-        )));
-    }
+    let private_config_authority =
+        private_d1_identity_overlay(repository, &config, &snapshot, config_source)?;
     let source_sha = repository.git.head.as_deref().ok_or_else(|| {
         CliError::Input(format!(
             "Worker deployment repository `{}` has no readable Git HEAD",
@@ -200,15 +196,21 @@ pub(super) fn prepare_target(
             "Worker deployment message must be exactly `{expected_message}`"
         )));
     }
+    let mut config_target = json!({
+        "path": config,
+        "sha256": config_sha256,
+    });
+    if let Some(authority) = private_config_authority {
+        config_target["authority"] = Value::String("private_d1_identity_overlay".to_owned());
+        config_target["template_path"] = json!(authority.path);
+        config_target["template_sha256"] = Value::String(authority.sha256);
+    }
     let mut target = json!({
         "schema_version": 1,
         "service_name": service_name,
         "source_sha": source_sha,
         "repository": repository.path,
-        "config": {
-            "path": config,
-            "sha256": config_sha256,
-        },
+        "config": config_target,
         "version_message": expected_message,
     });
     let target_object = target
@@ -219,6 +221,165 @@ pub(super) fn prepare_target(
     })?;
     target_object.extend(operation_object.clone());
     Ok(Some(target))
+}
+
+#[derive(Debug)]
+struct PrivateConfigAuthority {
+    path: PathBuf,
+    sha256: String,
+}
+
+fn private_d1_identity_overlay(
+    repository: &cfctl_workspace::RepositoryNode,
+    config: &Path,
+    snapshot: &cfctl_workspace::WranglerConfigSnapshot,
+    source: &cfctl_workspace::SourceConfigV1,
+) -> Result<Option<PrivateConfigAuthority>, CliError> {
+    if source.head_content_hash.as_deref() == Some(snapshot.content_hash.as_str()) {
+        return Ok(None);
+    }
+    if source.head_content_hash.is_some() || source.dirty || source.worktree_diff_hash.is_some() {
+        return Err(exact_head_config_error(config));
+    }
+    if source.content_hash != snapshot.content_hash {
+        return Err(CliError::Input(
+            "private Worker production config drifted after workspace discovery; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let template_path =
+        private_config_template_path(config).ok_or_else(|| exact_head_config_error(config))?;
+    if template_path.parent() != Some(repository.path.as_path()) {
+        return Err(exact_head_config_error(config));
+    }
+    let metadata = fs::symlink_metadata(config).map_err(|source| CliError::Io {
+        path: config.display().to_string(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > 1_048_576 {
+        return Err(CliError::Input(
+            "private Worker production config must be a regular file of at most 1 MiB".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(CliError::Input(
+                "private Worker production config must have mode 0600".to_owned(),
+            ));
+        }
+    }
+    let template_source = repository
+        .configs
+        .iter()
+        .find(|candidate| candidate.path == template_path)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "private Worker production config has no tracked role template `{}`",
+                template_path.display()
+            ))
+        })?;
+    let template_snapshot = load_wrangler_config_snapshot(&template_path)?;
+    if template_source.content_hash != template_snapshot.content_hash
+        || template_source.head_content_hash.as_deref()
+            != Some(template_snapshot.content_hash.as_str())
+        || template_source.dirty
+    {
+        return Err(CliError::Input(format!(
+            "private Worker production template `{}` does not match an exact Git HEAD blob",
+            template_path.display()
+        )));
+    }
+    let mut normalized = snapshot.document.clone();
+    normalize_private_d1_identity(&mut normalized, &template_snapshot.document)?;
+    if normalized != template_snapshot.document {
+        return Err(CliError::Input(
+            "private Worker production config differs from its tracked role template outside canonical D1 database IDs"
+                .to_owned(),
+        ));
+    }
+    let sha256 = template_snapshot
+        .content_hash
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            CliError::Input("tracked Worker template digest is not canonical SHA-256".to_owned())
+        })?
+        .to_owned();
+    Ok(Some(PrivateConfigAuthority {
+        path: template_path,
+        sha256,
+    }))
+}
+
+fn exact_head_config_error(config: &Path) -> CliError {
+    CliError::Input(format!(
+        "Wrangler configuration `{}` does not match an exact Git HEAD blob",
+        config.display()
+    ))
+}
+
+fn private_config_template_path(config: &Path) -> Option<PathBuf> {
+    let name = config.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".production.toml")?;
+    let role = stem.strip_prefix("wrangler.")?;
+    if role.is_empty() {
+        return None;
+    }
+    Some(config.with_file_name(format!("{stem}.toml")))
+}
+
+fn normalize_private_d1_identity(production: &mut Value, template: &Value) -> Result<(), CliError> {
+    let template_databases = template
+        .get("d1_databases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::Input("tracked Worker template has no D1 databases".to_owned()))?;
+    let production_databases = production
+        .get_mut("d1_databases")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            CliError::Input("private Worker production config has no D1 databases".to_owned())
+        })?;
+    for database in production_databases {
+        let binding = database
+            .get("binding")
+            .and_then(Value::as_str)
+            .filter(|binding| !binding.is_empty())
+            .ok_or_else(|| {
+                CliError::Input("private Worker D1 binding is missing or invalid".to_owned())
+            })?;
+        let matches = template_databases
+            .iter()
+            .filter(|candidate| candidate.get("binding").and_then(Value::as_str) == Some(binding))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(CliError::Input(
+                "private Worker D1 binding does not have one exact tracked-template match"
+                    .to_owned(),
+            ));
+        }
+        let production_id = database
+            .get("database_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("private Worker D1 database ID is missing".to_owned())
+            })?;
+        let parsed_id = uuid::Uuid::parse_str(production_id).map_err(|_| {
+            CliError::Input(
+                "private Worker D1 database ID is not a canonical lowercase UUID".to_owned(),
+            )
+        })?;
+        if parsed_id.to_string() != production_id {
+            return Err(CliError::Input(
+                "private Worker D1 database ID is not a canonical lowercase UUID".to_owned(),
+            ));
+        }
+        let template_id = matches[0].get("database_id").cloned().ok_or_else(|| {
+            CliError::Input("tracked Worker D1 database ID is missing".to_owned())
+        })?;
+        database["database_id"] = template_id;
+    }
+    Ok(())
 }
 
 fn versions_deploy_version_id(input: &CallInput) -> Result<&str, CliError> {
@@ -940,6 +1101,245 @@ mod tests {
             .expect_err("stale artifact identity must fail")
             .to_string();
         assert!(error.contains("message must be exactly"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one Git fixture proves private overlay admission, target binding, and execution-time drift rejection"
+    )]
+    fn target_accepts_mode_0600_private_config_with_only_d1_identity_overlaid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("repository root");
+        let build = root.path().join("build");
+        fs::create_dir_all(&build).expect("build directory");
+        fs::write(build.join("worker.js"), "worker\n").expect("worker");
+        let template = root.path().join("wrangler.mail-router.toml");
+        let private = root.path().join("wrangler.mail-router.production.toml");
+        let template_text = r#"name = "relay-router"
+main = "build/worker.js"
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "00000000-0000-4000-8000-000000000000"
+"#;
+        let private_text = template_text.replace(
+            "00000000-0000-4000-8000-000000000000",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        fs::write(&template, template_text).expect("tracked template");
+        fs::write(&private, &private_text).expect("private config");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600))
+            .expect("private config permissions");
+        fs::write(
+            root.path().join(".gitignore"),
+            "wrangler.mail-router.production.toml\n",
+        )
+        .expect("gitignore");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(root.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(root.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        let source_sha = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root.path())
+            .output()
+            .expect("git head");
+        let source_sha = String::from_utf8(source_sha.stdout)
+            .expect("UTF-8 head")
+            .trim()
+            .to_owned();
+        let artifact_sha256 =
+            artifact_set_sha256(root.path(), std::slice::from_ref(&build)).expect("hash");
+        let graph =
+            WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("workspace graph");
+        let private_source = graph.repositories[0]
+            .configs
+            .iter()
+            .find(|source| source.path == private.canonicalize().expect("canonical private"))
+            .expect("private config source");
+        assert!(private_source.head_content_hash.is_none());
+        assert!(!private_source.dirty);
+
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        let input = CallInput {
+            query: json!({
+                "config": private.canonicalize().expect("canonical private"),
+                "name": "relay-router",
+                "message": format!("source={source_sha} artifact-sha256={artifact_sha256}"),
+            }),
+            ..CallInput::default()
+        };
+        let projection = prepare_target(&graph, &capability, &input)
+            .expect("private production projection")
+            .expect("Worker projection");
+        assert_eq!(projection["source_sha"], source_sha);
+        assert_eq!(
+            projection["config"]["authority"],
+            "private_d1_identity_overlay"
+        );
+        assert_eq!(
+            projection["config"]["template_path"],
+            json!(template.canonicalize().expect("canonical template"))
+        );
+        assert!(
+            !serde_json::to_string(&projection)
+                .expect("projection JSON")
+                .contains("11111111-1111-4111-8111-111111111111"),
+            "private D1 identity escaped into the plan target"
+        );
+
+        let adapter_targets = json!({"worker_deployment": projection.clone()});
+        fs::write(
+            &private,
+            template_text.replace(
+                "00000000-0000-4000-8000-000000000000",
+                "22222222-2222-4222-8222-222222222222",
+            ),
+        )
+        .expect("drift private D1 identity");
+        let error = validate_current_target(&graph, &capability, &input, &adapter_targets)
+            .expect_err("private config whose hash drifted after planning must fail")
+            .to_string();
+        assert!(error.contains("drifted after workspace discovery"));
+
+        fs::write(
+            &private,
+            format!("{private_text}\n[vars]\nEXTRA = \"forbidden\"\n"),
+        )
+        .expect("add forbidden private field");
+        let forbidden_graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+            .expect("forbidden-field graph");
+        let error = prepare_target(&forbidden_graph, &capability, &input)
+            .expect_err("private config with extra field must fail")
+            .to_string();
+        assert!(error.contains("outside canonical D1 database IDs"));
+
+        for mode in [0o644, 0o400] {
+            fs::write(&private, &private_text).expect("restore private config");
+            fs::set_permissions(&private, fs::Permissions::from_mode(mode))
+                .expect("change private config permissions");
+            let mode_graph =
+                WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("mode graph");
+            let error = prepare_target(&mode_graph, &capability, &input)
+                .expect_err("non-0600 private config must fail")
+                .to_string();
+            assert!(error.contains("must have mode 0600"));
+        }
+    }
+
+    #[test]
+    fn private_config_normalizes_only_canonical_d1_database_ids() {
+        let parse = |text: &str| {
+            let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
+            serde_json::to_value(document).expect("Wrangler JSON")
+        };
+        let template = parse(
+            r#"name = "relay-router"
+main = "build/worker.js"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "00000000-0000-4000-8000-000000000000"
+"#,
+        );
+        let production_text = r#"name = "relay-router"
+main = "build/worker.js"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "11111111-1111-4111-8111-111111111111"
+"#;
+        let mut allowed = parse(production_text);
+        normalize_private_d1_identity(&mut allowed, &template).expect("normalize D1 ID");
+        assert_eq!(allowed, template);
+
+        for (pointer, value) in [
+            ("/main", json!("other.js")),
+            ("/observability/enabled", json!(false)),
+            ("/d1_databases/0/database_name", json!("other-db")),
+        ] {
+            let mut rejected = parse(production_text);
+            *rejected
+                .pointer_mut(pointer)
+                .expect("existing mutation pointer") = value;
+            normalize_private_d1_identity(&mut rejected, &template).expect("normalize D1 ID");
+            assert_ne!(
+                rejected, template,
+                "normalized forbidden drift at {pointer}"
+            );
+        }
+
+        for invalid in [
+            "not-a-uuid",
+            "11111111-1111-4111-8111-11111111111A",
+            "{11111111-1111-4111-8111-111111111111}",
+        ] {
+            let mut rejected = parse(production_text);
+            rejected["d1_databases"][0]["database_id"] = json!(invalid);
+            assert!(normalize_private_d1_identity(&mut rejected, &template).is_err());
+        }
+    }
+
+    #[test]
+    fn private_config_template_path_is_role_specific() {
+        assert_eq!(
+            private_config_template_path(Path::new("/repo/wrangler.mail-router.production.toml")),
+            Some(PathBuf::from("/repo/wrangler.mail-router.toml"))
+        );
+        assert_eq!(
+            private_config_template_path(Path::new("/repo/wrangler.production.toml")),
+            None
+        );
+        assert_eq!(
+            private_config_template_path(Path::new("/repo/wrangler.mail-router.toml")),
+            None
+        );
     }
 
     #[test]
