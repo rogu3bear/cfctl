@@ -216,6 +216,101 @@ fn deployment_plan_set_binds_order_without_aggregating_approval() {
 }
 
 #[test]
+fn deployment_plan_set_rejects_conflicting_snapshots_for_the_same_target_key() {
+    let first = "00000000-0000-4000-8000-000000000011";
+    let second = "00000000-0000-4000-8000-000000000012";
+    let first_hash = format!("sha256:{}", "3".repeat(64));
+    let second_hash = format!("sha256:{}", "4".repeat(64));
+    let same_worker_key = format!("worker_deployment_state:sha256:{}", "f".repeat(64));
+    let mut first_child = deployment_plan_set_child(1, first, Vec::new(), &first_hash);
+    first_child.provider_snapshot_hashes = [(same_worker_key.clone(), first_hash.clone())]
+        .into_iter()
+        .collect();
+    let mut second_child =
+        deployment_plan_set_child(2, second, vec![first.to_owned()], &second_hash);
+    second_child.provider_snapshot_hashes = [(same_worker_key.clone(), second_hash.clone())]
+        .into_iter()
+        .collect();
+    let error = DeploymentPlanSetV1::new(
+        "conflicting same-target snapshots".to_owned(),
+        format!("sha256:{}", "5".repeat(64)),
+        "profile-a".to_owned(),
+        vec!["account-a".to_owned()],
+        format!("sha256:{}", "6".repeat(64)),
+        format!("sha256:{}", "7".repeat(64)),
+        "credential-generation-a".to_owned(),
+        format!("compiled:sha256:{}", "8".repeat(64)),
+        format!("sha256:{}", "9".repeat(64)),
+        vec![DeploymentPlanSetRepositoryV1 {
+            repository_id: "example/provider".to_owned(),
+            root_sha256: format!("sha256:{}", "a".repeat(64)),
+            origin_identity: "example.com/provider".to_owned(),
+            head: "b".repeat(40),
+            tree: "c".repeat(40),
+        }],
+        vec![first_child, second_child],
+        vec!["live mutation".to_owned()],
+    )
+    .expect_err("same target key with different provider snapshots must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("provider snapshot `{same_worker_key}` disagrees"))
+    );
+}
+
+#[test]
+fn deployment_plan_set_accepts_same_worker_name_in_distinct_accounts() {
+    let first = "00000000-0000-4000-8000-000000000021";
+    let second = "00000000-0000-4000-8000-000000000022";
+    let first_hash = format!("sha256:{}", "d".repeat(64));
+    let second_hash = format!("sha256:{}", "e".repeat(64));
+    let mut router = deployment_plan_set_child(1, first, Vec::new(), &first_hash);
+    let first_target_key = format!("worker_deployment_state:sha256:{}", "a".repeat(64));
+    router.provider_snapshot_hashes = [(first_target_key.clone(), first_hash.clone())]
+        .into_iter()
+        .collect();
+    let mut outbound = deployment_plan_set_child(2, second, vec![first.to_owned()], &second_hash);
+    outbound.account_id = "account-b".to_owned();
+    let second_target_key = format!("worker_deployment_state:sha256:{}", "b".repeat(64));
+    outbound.provider_snapshot_hashes = [(second_target_key.clone(), second_hash.clone())]
+        .into_iter()
+        .collect();
+
+    let bundle = DeploymentPlanSetV1::new(
+        "distinct worker snapshots".to_owned(),
+        format!("sha256:{}", "1".repeat(64)),
+        "profile-a".to_owned(),
+        vec!["account-a".to_owned(), "account-b".to_owned()],
+        format!("sha256:{}", "2".repeat(64)),
+        format!("sha256:{}", "3".repeat(64)),
+        "credential-generation-a".to_owned(),
+        format!("compiled:sha256:{}", "4".repeat(64)),
+        format!("sha256:{}", "5".repeat(64)),
+        vec![DeploymentPlanSetRepositoryV1 {
+            repository_id: "example/provider".to_owned(),
+            root_sha256: format!("sha256:{}", "6".repeat(64)),
+            origin_identity: "example.com/provider".to_owned(),
+            head: "7".repeat(40),
+            tree: "8".repeat(40),
+        }],
+        vec![router, outbound],
+        vec!["live mutation".to_owned()],
+    )
+    .expect("different Worker targets have independent snapshot authority");
+
+    assert_eq!(
+        bundle.provider_snapshot_hashes.get(&first_target_key),
+        Some(&first_hash)
+    );
+    assert_eq!(
+        bundle.provider_snapshot_hashes.get(&second_target_key),
+        Some(&second_hash)
+    );
+}
+
+#[test]
 fn d1_full_export_contract_is_hash_bound_and_serializable() {
     let mut capability = CapabilityV1::new(
         "d1-full-export",
