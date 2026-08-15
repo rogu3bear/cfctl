@@ -996,7 +996,11 @@ of Wrangler's complete installed production/optional dependency graph. The
 bounded graph includes `wrangler-dist/cli.js`, the `blake3-wasm` implementation
 that determines provider asset hashes, `esbuild`, and the selected
 platform-native builder used for `_worker.js`, along with the version that
-generated the catalog carrier. A live exact-project
+generated the catalog carrier. When `_worker.js` is present, cfctl uses that
+bound builder before the provider boundary, requires its metafile to show that
+every resolved module is already inside the admitted artifact, and binds the
+closed bundle's size and SHA-256. Bare imports or ancestor `node_modules`
+resolution fail planning. A live exact-project
 read must then report `source: null` and the requested branch must equal the
 project's production branch. Existing deployments are read before planning;
 the same project/branch/commit identity is treated as a replay and rejected.
@@ -1007,7 +1011,10 @@ after the live concurrency read. Only then may the bound interpreter and
 producer run from a private configless directory with the selected
 account, cfctl's Wrangler cache, and the selected credential. Wrangler remains
 the authoritative multipart producer: it performs the content-addressed asset
-upload and sends the provider-required `manifest` form field, without implicit
+upload and sends the provider-required `manifest` form field. cfctl stages
+only the planned bytes and tells Wrangler not to rebundle the already-closed
+worker, so no second project dependency resolution can alter the request.
+There are no implicit
 `wrangler.toml`, Functions, dotenv, or current-directory inputs. Wrangler's
 governed structured-output file must return one canonical deployment ID with
 the exact project, production branch, environment, and commit. The verifier

@@ -6409,7 +6409,7 @@ async fn run_delegated_plan_boundary(
         return workspace_d1_projection::run(store, plan, credential).await;
     }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
-    let delegated_input =
+    let mut delegated_input =
         worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
     let (bound_program, bound_interpreter) = if pages_deployment::binds_artifact(&plan.capability) {
         (
@@ -6420,6 +6420,14 @@ async fn run_delegated_plan_boundary(
         )
     } else {
         (None, None)
+    };
+    let _staged_pages_artifact = if pages_deployment::binds_artifact(&plan.capability) {
+        Some(pages_deployment::stage_bound_artifact(
+            adapter_targets,
+            &mut delegated_input,
+        )?)
+    } else {
+        None
     };
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
         run_quick_tunnel(store, plan, input).await?
@@ -7365,6 +7373,11 @@ async fn run_delegated_cli(
     };
     append_cli_input(&mut command, &input.selectors)?;
     append_cli_input(&mut command, &input.query)?;
+    if pages_deployment::binds_artifact(capability) {
+        // cfctl already produced and hash-bound the closed worker bundle. A
+        // second Wrangler bundle would reopen ambient project resolution.
+        command.arg("--no-bundle");
+    }
     if input.body.is_some() {
         return Err(CliError::Input(
             "delegated CLI request bodies need a capability-specific native adapter".to_owned(),

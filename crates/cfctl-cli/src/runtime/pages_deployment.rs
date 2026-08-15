@@ -31,6 +31,21 @@ const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_PRODUCER_FILE_COUNT: usize = 10_000;
 const MAX_PRODUCER_BYTES: u64 = 512 * 1024 * 1024;
 const CONTROL_FILES: [&str; 4] = ["_headers", "_redirects", "_routes.json", "_worker.js"];
+const WORKER_BUNDLE_ARGS: &[&str] = &[
+    "--bundle",
+    "--format=esm",
+    "--platform=browser",
+    "--target=es2024",
+    "--conditions=workerd,worker,browser",
+    "--loader:.js=jsx",
+    "--loader:.mjs=jsx",
+    "--loader:.cjs=jsx",
+    "--supported:import-source=true",
+    "--keep-names",
+    "--define:process.env.NODE_ENV=\"production\"",
+    "--define:global.process.env.NODE_ENV=\"production\"",
+    "--define:globalThis.process.env.NODE_ENV=\"production\"",
+];
 
 pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
     capability.id == DIRECT_UPLOAD_CAPABILITY_ID
@@ -614,6 +629,197 @@ fn wrangler_producer_at(capability: &CapabilityV1, discovered: &Path) -> Result<
     }))
 }
 
+fn artifact_entry<'a>(artifact: &'a Value, path: &str) -> Option<&'a Value> {
+    artifact["entries"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(path))
+}
+
+fn producer_component_root(producer: &Value, component: &str) -> Result<PathBuf, CliError> {
+    producer
+        .pointer("/execution_closure/roots")
+        .and_then(Value::as_array)
+        .and_then(|roots| {
+            roots.iter().find_map(|root| {
+                (root["component"].as_str() == Some(component))
+                    .then(|| root["root"].as_str())
+                    .flatten()
+            })
+        })
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "Pages worker bundling requires `{component}` in the bound Wrangler dependency graph"
+            ))
+        })
+}
+
+fn validate_worker_metafile(
+    root: &Path,
+    artifact: &Value,
+    metafile: &Value,
+) -> Result<Value, CliError> {
+    let canonical_root = fs::canonicalize(root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    let inputs = metafile["inputs"].as_object().ok_or_else(|| {
+        CliError::Input("Pages worker bundler omitted its resolved input graph".to_owned())
+    })?;
+    let mut bound_inputs = Vec::new();
+    for input in inputs.keys() {
+        let joined = root.join(input);
+        let canonical = fs::canonicalize(&joined).map_err(|source| CliError::Io {
+            path: joined.display().to_string(),
+            source,
+        })?;
+        let relative = canonical.strip_prefix(&canonical_root).map_err(|_| {
+            CliError::Input(format!(
+                "Pages worker import `{input}` resolves outside the admitted artifact root"
+            ))
+        })?;
+        let path = relative.to_str().ok_or_else(|| {
+            CliError::Input("Pages worker input paths must be valid UTF-8".to_owned())
+        })?;
+        let path = path.replace('\\', "/");
+        let entry = artifact_entry(artifact, &path).ok_or_else(|| {
+            CliError::Input(format!(
+                "Pages worker input `{path}` is absent from the admitted artifact manifest"
+            ))
+        })?;
+        bound_inputs.push(json!({
+            "path": path,
+            "size": entry["size"],
+            "sha256": entry["sha256"],
+        }));
+    }
+    bound_inputs.sort_by_key(|entry| entry["path"].as_str().unwrap_or_default().to_owned());
+    let outputs = metafile["outputs"].as_object().ok_or_else(|| {
+        CliError::Input("Pages worker bundler omitted its output graph".to_owned())
+    })?;
+    if outputs.len() != 1
+        || outputs.values().any(|output| {
+            output["imports"]
+                .as_array()
+                .is_none_or(|imports| !imports.is_empty())
+        })
+    {
+        return Err(CliError::Input(
+            "Pages worker bundle retained an unresolved external import".to_owned(),
+        ));
+    }
+    Ok(Value::Array(bound_inputs))
+}
+
+fn build_worker_bundle(
+    root: &Path,
+    artifact: &Value,
+    producer: &Value,
+) -> Result<Option<(Value, Vec<u8>)>, CliError> {
+    if artifact_entry(artifact, "_worker.js").is_none() {
+        return Ok(None);
+    }
+    let esbuild_root = producer_component_root(producer, "esbuild")?;
+    let esbuild = esbuild_root.join("bin/esbuild");
+    let interpreter = producer
+        .pointer("/interpreter/path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages worker bundling requires the exact bound JavaScript interpreter".to_owned(),
+            )
+        })?;
+    let scratch = tempfile::Builder::new()
+        .prefix("cfctl-pages-worker-bundle-")
+        .tempdir()
+        .map_err(|source| CliError::Io {
+            path: "temporary Pages worker bundle directory".to_owned(),
+            source,
+        })?;
+    let output_path = scratch.path().join("_worker.js");
+    let metafile_path = scratch.path().join("metafile.json");
+    let output = Command::new(&interpreter)
+        .arg(&esbuild)
+        .arg("_worker.js")
+        .args(WORKER_BUNDLE_ARGS)
+        .arg(format!("--metafile={}", metafile_path.display()))
+        .arg(format!("--outfile={}", output_path.display()))
+        .current_dir(root)
+        .env_clear()
+        .env("HOME", scratch.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .map_err(|source| CliError::Io {
+            path: esbuild.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Input(format!(
+            "Pages worker did not form a closed bundle from the admitted artifact: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let metafile: Value =
+        serde_json::from_slice(&fs::read(&metafile_path).map_err(|source| CliError::Io {
+            path: metafile_path.display().to_string(),
+            source,
+        })?)
+        .map_err(|error| CliError::Input(format!("Pages worker metafile is invalid: {error}")))?;
+    let inputs = validate_worker_metafile(root, artifact, &metafile)?;
+    let bytes = fs::read(&output_path).map_err(|source| CliError::Io {
+        path: output_path.display().to_string(),
+        source,
+    })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES {
+        return Err(CliError::Input(
+            "Pages worker bundle exceeds the 25 MiB provider limit".to_owned(),
+        ));
+    }
+    Ok(Some((
+        json!({
+            "schema_version": 1,
+            "entrypoint": "_worker.js",
+            "producer_component": "esbuild",
+            "arguments": WORKER_BUNDLE_ARGS,
+            "inputs": inputs,
+            "output": {
+                "path": "_worker.js",
+                "size": bytes.len(),
+                "sha256": hex::encode(Sha256::digest(&bytes)),
+            },
+            "wrangler_bundle": false,
+        }),
+        bytes,
+    )))
+}
+
+fn transport_manifest(artifact: &Value, worker_bundle: Option<&Value>) -> Result<Value, CliError> {
+    let mut entries = artifact["entries"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| CliError::Input("Pages artifact manifest omitted entries".to_owned()))?;
+    if let Some(bundle) = worker_bundle {
+        let worker = entries
+            .iter_mut()
+            .find(|entry| entry["path"].as_str() == Some("_worker.js"))
+            .ok_or_else(|| {
+                CliError::Input("Pages worker bundle has no admitted entrypoint".to_owned())
+            })?;
+        worker["size"] = bundle["output"]["size"].clone();
+        worker["sha256"] = bundle["output"]["sha256"].clone();
+    }
+    let content_hash = hash_value(&Value::Array(entries.clone()))?;
+    Ok(json!({
+        "schema_version": 1,
+        "asset_count": artifact["asset_count"],
+        "entry_count": entries.len(),
+        "content_hash": content_hash,
+        "entries": entries,
+    }))
+}
+
 pub(super) fn prepare_target(
     graph: &WorkspaceGraph,
     capability: &CapabilityV1,
@@ -667,6 +873,9 @@ pub(super) fn prepare_target(
     }
     let artifact = manifest(&root)?;
     let producer = wrangler_producer(capability)?;
+    let worker_bundle =
+        build_worker_bundle(&root, &artifact, &producer)?.map(|(contract, _bytes)| contract);
+    let transport_manifest = transport_manifest(&artifact, worker_bundle.as_ref())?;
     Ok(Some(json!({
         "schema_version": 1,
         "project_name": project_name(capability, input)?,
@@ -678,6 +887,8 @@ pub(super) fn prepare_target(
         "artifact": artifact,
         "provider_request": {
             "producer": producer,
+            "worker_bundle": worker_bundle,
+            "transport_manifest": transport_manifest,
             "asset_transport": "content-addressed Pages asset upload",
             "deployment_transport": "multipart/form-data",
             "manifest_required": true,
@@ -735,6 +946,97 @@ pub(super) fn bound_wrangler_interpreter(
 
 pub(super) fn target(adapter_targets: &Value) -> Option<&Value> {
     adapter_targets.get("pages_deployment")
+}
+
+pub(super) fn stage_bound_artifact(
+    adapter_targets: &Value,
+    input: &mut CallInput,
+) -> Result<tempfile::TempDir, CliError> {
+    let expected = target(adapter_targets).ok_or_else(|| {
+        CliError::Input(
+            "Pages direct-upload plan omitted its immutable artifact target; create a new plan"
+                .to_owned(),
+        )
+    })?;
+    let root = artifact_root(input)?;
+    let artifact = manifest(&root)?;
+    if artifact != expected["artifact"] {
+        return Err(CliError::Input(
+            "Pages artifact drifted before staging; the provider boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let producer = &expected["provider_request"]["producer"];
+    let worker_bundle = build_worker_bundle(&root, &artifact, producer)?;
+    let expected_bundle = &expected["provider_request"]["worker_bundle"];
+    if worker_bundle
+        .as_ref()
+        .map_or(&Value::Null, |(contract, _bytes)| contract)
+        != expected_bundle
+    {
+        return Err(CliError::Input(
+            "Pages worker bundle drifted before staging; the provider boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let stage = tempfile::Builder::new()
+        .prefix("cfctl-pages-staged-artifact-")
+        .tempdir()
+        .map_err(|source| CliError::Io {
+            path: "temporary staged Pages artifact".to_owned(),
+            source,
+        })?;
+    let staged_root = stage.path().join("artifact");
+    fs::create_dir(&staged_root).map_err(|source| CliError::Io {
+        path: staged_root.display().to_string(),
+        source,
+    })?;
+    for entry in artifact["entries"].as_array().ok_or_else(|| {
+        CliError::Input("Pages artifact manifest omitted its admitted entries".to_owned())
+    })? {
+        let relative = entry["path"].as_str().ok_or_else(|| {
+            CliError::Input("Pages artifact manifest contains an invalid path".to_owned())
+        })?;
+        let source_path = root.join(relative);
+        let destination = staged_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        let bytes = if relative == "_worker.js" {
+            worker_bundle
+                .as_ref()
+                .map(|(_contract, bytes)| bytes.clone())
+                .ok_or_else(|| {
+                    CliError::Input("Pages worker entrypoint was not bundled".to_owned())
+                })?
+        } else {
+            fs::read(&source_path).map_err(|source| CliError::Io {
+                path: source_path.display().to_string(),
+                source,
+            })?
+        };
+        fs::write(&destination, bytes).map_err(|source| CliError::Io {
+            path: destination.display().to_string(),
+            source,
+        })?;
+    }
+    let staged = manifest(&staged_root)?;
+    let expected_transport = &expected["provider_request"]["transport_manifest"];
+    if staged["asset_count"] != expected_transport["asset_count"]
+        || staged["entry_count"] != expected_transport["entry_count"]
+        || staged["content_hash"] != expected_transport["content_hash"]
+        || staged["entries"] != expected_transport["entries"]
+    {
+        return Err(CliError::Input(
+            "Pages staged transport differs from the planned content-addressed payload; the provider boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    input.query["argument"] = json!(staged_root);
+    Ok(stage)
 }
 
 pub(super) fn validate_bound_plan(
@@ -1117,6 +1419,143 @@ mod tests {
             std::os::unix::fs::symlink(&asset, &alias).expect("nested symlink");
             assert!(manifest(root.path()).is_err());
         }
+    }
+
+    #[test]
+    fn worker_metafile_accepts_only_hash_bound_artifact_inputs() {
+        let parent = tempfile::tempdir().expect("worker project");
+        let artifact = parent.path().join("dist");
+        fs::create_dir(&artifact).expect("artifact root");
+        fs::write(
+            artifact.join("_worker.js"),
+            b"import './worker-support.js'; export default {};",
+        )
+        .expect("worker");
+        fs::write(
+            artifact.join("worker-support.js"),
+            b"export const ok = true;",
+        )
+        .expect("support");
+        fs::write(artifact.join("index.html"), b"ok").expect("asset");
+        let admitted = manifest(&artifact).expect("admitted manifest");
+        let local = json!({
+            "inputs": {
+                "_worker.js": {"bytes": 51, "imports": []},
+                "worker-support.js": {"bytes": 23, "imports": []}
+            },
+            "outputs": {
+                "/tmp/bundle.js": {"imports": []}
+            }
+        });
+        let bound = validate_worker_metafile(&artifact, &admitted, &local)
+            .expect("closed local worker graph");
+        assert_eq!(bound.as_array().expect("inputs").len(), 2);
+
+        let external = parent.path().join("node_modules/some-package");
+        fs::create_dir_all(&external).expect("ambient package");
+        fs::write(external.join("index.js"), b"export default 'drift';").expect("ambient input");
+        let escaped = json!({
+            "inputs": {
+                "_worker.js": {"bytes": 51, "imports": []},
+                "../node_modules/some-package/index.js": {"bytes": 23, "imports": []}
+            },
+            "outputs": {
+                "/tmp/bundle.js": {"imports": []}
+            }
+        });
+        let error = validate_worker_metafile(&artifact, &admitted, &escaped)
+            .expect_err("ancestor dependency must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the admitted artifact root")
+        );
+
+        let unresolved = json!({
+            "inputs": {"_worker.js": {"bytes": 51, "imports": []}},
+            "outputs": {
+                "/tmp/bundle.js": {"imports": [{"path":"some-package","external":true}]}
+            }
+        });
+        assert!(validate_worker_metafile(&artifact, &admitted, &unresolved).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_worker_is_the_planned_closed_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("worker artifact");
+        let artifact_root = root.path().join("site");
+        fs::create_dir(&artifact_root).expect("artifact root");
+        fs::write(
+            artifact_root.join("_worker.js"),
+            b"import './worker-support.js'; export default {};",
+        )
+        .expect("worker");
+        fs::write(
+            artifact_root.join("worker-support.js"),
+            b"export const ok = true;",
+        )
+        .expect("support");
+        fs::write(artifact_root.join("index.html"), b"ok").expect("asset");
+        let artifact_root = artifact_root.canonicalize().expect("canonical artifact");
+        let esbuild_root = root.path().join("producer/esbuild");
+        fs::create_dir_all(esbuild_root.join("bin")).expect("esbuild bin");
+        let esbuild = esbuild_root.join("bin/esbuild");
+        fs::write(
+            &esbuild,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    --metafile=*) metafile="${arg#--metafile=}" ;;
+    --outfile=*) outfile="${arg#--outfile=}" ;;
+  esac
+done
+printf 'closed-worker-bundle' > "$outfile"
+printf '%s' '{"inputs":{"_worker.js":{"bytes":51,"imports":[]},"worker-support.js":{"bytes":23,"imports":[]}},"outputs":{"bundle":{"imports":[]}}}' > "$metafile"
+"#,
+        )
+        .expect("fake esbuild");
+        let mut permissions = fs::metadata(&esbuild)
+            .expect("fake esbuild metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&esbuild, permissions).expect("fake esbuild mode");
+        let artifact = manifest(&artifact_root).expect("artifact manifest");
+        let producer = json!({
+            "interpreter": {"path":"/bin/sh"},
+            "execution_closure": {"roots":[{"component":"esbuild","root":esbuild_root}]}
+        });
+        let (bundle, _bytes) = build_worker_bundle(&artifact_root, &artifact, &producer)
+            .expect("worker build")
+            .expect("worker bundle");
+        let expected_transport = transport_manifest(&artifact, Some(&bundle)).expect("transport");
+        let targets = json!({
+            "pages_deployment": {
+                "artifact": artifact,
+                "provider_request": {
+                    "producer": producer,
+                    "worker_bundle": bundle,
+                    "transport_manifest": expected_transport
+                }
+            }
+        });
+        let mut input = CallInput {
+            query: json!({"argument":artifact_root}),
+            ..CallInput::default()
+        };
+        let stage = stage_bound_artifact(&targets, &mut input).expect("staged artifact");
+        let staged = input.query["argument"].as_str().expect("staged path");
+        assert!(Path::new(staged).starts_with(stage.path()));
+        assert_eq!(
+            fs::read(Path::new(staged).join("_worker.js")).expect("staged worker"),
+            b"closed-worker-bundle"
+        );
+        assert_eq!(
+            fs::read(Path::new(staged).join("worker-support.js")).expect("staged support"),
+            b"export const ok = true;"
+        );
     }
 
     #[test]
