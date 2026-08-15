@@ -2925,22 +2925,31 @@ mod tests {
             output
         }
 
-        fn run_hook(repo: &Path, fake_bin: &Path, cargo_log: &Path, update: &str) -> Output {
+        fn run_hook(
+            repo: &Path,
+            fake_bin: &Path,
+            cargo_log: &Path,
+            update: &str,
+            mutation_path: Option<&Path>,
+        ) -> Output {
             let mut search_path = vec![fake_bin.to_path_buf()];
             search_path.extend(std::env::split_paths(
                 &std::env::var_os("PATH").unwrap_or_default(),
             ));
             let search_path = std::env::join_paths(search_path).expect("fixture PATH is valid");
-            let mut child = Command::new("bash")
+            let mut command = Command::new("bash");
+            command
                 .arg(".githooks/pre-push-gate.sh")
                 .current_dir(repo)
                 .env("PATH", search_path)
                 .env("FAKE_CARGO_LOG", cargo_log)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("pre-push fixture starts");
+                .stderr(Stdio::piped());
+            if let Some(path) = mutation_path {
+                command.env("FAKE_CARGO_MUTATE_PATH", path);
+            }
+            let mut child = command.spawn().expect("pre-push fixture starts");
             child
                 .stdin
                 .as_mut()
@@ -2975,7 +2984,10 @@ mod tests {
         let fake_cargo = fake_bin.join("cargo");
         fs::write(
             &fake_cargo,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CARGO_LOG\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CARGO_LOG\"\n\
+             if [ -n \"${FAKE_CARGO_MUTATE_PATH:-}\" ]; then\n\
+               printf 'mutated\\n' > \"$FAKE_CARGO_MUTATE_PATH\"\n\
+             fi\n",
         )
         .expect("fake cargo is written");
         fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
@@ -2996,7 +3008,7 @@ mod tests {
             .to_owned();
         let zero_oid = "0".repeat(clean_oid.len());
         let clean_update = format!("refs/heads/main {clean_oid} refs/heads/main {zero_oid}\n");
-        let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update);
+        let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None);
         assert!(
             clean.status.success(),
             "one clean checked-out branch object must pass: {}",
@@ -3006,6 +3018,30 @@ mod tests {
             fs::read_to_string(&cargo_log).expect("fake cargo ran"),
             "xtask verify\n"
         );
+
+        fs::remove_file(&cargo_log).expect("fake cargo log is reset");
+        let tracked_path = repo.join("tracked.txt");
+        let raced = run_hook(
+            &repo,
+            &fake_bin,
+            &cargo_log,
+            &clean_update,
+            Some(&tracked_path),
+        );
+        assert!(
+            !raced.status.success(),
+            "source mutation during verification must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&raced.stderr).contains("source changed during verification"),
+            "unexpected verification-race error: {}",
+            String::from_utf8_lossy(&raced.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&cargo_log).expect("fake cargo ran before final rebind"),
+            "xtask verify\n"
+        );
+        fs::write(&tracked_path, "clean\n").expect("raced fixture is restored");
 
         fs::remove_file(&cargo_log).expect("fake cargo log is reset");
         fs::create_dir_all(repo.join(".github/workflows"))
@@ -3024,7 +3060,7 @@ mod tests {
         fs::remove_file(repo.join(".github/workflows/hosted.yml"))
             .expect("workflow is deleted only from the worktree");
         let dirty_update = format!("refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n");
-        let dirty = run_hook(&repo, &fake_bin, &cargo_log, &dirty_update);
+        let dirty = run_hook(&repo, &fake_bin, &cargo_log, &dirty_update, None);
         assert!(!dirty.status.success(), "dirty deletion must fail closed");
         assert!(
             String::from_utf8_lossy(&dirty.stderr).contains("source must be clean"),
@@ -3040,7 +3076,7 @@ mod tests {
         .expect("workflow fixture is restored");
         let non_head_update =
             format!("refs/heads/other {workflow_oid} refs/heads/other {zero_oid}\n");
-        let non_head = run_hook(&repo, &fake_bin, &cargo_log, &non_head_update);
+        let non_head = run_hook(&repo, &fake_bin, &cargo_log, &non_head_update, None);
         assert!(
             !non_head.status.success(),
             "non-HEAD refspec must fail closed"
@@ -3056,7 +3092,7 @@ mod tests {
             "refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n\
              refs/heads/other {clean_oid} refs/heads/other {zero_oid}\n"
         );
-        let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates);
+        let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates, None);
         assert!(
             !multiple.status.success(),
             "multiple distinct pushed objects must fail closed"

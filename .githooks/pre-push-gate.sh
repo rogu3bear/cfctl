@@ -77,6 +77,19 @@ echo "pre-push: running cargo xtask verify for ${head_oid:0:7}..."
 # Capture unpiped. Piping the gate through tail/head masks its exit status and
 # has produced a false green in this repo before.
 log="$(mktemp -t cfctl-pre-push-gate)"
+proof_parent="$(mktemp -d -t cfctl-pre-push-proof)"
+proof_root="$proof_parent/checkout"
+cleanup() {
+  git worktree remove --force "$proof_root" >/dev/null 2>&1 || true
+  rm -rf "$proof_parent"
+}
+trap cleanup EXIT
+
+# Verify an immutable detached checkout of the exact object supplied by Git's
+# pre-push protocol. The operator's working checkout may change while this
+# long-running proof executes; those bytes must never become proof for the
+# object Git selected before invoking the hook.
+git worktree add --detach --quiet "$proof_root" "$local_oid"
 set +e
 # Git exports GIT_DIR and friends into hooks. Left in place they reach every
 # subprocess the gate starts, including tests that create their own throwaway
@@ -85,10 +98,11 @@ set +e
 # exported path shares the main repository's config file, so that mistake marks
 # the real repository bare. The gate resolved its own root above; nothing past
 # this point should inherit the hook's git context.
-env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-  -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-  -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
-  cargo xtask verify >"$log" 2>&1
+(cd "$proof_root" && \
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
+    cargo xtask verify) >"$log" 2>&1
 verify_exit=$?
 set -e
 
@@ -102,5 +116,20 @@ if [ "$verify_exit" -ne 0 ]; then
   exit 1
 fi
 
+proof_oid="$(git -C "$proof_root" rev-parse HEAD)"
+current_head_ref="$(git symbolic-ref -q HEAD || true)"
+current_head_oid="$(git rev-parse HEAD)"
+if [ "$proof_oid" != "$local_oid" ] || [ -n "$(git -C "$proof_root" status --porcelain=v1 --untracked-files=all)" ]; then
+  echo "pre-push REFUSED: exact-object proof checkout drifted during verification" >&2
+  exit 1
+fi
+if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$local_oid" ] || \
+   [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
+  echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
+  exit 1
+fi
+
 rm -f "$log"
+trap - EXIT
+cleanup
 echo "pre-push: verify passed."
