@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
@@ -525,6 +525,15 @@ fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Res
 /// used by workspace discovery. Deployment planning consumes this public
 /// projection so config interpretation cannot drift from resource discovery.
 pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "deployment configuration path `{}` must not contain `.` or `..` components",
+            path.display()
+        )));
+    }
     let selected_metadata = fs::symlink_metadata(path).map_err(|source| WorkspaceError::Io {
         path: path.display().to_string(),
         source,

@@ -467,6 +467,7 @@ fn canonical_config(input: &CallInput) -> Result<PathBuf, CliError> {
             "Worker deployment requires an absolute Wrangler config path".to_owned(),
         ));
     }
+    load_wrangler_config(path)?;
     let canonical = fs::canonicalize(path).map_err(|source| CliError::Io {
         path: path.display().to_string(),
         source,
@@ -557,6 +558,72 @@ mod tests {
     use cfctl_core::{AdapterStatus, EffectClass, PlanStatus, RiskClass};
     use cfctl_workspace::RegisteredRoot;
     use std::process::Command;
+
+    #[test]
+    #[cfg(unix)]
+    fn config_selector_rejects_symlink_provenance_before_canonicalization() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("repository root");
+        fs::create_dir(root.path().join(".git")).expect("repository marker");
+        let config = root.path().join("wrangler.mail-router.production.toml");
+        fs::write(&config, "name = \"root-worker\"\nmain = \"worker.js\"\n")
+            .expect("root role config");
+        let ordinary = CallInput {
+            query: json!({"config": config}),
+            ..CallInput::default()
+        };
+        assert_eq!(
+            canonical_config(&ordinary).expect("ordinary config"),
+            config.canonicalize().expect("canonical ordinary config")
+        );
+
+        let leaf_alias = root.path().join("wrangler.alias.production.toml");
+        symlink(&config, &leaf_alias).expect("leaf config symlink");
+        let leaf_input = CallInput {
+            query: json!({"config": leaf_alias}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&leaf_input).is_err(),
+            "accepted leaf symlink selector"
+        );
+
+        let outside = tempfile::tempdir().expect("intermediate target");
+        symlink(outside.path(), root.path().join("intermediate-link"))
+            .expect("intermediate directory symlink");
+        let intermediate = root
+            .path()
+            .join("intermediate-link")
+            .join("wrangler.mail-router.production.toml");
+        fs::write(
+            outside.path().join("wrangler.mail-router.production.toml"),
+            "name = \"outside-worker\"\nmain = \"worker.js\"\n",
+        )
+        .expect("outside role config");
+        let intermediate_input = CallInput {
+            query: json!({"config": intermediate}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&intermediate_input).is_err(),
+            "accepted intermediate symlink selector"
+        );
+
+        let parent_component = root
+            .path()
+            .join("intermediate-link")
+            .join("..")
+            .join("wrangler.mail-router.production.toml");
+        let parent_input = CallInput {
+            query: json!({"config": parent_component}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&parent_input).is_err(),
+            "accepted selector that concealed a symlink behind `..`"
+        );
+    }
 
     #[test]
     fn artifact_hash_matches_the_repository_shell_contract() {
