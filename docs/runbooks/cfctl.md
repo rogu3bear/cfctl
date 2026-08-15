@@ -891,6 +891,20 @@ working directory. `cfctl doctor --json` projects this boundary under
 `result.delegated_cli_environment` so deploy wrappers can fail closed when an
 older cfctl build does not preserve it.
 
+The selected config ordinarily must be an exact tracked `HEAD` blob. A private
+role config named `wrangler.<role>.production.toml` may instead remain ignored
+only when it is a regular mode-`0600` file next to the exact tracked
+`wrangler.<role>.toml` template. The two parsed documents must be identical
+after replacing canonical lowercase `d1_databases[].database_id` values with
+the matching tracked binding values; Worker name, entry point, assets,
+bindings, queues, buckets, variables, compatibility settings, and every other
+field remain exact tracked authority. The plan records the private-config hash
+and tracked-template path/hash without retaining a database ID. Execution
+recomputes the same closed overlay and fails before Wrangler if either file,
+the source commit, or an artifact drifts. An arbitrary ignored config, a
+broader private difference, permissive file mode, missing template, or
+noncanonical database ID remains blocked.
+
 Artifact roots may be shared directories outside the config directory only
 when their canonical paths remain inside the same registered repository as the
 config. Hash manifests are repository-relative, so identical repository
