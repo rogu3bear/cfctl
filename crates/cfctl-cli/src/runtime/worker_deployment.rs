@@ -7,7 +7,7 @@ use std::{
 
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
 use cfctl_core::{CapabilityV1, PlanV1, hash_value, redact_json};
-use cfctl_workspace::{WorkspaceGraph, load_wrangler_config};
+use cfctl_workspace::{WorkspaceGraph, load_wrangler_config, load_wrangler_config_snapshot};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -46,6 +46,14 @@ pub(super) fn artifact_paths(
         CliError::Input("Wrangler configuration has no containing directory".to_owned())
     })?;
     let document = load_wrangler_config(&config)?;
+    artifact_paths_from_document(directory, &document, input)
+}
+
+fn artifact_paths_from_document(
+    directory: &Path,
+    document: &Value,
+    input: &CallInput,
+) -> Result<Vec<PathBuf>, CliError> {
     let main = input
         .query
         .get("argument")
@@ -100,8 +108,9 @@ pub(super) fn prepare_target(
         return Ok(None);
     }
     let config = canonical_config(input)?;
-    let document = load_wrangler_config(&config)?;
-    let service_name = validated_service_name(&document, input)?;
+    let snapshot = load_wrangler_config_snapshot(&config)?;
+    let document = &snapshot.document;
+    let service_name = validated_service_name(document, input)?;
     let repository = graph
         .repositories
         .iter()
@@ -129,7 +138,7 @@ pub(super) fn prepare_target(
                 config.display()
             ))
         })?;
-    if config_source.head_content_hash.as_deref() != Some(config_source.content_hash.as_str()) {
+    if config_source.head_content_hash.as_deref() != Some(snapshot.content_hash.as_str()) {
         return Err(CliError::Input(format!(
             "Wrangler configuration `{}` does not match an exact Git HEAD blob",
             config.display()
@@ -146,14 +155,18 @@ pub(super) fn prepare_target(
             "Worker deployment source identity is not a full lowercase Git SHA".to_owned(),
         ));
     }
-    let config_sha256 = hex::encode(Sha256::digest(fs::read(&config).map_err(|source| {
-        CliError::Io {
-            path: config.display().to_string(),
-            source,
-        }
-    })?));
+    let config_sha256 = snapshot
+        .content_hash
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            CliError::Input("Wrangler configuration digest is not canonical SHA-256".to_owned())
+        })?
+        .to_owned();
     let (expected_message, operation) = if binds_artifact(capability) {
-        let artifacts = artifact_paths(capability, input)?;
+        let config_directory = config.parent().ok_or_else(|| {
+            CliError::Input("Wrangler configuration has no containing directory".to_owned())
+        })?;
+        let artifacts = artifact_paths_from_document(config_directory, document, input)?;
         if artifacts
             .iter()
             .any(|artifact| !artifact.starts_with(&repository.path))
@@ -163,9 +176,6 @@ pub(super) fn prepare_target(
                     .to_owned(),
             ));
         }
-        let config_directory = config.parent().ok_or_else(|| {
-            CliError::Input("Wrangler configuration has no containing directory".to_owned())
-        })?;
         let artifact_sha256 = artifact_set_sha256(config_directory, &artifacts)?;
         (
             format!("source={source_sha} artifact-sha256={artifact_sha256}"),
@@ -695,11 +705,8 @@ mod tests {
         fs::write(build.join("index.wasm"), b"wasm").expect("wasm");
         fs::write(site.join("index.html"), "site\n").expect("site");
         let config = root.path().join("wrangler.toml");
-        fs::write(
-            &config,
-            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
-        )
-        .expect("config");
+        let config_text = "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n";
+        fs::write(&config, config_text).expect("config");
         assert!(
             Command::new("git")
                 .args(["init", "--quiet", "--initial-branch=main"])
@@ -783,6 +790,14 @@ mod tests {
             .expect_err("config without an exact HEAD blob must fail")
             .to_string();
         assert!(missing_blob.contains("does not match an exact Git HEAD blob"));
+
+        fs::write(&config, format!("# changed after discovery\n{config_text}"))
+            .expect("mutate config after workspace discovery");
+        let post_discovery_drift = prepare_target(&graph, &capability, &input)
+            .expect_err("post-discovery config drift must not inherit a stale clean snapshot")
+            .to_string();
+        assert!(post_discovery_drift.contains("does not match an exact Git HEAD blob"));
+        fs::write(&config, config_text).expect("restore exact HEAD config");
 
         let version_id = "11111111-2222-4333-8444-555555555555";
         let mut promotion = capability.clone();

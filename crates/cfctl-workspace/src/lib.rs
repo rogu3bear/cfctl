@@ -616,13 +616,32 @@ fn validate_deployment_config_path(path: &Path) -> Result<()> {
 /// used by workspace discovery. Deployment planning consumes this public
 /// projection so config interpretation cannot drift from resource discovery.
 pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+    Ok(load_wrangler_config_snapshot(path)?.document)
+}
+
+/// One captured Wrangler configuration used for both interpretation and
+/// content-addressed deployment authority. Callers must not parse one read and
+/// hash a later read of the same path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WranglerConfigSnapshot {
+    pub document: Value,
+    pub content_hash: String,
+}
+
+pub fn load_wrangler_config_snapshot(path: &Path) -> Result<WranglerConfigSnapshot> {
     validate_deployment_config_path(path)?;
-    let content = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
+    let content = fs::read(path).map_err(|source| WorkspaceError::Io {
         path: path.display().to_string(),
         source,
     })?;
-    match config_kind(path) {
-        "wrangler_toml" => toml::from_str::<toml::Value>(&content)
+    let text = std::str::from_utf8(&content).map_err(|_| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "Wrangler configuration `{}` is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    let document = match config_kind(path) {
+        "wrangler_toml" => toml::from_str::<toml::Value>(text)
             .ok()
             .and_then(|value| serde_json::to_value(value).ok())
             .ok_or_else(|| {
@@ -631,7 +650,7 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
                     path.display()
                 ))
             }),
-        "wrangler_json" => serde_json::from_str::<Value>(&strip_jsonc(&content)).map_err(|error| {
+        "wrangler_json" => serde_json::from_str::<Value>(&strip_jsonc(text)).map_err(|error| {
             WorkspaceError::DiscoveryInvariant(format!(
                 "Wrangler JSON configuration `{}` is malformed: {error}",
                 path.display()
@@ -641,7 +660,11 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
             "deployment configuration `{}` is not a canonical Wrangler TOML/JSON configuration name",
             path.display()
         ))),
-    }
+    }?;
+    Ok(WranglerConfigSnapshot {
+        document,
+        content_hash: hash_bytes(&content),
+    })
 }
 
 fn find_repository_root(path: &Path, boundary: &Path) -> Result<Option<PathBuf>> {
