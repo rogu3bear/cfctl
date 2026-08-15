@@ -1117,7 +1117,7 @@ pub struct D1ApprovedMlnImportContractV1 {
     /// as zero so read-only history and coverage remain available; zero cannot
     /// authorize execution because every source must be non-empty and no
     /// larger than this bound.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_source_bytes: u64,
     pub max_response_bytes: u64,
     pub max_poll_attempts: u64,
@@ -1761,6 +1761,11 @@ pub struct AsyncCollectionMutationContractV1 {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

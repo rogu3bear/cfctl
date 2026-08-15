@@ -3288,6 +3288,90 @@ fn legacy_catalog_hash_survives_absent_optional_resource_contracts() {
 }
 
 #[test]
+fn authentic_prefield_d1_catalog_hash_survives_current_load_without_rewrite() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_native_control_capabilities(&mut snapshot).expect("native capabilities");
+    snapshot.refresh_hash().expect("current catalog hash");
+
+    let mut stored = serde_json::to_value(&snapshot).expect("serialize current catalog");
+    let current = stored.clone();
+    let historical_contract =
+        stored["capabilities"]["d1-import-database"]["d1_approved_mln_import"]
+            .as_object_mut()
+            .expect("D1 import contract");
+    assert_eq!(
+        historical_contract.remove("max_source_bytes"),
+        Some(json!(64 * 1024 * 1024)),
+        "the current producer must serialize its explicit positive bound before the historical projection removes it"
+    );
+    stored["schema_hash"] =
+        json!(hash_value(&stored["capabilities"]).expect("pre-field producer hash"));
+
+    let root = tempfile::tempdir().expect("temp catalog");
+    let path = root.path().join("catalog.json");
+    let historical_bytes = serde_json::to_vec_pretty(&stored).expect("historical catalog bytes");
+    std::fs::write(&path, &historical_bytes).expect("write historical catalog");
+
+    let loaded = CatalogSnapshot::load(&path)
+        .expect("an authentic pre-field producer hash must survive current loading");
+    assert_eq!(
+        loaded
+            .capabilities
+            .get("d1-import-database")
+            .and_then(|capability| capability.d1_approved_mln_import.as_ref())
+            .map(|contract| contract.max_source_bytes),
+        Some(0),
+        "compatibility hydration must remain non-authorizing"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("reread historical catalog"),
+        historical_bytes,
+        "loading historical bytes must not rewrite or migrate them"
+    );
+
+    let mut changed_positive_bound = current;
+    changed_positive_bound["capabilities"]["d1-import-database"]["d1_approved_mln_import"]["max_source_bytes"] =
+        json!(42);
+    let changed_positive_bound_path = root.path().join("changed-positive-bound.json");
+    std::fs::write(
+        &changed_positive_bound_path,
+        serde_json::to_vec_pretty(&changed_positive_bound)
+            .expect("changed positive-bound catalog bytes"),
+    )
+    .expect("write changed positive-bound catalog");
+    let error = CatalogSnapshot::load(&changed_positive_bound_path)
+        .expect_err("a changed positive source bound must invalidate the current catalog hash")
+        .to_string();
+    assert!(error.contains("catalog content hash mismatch"), "{error}");
+
+    let mut tampered = stored.clone();
+    tampered["capabilities"]["d1-import-database"]["d1_approved_mln_import"]["max_response_bytes"] =
+        json!(42);
+    let tampered_path = root.path().join("tampered.json");
+    std::fs::write(
+        &tampered_path,
+        serde_json::to_vec_pretty(&tampered).expect("tampered catalog bytes"),
+    )
+    .expect("write tampered catalog");
+    let error = CatalogSnapshot::load(&tampered_path)
+        .expect_err("a pre-field hash must not authorize changed catalog content")
+        .to_string();
+    assert!(error.contains("catalog content hash mismatch"), "{error}");
+
+    let mut malformed = stored;
+    malformed["capabilities"]["d1-import-database"]["d1_approved_mln_import"]["max_source_bytes"] =
+        json!("zero");
+    let malformed_path = root.path().join("malformed.json");
+    std::fs::write(
+        &malformed_path,
+        serde_json::to_vec_pretty(&malformed).expect("malformed catalog bytes"),
+    )
+    .expect("write malformed catalog");
+    CatalogSnapshot::load(&malformed_path)
+        .expect_err("a malformed compatibility field must fail closed");
+}
+
+#[test]
 fn legacy_delete_contract_hash_survives_an_absent_default_pagination_flag() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     snapshot
