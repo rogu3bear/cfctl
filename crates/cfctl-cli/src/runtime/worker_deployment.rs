@@ -524,13 +524,26 @@ fn validate_artifact_tree_ownership(
     roots: &[PathBuf],
 ) -> Result<(), CliError> {
     for root in roots {
-        for entry in WalkDir::new(root).follow_links(false) {
+        let mut entries = WalkDir::new(root).follow_links(false).into_iter();
+        while let Some(entry) = entries.next() {
             let entry = entry.map_err(|error| {
                 CliError::Input(format!(
                     "failed to inspect Worker deployment artifact `{}`: {error}",
                     root.display()
                 ))
             })?;
+            if entry.file_name() == ".git" {
+                if entry.path().parent() != Some(repository) {
+                    return Err(CliError::Input(format!(
+                        "Worker deployment artifact contains nested Git repository metadata `{}`",
+                        entry.path().display()
+                    )));
+                }
+                if entry.file_type().is_dir() {
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
             if repository_owning_path(graph, entry.path())
                 .is_none_or(|owner| owner.path != repository)
             {
@@ -548,13 +561,26 @@ fn validate_artifact_tree_ownership(
 fn artifact_set_sha256(repository: &Path, roots: &[PathBuf]) -> Result<String, CliError> {
     let mut entries = Vec::new();
     for root in roots {
-        for entry in WalkDir::new(root).follow_links(false) {
+        let mut walker = WalkDir::new(root).follow_links(false).into_iter();
+        while let Some(entry) = walker.next() {
             let entry = entry.map_err(|error| {
                 CliError::Input(format!(
                     "failed to inspect Worker deployment artifact `{}`: {error}",
                     root.display()
                 ))
             })?;
+            if entry.file_name() == ".git" {
+                if entry.path().parent() != Some(repository) {
+                    return Err(CliError::Input(format!(
+                        "Worker deployment artifact contains nested Git repository metadata `{}`",
+                        entry.path().display()
+                    )));
+                }
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
             if entry.path() == root || entry.file_type().is_dir() {
                 continue;
             }
@@ -1097,6 +1123,121 @@ mod tests {
             .expect_err("artifact tree containing a nested repository must fail before planning")
             .to_string();
         assert!(error.contains("is not owned by config repository"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "independently committed ignored artifact repository proves traversal does not rely on the filtered workspace graph"
+    )]
+    fn target_rejects_nested_repository_inside_ignored_artifact_directory() {
+        let root = tempfile::tempdir().expect("repository root");
+        let worker = root.path().join("cloudflare/site");
+        let build = worker.join("build");
+        let ignored_artifacts = root.path().join("dist");
+        let nested = ignored_artifacts.join("child");
+        fs::create_dir_all(&build).expect("build directory");
+        fs::create_dir_all(&nested).expect("nested artifact directory");
+        fs::write(build.join("_worker.js"), "worker\n").expect("worker");
+        fs::write(nested.join("index.html"), "nested\n").expect("nested artifact");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "nested fixture",
+                ])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git commit")
+                .success()
+        );
+        let config = worker.join("wrangler.toml");
+        fs::write(
+            &config,
+            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../dist\"\n",
+        )
+        .expect("config");
+        fs::write(root.path().join(".gitignore"), "dist/\n").expect("ignore generated artifacts");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "outer fixture",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git commit")
+                .success()
+        );
+        let graph =
+            WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("workspace graph");
+        assert_eq!(
+            graph.repositories.len(),
+            1,
+            "ignored artifact repository must remain absent from discovery"
+        );
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        let input = CallInput {
+            query: json!({
+                "config": config.canonicalize().expect("canonical config"),
+                "name": "cfctl-site",
+                "message": "untrusted",
+            }),
+            ..CallInput::default()
+        };
+        let error = prepare_target(&graph, &capability, &input)
+            .expect_err("ignored artifact tree containing a nested repository must fail")
+            .to_string();
+        assert!(error.contains("nested Git repository metadata"));
     }
 
     #[test]
