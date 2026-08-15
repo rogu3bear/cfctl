@@ -990,15 +990,18 @@ Planning first admits one regular, symlink-free artifact root owned by a clean,
 registered repository on a named branch. It records every uploadable and
 multipart-control file by normalized path, byte size, and SHA-256, rejects an
 empty tree, path ambiguity, Wrangler-ignored sources, more than 20,000 assets,
-and files above the 25 MiB provider limit, and binds the exact Wrangler
-executable hash/version that generated the catalog carrier. A live exact-project
+and files above the 25 MiB provider limit. It also binds the canonical Wrangler
+launcher, its exact interpreter, and a deterministic path/size/SHA-256 manifest
+of the complete Wrangler package closure (including `wrangler-dist/cli.js`),
+along with the version that generated the catalog carrier. A live exact-project
 read must then report `source: null` and the requested branch must equal the
 project's production branch. Existing deployments are read before planning;
 the same project/branch/commit identity is treated as a replay and rejected.
 
-Execution recomputes the repository, producer, and complete manifest before
-credential access and again after the live concurrency read. Only then may the
-exact producer run from a private configless directory with the selected
+Execution recomputes the repository, complete producer closure, exact
+interpreter, and complete artifact manifest before credential access and again
+after the live concurrency read. Only then may the bound interpreter and
+producer run from a private configless directory with the selected
 account, cfctl's Wrangler cache, and the selected credential. Wrangler remains
 the authoritative multipart producer: it performs the content-addressed asset
 upload and sends the provider-required `manifest` form field, without implicit

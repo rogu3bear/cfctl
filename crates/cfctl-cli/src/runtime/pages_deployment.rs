@@ -28,6 +28,8 @@ pub(super) const DEPLOYMENT_DETAIL_PATH: &str =
 
 const MAX_ASSET_COUNT: usize = 20_000;
 const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_PRODUCER_FILE_COUNT: usize = 10_000;
+const MAX_PRODUCER_BYTES: u64 = 512 * 1024 * 1024;
 const CONTROL_FILES: [&str; 4] = ["_headers", "_redirects", "_routes.json", "_worker.js"];
 
 pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
@@ -294,6 +296,144 @@ fn wrangler_producer(capability: &CapabilityV1) -> Result<Value, CliError> {
     wrangler_producer_at(capability, &discovered)
 }
 
+fn wrangler_package_root(executable: &Path) -> Option<PathBuf> {
+    let package = executable.parent()?.parent()?;
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(package.join("package.json")).ok()?).ok()?;
+    (metadata.get("name").and_then(Value::as_str) == Some("wrangler")
+        && package.join("wrangler-dist/cli.js").is_file())
+    .then(|| package.to_path_buf())
+}
+
+fn producer_closure(executable: &Path) -> Result<Value, CliError> {
+    let package_root = wrangler_package_root(executable);
+    let executable_parent = executable
+        .parent()
+        .ok_or_else(|| CliError::Input("Wrangler executable has no package parent".to_owned()))?;
+    let root = package_root.as_deref().unwrap_or(executable_parent);
+    let mut paths = if package_root.is_some() {
+        WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                CliError::Input(format!("Wrangler package cannot be inspected: {error}"))
+            })?
+            .into_iter()
+            .filter(|entry| entry.path() != root)
+            .map(walkdir::DirEntry::into_path)
+            .collect::<Vec<_>>()
+    } else {
+        vec![executable.to_path_buf()]
+    };
+    paths.sort();
+    if paths.len() > MAX_PRODUCER_FILE_COUNT {
+        return Err(CliError::Input(format!(
+            "Wrangler producer closure contains more than {MAX_PRODUCER_FILE_COUNT} entries"
+        )));
+    }
+    let mut total_bytes = 0_u64;
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(CliError::Input(format!(
+                "Wrangler producer closure contains an ambiguous entry `{}`",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+            CliError::Input("Wrangler producer closure size overflowed".to_owned())
+        })?;
+        if total_bytes > MAX_PRODUCER_BYTES {
+            return Err(CliError::Input(format!(
+                "Wrangler producer closure exceeds {MAX_PRODUCER_BYTES} bytes"
+            )));
+        }
+        let bytes = fs::read(&path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            CliError::Input("Wrangler producer closure escaped its package root".to_owned())
+        })?;
+        files.push(json!({
+            "path": relative.to_string_lossy().replace('\\', "/"),
+            "size": metadata.len(),
+            "sha256": hex::encode(Sha256::digest(&bytes)),
+        }));
+    }
+    let manifest = json!(&files);
+    let manifest_sha256 = hash_value(&manifest).map_err(|error| {
+        CliError::Input(format!(
+            "Wrangler producer closure cannot be hashed: {error}"
+        ))
+    })?;
+    Ok(json!({
+        "kind": if package_root.is_some() { "package" } else { "single_file" },
+        "root": root,
+        "file_count": files.len(),
+        "total_bytes": total_bytes,
+        "manifest_sha256": manifest_sha256,
+        "files": files,
+    }))
+}
+
+fn executable_interpreter(executable: &Path, bytes: &[u8]) -> Result<Option<Value>, CliError> {
+    let Some(line) = bytes.split(|byte| *byte == b'\n').next() else {
+        return Ok(None);
+    };
+    let Ok(line) = std::str::from_utf8(line) else {
+        return Ok(None);
+    };
+    let Some(shebang) = line.strip_prefix("#!") else {
+        return Ok(None);
+    };
+    let parts = shebang.split_whitespace().collect::<Vec<_>>();
+    let raw = match parts.as_slice() {
+        ["/usr/bin/env", program] => which::which(program).map_err(|error| {
+            CliError::Input(format!(
+                "Wrangler interpreter `{program}` is unavailable before planning: {error}"
+            ))
+        })?,
+        [absolute] if Path::new(absolute).is_absolute() => PathBuf::from(absolute),
+        _ => {
+            return Err(CliError::Input(format!(
+                "Wrangler launcher `{}` has an unsupported interpreter contract",
+                executable.display()
+            )));
+        }
+    };
+    let path = fs::canonicalize(&raw).map_err(|source| CliError::Io {
+        path: raw.display().to_string(),
+        source,
+    })?;
+    let metadata = fs::metadata(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(CliError::Input(format!(
+            "Wrangler interpreter `{}` is not one regular file",
+            path.display()
+        )));
+    }
+    let interpreter_bytes = fs::read(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(Some(json!({
+        "path": path,
+        "sha256": hex::encode(Sha256::digest(&interpreter_bytes)),
+    })))
+}
+
 fn wrangler_producer_at(capability: &CapabilityV1, discovered: &Path) -> Result<Value, CliError> {
     let executable = fs::canonicalize(discovered).map_err(|source| CliError::Io {
         path: discovered.display().to_string(),
@@ -313,6 +453,8 @@ fn wrangler_producer_at(capability: &CapabilityV1, discovered: &Path) -> Result<
         path: executable.display().to_string(),
         source,
     })?;
+    let closure = producer_closure(&executable)?;
+    let interpreter = executable_interpreter(&executable, &bytes)?;
     let isolated_home = tempfile::Builder::new()
         .prefix("cfctl-wrangler-version-")
         .tempdir()
@@ -320,7 +462,18 @@ fn wrangler_producer_at(capability: &CapabilityV1, discovered: &Path) -> Result<
             path: "temporary Wrangler version home".to_owned(),
             source,
         })?;
-    let output = Command::new(&executable)
+    let mut version_command = if let Some(path) = interpreter
+        .as_ref()
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+    {
+        let mut command = Command::new(path);
+        command.arg(&executable);
+        command
+    } else {
+        Command::new(&executable)
+    };
+    let output = version_command
         .arg("--version")
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
@@ -347,6 +500,8 @@ fn wrangler_producer_at(capability: &CapabilityV1, discovered: &Path) -> Result<
     Ok(json!({
         "executable": executable,
         "executable_sha256": hex::encode(Sha256::digest(&bytes)),
+        "execution_closure": closure,
+        "interpreter": interpreter,
         "version": version,
         "catalog_source": capability.source,
     }))
@@ -436,6 +591,39 @@ pub(super) fn bound_wrangler_executable(adapter_targets: &Value) -> Result<PathB
             )
         })?;
     Ok(PathBuf::from(raw))
+}
+
+pub(super) fn bound_wrangler_interpreter(
+    adapter_targets: &Value,
+) -> Result<Option<PathBuf>, CliError> {
+    let producer = target(adapter_targets)
+        .and_then(|value| value.pointer("/provider_request/producer"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages direct-upload plan omitted its exact Wrangler producer; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let Some(interpreter) = producer.get("interpreter") else {
+        return Err(CliError::Input(
+            "Pages direct-upload plan predates interpreter binding; create a new plan".to_owned(),
+        ));
+    };
+    if interpreter.is_null() {
+        return Ok(None);
+    }
+    interpreter
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(Some)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages direct-upload plan has an invalid Wrangler interpreter binding; create a new plan"
+                    .to_owned(),
+            )
+        })
 }
 
 pub(super) fn target(adapter_targets: &Value) -> Option<&Value> {
@@ -951,24 +1139,74 @@ mod tests {
         let canonical = executable.canonicalize().expect("canonical producer");
         assert_eq!(producer["executable"].as_str(), canonical.to_str());
         assert_eq!(producer["version"], "4.107.0");
+        assert_eq!(producer["execution_closure"]["kind"], "single_file");
+        assert_eq!(producer["execution_closure"]["file_count"], 1);
+        assert_eq!(producer["interpreter"]["path"], "/bin/sh");
         assert_eq!(
             producer["executable_sha256"],
             hex::encode(Sha256::digest(
                 fs::read(&executable).expect("producer bytes")
             ))
         );
+        let targets = json!({
+            "pages_deployment": {
+                "provider_request": {"producer": producer}
+            }
+        });
         assert_eq!(
-            bound_wrangler_executable(&json!({
-                "pages_deployment": {
-                    "provider_request": {"producer": producer}
-                }
-            }))
-            .expect("bound path"),
+            bound_wrangler_executable(&targets).expect("bound path"),
             canonical
+        );
+        assert_eq!(
+            bound_wrangler_interpreter(&targets).expect("bound interpreter"),
+            Some(PathBuf::from("/bin/sh"))
         );
 
         capability.source = "wrangler 4.106.0 pages deploy help".to_owned();
         assert!(wrangler_producer_at(&capability, &executable).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_identity_rejects_unchanged_launcher_with_drifted_package_payload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("producer root");
+        let package = root.path().join("wrangler");
+        let bin = package.join("bin");
+        let distribution = package.join("wrangler-dist");
+        fs::create_dir_all(&bin).expect("bin");
+        fs::create_dir_all(&distribution).expect("distribution");
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"wrangler","version":"4.107.0"}"#,
+        )
+        .expect("package metadata");
+        let executable = bin.join("wrangler.js");
+        fs::write(&executable, "#!/bin/sh\nprintf '4.107.0\\n'\n").expect("launcher");
+        let mut permissions = fs::metadata(&executable)
+            .expect("launcher metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("launcher mode");
+        let payload = distribution.join("cli.js");
+        fs::write(&payload, "upload-v1").expect("payload");
+
+        let mut capability = direct_upload();
+        capability.source = "wrangler 4.107.0 pages deploy help".to_owned();
+        let planned = wrangler_producer_at(&capability, &executable).expect("planned producer");
+        fs::write(&payload, "upload-v2").expect("drifted payload");
+        let current = wrangler_producer_at(&capability, &executable).expect("current producer");
+
+        assert_ne!(
+            planned, current,
+            "the bound producer must change when an unmodified launcher delegates to drifted package bytes"
+        );
+        assert_eq!(planned["executable_sha256"], current["executable_sha256"]);
+        assert_ne!(
+            planned["execution_closure"]["manifest_sha256"],
+            current["execution_closure"]["manifest_sha256"]
+        );
     }
 
     #[test]

@@ -6167,6 +6167,7 @@ async fn execute_delegated_read(
         account_id.as_deref(),
         &store.paths().cache_dir,
         None,
+        None,
     )
     .await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
@@ -6410,12 +6411,15 @@ async fn run_delegated_plan_boundary(
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let delegated_input =
         worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
-    let bound_program = if pages_deployment::binds_artifact(&plan.capability) {
-        Some(pages_deployment::bound_wrangler_executable(
-            adapter_targets,
-        )?)
+    let (bound_program, bound_interpreter) = if pages_deployment::binds_artifact(&plan.capability) {
+        (
+            Some(pages_deployment::bound_wrangler_executable(
+                adapter_targets,
+            )?),
+            pages_deployment::bound_wrangler_interpreter(adapter_targets)?,
+        )
     } else {
-        None
+        (None, None)
     };
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
         run_quick_tunnel(store, plan, input).await?
@@ -6427,6 +6431,7 @@ async fn run_delegated_plan_boundary(
             Some(&plan.account_id),
             &store.paths().cache_dir,
             bound_program.as_deref(),
+            bound_interpreter.as_deref(),
         )
         .await?
     };
@@ -7308,6 +7313,7 @@ async fn run_delegated_cli(
     account_id: Option<&str>,
     cache_dir: &Path,
     program_override: Option<&Path>,
+    interpreter_override: Option<&Path>,
 ) -> Result<Value> {
     let mut path_parts = capability.path.split_whitespace();
     let program = path_parts
@@ -7318,7 +7324,14 @@ async fn run_delegated_cli(
             "delegated program `{program}` is not governed by cfctl"
         )));
     }
-    let mut command = ProcessCommand::new(program_override.unwrap_or_else(|| Path::new(program)));
+    let selected_program = program_override.unwrap_or_else(|| Path::new(program));
+    let mut command = if let Some(interpreter) = interpreter_override {
+        let mut command = ProcessCommand::new(interpreter);
+        command.arg(selected_program);
+        command
+    } else {
+        ProcessCommand::new(selected_program)
+    };
     command.args(path_parts);
     let isolated_wrangler_directory =
         if worker_deployment::requires_configless_working_directory(capability, input)
@@ -35806,6 +35819,7 @@ mod tests {
             Some("fixture-account"),
             &cache,
             Some(&program),
+            Some(Path::new("/bin/sh")),
         )
         .await
         .expect("governed boundary receipt");
@@ -35831,6 +35845,7 @@ mod tests {
             Some("fixture-account"),
             &cache,
             Some(&program),
+            Some(Path::new("/bin/sh")),
         )
         .await
         .expect("missing output remains a truthful receipt");
