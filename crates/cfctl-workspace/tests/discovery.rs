@@ -81,6 +81,17 @@ fn exact_and_role_specific_production_wrangler_toml_are_supported() {
             load_wrangler_config(&nested).is_err(),
             "accepted nested symlink to root role config"
         );
+
+        let fifo = repository.join("wrangler.fifo-role.production.toml");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("create FIFO config fixture");
+        assert!(status.success(), "mkfifo failed");
+        assert!(
+            load_wrangler_config(&fifo).is_err(),
+            "accepted FIFO as deployment configuration authority"
+        );
     }
 }
 
