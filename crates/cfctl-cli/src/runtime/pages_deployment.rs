@@ -305,69 +305,158 @@ fn wrangler_package_root(executable: &Path) -> Option<PathBuf> {
     .then(|| package.to_path_buf())
 }
 
+fn package_metadata(root: &Path) -> Result<Value, CliError> {
+    let path = root.join("package.json");
+    let bytes = fs::read(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::Input(format!(
+            "Wrangler producer package metadata `{}` is invalid: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn esbuild_closure_roots(wrangler_root: &Path) -> Result<Vec<(String, PathBuf)>, CliError> {
+    let wrangler = package_metadata(wrangler_root)?;
+    let expected_version = wrangler
+        .pointer("/dependencies/esbuild")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Wrangler producer does not declare its required esbuild version".to_owned(),
+            )
+        })?;
+    let node_modules = wrangler_root
+        .parent()
+        .ok_or_else(|| CliError::Input("Wrangler package has no node_modules parent".to_owned()))?;
+    let esbuild_root = node_modules.join("esbuild");
+    let esbuild = package_metadata(&esbuild_root)?;
+    if esbuild.get("name").and_then(Value::as_str) != Some("esbuild")
+        || esbuild.get("version").and_then(Value::as_str) != Some(expected_version)
+    {
+        return Err(CliError::Input(format!(
+            "Wrangler requires esbuild {expected_version}, but the resolved package identity differs"
+        )));
+    }
+    let platform_parent = node_modules.join("@esbuild");
+    let mut platforms = fs::read_dir(&platform_parent)
+        .map_err(|source| CliError::Io {
+            path: platform_parent.display().to_string(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| CliError::Io {
+            path: platform_parent.display().to_string(),
+            source,
+        })?;
+    platforms.sort_by_key(std::fs::DirEntry::file_name);
+    let mut selected = Vec::new();
+    for entry in platforms {
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|source| CliError::Io {
+                path: path.display().to_string(),
+                source,
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        let metadata = package_metadata(&path)?;
+        let name = metadata.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.starts_with("@esbuild/")
+            && metadata.get("version").and_then(Value::as_str) == Some(expected_version)
+        {
+            selected.push((name.to_owned(), path));
+        }
+    }
+    let [(platform_name, platform_root)] = selected.as_slice() else {
+        return Err(CliError::Input(format!(
+            "Wrangler producer requires exactly one installed esbuild {expected_version} platform package"
+        )));
+    };
+    Ok(vec![
+        ("wrangler".to_owned(), wrangler_root.to_path_buf()),
+        ("esbuild".to_owned(), esbuild_root),
+        (platform_name.clone(), platform_root.clone()),
+    ])
+}
+
 fn producer_closure(executable: &Path) -> Result<Value, CliError> {
     let package_root = wrangler_package_root(executable);
     let executable_parent = executable
         .parent()
         .ok_or_else(|| CliError::Input("Wrangler executable has no package parent".to_owned()))?;
-    let root = package_root.as_deref().unwrap_or(executable_parent);
-    let mut paths = if package_root.is_some() {
-        WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                CliError::Input(format!("Wrangler package cannot be inspected: {error}"))
-            })?
-            .into_iter()
-            .filter(|entry| entry.path() != root)
-            .map(walkdir::DirEntry::into_path)
-            .collect::<Vec<_>>()
+    let roots = if let Some(root) = &package_root {
+        esbuild_closure_roots(root)?
     } else {
-        vec![executable.to_path_buf()]
+        vec![("executable".to_owned(), executable_parent.to_path_buf())]
     };
-    paths.sort();
-    if paths.len() > MAX_PRODUCER_FILE_COUNT {
-        return Err(CliError::Input(format!(
-            "Wrangler producer closure contains more than {MAX_PRODUCER_FILE_COUNT} entries"
-        )));
-    }
     let mut total_bytes = 0_u64;
-    let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
-        let metadata = fs::symlink_metadata(&path).map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
-            return Err(CliError::Input(format!(
-                "Wrangler producer closure contains an ambiguous entry `{}`",
-                path.display()
-            )));
+    let mut files = Vec::new();
+    for (component, root) in &roots {
+        let mut paths = if package_root.is_some() {
+            WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    CliError::Input(format!("Wrangler package cannot be inspected: {error}"))
+                })?
+                .into_iter()
+                .filter(|entry| entry.path() != root)
+                .map(walkdir::DirEntry::into_path)
+                .collect::<Vec<_>>()
+        } else {
+            vec![executable.to_path_buf()]
+        };
+        paths.sort();
+        for path in paths {
+            let metadata = fs::symlink_metadata(&path).map_err(|source| CliError::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+                return Err(CliError::Input(format!(
+                    "Wrangler producer closure contains an ambiguous entry `{}`",
+                    path.display()
+                )));
+            }
+            if metadata.is_dir() {
+                continue;
+            }
+            total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                CliError::Input("Wrangler producer closure size overflowed".to_owned())
+            })?;
+            if total_bytes > MAX_PRODUCER_BYTES {
+                return Err(CliError::Input(format!(
+                    "Wrangler producer closure exceeds {MAX_PRODUCER_BYTES} bytes"
+                )));
+            }
+            let bytes = fs::read(&path).map_err(|source| CliError::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            let relative = path.strip_prefix(root).map_err(|_| {
+                CliError::Input("Wrangler producer closure escaped its package root".to_owned())
+            })?;
+            files.push(json!({
+                "component": component,
+                "path": relative.to_string_lossy().replace('\\', "/"),
+                "size": metadata.len(),
+                "sha256": hex::encode(Sha256::digest(&bytes)),
+            }));
+            if files.len() > MAX_PRODUCER_FILE_COUNT {
+                return Err(CliError::Input(format!(
+                    "Wrangler producer closure contains more than {MAX_PRODUCER_FILE_COUNT} files"
+                )));
+            }
         }
-        if metadata.is_dir() {
-            continue;
-        }
-        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
-            CliError::Input("Wrangler producer closure size overflowed".to_owned())
-        })?;
-        if total_bytes > MAX_PRODUCER_BYTES {
-            return Err(CliError::Input(format!(
-                "Wrangler producer closure exceeds {MAX_PRODUCER_BYTES} bytes"
-            )));
-        }
-        let bytes = fs::read(&path).map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let relative = path.strip_prefix(root).map_err(|_| {
-            CliError::Input("Wrangler producer closure escaped its package root".to_owned())
-        })?;
-        files.push(json!({
-            "path": relative.to_string_lossy().replace('\\', "/"),
-            "size": metadata.len(),
-            "sha256": hex::encode(Sha256::digest(&bytes)),
-        }));
     }
     let manifest = json!(&files);
     let manifest_sha256 = hash_value(&manifest).map_err(|error| {
@@ -376,8 +465,8 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
         ))
     })?;
     Ok(json!({
-        "kind": if package_root.is_some() { "package" } else { "single_file" },
-        "root": root,
+        "kind": if package_root.is_some() { "wrangler_with_esbuild" } else { "single_file" },
+        "roots": roots.iter().map(|(component, root)| json!({"component": component, "root": root})).collect::<Vec<_>>(),
         "file_count": files.len(),
         "total_bytes": total_bytes,
         "manifest_sha256": manifest_sha256,
@@ -1168,7 +1257,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn producer_identity_rejects_unchanged_launcher_with_drifted_package_payload() {
+    fn producer_identity_rejects_unchanged_launcher_with_drifted_external_builder() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().expect("producer root");
@@ -1179,7 +1268,7 @@ mod tests {
         fs::create_dir_all(&distribution).expect("distribution");
         fs::write(
             package.join("package.json"),
-            r#"{"name":"wrangler","version":"4.107.0"}"#,
+            r#"{"name":"wrangler","version":"4.107.0","dependencies":{"esbuild":"0.28.1"}}"#,
         )
         .expect("package metadata");
         let executable = bin.join("wrangler.js");
@@ -1189,18 +1278,34 @@ mod tests {
             .permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).expect("launcher mode");
-        let payload = distribution.join("cli.js");
-        fs::write(&payload, "upload-v1").expect("payload");
+        fs::write(distribution.join("cli.js"), "require('esbuild')").expect("payload");
+        let esbuild = root.path().join("esbuild");
+        fs::create_dir_all(esbuild.join("lib")).expect("esbuild package");
+        fs::write(
+            esbuild.join("package.json"),
+            r#"{"name":"esbuild","version":"0.28.1"}"#,
+        )
+        .expect("esbuild metadata");
+        fs::write(esbuild.join("lib/main.js"), "builder-v1").expect("esbuild runtime");
+        let platform = root.path().join("@esbuild/darwin-arm64");
+        fs::create_dir_all(platform.join("bin")).expect("platform package");
+        fs::write(
+            platform.join("package.json"),
+            r#"{"name":"@esbuild/darwin-arm64","version":"0.28.1"}"#,
+        )
+        .expect("platform metadata");
+        let native = platform.join("bin/esbuild");
+        fs::write(&native, "native-v1").expect("native builder");
 
         let mut capability = direct_upload();
         capability.source = "wrangler 4.107.0 pages deploy help".to_owned();
         let planned = wrangler_producer_at(&capability, &executable).expect("planned producer");
-        fs::write(&payload, "upload-v2").expect("drifted payload");
+        fs::write(&native, "native-v2").expect("drifted external builder");
         let current = wrangler_producer_at(&capability, &executable).expect("current producer");
 
         assert_ne!(
             planned, current,
-            "the bound producer must change when an unmodified launcher delegates to drifted package bytes"
+            "the bound producer must change when an unmodified Wrangler package delegates to drifted external builder bytes"
         );
         assert_eq!(planned["executable_sha256"], current["executable_sha256"]);
         assert_ne!(
