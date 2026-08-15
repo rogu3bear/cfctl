@@ -22607,6 +22607,7 @@ fn workspace_d1_migration_rectification_eligible(plan: &PlanV1) -> bool {
         && matches!(
             plan.transaction_stage,
             TransactionStageV1::BoundaryResponsePersisted
+                | TransactionStageV1::VerificationAttemptPersisted
                 | TransactionStageV1::VerificationResponsePersisted
         )
         && plan.transaction_journal.iter().any(|checkpoint| {
@@ -42435,6 +42436,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one lifecycle test covers boundary eligibility, crash retry, failed readback, and hash-chained closure"
+    )]
     fn workspace_d1_rectification_requires_a_boundary_receipt_and_journals_a_passing_retry() {
         let mut capability = CapabilityV1::new(
             "example.d1-migrations-apply",
@@ -42488,6 +42493,10 @@ mod tests {
         plan.status = PlanStatus::RectificationRequired;
         plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
             .expect("verification attempt");
+        assert!(
+            workspace_d1_migration_rectification_eligible(&plan),
+            "a crash after the read-only verification-attempt checkpoint must remain retryable"
+        );
         plan.record_transaction_stage_with_artifact(
             TransactionStageV1::VerificationResponsePersisted,
             json!({"state":"failed","evidence_hash":format!("sha256:{}", "b".repeat(64))}),
