@@ -22495,6 +22495,9 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, &mut plan);
     }
+    if workspace_d1_migration_rectification_eligible(&plan) {
+        return rectify_workspace_d1_migration(store, &mut plan).await;
+    }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
     if let Some(mut request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
@@ -22594,6 +22597,116 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     );
     if let Some(evidence) = lineage_evidence {
         envelope.evidence.push(evidence);
+    }
+    Ok(envelope)
+}
+
+fn workspace_d1_migration_rectification_eligible(plan: &PlanV1) -> bool {
+    plan.capability.workspace_d1_migration.is_some()
+        && plan.status == PlanStatus::RectificationRequired
+        && matches!(
+            plan.transaction_stage,
+            TransactionStageV1::BoundaryResponsePersisted
+                | TransactionStageV1::VerificationResponsePersisted
+        )
+        && plan.transaction_journal.iter().any(|checkpoint| {
+            checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted
+                && checkpoint.artifact_hash.is_some()
+        })
+}
+
+async fn rectify_workspace_d1_migration(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    workspace_d1_migration::validate_bound_plan(store, plan)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "workspace D1 migration rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
+    if plan.transaction_stage == TransactionStageV1::BoundaryResponsePersisted {
+        persist_transaction_stage(
+            store,
+            plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )?;
+    }
+    let verification = workspace_d1_migration::verify(store, plan, &credential).await;
+    let verification_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let passed = verification
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let basis = verification
+        .get("basis")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace D1 migration reconciliation did not return a basis")
+        .to_owned();
+
+    if plan.transaction_stage == TransactionStageV1::VerificationAttemptPersisted {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({
+                "state": if passed { "passed" } else { "failed" },
+                "basis_hash": hash_value(&json!(basis))?,
+                "evidence_hash": verification_evidence.content_hash,
+                "reconciliation": true,
+                "boundary_replayed": false,
+            }),
+        )?;
+    }
+    if passed {
+        plan.status = PlanStatus::Verified;
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+    } else {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+    }
+
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id": plan.operation_id,
+            "status": plan.status,
+            "verification_only": true,
+            "boundary_replayed": false,
+            "message": if passed {
+                "The already-crossed workspace D1 migration boundary was reconciled from fresh ledger and schema readback without replaying Wrangler apply."
+            } else {
+                "Fresh workspace D1 ledger and schema readback did not verify; the plan remains rectification_required and the mutation was not replayed."
+            },
+        }),
+    )
+    .with_evidence(verification_evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.clone());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis,
+            next_step: Some(
+                "Inspect the fresh ledger/schema evidence and repair the observed state; do not replay the migration plan."
+                    .to_owned(),
+            ),
+        });
     }
     Ok(envelope)
 }
@@ -28340,8 +28453,9 @@ mod tests {
         validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
         validate_zone_account_receipt_precondition, validate_zone_id,
         validated_standing_lineage_token_id, verification_outcome,
-        workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
-        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
+        workspace_d1_migration_rectification_eligible, workspace_operational_proof_posture,
+        workspace_precondition_hashes_for_scope, workspace_resource_keys,
+        wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
         wrangler_version_readback_matches, wrangler_versions_deploy_version_id,
         wrangler_worker_version_id, zone_target,
@@ -28374,7 +28488,7 @@ mod tests {
         RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
         SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
         StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-        WorkflowContractV1, WorkflowStepV1, hash_value,
+        WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -42286,6 +42400,58 @@ mod tests {
                 .minted_token_ids,
             vec!["token-in-flight"]
         );
+    }
+
+    #[test]
+    fn workspace_d1_rectification_requires_a_durable_boundary_receipt_and_never_a_draft() {
+        let mut capability = CapabilityV1::new(
+            "example.d1-migrations-apply",
+            "Apply workspace D1 migrations",
+            "POST",
+            "/workspace/d1/migrations",
+        );
+        capability.workspace_d1_migration = Some(WorkspaceD1MigrationContractV1 {
+            repository_root: "/repo".to_owned(),
+            repository_head: "a".repeat(40),
+            repository_origin: "https://example.com/repo.git".to_owned(),
+            operation_pack_path: ".cfctl/operations/d1.toml".to_owned(),
+            operation_pack_sha256: format!("sha256:{}", "a".repeat(64)),
+            config_template_path: "wrangler.toml".to_owned(),
+            config_template_sha256: format!("sha256:{}", "b".repeat(64)),
+            production_config_path: "wrangler.production.toml".to_owned(),
+            migrations_dir: "migrations".to_owned(),
+            database_binding: "DB".to_owned(),
+            wrangler_version: "4.120.1".to_owned(),
+            migrations: Vec::new(),
+            assertions: Vec::new(),
+            recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
+            recovery_max_age_seconds: 600,
+            rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("workspace D1 plan");
+        assert!(!workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"boundary_crossed":true,"success":true}),
+        )
+        .expect("durable boundary response");
+        plan.status = PlanStatus::RectificationRequired;
+        assert!(workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.status = PlanStatus::Draft;
+        assert!(!workspace_d1_migration_rectification_eligible(&plan));
     }
 
     #[tokio::test]
