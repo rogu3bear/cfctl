@@ -443,8 +443,73 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_local_only_ci_contract()?;
     verify_workspace_contract()?;
     verify_v1_cutover_contract()?;
+    verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
     verify_documented_contracts()
+}
+
+fn verify_public_domain_contract() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    for path in tracked_files(repository_root)? {
+        if path.starts_with("compat/v1/") || path.starts_with("crates/cfctl-agent/tests/fixtures/")
+        {
+            continue;
+        }
+        let absolute_path = repository_root.join(&path);
+        let bytes = fs::read(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if contains_retired_public_domain(content) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} contains the retired public domain; cfctl.com is the only active public domain"
+            )));
+        }
+    }
+
+    for (path, required_anchor) in [
+        (
+            "crates/cfctl-auth/src/lib.rs",
+            "pub const CFCTL_CALLBACK_URL: &str = \"https://cfctl.com/oauth/callback\";",
+        ),
+        (
+            "packaging/homebrew/cfctl.rb.in",
+            "homepage \"https://cfctl.com\"",
+        ),
+        (
+            "README.md",
+            "`cfctl.com` site publication, publisher-domain verification",
+        ),
+        (
+            "crates/cfctl-cli/src/runtime.rs",
+            "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth",
+        ),
+    ] {
+        let absolute_path = repository_root.join(path);
+        let content = fs::read_to_string(&absolute_path)
+            .map_err(|source| io_error(&absolute_path, source))?;
+        validate_public_domain_anchor(path, &content, required_anchor)?;
+    }
+    Ok(())
+}
+
+fn contains_retired_public_domain(content: &str) -> bool {
+    content
+        .to_ascii_lowercase()
+        .contains(&["cfctl", ".io"].concat())
+}
+
+fn validate_public_domain_anchor(
+    path: &str,
+    content: &str,
+    required_anchor: &str,
+) -> Result<(), TaskError> {
+    if !content.contains(required_anchor) {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "{path} does not carry the exact cfctl.com public identity anchor `{required_anchor}`"
+        )));
+    }
+    Ok(())
 }
 
 fn verify_local_only_ci_contract() -> Result<(), TaskError> {
@@ -2829,18 +2894,20 @@ mod tests {
 
     use super::{
         PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, classify_pre_push_registration,
-        collect_workflow_paths, expected_signed_release_file_names,
+        collect_workflow_paths, contains_retired_public_domain, expected_signed_release_file_names,
         extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
         is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_linux_musl,
         parse_remote_tag_commit, release_build_driver, release_build_subcommand,
         release_tag_is_exact_version, render_linux_installer_text, repository_root,
         security_proof_commands, validate_bootstrap_contract, validate_codesign_details,
         validate_command_refs, validate_extracted_command_refs, validate_local_only_ci_contract,
-        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
+        validate_notary_receipt_value, validate_public_domain_anchor,
+        validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
         verify_generated_guidance_section_text, verify_managed_agent_documents,
-        verify_quickstart_pins_the_release_version, verify_tracked_cfctl_command_references,
-        verify_v1_cutover_contract, verify_workspace_dependency_versions,
+        verify_public_domain_contract, verify_quickstart_pins_the_release_version,
+        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
+        verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -2855,6 +2922,31 @@ mod tests {
         assert!(
             error.to_string().contains("must not hold a Cargo run gate"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn active_sources_use_only_the_cfctl_com_public_domain() {
+        verify_public_domain_contract().expect("active sources use only cfctl.com");
+
+        let callback_anchor =
+            "pub const CFCTL_CALLBACK_URL: &str = \"https://cfctl.com/oauth/callback\";";
+        let wrong_domain = callback_anchor.replace("cfctl.com", "cfctl.net");
+        let error = validate_public_domain_anchor(
+            "crates/cfctl-auth/src/lib.rs",
+            &wrong_domain,
+            callback_anchor,
+        )
+        .expect_err("a different public domain must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("exact cfctl.com public identity")
+        );
+
+        assert!(
+            contains_retired_public_domain(&["https://CFCTL", ".IO/oauth/callback"].concat()),
+            "the active-source scan must normalize retired-domain case"
         );
     }
 

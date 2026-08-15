@@ -983,7 +983,10 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
         doctor["result"]["running_build"],
         doctor["result"]["path_build"]["build"]
     );
-    assert!(doctor["result"]["public_oauth"].is_string());
+    assert_eq!(
+        doctor["result"]["public_oauth"],
+        "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane"
+    );
 
     let add = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
         .env("CFCTL_HOME", runtime.path())

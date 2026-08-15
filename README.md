@@ -350,6 +350,7 @@ Published releases are unsigned by operator decision, with integrity from
 provenance. Install by direct download plus checksum verification, the
 release's Homebrew formula, or a source build.
 
-`cfctl.io` registration, site publication, publisher-domain verification,
-permanent Cloudflare OAuth promotion, and release publication all require
-explicit operator action and are never silently performed or claimed.
+`cfctl.com` site publication, publisher-domain verification, permanent
+Cloudflare OAuth promotion, and release publication each require explicit
+operator action and are never silently performed or claimed. Publishing the
+site does not enable public OAuth.
