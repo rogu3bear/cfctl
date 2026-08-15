@@ -5,7 +5,7 @@ use std::{fs, path::Path, process::Command};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph, load_wrangler_config};
 
 #[test]
-fn exact_production_wrangler_toml_is_supported_without_admitting_arbitrary_variants() {
+fn exact_and_role_specific_production_wrangler_toml_are_supported() {
     let root = tempfile::tempdir().expect("workspace root");
     let repository = root.path().join("production-app");
     init_repo(
@@ -26,13 +26,131 @@ fn exact_production_wrangler_toml_is_supported_without_admitting_arbitrary_varia
             .any(|resource| resource.key == "worker:production-worker")
     );
 
-    let arbitrary = repository.join("wrangler.unreviewed.toml");
-    fs::write(&arbitrary, "name = \"unreviewed-worker\"\n").expect("arbitrary config");
+    for name in [
+        "wrangler.mail-router.toml",
+        "wrangler.mail-router.production.toml",
+        "wrangler.mail-outbound.production.toml",
+        "wrangler.routing-health.production.toml",
+    ] {
+        let role = repository.join(name);
+        fs::write(&role, "name = \"role-worker\"\n").expect("role config");
+        assert_eq!(
+            load_wrangler_config(&role).expect("role-specific Wrangler TOML")["name"],
+            "role-worker"
+        );
+    }
+
+    for name in [
+        "wrangler..toml",
+        "wrangler.role_name.toml",
+        "wrangler.-role.toml",
+        "wrangler.role-.production.toml",
+        "wrangler.unreviewed.extra.toml",
+        "Wrangler.mail-router.production.toml",
+    ] {
+        let invalid = repository.join(name);
+        fs::write(&invalid, "name = \"invalid-worker\"\n").expect("invalid config");
+        assert!(load_wrangler_config(&invalid).is_err(), "accepted {name}");
+    }
+
+    let nested = repository
+        .join("nested")
+        .join("wrangler.mail-router.production.toml");
+    fs::create_dir_all(nested.parent().expect("nested parent")).expect("nested directory");
+    fs::write(&nested, "name = \"nested-role-worker\"\n").expect("nested role config");
     assert!(
-        load_wrangler_config(&arbitrary)
-            .expect_err("arbitrary Wrangler variants must remain outside the authority contract")
-            .to_string()
-            .contains("not wrangler.toml")
+        load_wrangler_config(&nested).is_err(),
+        "accepted nested role-specific config"
+    );
+    assert!(
+        WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).is_err(),
+        "discovered nested role-specific config as deployment authority"
+    );
+
+    let interior_dot = Path::new(&format!(
+        "{}/./wrangler.mail-router.production.toml",
+        repository.display()
+    ))
+    .to_path_buf();
+    assert!(
+        load_wrangler_config(&interior_dot).is_err(),
+        "accepted a raw selector containing an interior `.` component"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(&nested).expect("remove nested regular config");
+        symlink(
+            repository.join("wrangler.mail-router.production.toml"),
+            &nested,
+        )
+        .expect("nested role symlink");
+        assert!(
+            load_wrangler_config(&nested).is_err(),
+            "accepted nested symlink to root role config"
+        );
+
+        let fifo = repository.join("wrangler.fifo-role.production.toml");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("create FIFO config fixture");
+        assert!(status.success(), "mkfifo failed");
+        assert!(
+            load_wrangler_config(&fifo).is_err(),
+            "accepted FIFO as deployment configuration authority"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn nested_git_marker_cannot_spoof_the_actual_repository_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("parent-repository");
+    let nested = repository.join("nested");
+    fs::create_dir_all(&nested).expect("nested directory");
+    run_git(&repository, &["init", "--quiet"]);
+    run_git(&repository, &["config", "user.name", "cfctl fixture"]);
+    run_git(
+        &repository,
+        &["config", "user.email", "cfctl@example.invalid"],
+    );
+    let config = nested.join("wrangler.mail-router.production.toml");
+    fs::write(&config, "name = \"nested-worker\"\n").expect("nested role config");
+    run_git(&repository, &["add", "."]);
+    run_git(&repository, &["commit", "--quiet", "-m", "fixture"]);
+    run_git(
+        &repository,
+        &[
+            "config",
+            "core.worktree",
+            repository.to_str().expect("UTF-8 repository"),
+        ],
+    );
+    symlink("../.git", nested.join(".git")).expect("nested Git marker alias");
+
+    let top_level = Command::new("git")
+        .current_dir(&nested)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .expect("nested Git top level");
+    assert!(top_level.status.success());
+    assert_eq!(
+        Path::new(String::from_utf8_lossy(&top_level.stdout).trim()),
+        repository.canonicalize().expect("canonical repository")
+    );
+    assert!(
+        load_wrangler_config(&config).is_err(),
+        "accepted a nested role config through a spoofed Git marker"
+    );
+    assert!(
+        WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).is_err(),
+        "discovered a nested role config through a spoofed Git marker"
     );
 }
 

@@ -22495,6 +22495,9 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, &mut plan);
     }
+    if workspace_d1_migration_rectification_eligible(&plan) {
+        return rectify_workspace_d1_migration(store, &mut plan).await;
+    }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
     if let Some(mut request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
@@ -22596,6 +22599,153 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
         envelope.evidence.push(evidence);
     }
     Ok(envelope)
+}
+
+fn workspace_d1_migration_rectification_eligible(plan: &PlanV1) -> bool {
+    plan.capability.workspace_d1_migration.is_some()
+        && plan.status == PlanStatus::RectificationRequired
+        && matches!(
+            plan.transaction_stage,
+            TransactionStageV1::BoundaryResponsePersisted
+                | TransactionStageV1::SecretSinkPersisted
+                | TransactionStageV1::VerificationAttemptPersisted
+                | TransactionStageV1::VerificationResponsePersisted
+        )
+        && plan.transaction_journal.iter().any(|checkpoint| {
+            checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted
+                && checkpoint.artifact_hash.is_some()
+        })
+}
+
+async fn rectify_workspace_d1_migration(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    workspace_d1_migration::validate_bound_plan_for_rectification(store, plan)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "workspace D1 migration rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
+    let retrying_after_verification_response =
+        plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted;
+    if matches!(
+        plan.transaction_stage,
+        TransactionStageV1::BoundaryResponsePersisted | TransactionStageV1::SecretSinkPersisted
+    ) {
+        persist_transaction_stage(
+            store,
+            plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )?;
+    }
+    let verification = workspace_d1_migration::verify_rectification(store, plan, &credential).await;
+    let verification_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let passed = verification
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let basis = verification
+        .get("basis")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace D1 migration reconciliation did not return a basis")
+        .to_owned();
+    let verification_receipt = json!({
+        "state": if passed { "passed" } else { "failed" },
+        "basis_hash": hash_value(&json!(basis))?,
+        "evidence_hash": verification_evidence.content_hash,
+        "reconciliation": true,
+        "boundary_replayed": false,
+    });
+
+    persist_workspace_d1_rectification_result(
+        store,
+        plan,
+        verification_receipt,
+        passed,
+        retrying_after_verification_response,
+    )?;
+
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id": plan.operation_id,
+            "status": plan.status,
+            "verification_only": true,
+            "boundary_replayed": false,
+            "message": if passed {
+                "The already-crossed workspace D1 migration boundary was reconciled from fresh ledger and schema readback without replaying Wrangler apply."
+            } else {
+                "Fresh workspace D1 ledger and schema readback did not verify; the plan remains rectification_required and the mutation was not replayed."
+            },
+        }),
+    )
+    .with_evidence(verification_evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.clone());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis,
+            next_step: Some(
+                "Inspect the fresh ledger/schema evidence and repair the observed state; do not replay the migration plan."
+                    .to_owned(),
+            ),
+        });
+    }
+    Ok(envelope)
+}
+
+fn persist_workspace_d1_rectification_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    verification_receipt: Value,
+    passed: bool,
+    retrying_after_verification_response: bool,
+) -> Result<()> {
+    if plan.transaction_stage == TransactionStageV1::VerificationAttemptPersisted {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            verification_receipt.clone(),
+        )?;
+    }
+    if !passed {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(());
+    }
+
+    plan.status = PlanStatus::Verified;
+    if retrying_after_verification_response {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::Closed,
+            json!({
+                "rectification_verification": verification_receipt,
+                "retry": true,
+            }),
+        )
+    } else {
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+    }
 }
 
 #[expect(
@@ -28299,16 +28449,16 @@ mod tests {
         normalize_reviewed_mln_repository_id, operational_proof_coverage,
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage, plan_impact,
-        plan_requires_live_credential, plan_state_next_step, plan_status_label,
-        preflight_call_input, preflight_secret_sink, preflight_standing_authority,
-        prepare_r2_temporary_credentials_input, prepare_security_action_input,
-        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
-        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
-        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
-        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
-        repair_keychain_access_with_warning, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        persist_workspace_d1_rectification_result, plan_impact, plan_requires_live_credential,
+        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        prepare_security_action_input, prepare_wrangler_deployment_status_command,
+        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
+        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
+        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -28340,8 +28490,9 @@ mod tests {
         validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
         validate_zone_account_receipt_precondition, validate_zone_id,
         validated_standing_lineage_token_id, verification_outcome,
-        workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
-        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
+        workspace_d1_migration_rectification_eligible, workspace_operational_proof_posture,
+        workspace_precondition_hashes_for_scope, workspace_resource_keys,
+        wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
         wrangler_version_readback_matches, wrangler_versions_deploy_version_id,
         wrangler_worker_version_id, zone_target,
@@ -28374,7 +28525,7 @@ mod tests {
         RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
         SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
         StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-        WorkflowContractV1, WorkflowStepV1, hash_value,
+        WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -42285,6 +42436,130 @@ mod tests {
                 .expect("reconciled authority reloads")
                 .minted_token_ids,
             vec!["token-in-flight"]
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one lifecycle test covers boundary eligibility, crash retry, failed readback, and hash-chained closure"
+    )]
+    fn workspace_d1_rectification_requires_a_boundary_receipt_and_journals_a_passing_retry() {
+        let mut capability = CapabilityV1::new(
+            "example.d1-migrations-apply",
+            "Apply workspace D1 migrations",
+            "POST",
+            "/workspace/d1/migrations",
+        );
+        capability.workspace_d1_migration = Some(WorkspaceD1MigrationContractV1 {
+            repository_root: "/repo".to_owned(),
+            repository_head: "a".repeat(40),
+            repository_origin: "https://example.com/repo.git".to_owned(),
+            operation_pack_path: ".cfctl/operations/d1.toml".to_owned(),
+            operation_pack_sha256: format!("sha256:{}", "a".repeat(64)),
+            config_template_path: "wrangler.toml".to_owned(),
+            config_template_sha256: format!("sha256:{}", "b".repeat(64)),
+            production_config_path: "wrangler.production.toml".to_owned(),
+            migrations_dir: "migrations".to_owned(),
+            database_binding: "DB".to_owned(),
+            wrangler_version: "4.120.1".to_owned(),
+            migrations: Vec::new(),
+            assertions: Vec::new(),
+            recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
+            recovery_max_age_seconds: 600,
+            rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("workspace D1 plan");
+        assert!(!workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"boundary_crossed":true,"success":true}),
+        )
+        .expect("durable boundary response");
+        plan.status = PlanStatus::RectificationRequired;
+        assert!(workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::SecretSinkPersisted,
+            json!({"sink":"private","success":true}),
+        )
+        .expect("durable secret sink receipt");
+        assert!(
+            workspace_d1_migration_rectification_eligible(&plan),
+            "a crossed migration whose private receipt persisted before verification must remain retryable"
+        );
+
+        plan.status = PlanStatus::Draft;
+        assert!(!workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("verification attempt");
+        assert!(
+            workspace_d1_migration_rectification_eligible(&plan),
+            "a crash after the read-only verification-attempt checkpoint must remain retryable"
+        );
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"failed","evidence_hash":format!("sha256:{}", "b".repeat(64))}),
+        )
+        .expect("failed verification response");
+        let root = tempfile::tempdir().expect("rectification store");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        store.save_plan(&plan).expect("save failed verification");
+        let journal_len_before_retry = plan.transaction_journal.len();
+        persist_workspace_d1_rectification_result(
+            &store,
+            &mut plan,
+            json!({"state":"failed","evidence_hash":format!("sha256:{}", "c".repeat(64))}),
+            false,
+            true,
+        )
+        .expect("failed retry remains open");
+        assert_eq!(plan.transaction_journal.len(), journal_len_before_retry);
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+
+        let passing_receipt = json!({
+            "state":"passed",
+            "evidence_hash":format!("sha256:{}", "d".repeat(64)),
+            "reconciliation":true,
+            "boundary_replayed":false,
+        });
+        persist_workspace_d1_rectification_result(
+            &store,
+            &mut plan,
+            passing_receipt.clone(),
+            true,
+            true,
+        )
+        .expect("passing retry closes with receipt");
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::Closed)
+                .expect("closed checkpoint artifact")["rectification_verification"],
+            passing_receipt
+        );
+        plan.validate_transaction_journal()
+            .expect("passing retry remains hash chained");
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("reload closed rectification plan");
+        assert_eq!(
+            durable.transaction_artifact(TransactionStageV1::Closed),
+            plan.transaction_artifact(TransactionStageV1::Closed)
         );
     }
 

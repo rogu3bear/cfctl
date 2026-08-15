@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -7,7 +8,7 @@ use std::{
 
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
 use cfctl_core::{CapabilityV1, PlanV1, hash_value, redact_json};
-use cfctl_workspace::{WorkspaceGraph, load_wrangler_config};
+use cfctl_workspace::{WorkspaceGraph, load_wrangler_config, load_wrangler_config_snapshot};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -46,6 +47,14 @@ pub(super) fn artifact_paths(
         CliError::Input("Wrangler configuration has no containing directory".to_owned())
     })?;
     let document = load_wrangler_config(&config)?;
+    artifact_paths_from_document(directory, &document, input)
+}
+
+fn artifact_paths_from_document(
+    directory: &Path,
+    document: &Value,
+    input: &CallInput,
+) -> Result<Vec<PathBuf>, CliError> {
     let main = input
         .query
         .get("argument")
@@ -91,8 +100,9 @@ pub(super) fn prepare_target(
         return Ok(None);
     }
     let config = canonical_config(input)?;
-    let document = load_wrangler_config(&config)?;
-    let service_name = validated_service_name(&document, input)?;
+    let snapshot = load_wrangler_config_snapshot(&config)?;
+    let document = &snapshot.document;
+    let service_name = validated_service_name(document, input)?;
     let repository = repository_owning_path(graph, &config).ok_or_else(|| {
         CliError::Input(format!(
             "Wrangler configuration `{}` is not owned by a registered repository",
@@ -103,6 +113,22 @@ pub(super) fn prepare_target(
         return Err(CliError::Input(format!(
             "Worker deployment repository `{}` is dirty; commit the reviewed source before planning",
             repository.path.display()
+        )));
+    }
+    let config_source = repository
+        .configs
+        .iter()
+        .find(|source| source.path == config)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "Wrangler configuration `{}` is absent from its repository source graph",
+                config.display()
+            ))
+        })?;
+    if config_source.head_content_hash.as_deref() != Some(snapshot.content_hash.as_str()) {
+        return Err(CliError::Input(format!(
+            "Wrangler configuration `{}` does not match an exact Git HEAD blob",
+            config.display()
         )));
     }
     let source_sha = repository.git.head.as_deref().ok_or_else(|| {
@@ -116,14 +142,18 @@ pub(super) fn prepare_target(
             "Worker deployment source identity is not a full lowercase Git SHA".to_owned(),
         ));
     }
-    let config_sha256 = hex::encode(Sha256::digest(fs::read(&config).map_err(|source| {
-        CliError::Io {
-            path: config.display().to_string(),
-            source,
-        }
-    })?));
+    let config_sha256 = snapshot
+        .content_hash
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            CliError::Input("Wrangler configuration digest is not canonical SHA-256".to_owned())
+        })?
+        .to_owned();
     let (expected_message, operation) = if binds_artifact(capability) {
-        let artifacts = artifact_paths(capability, input)?;
+        let config_directory = config.parent().ok_or_else(|| {
+            CliError::Input("Wrangler configuration has no containing directory".to_owned())
+        })?;
+        let artifacts = artifact_paths_from_document(config_directory, document, input)?;
         if artifacts.iter().any(|artifact| {
             repository_owning_path(graph, artifact)
                 .is_none_or(|owner| owner.path != repository.path)
@@ -451,6 +481,7 @@ fn canonical_config(input: &CallInput) -> Result<PathBuf, CliError> {
             "Worker deployment requires an absolute Wrangler config path".to_owned(),
         ));
     }
+    load_wrangler_config(path)?;
     let canonical = fs::canonicalize(path).map_err(|source| CliError::Io {
         path: path.display().to_string(),
         source,
@@ -488,19 +519,37 @@ fn repository_owning_path<'a>(
         .max_by_key(|repository| repository.path.components().count())
 }
 
+fn is_git_metadata_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|value| value.eq_ignore_ascii_case(".git"))
+}
+
 fn validate_artifact_tree_ownership(
     graph: &WorkspaceGraph,
     repository: &Path,
     roots: &[PathBuf],
 ) -> Result<(), CliError> {
     for root in roots {
-        for entry in WalkDir::new(root).follow_links(false) {
+        let mut entries = WalkDir::new(root).follow_links(false).into_iter();
+        while let Some(entry) = entries.next() {
             let entry = entry.map_err(|error| {
                 CliError::Input(format!(
                     "failed to inspect Worker deployment artifact `{}`: {error}",
                     root.display()
                 ))
             })?;
+            if is_git_metadata_name(entry.file_name()) {
+                if entry.path().parent() != Some(repository) {
+                    return Err(CliError::Input(format!(
+                        "Worker deployment artifact contains nested Git repository metadata `{}`",
+                        entry.path().display()
+                    )));
+                }
+                if entry.file_type().is_dir() {
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
             if repository_owning_path(graph, entry.path())
                 .is_none_or(|owner| owner.path != repository)
             {
@@ -518,13 +567,26 @@ fn validate_artifact_tree_ownership(
 fn artifact_set_sha256(repository: &Path, roots: &[PathBuf]) -> Result<String, CliError> {
     let mut entries = Vec::new();
     for root in roots {
-        for entry in WalkDir::new(root).follow_links(false) {
+        let mut walker = WalkDir::new(root).follow_links(false).into_iter();
+        while let Some(entry) = walker.next() {
             let entry = entry.map_err(|error| {
                 CliError::Input(format!(
                     "failed to inspect Worker deployment artifact `{}`: {error}",
                     root.display()
                 ))
             })?;
+            if is_git_metadata_name(entry.file_name()) {
+                if entry.path().parent() != Some(repository) {
+                    return Err(CliError::Input(format!(
+                        "Worker deployment artifact contains nested Git repository metadata `{}`",
+                        entry.path().display()
+                    )));
+                }
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
             if entry.path() == root || entry.file_type().is_dir() {
                 continue;
             }
@@ -581,6 +643,93 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    #[cfg(unix)]
+    fn config_selector_rejects_symlink_provenance_before_canonicalization() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("repository root");
+        fs::create_dir(root.path().join(".git")).expect("repository marker");
+        let config = root.path().join("wrangler.mail-router.production.toml");
+        fs::write(&config, "name = \"root-worker\"\nmain = \"worker.js\"\n")
+            .expect("root role config");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let ordinary = CallInput {
+            query: json!({"config": config}),
+            ..CallInput::default()
+        };
+        assert_eq!(
+            canonical_config(&ordinary).expect("ordinary config"),
+            config.canonicalize().expect("canonical ordinary config")
+        );
+
+        let leaf_alias = root.path().join("wrangler.alias.production.toml");
+        symlink(&config, &leaf_alias).expect("leaf config symlink");
+        let leaf_input = CallInput {
+            query: json!({"config": leaf_alias}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&leaf_input).is_err(),
+            "accepted leaf symlink selector"
+        );
+
+        let outside = tempfile::tempdir().expect("intermediate target");
+        symlink(outside.path(), root.path().join("intermediate-link"))
+            .expect("intermediate directory symlink");
+        let intermediate = root
+            .path()
+            .join("intermediate-link")
+            .join("wrangler.mail-router.production.toml");
+        fs::write(
+            outside.path().join("wrangler.mail-router.production.toml"),
+            "name = \"outside-worker\"\nmain = \"worker.js\"\n",
+        )
+        .expect("outside role config");
+        let intermediate_input = CallInput {
+            query: json!({"config": intermediate}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&intermediate_input).is_err(),
+            "accepted intermediate symlink selector"
+        );
+
+        let parent_component = root
+            .path()
+            .join("intermediate-link")
+            .join("..")
+            .join("wrangler.mail-router.production.toml");
+        let parent_input = CallInput {
+            query: json!({"config": parent_component}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&parent_input).is_err(),
+            "accepted selector that concealed a symlink behind `..`"
+        );
+
+        let interior_dot = PathBuf::from(format!(
+            "{}/./wrangler.mail-router.production.toml",
+            root.path().display()
+        ));
+        let interior_dot_input = CallInput {
+            query: json!({"config": interior_dot}),
+            ..CallInput::default()
+        };
+        assert!(
+            canonical_config(&interior_dot_input).is_err(),
+            "accepted selector containing an interior `.` component"
+        );
+    }
+
+    #[test]
     fn artifact_hash_matches_the_repository_shell_contract() {
         let root = tempfile::tempdir().expect("artifact root");
         let build = root.path().join("build");
@@ -614,11 +763,8 @@ mod tests {
         fs::write(build.join("index.wasm"), b"wasm").expect("wasm");
         fs::write(site.join("index.html"), "site\n").expect("site");
         let config = worker.join("wrangler.toml");
-        fs::write(
-            &config,
-            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n",
-        )
-        .expect("config");
+        let config_text = "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n";
+        fs::write(&config, config_text).expect("config");
         assert!(
             Command::new("git")
                 .args(["init", "--quiet", "--initial-branch=main"])
@@ -689,6 +835,27 @@ mod tests {
             projection["artifact"]["roots"],
             json!([build.canonicalize().unwrap(), site.canonicalize().unwrap()])
         );
+
+        let mut missing_blob_graph = graph.clone();
+        let config_source = missing_blob_graph
+            .repositories
+            .iter_mut()
+            .flat_map(|repository| repository.configs.iter_mut())
+            .find(|source| source.path == config.canonicalize().unwrap())
+            .expect("config source");
+        config_source.head_content_hash = None;
+        let missing_blob = prepare_target(&missing_blob_graph, &capability, &input)
+            .expect_err("config without an exact HEAD blob must fail")
+            .to_string();
+        assert!(missing_blob.contains("does not match an exact Git HEAD blob"));
+
+        fs::write(&config, format!("# changed after discovery\n{config_text}"))
+            .expect("mutate config after workspace discovery");
+        let post_discovery_drift = prepare_target(&graph, &capability, &input)
+            .expect_err("post-discovery config drift must not inherit a stale clean snapshot")
+            .to_string();
+        assert!(post_discovery_drift.contains("does not match an exact Git HEAD blob"));
+        fs::write(&config, config_text).expect("restore exact HEAD config");
 
         let version_id = "11111111-2222-4333-8444-555555555555";
         let mut promotion = capability.clone();
@@ -962,6 +1129,126 @@ mod tests {
             .expect_err("artifact tree containing a nested repository must fail before planning")
             .to_string();
         assert!(error.contains("is not owned by config repository"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "independently committed ignored artifact repository proves traversal does not rely on the filtered workspace graph"
+    )]
+    fn target_rejects_nested_repository_inside_ignored_artifact_directory() {
+        let root = tempfile::tempdir().expect("repository root");
+        let worker = root.path().join("cloudflare/site");
+        let build = worker.join("build");
+        let ignored_artifacts = root.path().join("dist");
+        let nested = ignored_artifacts.join("child");
+        fs::create_dir_all(&build).expect("build directory");
+        fs::create_dir_all(&nested).expect("nested artifact directory");
+        fs::write(build.join("_worker.js"), "worker\n").expect("worker");
+        fs::write(nested.join("index.html"), "nested\n").expect("nested artifact");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "nested fixture",
+                ])
+                .current_dir(&nested)
+                .status()
+                .expect("nested git commit")
+                .success()
+        );
+        let config = worker.join("wrangler.toml");
+        fs::write(
+            &config,
+            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../dist\"\n",
+        )
+        .expect("config");
+        fs::write(root.path().join(".gitignore"), "dist/\n").expect("ignore generated artifacts");
+        let nested_git = nested.join(".git");
+        let intermediate_git = nested.join(".git-case-rename");
+        fs::rename(&nested_git, &intermediate_git).expect("stage nested Git metadata rename");
+        fs::rename(&intermediate_git, nested.join(".GIT"))
+            .expect("use a case-variant nested Git metadata marker");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "outer fixture",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("outer git commit")
+                .success()
+        );
+        let graph =
+            WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("workspace graph");
+        assert_eq!(
+            graph.repositories.len(),
+            1,
+            "ignored artifact repository must remain absent from discovery"
+        );
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        let input = CallInput {
+            query: json!({
+                "config": config.canonicalize().expect("canonical config"),
+                "name": "cfctl-site",
+                "message": "untrusted",
+            }),
+            ..CallInput::default()
+        };
+        let error = prepare_target(&graph, &capability, &input)
+            .expect_err("ignored artifact tree containing a nested repository must fail")
+            .to_string();
+        assert!(error.contains("nested Git repository metadata"));
     }
 
     #[test]

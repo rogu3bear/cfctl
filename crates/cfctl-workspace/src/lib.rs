@@ -336,7 +336,7 @@ fn discover_root(
         if !entry.file_type().is_file() || !is_cloudflare_config(entry.path()) {
             continue;
         }
-        let Some(repo_path) = find_repository_root(entry.path(), &root.path) else {
+        let Some(repo_path) = find_repository_root(entry.path(), &root.path)? else {
             continue;
         };
         let repo_path = register_repository(&repo_path, repositories)?;
@@ -344,6 +344,7 @@ fn discover_root(
             .path()
             .canonicalize()
             .map_err(|source| io_error(entry.path(), source))?;
+        require_role_config_at_repository_root(&config_path, &repo_path)?;
         let repository = repositories.get_mut(&repo_path).ok_or_else(|| {
             WorkspaceError::DiscoveryInvariant(format!(
                 "registered repository {} is unavailable",
@@ -379,9 +380,12 @@ fn register_repository(
     path: &Path,
     repositories: &mut BTreeMap<PathBuf, RepositoryNode>,
 ) -> Result<PathBuf> {
-    let repo_path = path
-        .canonicalize()
-        .map_err(|source| io_error(path, source))?;
+    let repo_path = git_repository_root(path)?.ok_or_else(|| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "repository marker at `{}` is not backed by a readable Git worktree",
+            path.display()
+        ))
+    })?;
     if !repositories.contains_key(&repo_path) {
         let name = repo_path
             .file_name()
@@ -435,12 +439,12 @@ fn is_cloudflare_config(path: &Path) -> bool {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
     let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "wrangler.toml" | "wrangler.production.toml" | "wrangler.json" | "wrangler.jsonc"
-    ) || path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("tf"))
+    matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml")
+        || is_role_specific_wrangler_toml_name(name)
+        || matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc")
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("tf"))
         || lower.strip_suffix(".tf.json").is_some()
         || (path.extension().is_some_and(|extension| {
             extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
@@ -448,12 +452,14 @@ fn is_cloudflare_config(path: &Path) -> bool {
 }
 
 fn config_kind(path: &Path) -> &'static str {
-    let lower = path
+    let name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml") {
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "wrangler.toml" | "wrangler.production.toml")
+        || is_role_specific_wrangler_toml_name(name)
+    {
         "wrangler_toml"
     } else if matches!(lower.as_str(), "wrangler.json" | "wrangler.jsonc") {
         "wrangler_json"
@@ -468,16 +474,174 @@ fn config_kind(path: &Path) -> &'static str {
     }
 }
 
+fn is_wrangler_toml_name(name: &str) -> bool {
+    if matches!(name, "wrangler.toml" | "wrangler.production.toml") {
+        return true;
+    }
+    let Some(stem) = name
+        .strip_prefix("wrangler.")
+        .and_then(|value| value.strip_suffix(".toml"))
+    else {
+        return false;
+    };
+    let role = stem.strip_suffix(".production").unwrap_or(stem);
+    !role.is_empty()
+        && role.len() <= 63
+        && role.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'-' => index > 0 && index + 1 < role.len(),
+            _ => false,
+        })
+}
+
+fn is_role_specific_wrangler_toml_name(name: &str) -> bool {
+    name == name.to_ascii_lowercase()
+        && is_wrangler_toml_name(name)
+        && !matches!(name, "wrangler.toml" | "wrangler.production.toml")
+}
+
+fn require_role_config_at_repository_root(path: &Path, repository: &Path) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    if !is_role_specific_wrangler_toml_name(name) {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "role-specific Wrangler configuration `{}` has no repository parent",
+            path.display()
+        ))
+    })?;
+    if parent == repository {
+        return Ok(());
+    }
+    Err(WorkspaceError::DiscoveryInvariant(format!(
+        "role-specific Wrangler configuration `{}` must be located at repository root `{}`",
+        path.display(),
+        repository.display()
+    )))
+}
+
+fn validate_deployment_config_path(path: &Path) -> Result<()> {
+    // `Path::components()` normalizes interior `.` segments away, which would
+    // erase part of the caller's raw selector before this authority check.
+    // Deployment selectors originate as UTF-8 CLI/JSON strings, so reject
+    // non-UTF-8 selectors and inspect both platform separator spellings
+    // lexically before any filesystem lookup or canonicalization.
+    let contains_lexical_dot_component = path.to_str().is_none_or(|raw| {
+        raw.split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+    });
+    if contains_lexical_dot_component {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "deployment configuration path `{}` must not contain `.` or `..` components",
+            path.display()
+        )));
+    }
+    let selected_metadata = fs::symlink_metadata(path).map_err(|source| WorkspaceError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if !selected_metadata.file_type().is_file() {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "deployment configuration `{}` must be an ordinary regular file",
+            path.display()
+        )));
+    }
+    let actual_repository = path
+        .parent()
+        .map(git_repository_root)
+        .transpose()?
+        .flatten();
+    let lexical_repository = actual_repository.as_ref().and_then(|actual| {
+        path.ancestors().skip(1).find_map(|candidate| {
+            candidate
+                .canonicalize()
+                .ok()
+                .filter(|canonical| canonical == actual)
+                .map(|_| candidate.to_path_buf())
+        })
+    });
+    for component in path
+        .ancestors()
+        .filter(|component| !component.as_os_str().is_empty())
+    {
+        let metadata = fs::symlink_metadata(component).map_err(|source| WorkspaceError::Io {
+            path: component.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::DiscoveryInvariant(format!(
+                "deployment configuration path `{}` contains symlink component `{}`",
+                path.display(),
+                component.display()
+            )));
+        }
+        if lexical_repository
+            .as_ref()
+            .is_none_or(|repository| component == repository)
+        {
+            break;
+        }
+    }
+    let canonical_path = path.canonicalize().map_err(|source| WorkspaceError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if let Some(repository) = actual_repository {
+        if !canonical_path.starts_with(&repository) {
+            return Err(WorkspaceError::DiscoveryInvariant(format!(
+                "deployment configuration `{}` escapes Git repository `{}`",
+                canonical_path.display(),
+                repository.display()
+            )));
+        }
+        require_role_config_at_repository_root(&canonical_path, &repository)?;
+    } else if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(is_role_specific_wrangler_toml_name)
+    {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "role-specific Wrangler configuration `{}` is not owned by a readable Git worktree",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Load one Wrangler configuration through the same TOML/JSON/JSONC parser
 /// used by workspace discovery. Deployment planning consumes this public
 /// projection so config interpretation cannot drift from resource discovery.
 pub fn load_wrangler_config(path: &Path) -> Result<Value> {
-    let content = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
+    Ok(load_wrangler_config_snapshot(path)?.document)
+}
+
+/// One captured Wrangler configuration used for both interpretation and
+/// content-addressed deployment authority. Callers must not parse one read and
+/// hash a later read of the same path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WranglerConfigSnapshot {
+    pub document: Value,
+    pub content_hash: String,
+}
+
+pub fn load_wrangler_config_snapshot(path: &Path) -> Result<WranglerConfigSnapshot> {
+    validate_deployment_config_path(path)?;
+    let content = fs::read(path).map_err(|source| WorkspaceError::Io {
         path: path.display().to_string(),
         source,
     })?;
-    match config_kind(path) {
-        "wrangler_toml" => toml::from_str::<toml::Value>(&content)
+    let text = std::str::from_utf8(&content).map_err(|_| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "Wrangler configuration `{}` is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    let document = match config_kind(path) {
+        "wrangler_toml" => toml::from_str::<toml::Value>(text)
             .ok()
             .and_then(|value| serde_json::to_value(value).ok())
             .ok_or_else(|| {
@@ -486,27 +650,82 @@ pub fn load_wrangler_config(path: &Path) -> Result<Value> {
                     path.display()
                 ))
             }),
-        "wrangler_json" => serde_json::from_str::<Value>(&strip_jsonc(&content)).map_err(|error| {
+        "wrangler_json" => serde_json::from_str::<Value>(&strip_jsonc(text)).map_err(|error| {
             WorkspaceError::DiscoveryInvariant(format!(
                 "Wrangler JSON configuration `{}` is malformed: {error}",
                 path.display()
             ))
         }),
         _ => Err(WorkspaceError::DiscoveryInvariant(format!(
-            "deployment configuration `{}` is not wrangler.toml, wrangler.production.toml, wrangler.json, or wrangler.jsonc",
+            "deployment configuration `{}` is not a canonical Wrangler TOML/JSON configuration name",
             path.display()
         ))),
-    }
+    }?;
+    Ok(WranglerConfigSnapshot {
+        document,
+        content_hash: hash_bytes(&content),
+    })
 }
 
-fn find_repository_root(path: &Path, boundary: &Path) -> Option<PathBuf> {
-    path.ancestors()
-        .take_while(|candidate| candidate.starts_with(boundary))
-        .find(|candidate| candidate.join(".git").exists())
-        .map(Path::to_path_buf)
+fn find_repository_root(path: &Path, boundary: &Path) -> Result<Option<PathBuf>> {
+    let Some(directory) = path.parent() else {
+        return Ok(None);
+    };
+    let Some(repository) = git_repository_root(directory)? else {
+        return Ok(None);
+    };
+    let boundary = boundary
+        .canonicalize()
+        .map_err(|source| io_error(boundary, source))?;
+    Ok(repository.starts_with(boundary).then_some(repository))
+}
+
+fn git_repository_root(path: &Path) -> Result<Option<PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|source| io_error(path, source))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8(output.stdout).map_err(|_| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "Git repository root for `{}` is not UTF-8",
+            path.display()
+        ))
+    })?;
+    let root = raw.trim();
+    if root.is_empty() {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "Git returned an empty repository root for `{}`",
+            path.display()
+        )));
+    }
+    Path::new(root)
+        .canonicalize()
+        .map(Some)
+        .map_err(|source| io_error(Path::new(root), source))
 }
 
 fn inspect_git(repository: &Path) -> Result<GitStateV1> {
+    let canonical_repository = repository
+        .canonicalize()
+        .map_err(|source| io_error(repository, source))?;
+    let actual_repository = git_repository_root(repository)?.ok_or_else(|| {
+        WorkspaceError::DiscoveryInvariant(format!(
+            "repository `{}` has no readable Git top level",
+            repository.display()
+        ))
+    })?;
+    if actual_repository != canonical_repository {
+        return Err(WorkspaceError::DiscoveryInvariant(format!(
+            "repository `{}` resolves through Git to different top level `{}`",
+            canonical_repository.display(),
+            actual_repository.display()
+        )));
+    }
     let head = git_optional(repository, &["rev-parse", "HEAD"])?;
     let branch = git_optional(repository, &["branch", "--show-current"])?
         .filter(|branch| !branch.is_empty());
