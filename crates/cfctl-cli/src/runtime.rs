@@ -22629,6 +22629,8 @@ async fn rectify_workspace_d1_migration(
         ));
     }
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
+    let retrying_after_verification_response =
+        plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted;
     if plan.transaction_stage == TransactionStageV1::BoundaryResponsePersisted {
         persist_transaction_stage(
             store,
@@ -22648,28 +22650,21 @@ async fn rectify_workspace_d1_migration(
         .and_then(Value::as_str)
         .unwrap_or("workspace D1 migration reconciliation did not return a basis")
         .to_owned();
+    let verification_receipt = json!({
+        "state": if passed { "passed" } else { "failed" },
+        "basis_hash": hash_value(&json!(basis))?,
+        "evidence_hash": verification_evidence.content_hash,
+        "reconciliation": true,
+        "boundary_replayed": false,
+    });
 
-    if plan.transaction_stage == TransactionStageV1::VerificationAttemptPersisted {
-        persist_transaction_stage_with_artifact(
-            store,
-            plan,
-            TransactionStageV1::VerificationResponsePersisted,
-            json!({
-                "state": if passed { "passed" } else { "failed" },
-                "basis_hash": hash_value(&json!(basis))?,
-                "evidence_hash": verification_evidence.content_hash,
-                "reconciliation": true,
-                "boundary_replayed": false,
-            }),
-        )?;
-    }
-    if passed {
-        plan.status = PlanStatus::Verified;
-        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
-    } else {
-        plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
-    }
+    persist_workspace_d1_rectification_result(
+        store,
+        plan,
+        verification_receipt,
+        passed,
+        retrying_after_verification_response,
+    )?;
 
     let mut envelope = ResultEnvelopeV2::success(
         "plans rectify",
@@ -22709,6 +22704,43 @@ async fn rectify_workspace_d1_migration(
         });
     }
     Ok(envelope)
+}
+
+fn persist_workspace_d1_rectification_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    verification_receipt: Value,
+    passed: bool,
+    retrying_after_verification_response: bool,
+) -> Result<()> {
+    if plan.transaction_stage == TransactionStageV1::VerificationAttemptPersisted {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            verification_receipt.clone(),
+        )?;
+    }
+    if !passed {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(());
+    }
+
+    plan.status = PlanStatus::Verified;
+    if retrying_after_verification_response {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::Closed,
+            json!({
+                "rectification_verification": verification_receipt,
+                "retry": true,
+            }),
+        )
+    } else {
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+    }
 }
 
 #[expect(
@@ -28412,16 +28444,16 @@ mod tests {
         normalize_reviewed_mln_repository_id, operational_proof_coverage,
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage, plan_impact,
-        plan_requires_live_credential, plan_state_next_step, plan_status_label,
-        preflight_call_input, preflight_secret_sink, preflight_standing_authority,
-        prepare_r2_temporary_credentials_input, prepare_security_action_input,
-        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
-        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
-        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
-        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
-        repair_keychain_access_with_warning, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        persist_workspace_d1_rectification_result, plan_impact, plan_requires_live_credential,
+        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        prepare_security_action_input, prepare_wrangler_deployment_status_command,
+        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
+        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
+        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -42403,7 +42435,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_d1_rectification_requires_a_durable_boundary_receipt_and_never_a_draft() {
+    fn workspace_d1_rectification_requires_a_boundary_receipt_and_journals_a_passing_retry() {
         let mut capability = CapabilityV1::new(
             "example.d1-migrations-apply",
             "Apply workspace D1 migrations",
@@ -42452,6 +42484,60 @@ mod tests {
 
         plan.status = PlanStatus::Draft;
         assert!(!workspace_d1_migration_rectification_eligible(&plan));
+
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("verification attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"failed","evidence_hash":format!("sha256:{}", "b".repeat(64))}),
+        )
+        .expect("failed verification response");
+        let root = tempfile::tempdir().expect("rectification store");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        store.save_plan(&plan).expect("save failed verification");
+        let journal_len_before_retry = plan.transaction_journal.len();
+        persist_workspace_d1_rectification_result(
+            &store,
+            &mut plan,
+            json!({"state":"failed","evidence_hash":format!("sha256:{}", "c".repeat(64))}),
+            false,
+            true,
+        )
+        .expect("failed retry remains open");
+        assert_eq!(plan.transaction_journal.len(), journal_len_before_retry);
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+
+        let passing_receipt = json!({
+            "state":"passed",
+            "evidence_hash":format!("sha256:{}", "d".repeat(64)),
+            "reconciliation":true,
+            "boundary_replayed":false,
+        });
+        persist_workspace_d1_rectification_result(
+            &store,
+            &mut plan,
+            passing_receipt.clone(),
+            true,
+            true,
+        )
+        .expect("passing retry closes with receipt");
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::Closed)
+                .expect("closed checkpoint artifact")["rectification_verification"],
+            passing_receipt
+        );
+        plan.validate_transaction_journal()
+            .expect("passing retry remains hash chained");
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("reload closed rectification plan");
+        assert_eq!(
+            durable.transaction_artifact(TransactionStageV1::Closed),
+            plan.transaction_artifact(TransactionStageV1::Closed)
+        );
     }
 
     #[tokio::test]
