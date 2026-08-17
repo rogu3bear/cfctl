@@ -52,6 +52,16 @@ inferred from model output. Generated API writes are executable only when
 their operation contract is complete; reads remain dynamically executable, and
 incomplete writes stay searchable with every missing contract field explained.
 
+Read-only does not mean shape-free. The exact Email Routing rules capability
+returns the core-owned `EmailRoutingRuleSetV1` rather than raw provider rule
+objects. Its adapter enumerates explicit bounded pages through an empty
+terminal page, models field-bound and type-only matchers, retains only Worker
+targets, and reduces non-Worker action values to counts. A shape or completion
+failure remains a performed live read but produces only a typed diagnostic and
+failed verification. This is a consumer-breaking result-contract improvement:
+application consumers must cut over before release adoption, and cfctl does not
+dual-emit raw rules as a compatibility escape hatch.
+
 Adapter selection is separate from authority ownership. Catalog schema v2
 classifies every newly built capability as `provider_generic`, `cfctl_product`,
 `workspace_owned`, or `legacy_embedded`. Generic provider contracts must remain
@@ -209,4 +219,4 @@ operators back to the same CLI topics, and `cargo xtask verify` compares each
 generated section to the core renderer byte-for-byte, so lifecycle facts
 cannot drift silently.
 
-See [ADR 0001](architecture/adr/0001-rust-clean-break.md), [ADR 0002](architecture/adr/0002-risk-based-approval.md), and [ADR 0003](architecture/adr/0003-executable-guidance-projection.md).
+See [ADR 0001](architecture/adr/0001-rust-clean-break.md), [ADR 0002](architecture/adr/0002-risk-based-approval.md), [ADR 0003](architecture/adr/0003-executable-guidance-projection.md), and [ADR 0004](architecture/adr/0004-email-routing-read-projection.md).

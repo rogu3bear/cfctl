@@ -8545,6 +8545,7 @@ fn apply_post_normalization_contracts(
     finalize_r2_lifecycle_contract(capabilities);
     finalize_email_sending_contracts(capabilities);
     finalize_email_routing_subdomain_contract(capabilities);
+    finalize_email_routing_rules_read_projection(capabilities);
     finalize_worker_script_delete_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
     finalize_access_application_login_methods_contract(document, capabilities);
@@ -8552,6 +8553,31 @@ fn apply_post_normalization_contracts(
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
+}
+
+fn finalize_email_routing_rules_read_projection(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let Some(capability) = capabilities.get_mut(cfctl_core::EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
+    else {
+        return;
+    };
+    if !cfctl_core::is_email_routing_rules_list_capability(capability) {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "Email Routing rules no longer match the pinned typed read-projection contract"
+                .to_owned(),
+        );
+        return;
+    }
+    capability.description = Some(
+        "Lists routing rules as cfctl's bounded `EmailRoutingRuleSetV1` projection; raw non-Worker action values never enter stdout or evidence."
+            .to_owned(),
+    );
+    capability.aliases.extend([
+        "typed Email Routing rule set".to_owned(),
+        "privacy-safe Email Routing inventory".to_owned(),
+    ]);
+    capability.aliases.sort();
+    capability.aliases.dedup();
 }
 
 const PAGES_DEPLOYMENT_CREATE_CAPABILITY_ID: &str = "pages-deployment-create-deployment";
