@@ -578,10 +578,12 @@ cfctl call email-routing-routing-rules-list-routing-rules \
 
 The result is `EmailRoutingRuleSetV1`, not Cloudflare's raw rule array. cfctl
 owns explicit 50-item page enumeration, requires an empty terminal page within
-100 reads, accepts both field-bound and type-only matchers, and retains values
-only for validated Worker actions. Values belonging to forwarding or other
-non-Worker actions are represented only by `value_count`; they do not enter
-stdout or evidence. A malformed, oversized, partial, or unterminated response
+100 reads, accepts both field-bound and type-only matchers, hashes field-bound
+matcher values into `value_sha256`, and retains plaintext values only for
+validated Worker action targets. Values belonging to forwarding or other
+non-Worker actions are represented only by `value_count`; matcher plaintext and
+non-Worker values do not enter stdout or evidence. A malformed, oversized,
+partial, or unterminated response
 returns `CFCTL_RESPONSE_CONTRACT_MISMATCH` with `performed: true`, failed
 verification, and a bounded diagnostic code. Do not parse around that failure
 or fall back to raw API output.

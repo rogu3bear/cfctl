@@ -29,9 +29,10 @@ Cloudflare JSON response envelope all match the pinned contract.
 `cfctl-cloudflare` reads explicit 50-item pages until an empty terminal page,
 with a maximum of 100 performed page reads. Every rule, matcher, action, action
 value, and copied string is bounded before projection. Field-bound matchers
-retain their field and value; type-only matchers remain type-only. Worker
-actions retain validated Worker targets. Non-Worker action values are reduced
-to a count and never enter the returned result or durable evidence.
+retain their field and a `sha256:` identity of the matcher value; matcher
+plaintext never enters the projection. Type-only matchers remain type-only.
+Worker actions retain validated Worker targets. Non-Worker action values are
+reduced to a count and never enter the returned result or durable evidence.
 
 Successful calls return only `EmailRoutingRuleSetV1`, not the raw provider
 rule array. Provider-shape, size, or termination failures return a bounded
