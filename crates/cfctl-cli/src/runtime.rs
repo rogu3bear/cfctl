@@ -454,7 +454,18 @@ fn live_read_availability(capability: &CapabilityV1, response: &CloudflareRespon
             .and_then(|info| info.pointer("/output/rows"))
             .and_then(Value::as_u64)
     });
-    let (state, data_state, distinction_proven, next_action) = if response.success {
+    let (state, data_state, distinction_proven, next_action) = if email_routing_contract_diagnostic(
+        response,
+    )
+    .is_some()
+    {
+        (
+            "response_contract_rejected",
+            "not_observed",
+            true,
+            "Inspect the bounded diagnostic code and update the cfctl-owned Email Routing projection contract before retrying; never consume or expose the raw provider response.",
+        )
+    } else if response.success {
         if analytics_rows == Some(0) {
             (
                 "available",
@@ -511,6 +522,38 @@ fn live_read_availability(capability: &CapabilityV1, response: &CloudflareRespon
         "sampling": capability.analytics_query.as_ref().and_then(|query| query.sampling.as_deref()),
         "next_action": next_action,
     })
+}
+
+fn email_routing_contract_diagnostic(response: &CloudflareResponseV1) -> Option<&Value> {
+    (response
+        .result
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        == Some(1)
+        && response.result.get("complete").and_then(Value::as_bool) == Some(false))
+    .then(|| response.result.get("diagnostic"))
+    .flatten()
+    .filter(|diagnostic| {
+        diagnostic.get("schema_version").and_then(Value::as_u64) == Some(1)
+            && diagnostic.get("code").and_then(Value::as_str).is_some()
+            && diagnostic
+                .get("component")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+}
+
+fn live_read_failure_guidance_for_response(
+    response: &CloudflareResponseV1,
+) -> (&'static str, String) {
+    if email_routing_contract_diagnostic(response).is_some() {
+        return (
+            "CFCTL_RESPONSE_CONTRACT_MISMATCH",
+            "Inspect only the bounded diagnostic code, update the cfctl-owned response projection with reserved fixtures, and repeat the exact read; do not expose or consume raw provider values."
+                .to_owned(),
+        );
+    }
+    live_read_failure_guidance(response.status)
 }
 
 pub type Result<T> = std::result::Result<T, CliError>;
@@ -6088,6 +6131,7 @@ async fn execute_read(
     envelope.account_id = account_id;
     envelope.ok = response.success;
     envelope.performed = true;
+    let email_routing_contract_rejected = email_routing_contract_diagnostic(&response).is_some();
     if capability.mln_0143_data_invariants.is_some() {
         let verified = response.result.get("complete").and_then(Value::as_bool) == Some(true)
             && response
@@ -6120,6 +6164,12 @@ async fn execute_read(
         };
         envelope.verification.basis =
             Some("same output file exists and its SHA-256 matches the streamed receipt".to_owned());
+    } else if email_routing_contract_rejected {
+        envelope.verification.state = VerificationState::Failed;
+        envelope.verification.basis = Some(
+            "cfctl rejected the Email Routing provider response before consumer projection"
+                .to_owned(),
+        );
     } else {
         envelope.verification.state = VerificationState::NotApplicable;
         envelope.verification.basis = Some(format!(
@@ -6131,13 +6181,20 @@ async fn execute_read(
     // to the agent. Without an ErrorV1 it would surface as `ok:false` with no
     // guidance; attach a status-specific next step so the agent knows the move.
     if !response.success {
-        let (code, next_step) = live_read_failure_guidance(response.status);
+        let (code, next_step) = live_read_failure_guidance_for_response(&response);
         envelope.error = Some(ErrorV1 {
             code: code.to_owned(),
-            message: format!(
-                "the Cloudflare read did not succeed (HTTP {}) for capability `{}`",
-                response.status, capability.id
-            ),
+            message: if email_routing_contract_rejected {
+                format!(
+                    "the performed Cloudflare read failed the normalized response contract for capability `{}`",
+                    capability.id
+                )
+            } else {
+                format!(
+                    "the Cloudflare read did not succeed (HTTP {}) for capability `{}`",
+                    response.status, capability.id
+                )
+            },
             next_step: Some(next_step),
         });
     }
@@ -44989,6 +45046,53 @@ mod tests {
             "CFCTL_LIVE_UPSTREAM"
         );
         assert_eq!(super::live_read_failure_guidance(418).0, "CFCTL_LIVE_ERROR");
+    }
+
+    #[test]
+    fn email_routing_contract_rejection_is_performed_but_never_raw_provider_data() {
+        let capability = resolver_read_capability(
+            "email-routing-routing-rules-list-routing-rules",
+            "List routing rules",
+            "Email Routing",
+        );
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: false,
+            result: json!({
+                "schema_version": 1,
+                "complete": false,
+                "diagnostic": {
+                    "schema_version": 1,
+                    "code": "matcher_pair_incomplete",
+                    "rule_index": 0,
+                    "component": "matcher"
+                }
+            }),
+            errors: vec![CloudflareApiErrorV1 {
+                code: None,
+                message: "bounded normalized response rejection".to_owned(),
+            }],
+            result_info: Some(json!({
+                "cfctl_projection": "email_routing_rule_set_v1",
+                "cfctl_page_probe_complete": false
+            })),
+            etag: None,
+            cf_ray: None,
+        };
+
+        assert!(super::email_routing_contract_diagnostic(&response).is_some());
+        assert_eq!(
+            super::live_read_failure_guidance_for_response(&response).0,
+            "CFCTL_RESPONSE_CONTRACT_MISMATCH"
+        );
+        let availability = super::live_read_availability(&capability, &response);
+        assert_eq!(availability["state"], "response_contract_rejected");
+        assert_eq!(availability["data_state"], "not_observed");
+        assert!(
+            !serde_json::to_string(&response)
+                .expect("serialize bounded rejection")
+                .contains("operator@example.com")
+        );
     }
 
     #[test]

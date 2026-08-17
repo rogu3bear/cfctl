@@ -11,10 +11,11 @@ use cfctl_catalog::{
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1,
-    CostExposureV1, CreatedResourceContractV1, DeletedResourceContractV1, EffectClass,
-    KnowledgeReferenceV1, PaginationModeV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
-    SamePathReadContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1,
-    TimestampFormatV1, hash_value,
+    CostExposureV1, CreatedResourceContractV1, DeletedResourceContractV1,
+    EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID, EffectClass, KnowledgeReferenceV1, PaginationModeV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
+    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, TimestampFormatV1, hash_value,
+    is_email_routing_rules_list_capability,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -99,6 +100,49 @@ fn cloudflare_named_result_responses() -> Value {
             }}}
         }
     })
+}
+
+#[test]
+fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/zones/{zone_id}/email/routing/rules": {
+                "get": {
+                    "operationId": EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID,
+                    "summary": "List routing rules",
+                    "tags": ["Email Routing routing rules"],
+                    "parameters": [
+                        {"in":"path","name":"zone_id","required":true,"schema":{"type":"string","maxLength":32}},
+                        {"in":"query","name":"page","required":false,"schema":{"type":"number","minimum":1}},
+                        {"in":"query","name":"per_page","required":false,"schema":{"type":"number","minimum":5,"maximum":50}}
+                    ],
+                    "responses": cloudflare_envelope_responses()
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("normalize Email Routing fixture");
+    let capability = snapshot
+        .capabilities
+        .get(EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
+        .expect("typed Email Routing capability");
+    assert!(is_email_routing_rules_list_capability(capability));
+    assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+    assert!(
+        capability
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("EmailRoutingRuleSetV1"))
+    );
+    assert!(
+        capability
+            .aliases
+            .iter()
+            .any(|alias| alias == "privacy-safe Email Routing inventory")
+    );
 }
 
 fn pages_domain_fixture() -> Value {
