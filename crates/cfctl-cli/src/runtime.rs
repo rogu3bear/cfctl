@@ -455,8 +455,7 @@ fn live_read_availability(capability: &CapabilityV1, response: &CloudflareRespon
             .and_then(Value::as_u64)
     });
     let (state, data_state, distinction_proven, next_action) = if email_routing_contract_diagnostic(
-        capability,
-        response,
+        capability, response,
     )
     .is_some()
     {
@@ -531,10 +530,10 @@ fn email_routing_contract_diagnostic<'a>(
 ) -> Option<&'a Value> {
     (cfctl_core::is_email_routing_rules_list_capability(capability)
         && response
-        .result
-        .get("schema_version")
-        .and_then(Value::as_u64)
-        == Some(1)
+            .result
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            == Some(1)
         && response.result.get("complete").and_then(Value::as_bool) == Some(false))
     .then(|| response.result.get("diagnostic"))
     .flatten()

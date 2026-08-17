@@ -151,8 +151,7 @@ fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
         .expect("path item")
         .remove("get")
         .expect("GET operation");
-    wrong_path["paths"]["/zones/{zone_id}/email/routing/other"] =
-        json!({"get": operation});
+    wrong_path["paths"]["/zones/{zone_id}/email/routing/other"] = json!({"get": operation});
     drifted_documents.push(wrong_path);
 
     let mut wrong_method = document.clone();
@@ -164,13 +163,12 @@ fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
     drifted_documents.push(wrong_method);
 
     let mut wrong_envelope = document;
-    wrong_envelope["paths"]["/zones/{zone_id}/email/routing/rules"]["get"]["responses"] =
-        json!({
-            "200": {
-                "description": "JSON without the Cloudflare success envelope",
-                "content": {"application/json": {"schema": {"type": "object"}}}
-            }
-        });
+    wrong_envelope["paths"]["/zones/{zone_id}/email/routing/rules"]["get"]["responses"] = json!({
+        "200": {
+            "description": "JSON without the Cloudflare success envelope",
+            "content": {"application/json": {"schema": {"type": "object"}}}
+        }
+    });
     drifted_documents.push(wrong_envelope);
 
     for drifted in drifted_documents {
