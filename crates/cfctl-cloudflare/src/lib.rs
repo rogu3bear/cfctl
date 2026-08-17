@@ -2618,7 +2618,24 @@ impl Executor {
             );
             let response = self.send(&page_request, credential).await?;
             if !response.success {
-                return Ok(response);
+                return Ok(email_routing_rules_rejected_response(
+                    response,
+                    EmailRoutingRuleDiagnosticV1::new(
+                        "provider_page_unsuccessful",
+                        None,
+                        "provider_response",
+                    ),
+                ));
+            }
+            if !response.errors.is_empty() {
+                return Ok(email_routing_rules_rejected_response(
+                    response,
+                    EmailRoutingRuleDiagnosticV1::new(
+                        "provider_errors_present",
+                        None,
+                        "provider_response",
+                    ),
+                ));
             }
             let Some(page_rules) = response.result.as_array() else {
                 return Ok(email_routing_rules_rejected_response(

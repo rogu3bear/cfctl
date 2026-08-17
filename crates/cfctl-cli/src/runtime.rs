@@ -455,6 +455,7 @@ fn live_read_availability(capability: &CapabilityV1, response: &CloudflareRespon
             .and_then(Value::as_u64)
     });
     let (state, data_state, distinction_proven, next_action) = if email_routing_contract_diagnostic(
+        capability,
         response,
     )
     .is_some()
@@ -524,8 +525,12 @@ fn live_read_availability(capability: &CapabilityV1, response: &CloudflareRespon
     })
 }
 
-fn email_routing_contract_diagnostic(response: &CloudflareResponseV1) -> Option<&Value> {
-    (response
+fn email_routing_contract_diagnostic<'a>(
+    capability: &CapabilityV1,
+    response: &'a CloudflareResponseV1,
+) -> Option<&'a Value> {
+    (cfctl_core::is_email_routing_rules_list_capability(capability)
+        && response
         .result
         .get("schema_version")
         .and_then(Value::as_u64)
@@ -544,9 +549,10 @@ fn email_routing_contract_diagnostic(response: &CloudflareResponseV1) -> Option<
 }
 
 fn live_read_failure_guidance_for_response(
+    capability: &CapabilityV1,
     response: &CloudflareResponseV1,
 ) -> (&'static str, String) {
-    if email_routing_contract_diagnostic(response).is_some() {
+    if email_routing_contract_diagnostic(capability, response).is_some() {
         return (
             "CFCTL_RESPONSE_CONTRACT_MISMATCH",
             "Inspect only the bounded diagnostic code, update the cfctl-owned response projection with reserved fixtures, and repeat the exact read; do not expose or consume raw provider values."
@@ -6131,7 +6137,8 @@ async fn execute_read(
     envelope.account_id = account_id;
     envelope.ok = response.success;
     envelope.performed = true;
-    let email_routing_contract_rejected = email_routing_contract_diagnostic(&response).is_some();
+    let email_routing_contract_rejected =
+        email_routing_contract_diagnostic(capability, &response).is_some();
     if capability.mln_0143_data_invariants.is_some() {
         let verified = response.result.get("complete").and_then(Value::as_bool) == Some(true)
             && response
@@ -6181,7 +6188,7 @@ async fn execute_read(
     // to the agent. Without an ErrorV1 it would surface as `ok:false` with no
     // guidance; attach a status-specific next step so the agent knows the move.
     if !response.success {
-        let (code, next_step) = live_read_failure_guidance_for_response(&response);
+        let (code, next_step) = live_read_failure_guidance_for_response(capability, &response);
         envelope.error = Some(ErrorV1 {
             code: code.to_owned(),
             message: if email_routing_contract_rejected {
@@ -45050,11 +45057,17 @@ mod tests {
 
     #[test]
     fn email_routing_contract_rejection_is_performed_but_never_raw_provider_data() {
-        let capability = resolver_read_capability(
+        let mut capability = CapabilityV1::new(
             "email-routing-routing-rules-list-routing-rules",
             "List routing rules",
-            "Email Routing",
+            "GET",
+            "/zones/{zone_id}/email/routing/rules",
         );
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
         let response = CloudflareResponseV1 {
             status: 200,
             success: false,
@@ -45080,9 +45093,9 @@ mod tests {
             cf_ray: None,
         };
 
-        assert!(super::email_routing_contract_diagnostic(&response).is_some());
+        assert!(super::email_routing_contract_diagnostic(&capability, &response).is_some());
         assert_eq!(
-            super::live_read_failure_guidance_for_response(&response).0,
+            super::live_read_failure_guidance_for_response(&capability, &response).0,
             "CFCTL_RESPONSE_CONTRACT_MISMATCH"
         );
         let availability = super::live_read_availability(&capability, &response);

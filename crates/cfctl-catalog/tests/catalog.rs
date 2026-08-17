@@ -143,6 +143,48 @@ fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
             .iter()
             .any(|alias| alias == "privacy-safe Email Routing inventory")
     );
+
+    let mut drifted_documents = Vec::new();
+    let mut wrong_path = document.clone();
+    let operation = wrong_path["paths"]["/zones/{zone_id}/email/routing/rules"]
+        .as_object_mut()
+        .expect("path item")
+        .remove("get")
+        .expect("GET operation");
+    wrong_path["paths"]["/zones/{zone_id}/email/routing/other"] =
+        json!({"get": operation});
+    drifted_documents.push(wrong_path);
+
+    let mut wrong_method = document.clone();
+    let path_item = wrong_method["paths"]["/zones/{zone_id}/email/routing/rules"]
+        .as_object_mut()
+        .expect("path item");
+    let operation = path_item.remove("get").expect("GET operation");
+    path_item.insert("post".to_owned(), operation);
+    drifted_documents.push(wrong_method);
+
+    let mut wrong_envelope = document;
+    wrong_envelope["paths"]["/zones/{zone_id}/email/routing/rules"]["get"]["responses"] =
+        json!({
+            "200": {
+                "description": "JSON without the Cloudflare success envelope",
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }
+        });
+    drifted_documents.push(wrong_envelope);
+
+    for drifted in drifted_documents {
+        let snapshot = normalize_openapi(&drifted).expect("normalize drift fixture");
+        let capability = snapshot
+            .capabilities
+            .get(EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
+            .expect("drifted capability remains searchable");
+        assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+        assert_eq!(
+            capability.blocked_reason.as_deref(),
+            Some("Email Routing rules no longer match the pinned typed read-projection contract")
+        );
+    }
 }
 
 fn pages_domain_fixture() -> Value {

@@ -969,7 +969,7 @@ pub struct EmailRoutingMatcherV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    pub value_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1123,7 +1123,7 @@ fn normalize_email_routing_matcher(
     })?;
     let field = matcher.get("field");
     let value = matcher.get("value");
-    let (field, value) = match (field, value) {
+    let (field, value_sha256) = match (field, value) {
         (None, None) => (None, None),
         (Some(field), Some(value)) => {
             let field = bounded_email_routing_string(Some(field)).ok_or_else(|| {
@@ -1140,7 +1140,13 @@ fn normalize_email_routing_matcher(
                     "matcher.value",
                 )
             })?;
-            (Some(field), Some(value))
+            (
+                Some(field),
+                Some(format!(
+                    "sha256:{}",
+                    hex::encode(Sha256::digest(value.as_bytes()))
+                )),
+            )
         }
         _ => {
             return Err(EmailRoutingRuleDiagnosticV1::new(
@@ -1153,7 +1159,7 @@ fn normalize_email_routing_matcher(
     Ok(EmailRoutingMatcherV1 {
         matcher_type,
         field,
-        value,
+        value_sha256,
     })
 }
 

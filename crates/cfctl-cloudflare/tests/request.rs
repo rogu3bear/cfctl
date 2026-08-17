@@ -4642,15 +4642,17 @@ async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
     assert_eq!(response.result["rule_count"], 2);
     assert_eq!(response.result["rules"][0]["matchers"][0]["field"], "to");
     assert_eq!(
+        response.result["rules"][0]["matchers"][0]["value_sha256"],
+        "sha256:786906db96ef646937f205d3e7398630ce2e97df5364baf31b81ef84f1386c3f"
+    );
+    assert_eq!(
         response.result["rules"][0]["actions"][0]["worker_targets"],
         json!(["maildesk-router"])
     );
     assert_eq!(response.result["rules"][1]["actions"][0]["value_count"], 1);
-    assert!(
-        !serde_json::to_string(&response.result)
-            .expect("serialize projection")
-            .contains("operator@example.com")
-    );
+    let serialized = serde_json::to_string(&response.result).expect("serialize projection");
+    assert!(!serialized.contains("operator@example.com"));
+    assert!(!serialized.contains("security@example.com"));
 
     let requests = server.await.expect("server joins");
     assert_eq!(requests.len(), 2);
@@ -4717,6 +4719,104 @@ async fn email_routing_rules_read_rejects_shape_drift_without_echoing_values() {
 
     let requests = server.await.expect("server joins");
     assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn email_routing_rules_read_suppresses_failed_page_values_after_a_boundary() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"worker","value":["maildesk-router"]}]}],"errors":[]}"#,
+        r#"{"success":false,"result":[{"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[{"message":"operator@example.com"}]}"#,
+    ])
+    .await;
+    let capability = email_routing_rules_test_capability();
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let response = executor
+        .execute_read(
+            &capability,
+            &CallInput {
+                selectors: json!({"zone_id":"zone-example"}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("safe failed-page projection");
+
+    assert!(!response.success);
+    assert_eq!(
+        response.result["diagnostic"]["code"],
+        "provider_page_unsuccessful"
+    );
+    let serialized = serde_json::to_string(&response).expect("serialize rejection");
+    assert!(!serialized.contains("operator@example.com"));
+    assert!(!serialized.contains("security@example.com"));
+    assert_eq!(server.await.expect("server joins").len(), 2);
+}
+
+#[tokio::test]
+async fn email_routing_rules_read_rejects_provider_errors_on_a_success_envelope() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[{"message":"operator@example.com"}]}"#,
+    ])
+    .await;
+    let capability = email_routing_rules_test_capability();
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let response = executor
+        .execute_read(
+            &capability,
+            &CallInput {
+                selectors: json!({"zone_id":"zone-example"}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("safe provider-error projection");
+
+    assert!(!response.success);
+    assert_eq!(
+        response.result["diagnostic"]["code"],
+        "provider_errors_present"
+    );
+    let serialized = serde_json::to_string(&response).expect("serialize rejection");
+    assert!(!serialized.contains("operator@example.com"));
+    assert!(!serialized.contains("security@example.com"));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+fn email_routing_rules_test_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "email-routing-routing-rules-list-routing-rules",
+        "List routing rules",
+        "GET",
+        "/zones/{zone_id}/email/routing/rules",
+    );
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability
 }
 
 #[tokio::test]
