@@ -6,11 +6,11 @@
 |---|---|---|
 | Repair repeated Keychain prompts through existing SSOT | Done | Installed and source SHA `87f8ded` match; `doctor` reports sticky `fallback_file`; authenticated D1 read returned 200 without prompt. |
 | Reconcile substantive branches before site work | Done | Pages, quick tunnel, and WebSockets merged; exact merged SHA proved and pushed. |
-| Select the HORIZON direction | Blocked on owner | Exact design-stage decision recorded in `HORIZON.md`. |
 | Select Workers vs Pages | Recommendation ready | Workers Assets selected for cargo-leptos SSR, or explicit owner override recorded. |
-| Build minimum Leptos routes | Pending | SSR/hydration/Router build green; no template residue. |
-| Define/review security policy delta | Pending approval | Exact `SECURITY.md` diff shown before any write. |
-| Complete threat model | Pending scope answers | Trust boundaries, threats, mitigations, and residual risk accepted. |
+| Build minimum Leptos routes | Done in source | The current `site/src` route tree, SSR/hydration path, and Worker asset build replace the former template; rendered acceptance and deployment remain separate rows. |
+| Review the implemented site at wide and narrow viewports | Pending proof | Current `site/src` and `site/style/main.css` are reviewed against `ACCEPTANCE_CRITERIA.md`; findings are repaired or recorded without treating implementation as its own proof. |
+| Define/review security policy delta | Implemented; acceptance open | `../SECURITY.md` governs the current site boundary; named security/privacy acceptance and live configuration readback remain open in `LAUNCH_CHECKLIST.md`. |
+| Complete threat model | Implemented; acceptance open | `../site-threat-model.md` records the current scope, trust boundaries, threats, mitigations, and residual risks; a boundary change or named acceptance can require a successor review. |
 
 ## P1 — activation proof
 

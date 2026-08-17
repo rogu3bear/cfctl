@@ -1,6 +1,7 @@
 # Build risk review
 
-Decision: **Build small** after design-direction selection.
+Decision: **Validate the implemented small build** against the acceptance
+criteria before release.
 
 ## Primary risk
 
@@ -15,7 +16,7 @@ Desirability and activation, not technical feasibility. The repository already p
 | Pages/Workers ambiguity creates two deployment authorities | cargo-leptos SSR maps naturally to Workers; Pages static would change build/runtime model | High | High | Select one canonical Workers deployment for v1; treat Pages as a later static alternative. |
 | Analytics harms the local-first trust promise | No instrumentation policy exists | Medium | High | Launch without behavioral analytics or collect only documented, content-free activation events after review. |
 | Credential prompt regression damages trust | Old installed binary demonstrated this failure mode | Medium | High | Publish exact build identity and `doctor` verification; retain sticky fallback tests. |
-| Visual ambition obscures accessibility or performance | Creative direction not selected or rendered | Medium | Medium | SSR useful content, reduced motion, keyboard proof, narrow-screen proof, performance budget. |
+| Visual ambition obscures accessibility or performance | The implemented direction has bounded render evidence, but complete keyboard, native 320 px, 200% zoom, and second-browser acceptance remain open in `LAUNCH_CHECKLIST.md` | Medium | Medium | Review the exact `site/src` and `site/style/main.css` candidate against `ACCEPTANCE_CRITERIA.md`; retain SSR useful content, reduced motion, keyboard proof, narrow-screen proof, and a performance budget. |
 
 ## Smallest build that tests the thesis
 
@@ -27,7 +28,9 @@ Desirability and activation, not technical feasibility. The repository already p
 
 ## Stop conditions
 
-- No selected design authority.
+- The exact site source and `ACCEPTANCE_CRITERIA.md` are not bound for review,
+  or the rendered candidate fails a required criterion without an owned repair
+  or explicit release disposition.
 - Published commands cannot be tested against the exact CLI.
 - Worker build cannot produce useful no-JS SSR HTML.
 - Security/threat-model review finds an unresolved high-risk issue.
