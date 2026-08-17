@@ -566,6 +566,26 @@ fail closed.
 
 ### Email Sending and Email Routing subdomains
 
+Read Email Routing inventory through the typed projection before evaluating
+any routing change:
+
+```bash
+cfctl call email-routing-routing-rules-list-routing-rules \
+  --selector zone_id=<zone-id> \
+  --profile <account-bound-profile> \
+  --account <account-id> --json
+```
+
+The result is `EmailRoutingRuleSetV1`, not Cloudflare's raw rule array. cfctl
+owns explicit 50-item page enumeration, requires an empty terminal page within
+100 reads, accepts both field-bound and type-only matchers, and retains values
+only for validated Worker actions. Values belonging to forwarding or other
+non-Worker actions are represented only by `value_count`; they do not enter
+stdout or evidence. A malformed, oversized, partial, or unterminated response
+returns `CFCTL_RESPONSE_CONTRACT_MISMATCH` with `performed: true`, failed
+verification, and a bounded diagnostic code. Do not parse around that failure
+or fall back to raw API output.
+
 Start every email-provider transaction with read-only discovery and the exact
 current catalog contracts:
 
