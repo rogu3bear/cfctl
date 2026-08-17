@@ -17,10 +17,12 @@ use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
     D1ApprovedMlnImportContractV1, D1FullExportContractV1, D1RestoreExactBookmarkContractV1,
-    D1SchemaIntrospectionContractV1, GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1,
+    D1SchemaIntrospectionContractV1, EMAIL_ROUTING_RULES_MAX_PAGES, EMAIL_ROUTING_RULES_PAGE_SIZE,
+    EmailRoutingRuleDiagnosticV1, GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1,
     OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
     ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1,
-    TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
+    TimestampFormatV1, TransactionStageV1, hash_value, is_email_routing_rules_list_capability,
+    normalize_email_routing_rule_set, request_header_is_reserved,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
@@ -153,6 +155,8 @@ pub enum CloudflareError {
     PaginationCursorMetadataMissing,
     #[error("Cloudflare request failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("Cloudflare response projection could not be serialized: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("approved plan pins catalog {planned}, but the current catalog is {current}")]
     CatalogDrift { planned: String, current: String },
     #[error("approved plan cannot be executed: {0}")]
@@ -2340,6 +2344,27 @@ pub struct CloudflareResponseV1 {
     pub cf_ray: Option<String>,
 }
 
+fn email_routing_rules_rejected_response(
+    mut response: CloudflareResponseV1,
+    diagnostic: EmailRoutingRuleDiagnosticV1,
+) -> CloudflareResponseV1 {
+    response.success = false;
+    response.result = serde_json::json!({
+        "schema_version": 1,
+        "complete": false,
+        "diagnostic": diagnostic,
+    });
+    response.result_info = Some(serde_json::json!({
+        "cfctl_projection": "email_routing_rule_set_v1",
+        "cfctl_page_probe_complete": false,
+    }));
+    response.errors = vec![CloudflareApiErrorV1 {
+        code: None,
+        message: "Email Routing rules failed the bounded normalized response contract".to_owned(),
+    }];
+    response
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperationVerificationV1 {
     pub strategy: String,
@@ -2568,7 +2593,84 @@ impl Executor {
             return Err(CloudflareError::R2LogCredentialsRequired);
         }
         let request = self.builder.build(capability, input)?;
+        if is_email_routing_rules_list_capability(capability) {
+            return self
+                .execute_email_routing_rules_read(&request, credential)
+                .await;
+        }
         self.send_paginated(&request, credential).await
+    }
+
+    async fn execute_email_routing_rules_read(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        let mut combined = Vec::new();
+        let mut base_response = None;
+        for page in 1..=EMAIL_ROUTING_RULES_MAX_PAGES {
+            let mut page_request = request.clone();
+            set_query_parameter(&mut page_request.url, "page", &page.to_string());
+            set_query_parameter(
+                &mut page_request.url,
+                "per_page",
+                &EMAIL_ROUTING_RULES_PAGE_SIZE.to_string(),
+            );
+            let response = self.send(&page_request, credential).await?;
+            if !response.success {
+                return Ok(response);
+            }
+            let Some(page_rules) = response.result.as_array() else {
+                return Ok(email_routing_rules_rejected_response(
+                    response,
+                    EmailRoutingRuleDiagnosticV1::new("rules_not_array", None, "rules"),
+                ));
+            };
+            if page_rules.len()
+                > usize::try_from(EMAIL_ROUTING_RULES_PAGE_SIZE).unwrap_or(usize::MAX)
+            {
+                return Ok(email_routing_rules_rejected_response(
+                    response,
+                    EmailRoutingRuleDiagnosticV1::new("page_bound_exceeded", None, "pagination"),
+                ));
+            }
+            if base_response.is_none() {
+                base_response = Some(response.clone());
+            }
+            if page_rules.is_empty() {
+                let projection =
+                    match normalize_email_routing_rule_set(&Value::Array(combined), page) {
+                        Ok(projection) => projection,
+                        Err(diagnostic) => {
+                            return Ok(email_routing_rules_rejected_response(response, diagnostic));
+                        }
+                    };
+                let mut completed = base_response.unwrap_or(response);
+                completed.result = serde_json::to_value(&projection)?;
+                completed.result_info = Some(serde_json::json!({
+                    "page": 1,
+                    "per_page": EMAIL_ROUTING_RULES_PAGE_SIZE,
+                    "total_pages": page,
+                    "total_count": projection.rule_count,
+                    "cfctl_page_probe_complete": true,
+                    "cfctl_projection": "email_routing_rule_set_v1",
+                }));
+                return Ok(completed);
+            }
+            combined.extend(page_rules.iter().cloned());
+        }
+        Ok(email_routing_rules_rejected_response(
+            base_response.unwrap_or(CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: Value::Null,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            }),
+            EmailRoutingRuleDiagnosticV1::new("page_bound_exceeded", None, "pagination"),
+        ))
     }
 
     pub fn event_batch_transport<'a>(

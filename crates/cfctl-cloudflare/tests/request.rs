@@ -4573,6 +4573,153 @@ async fn executor_collects_all_cloudflare_result_pages() {
 }
 
 #[tokio::test]
+async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"worker","value":["maildesk-router"]}]},{"enabled":true,"matchers":[{"type":"all"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[],"result_info":{"page":1,"per_page":50,"total_count":2}}"#,
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":2,"per_page":50,"total_count":2}}"#,
+    ])
+    .await;
+    let mut capability = CapabilityV1::new(
+        "email-routing-routing-rules-list-routing-rules",
+        "List routing rules",
+        "GET",
+        "/zones/{zone_id}/email/routing/rules",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "number".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "per_page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "number".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let response = executor
+        .execute_read(
+            &capability,
+            &CallInput {
+                selectors: json!({"zone_id":"zone-example"}),
+                query: json!({"page":1,"per_page":50}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("typed Email Routing response");
+
+    assert!(response.success);
+    assert_eq!(response.result["schema_version"], 1);
+    assert_eq!(response.result["complete"], true);
+    assert_eq!(response.result["rule_count"], 2);
+    assert_eq!(response.result["rules"][0]["matchers"][0]["field"], "to");
+    assert_eq!(
+        response.result["rules"][0]["actions"][0]["worker_targets"],
+        json!(["maildesk-router"])
+    );
+    assert_eq!(response.result["rules"][1]["actions"][0]["value_count"], 1);
+    assert!(
+        !serde_json::to_string(&response.result)
+            .expect("serialize projection")
+            .contains("operator@example.com")
+    );
+
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("page=1"));
+    assert!(requests[0].contains("per_page=50"));
+    assert!(requests[1].contains("page=2"));
+}
+
+#[tokio::test]
+async fn email_routing_rules_read_rejects_shape_drift_without_echoing_values() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[]}"#,
+        r#"{"success":true,"result":[],"errors":[]}"#,
+    ])
+    .await;
+    let mut capability = CapabilityV1::new(
+        "email-routing-routing-rules-list-routing-rules",
+        "List routing rules",
+        "GET",
+        "/zones/{zone_id}/email/routing/rules",
+    );
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let response = executor
+        .execute_read(
+            &capability,
+            &CallInput {
+                selectors: json!({"zone_id":"zone-example"}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("safe rejected projection");
+
+    assert!(!response.success);
+    assert_eq!(response.result["complete"], false);
+    assert_eq!(
+        response.result["diagnostic"]["code"],
+        "matcher_pair_incomplete"
+    );
+    assert_eq!(response.result["diagnostic"]["component"], "matcher");
+    let serialized = serde_json::to_string(&response).expect("serialize rejection");
+    assert!(!serialized.contains("operator@example.com"));
+    assert!(!serialized.contains("zone-example"));
+
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
 async fn consumed_mutation_carries_plan_id_as_idempotency_key() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
