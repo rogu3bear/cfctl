@@ -529,6 +529,10 @@ fn email_routing_contract_diagnostic<'a>(
     response: &'a CloudflareResponseV1,
 ) -> Option<&'a Value> {
     (cfctl_core::is_email_routing_rules_list_capability(capability)
+        // The adapter also uses this redacted diagnostic shape to suppress a
+        // failed provider page. A non-2xx status is provider rejection, not
+        // projection drift, so status-specific live-read guidance must win.
+        && (200..300).contains(&response.status)
         && response
             .result
             .get("schema_version")
@@ -45104,6 +45108,64 @@ mod tests {
             !serde_json::to_string(&response)
                 .expect("serialize bounded rejection")
                 .contains("operator@example.com")
+        );
+    }
+
+    #[test]
+    fn email_routing_provider_denial_uses_status_guidance_after_redaction() {
+        let mut capability = CapabilityV1::new(
+            "email-routing-routing-rules-list-routing-rules",
+            "List routing rules",
+            "GET",
+            "/zones/{zone_id}/email/routing/rules",
+        );
+        capability.permissions = vec![
+            "Email Routing Rules Write".to_owned(),
+            "Email Routing Rules Read".to_owned(),
+        ];
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
+        let response = CloudflareResponseV1 {
+            status: 403,
+            success: false,
+            result: json!({
+                "schema_version": 1,
+                "complete": false,
+                "diagnostic": {
+                    "schema_version": 1,
+                    "code": "provider_page_unsuccessful",
+                    "component": "provider_response"
+                }
+            }),
+            errors: vec![CloudflareApiErrorV1 {
+                code: None,
+                message: "Email Routing rules failed the bounded normalized response contract"
+                    .to_owned(),
+            }],
+            result_info: Some(json!({
+                "cfctl_projection": "email_routing_rule_set_v1",
+                "cfctl_page_probe_complete": false
+            })),
+            etag: None,
+            cf_ray: None,
+        };
+
+        assert!(super::email_routing_contract_diagnostic(&capability, &response).is_none());
+        assert_eq!(
+            super::live_read_failure_guidance_for_response(&capability, &response).0,
+            "CFCTL_LIVE_UNAUTHORIZED"
+        );
+        let availability = super::live_read_availability(&capability, &response);
+        assert_eq!(
+            availability["state"],
+            "authorization_or_entitlement_unresolved"
+        );
+        assert_eq!(
+            availability["authorization_entitlement_distinction_proven"],
+            false
         );
     }
 
