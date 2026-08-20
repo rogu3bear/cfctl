@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  parseCsp,
   productionOrigin,
   verifyAssetManifest,
   verifyHtmlResponse,
@@ -10,7 +11,7 @@ function htmlResponse(body = "See the boundary before you cross it.", overrides 
     status: overrides.status ?? 200,
     headers: {
       "cache-control": "no-cache, max-age=0, must-revalidate",
-      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'self';",
+      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' 'wasm-unsafe-eval';",
       "content-type": "text/html; charset=utf-8",
       "cross-origin-opener-policy": "same-origin",
       "permissions-policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
@@ -49,6 +50,37 @@ describe("HTML response contract", () => {
       status: 200,
       marker: "See the boundary before you cross it.",
     })).rejects.toThrow("content-security-policy");
+  });
+
+  test("rejects permissive first directives hidden by secure duplicates", async () => {
+    const response = htmlResponse("See the boundary before you cross it.", {
+      headers: {
+        "content-security-policy": "default-src *; default-src 'self'; base-uri *; base-uri 'none'; object-src *; object-src 'none'; frame-ancestors *; frame-ancestors 'none'; form-action *; form-action 'none'; connect-src *; connect-src 'self'",
+      },
+    });
+    await expect(verifyHtmlResponse(response, {
+      path: "/",
+      status: 200,
+      marker: "See the boundary before you cross it.",
+    })).rejects.toThrow("repeats the default-src directive");
+  });
+
+  test("rejects a permissive script-src that overrides default-src", async () => {
+    const response = htmlResponse("See the boundary before you cross it.", {
+      headers: {
+        "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src * 'unsafe-inline' 'unsafe-eval';",
+      },
+    });
+    await expect(verifyHtmlResponse(response, {
+      path: "/",
+      status: 200,
+      marker: "See the boundary before you cross it.",
+    })).rejects.toThrow("script-src does not match the production hash-bound policy");
+  });
+
+  test("parses every directive once and rejects duplicates", () => {
+    expect(parseCsp("default-src 'self'; base-uri 'none'").get("base-uri")).toEqual(["'none'"]);
+    expect(() => parseCsp("default-src *; default-src 'self'")).toThrow("repeats the default-src directive");
   });
 
   test("rejects callback values rendered into SSR HTML", async () => {

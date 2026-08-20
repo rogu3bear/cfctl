@@ -2,14 +2,17 @@
 
 const CALLBACK_CODE_SENTINEL = "cfctl-live-verifier-code-do-not-log";
 const CALLBACK_STATE_SENTINEL = "cfctl-live-verifier-state-do-not-log";
-const REQUIRED_CSP = [
-  "default-src 'self'",
-  "base-uri 'none'",
-  "object-src 'none'",
-  "frame-ancestors 'none'",
-  "form-action 'none'",
-  "connect-src 'self'",
-];
+const REQUIRED_CSP = new Map([
+  ["default-src", ["'self'"]],
+  ["base-uri", ["'none'"]],
+  ["object-src", ["'none'"]],
+  ["frame-ancestors", ["'none'"]],
+  ["form-action", ["'none'"]],
+  ["img-src", ["'self'", "data:"]],
+  ["font-src", ["'self'"]],
+  ["connect-src", ["'self'"]],
+  ["style-src", ["'self'"]],
+]);
 
 export const ROUTES = [
   { path: "/", status: 200, marker: "See the boundary before you cross it." },
@@ -49,6 +52,18 @@ export function productionOrigin(value) {
   return origin;
 }
 
+export function parseCsp(value) {
+  const directives = new Map();
+  for (const serialized of value.split(";")) {
+    const tokens = serialized.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+    const name = tokens.shift().toLowerCase();
+    requireCondition(!directives.has(name), `CSP repeats the ${name} directive`);
+    directives.set(name, tokens);
+  }
+  return directives;
+}
+
 export async function verifyHtmlResponse(response, route) {
   requireCondition(response.status === route.status, `${route.path} returned ${response.status}, expected ${route.status}`);
   requireCondition(response.redirected === false, `${route.path} redirected unexpectedly`);
@@ -60,10 +75,25 @@ export async function verifyHtmlResponse(response, route) {
   requireCondition(header(response, "permissions-policy").includes("camera=()"), `${route.path} lacks the permissions policy`);
   requireCondition(response.headers.get("set-cookie") === null, `${route.path} unexpectedly sets a cookie`);
 
-  const csp = header(response, "content-security-policy");
-  for (const directive of REQUIRED_CSP) {
-    requireCondition(csp.includes(directive), `${route.path} CSP is missing ${directive}`);
+  const csp = parseCsp(header(response, "content-security-policy"));
+  for (const [name, expectedSources] of REQUIRED_CSP) {
+    const actualSources = csp.get(name);
+    requireCondition(actualSources !== undefined, `${route.path} CSP is missing ${name}`);
+    requireCondition(
+      actualSources.length === expectedSources.length
+        && actualSources.every((source, index) => source === expectedSources[index]),
+      `${route.path} CSP ${name} is broader than ${expectedSources.join(" ")}`,
+    );
   }
+  const scriptSources = csp.get("script-src");
+  requireCondition(scriptSources !== undefined, `${route.path} CSP is missing script-src`);
+  requireCondition(
+    scriptSources.length === 3
+      && scriptSources[0] === "'self'"
+      && /^'sha256-[A-Za-z0-9+/]{43}='$/.test(scriptSources[1])
+      && scriptSources[2] === "'wasm-unsafe-eval'",
+    `${route.path} CSP script-src does not match the production hash-bound policy`,
+  );
 
   const cacheControl = header(response, "cache-control");
   const referrerPolicy = header(response, "referrer-policy");
