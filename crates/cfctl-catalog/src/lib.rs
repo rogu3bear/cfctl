@@ -16,10 +16,11 @@ use cfctl_core::{
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
     Maturity, Mln0142PostImportSchemaContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1,
     PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
-    R2PrivateFileUploadContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
-    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
+    R2PrivateFileUploadContractV1, R2PrivateObjectDigestContractV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, RollbackSpecV1, SamePathReadContractV1,
+    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+    SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
+    UpdatedResourceContractV1, VerificationSpecV1, WorkflowContractV1, WorkflowStepV1, hash_value,
     request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
@@ -163,6 +164,64 @@ mod maildesk_provider_contract_tests {
                         && contract.read_capability_id == "r2-get-object"
                         && contract.delete_capability_id == "r2-delete-object"
                 })
+        );
+    }
+
+    #[test]
+    fn r2_private_digest_is_body_free_and_generic_read_remains_blocked() {
+        let mut capabilities = BTreeMap::new();
+        let mut raw = read("r2-get-object", R2_OBJECT_PATH, "R2 Object");
+        raw.selectors = vec![
+            SelectorV1 {
+                name: "account_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+            SelectorV1 {
+                name: "bucket_name".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+            object_key_selector("Slashes MUST NOT be percent-encoded"),
+        ];
+        capabilities.insert(raw.id.clone(), raw);
+
+        finalize_r2_private_object_digest_contract(&mut capabilities);
+
+        let raw = &capabilities["r2-get-object"];
+        assert_eq!(raw.adapter_status, AdapterStatus::Blocked);
+        assert!(
+            raw.blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("raw R2 object bytes"))
+        );
+        let digest = &capabilities["r2-get-private-object-digest"];
+        assert_eq!(digest.adapter_status, AdapterStatus::Native);
+        assert_eq!(digest.risk, RiskClass::Read);
+        assert_eq!(digest.effect, EffectClass::ReadOnly);
+        assert!(!digest.mutating);
+        assert!(digest.request_schema.is_none());
+        assert!(digest.verification_contract_supported());
+        assert!(digest.r2_private_file_upload.is_none());
+        assert_eq!(
+            digest
+                .r2_private_object_digest
+                .as_ref()
+                .map(|contract| contract.max_object_bytes),
+            Some(300_000_000)
+        );
+        assert_eq!(
+            digest
+                .response_contract
+                .as_ref()
+                .map(|contract| contract.body_mode),
+            Some(ResponseBodyModeV1::R2PrivateObjectDigest)
         );
     }
 
@@ -8166,6 +8225,76 @@ fn finalize_r2_private_file_upload_contract(capabilities: &mut BTreeMap<String, 
     refresh_dynamic_mutation_contract(capability);
 }
 
+fn finalize_r2_private_object_digest_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let Some(raw) = capabilities.get("r2-get-object").cloned() else {
+        return;
+    };
+    let selectors_are_exact = ["account_id", "bucket_name", "object_key"]
+        .iter()
+        .all(|name| {
+            raw.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        });
+    let raw_supported = raw.method == "GET"
+        && raw.path == R2_OBJECT_PATH
+        && raw.product == "R2 Object"
+        && !raw.mutating
+        && raw.request_schema.is_none()
+        && selectors_are_exact;
+    if raw_supported {
+        let mut digest = raw;
+        digest.id = "r2-get-private-object-digest".to_owned();
+        digest.title = "Read one private R2 object digest without returning bytes".to_owned();
+        digest.description = Some(
+            "Streams one exact private object only inside cfctl and returns bounded identity, ETag, byte count, and SHA-256 evidence; object bytes never enter stdout, plans, receipts, logs, or files."
+                .to_owned(),
+        );
+        digest.permissions = vec!["Workers R2 Storage Read".to_owned()];
+        digest.risk = RiskClass::Read;
+        digest.effect = EffectClass::ReadOnly;
+        digest.adapter_status = AdapterStatus::Native;
+        digest.blocked_reason = None;
+        digest.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/octet-stream".to_owned()],
+            body_mode: ResponseBodyModeV1::R2PrivateObjectDigest,
+        });
+        digest.verification = VerificationSpecV1 {
+            required: true,
+            strategy: "r2_private_object_digest".to_owned(),
+        };
+        digest.rollback = RollbackSpecV1 {
+            supported: false,
+            strategy: None,
+            warning: None,
+        };
+        digest.r2_private_file_upload = None;
+        digest.r2_private_object_digest = Some(R2PrivateObjectDigestContractV1 {
+            max_object_bytes: 300_000_000,
+        });
+        zero_direct_usage_cost(
+            &mut digest,
+            "the digest is one R2 Class B read with no direct configuration charge and never retains object bytes",
+            vec![official_reference(
+                "R2 pricing",
+                "https://developers.cloudflare.com/r2/pricing/",
+            )],
+        );
+        capabilities.insert(digest.id.clone(), digest);
+    }
+    if let Some(raw) = capabilities.get_mut("r2-get-object") {
+        raw.adapter_status = AdapterStatus::Blocked;
+        raw.blocked_reason = Some(
+            "raw R2 object bytes are intentionally unavailable; use r2-get-private-object-digest for body-free identity evidence"
+                .to_owned(),
+        );
+    }
+}
+
 fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
     let read_supported = capabilities
         .get("r2-get-bucket-lifecycle-configuration")
@@ -8542,6 +8671,7 @@ fn apply_post_normalization_contracts(
     finalize_dns_record_delete_response_contract(capabilities);
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_r2_private_file_upload_contract(capabilities);
+    finalize_r2_private_object_digest_contract(capabilities);
     finalize_r2_lifecycle_contract(capabilities);
     finalize_email_sending_contracts(capabilities);
     finalize_email_routing_subdomain_contract(capabilities);

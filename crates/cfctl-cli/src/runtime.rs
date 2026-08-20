@@ -6112,7 +6112,11 @@ async fn execute_read(
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
-    let response = if capability.r2_log_retrieval.is_some() {
+    let response = if capability.r2_private_object_digest.is_some() {
+        executor
+            .execute_r2_private_object_digest(capability, input, &credential)
+            .await?
+    } else if capability.r2_log_retrieval.is_some() {
         let output_path = output_path.ok_or(CloudflareError::R2LogOutputFileRequired)?;
         let r2_credentials = r2_credentials.ok_or(CloudflareError::R2LogCredentialsRequired)?;
         executor
@@ -6167,6 +6171,36 @@ async fn execute_read(
         };
         envelope.verification.basis =
             Some("closed MLN 0143 phase assertions and bounded completeness manifest".to_owned());
+    } else if capability.r2_private_object_digest.is_some() {
+        let verified = response
+            .result
+            .get("body_returned")
+            .and_then(Value::as_bool)
+            == Some(false)
+            && response
+                .result
+                .get("byte_count")
+                .and_then(Value::as_u64)
+                .is_some()
+            && response
+                .result
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71)
+            && response
+                .result
+                .get("etag")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+        envelope.verification.state = if verified {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis = Some(
+            "exact private object identity, bounded streamed SHA-256, ETag, byte count, and body_returned:false"
+                .to_owned(),
+        );
     } else if capability.d1_full_export.is_some() {
         let verified = response
             .result
