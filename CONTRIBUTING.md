@@ -20,9 +20,10 @@ documentation, and evidence model agree.
   for the typed operation-pack loader and remain in its owning repository.
 - Reads are not plans, plans are not applies, and apply artifacts are not
   post-change verification. Keep those evidence classes distinct.
-- All mutations use the one-use `PlanV1` lifecycle. Never weaken approval,
-  account/target binding, catalog hashes, drift checks, locks, journals,
-  verification, or rectification to make a capability executable.
+- All new mutations use the one-use canonical `PlanV2` lifecycle. The stored
+  `PlanV1` projection is compatibility data, not execution authority. Never
+  weaken approval, account/target binding, catalog hashes, drift checks, locks,
+  journals, verification, or rectification to make a capability executable.
 - Secret inputs come from stdin or the platform secret store. Secret outputs
   require `--value-out`; values never belong in arguments, stdout, plans,
   logs, fixtures, or repository files.
@@ -124,11 +125,16 @@ obligation.
 
 ## Making a change
 
+Read `NORTH_STAR.md`, `ANCHOR.md`, and `LAYERS.md` before changing public
+behavior or repository structure. They define the outcome, invariants, and
+authority boundaries; this guide is their contributor-facing projection.
+
 1. Identify the owning crate and the catalog capability or public contract.
 2. Add a failing test or contract fixture that demonstrates the missing
    behavior.
-3. Implement the smallest complete change, including catalog metadata and
-   documentation when the public surface changes.
+3. Implement the smallest complete change with the least powerful mechanism
+   that satisfies the requirement, including catalog metadata and documentation
+   when the public surface changes.
 4. Run `cargo xtask verify`.
 5. For live behavior, use a selected non-production account and report the
    evidence class for every claim. Account-backed disposable mutations remain
