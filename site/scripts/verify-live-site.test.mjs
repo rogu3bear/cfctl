@@ -78,6 +78,24 @@ describe("HTML response contract", () => {
     })).rejects.toThrow("script-src does not match the production hash-bound policy");
   });
 
+  for (const override of [
+    "script-src-elem * 'unsafe-inline'",
+    "script-src-attr 'unsafe-inline'",
+  ]) {
+    test(`rejects browser-effective ${override.split(" ")[0]} authority`, async () => {
+      const response = htmlResponse("See the boundary before you cross it.", {
+        headers: {
+          "content-security-policy": `${htmlResponse().headers.get("content-security-policy")} ${override};`,
+        },
+      });
+      await expect(verifyHtmlResponse(response, {
+        path: "/",
+        status: 200,
+        marker: "See the boundary before you cross it.",
+      })).rejects.toThrow("directive outside the exact production policy");
+    });
+  }
+
   test("parses every directive once and rejects duplicates", () => {
     expect(parseCsp("default-src 'self'; base-uri 'none'").get("base-uri")).toEqual(["'none'"]);
     expect(() => parseCsp("default-src *; default-src 'self'")).toThrow("repeats the default-src directive");

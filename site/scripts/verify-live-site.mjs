@@ -13,6 +13,7 @@ const REQUIRED_CSP = new Map([
   ["connect-src", ["'self'"]],
   ["style-src", ["'self'"]],
 ]);
+const REQUIRED_CSP_NAMES = new Set([...REQUIRED_CSP.keys(), "script-src"]);
 
 export const ROUTES = [
   { path: "/", status: 200, marker: "See the boundary before you cross it." },
@@ -76,6 +77,11 @@ export async function verifyHtmlResponse(response, route) {
   requireCondition(response.headers.get("set-cookie") === null, `${route.path} unexpectedly sets a cookie`);
 
   const csp = parseCsp(header(response, "content-security-policy"));
+  requireCondition(
+    csp.size === REQUIRED_CSP_NAMES.size
+      && [...csp.keys()].every((name) => REQUIRED_CSP_NAMES.has(name)),
+    `${route.path} CSP contains a directive outside the exact production policy`,
+  );
   for (const [name, expectedSources] of REQUIRED_CSP) {
     const actualSources = csp.get(name);
     requireCondition(actualSources !== undefined, `${route.path} CSP is missing ${name}`);
