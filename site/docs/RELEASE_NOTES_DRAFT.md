@@ -1,50 +1,64 @@
-# Draft mainline release notes — 2026-08-05
+# Draft website production notes
 
-Status: repository mainline notes, not a public version announcement or deployment claim.
+Status: source-candidate notes only. Do not publish this text as a deployment,
+custom-domain, CLI release, or OAuth claim until the corresponding receipts and
+live readbacks exist.
 
-## A quieter credential path
+## What the website candidate contains
 
-`cfctl` now keeps using its governed fallback credential store once that store is active. Ordinary commands no longer reopen macOS Keychain merely to discover that the fallback remains authoritative. Operators still have an explicit repair path when they intentionally want to test or restore Keychain.
+`cfctl-site` is a server-rendered Leptos application for Cloudflare Workers and
+Workers Assets. It explains the ordered read, plan, approval, execution, and
+verification boundary; provides a first-read path; and exposes direct security,
+privacy, terms, and bounded OAuth callback routes.
 
-The source tree makes the installed revision visible through `cfctl doctor`,
-which provides the build-identity check required before any later live work.
-This draft does not claim that the accumulator branch is installed or that an
-authenticated provider read has run from it.
+The website declares no account system, forms, application database, object
+storage, analytics, runtime secrets, or third-party scripts. Ordinary pages are
+no-cache, callback responses are no-store and no-referrer, framing is denied,
+and the release CSP prevents form submission and cross-origin connections.
 
-## New governed capabilities
+## Production proof added in this candidate
 
-- Pages direct uploads and custom-domain workflows now carry catalog, guide, plan, verification, and compensation contracts.
-- Quick tunnels can be created through a bounded temporary-endpoint contract.
-- WebSockets settings can be read and changed through the governed zone-setting lifecycle.
+The repository now owns a live-site verifier that checks:
 
-Each write remains plan-first. Landing code on `main` does not mean an account mutation, website deployment, or public release occurred.
+- the home, start, security, privacy, terms, callback, and 404 routes;
+- security, referrer, framing, permissions, HSTS, content-type, and cache
+  headers;
+- absence of callback query sentinels from server-rendered HTML;
+- the no-store asset manifest; and
+- nonempty immutable JS, Wasm, and CSS assets whose filenames bind their
+  manifest hashes.
 
-## Documentation correction
+The authoritative local gate tests the verifier's success and failure
+contracts. Running that gate proves the verifier and artifact locally; only a
+post-deploy verifier run proves a named live origin.
 
-The security guide now agrees with runtime policy: the fallback store is sticky after activation, and Keychain repair is an explicit operator action rather than a routine credential probe.
+## Deployment boundary
 
-## Upcoming website preview
+The selected carrier is the `cfctl-site` Worker described by
+`site/wrangler.toml`. Production uses two governed operations: upload one inert
+Worker version, then promote exactly that reviewed UUID to 100% traffic. The
+`workers.dev` deployment must pass provider and runtime readback before a
+separate `cfctl.com` domain transaction begins.
 
-The former static site template has been replaced locally by a standalone
-Leptos 0.8 application for Cloudflare Workers and Workers Assets. Its Control
-Ledger design explains the ordered read/plan/admit/execute/verify boundary,
-adds a bounded first-read guide, preserves direct privacy and terms routes, and
-hardens the OAuth callback as a browser-only, query-erasing, one-copy bridge.
-
-The v1 website has no user accounts, forms, database, object storage,
-analytics, runtime secrets, or third-party scripts. Content is useful SSR HTML;
-only command copy and the callback bridge hydrate. This section is preview
-notes for an uncommitted, undeployed tree—not a public launch claim.
+Public OAuth remains disabled. Publishing the Worker or `cfctl.com` does not
+create, configure, or promote an OAuth client. The event-ingress bridge and a
+new downloadable CLI release are also outside this website transaction.
 
 ## Operator impact
 
-- If you already use fallback credentials, ordinary `auth status` and governed calls should no longer trigger repeated Keychain password prompts.
-- If a call returns an authorization error, use the capability-specific governed command and verify that the active token has the required scope; do not broaden credentials merely to silence the error.
-- Use `cfctl doctor` to confirm the installed source revision and active secret backend when behavior differs between checkouts or hosts.
+- Use `cfctl version --json`, `cfctl doctor --json`, and
+  `cfctl agents doctor --json` to bind the running control plane before live
+  work.
+- Use a profile owned by `cfctl-site`; do not reuse an unrelated deployment
+  profile solely because it points at the same account.
+- Treat upload, promotion, domain attachment, and rollback as distinct
+  plan/approve/run/verify lifecycles.
+- If execution crosses a provider boundary and becomes uncertain, inspect the
+  operation status and use its governed recovery path; never replay it.
 
-## Evidence and limits
+## Claims intentionally withheld
 
-The website exists only as source and local build artifacts until the current
-accumulator candidate passes its complete proof lane. No Cloudflare deployment
-plan has been created, no provider mutation has run, no live edge readback
-exists, and no public release is claimed.
+Until current receipts exist, these notes do not claim that a Worker version
+was uploaded, traffic changed, `workers.dev` passed, `cfctl.com` resolves, TLS
+is valid, the website is publicly launched, a CLI release was published, or
+OAuth was enabled.

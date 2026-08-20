@@ -18,7 +18,7 @@ render-and-test loop against the current source and acceptance criteria.
 - No validated user research or current funnel baseline.
 - No named decider, recruited test participants, or scheduled test window.
 - The Leptos Design Studio's required Creative Production and Product Design stages are unavailable in the installed tool set.
-- The deployment request mentions both Workers and “probably Pages”; the runtime choice is not yet explicitly closed.
+- The runtime choice is closed for the first production launch: server-rendered Leptos runs on a Worker with Workers Assets. Pages would require a separate static/runtime architecture decision.
 
 ## Recommendation
 

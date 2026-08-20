@@ -29,7 +29,7 @@ Audit date: 2026-08-05. “Loads” means the named `SKILL.md` and its required 
 | WebGPU/Three.js TSL | Three/WebGPU specialists are available | Loads | Technically possible, strategically unjustified for v1. |
 | Define security policy | Security reviewer/tool fit | Loads; exact `site/SECURITY.md` scope was owner-approved and written | Policy now matches implemented callback controls; staging/commit remains a separate authorization gate. |
 | Security threat model | Security specialist fit | Loads; owner confirmed exposure/data/deployment assumptions | Grounded `site-threat-model.md` produced with eight abuse paths and stable threat IDs. |
-| Deploy + cf-deploy | Governed plan/apply/readback through the CLI | Load; the Workers Assets source contract is present, but account and provider state are intentionally unbound | A `workers.dev` preview is the first live target. Planning waits for a committed release tree, a fresh account/service read, and exact operation approval. |
+| Deploy + cf-deploy | Governed plan/apply/readback through the CLI | Load; the Workers Assets source contract and live-site verifier are present, while current provider state remains deliberately unclaimed until a fresh read | `workers.dev` is the first verified target. Planning waits for the exact merged tree, a profile owned by `cfctl-site`, fresh account/service reads, and exact operation approval. |
 
 ## Available-agent conclusion
 
