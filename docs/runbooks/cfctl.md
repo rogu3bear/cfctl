@@ -449,8 +449,9 @@ are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
 ### Repository-bound D1 changes
 
 Application repositories may declare ordered migration operations in
-`.cfctl/operations/d1-migrations.toml` and private policy projections in
-`.cfctl/operations/d1-policy-projections.toml`. The repository must already be
+`.cfctl/operations/d1-migrations.toml`, private policy projections in
+`.cfctl/operations/d1-policy-projections.toml`, and fixed body-free readiness
+reads in `.cfctl/operations/d1-evidence.toml`. The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
 the operation pack and tracked Wrangler template at that HEAD. Migration packs
 also close the ordered migration directory with exact per-file SHA-256 values.
@@ -513,6 +514,26 @@ leaves it `rectification_required`.
 Policy projection verification returns only the route count and the active policy,
 desired-state, and projection digests through compiler-owned queries.
 
+A D1 evidence declaration is read-only and has no caller SQL surface. It pins
+one committed, parameter-free `SELECT` or `WITH` query by SHA-256 and requires
+the exact Maildesk evidence columns. The adapter executes that query internally
+and discards the provider rows after projecting `MaildeskD1EvidenceV1`: policy,
+desired-state, and semantic-projection digests; immutable object key; expected
+and projected domain/route counts; approved schema/table flags; bounded audit
+counts; and Queue/DLQ correlations. Addresses, subjects, recipients, message
+content, arbitrary columns, output paths, parameters, PRAGMAs, and mutating SQL
+are not representable. A dirty repository, wrong HEAD/origin/config/binding,
+query drift, extra column, malformed map, or non-singleton result fails closed.
+
+```sh
+cfctl call <repository-d1-evidence-operation-id> \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-uuid> \
+  --query config=/absolute/path/to/wrangler.production.toml \
+  --query binding=DB \
+  --json
+```
+
 Do not substitute raw D1 query or direct Wrangler execution. If execution may
 have crossed the provider boundary but fails before verified readback, preserve
 the receipt and rectify. Recovery is a new, independently approved
@@ -540,6 +561,20 @@ returning policy content. If the provider outcome is ambiguous, cfctl preserves
 the private stage for rectification and never retries the PUT automatically.
 Rollback of a new object is a separate exact-object delete plan; an existing
 immutable key is never overwritten.
+
+For later readiness checks, use the digest-only read. It streams the exact
+object only inside cfctl, refuses objects above 300 MB, requires one ETag, and
+returns `R2PrivateObjectDigestV1` with target identity, byte count, ETag,
+SHA-256, and `body_returned:false`. It has no `--out` path and never serializes
+object bytes. Generic `r2-get-object` remains blocked.
+
+```bash
+cfctl call r2-get-private-object-digest \
+  --selector account_id=<account-id> \
+  --selector bucket_name=<policy-bucket> \
+  --selector object_key=config/policy/sha256-<digest>.json \
+  --json
+```
 
 R2 lifecycle PUT is a destructive complete replacement, not a patch. Read the
 current complete lifecycle first, preserve its hash-bound snapshot, then plan
@@ -870,10 +905,24 @@ Access application creation is governed: its request body is a 13-way
 polymorphic union with no universally required field, so verification is bound
 to a curated set — `name` and `type`, present in every application type — read
 back by the returned id, with a reviewed delete as compensation. Variant fields
-like `domain` are part of the create but not verified. Access application
-*update* is deliberately left blocked: the union has no honest universal field
-contract to verify an update against. Creating or deleting an application is
-identity-affecting and always requires explicit approval.
+like `domain` are part of the create but not verified. Generic Access
+application *update* remains blocked: the union has no honest universal field
+contract. The specialized
+`access-applications-update-owned-self-hosted-whole-host` capability admits only
+one complete, exact-ID, self-hosted whole-host application. It reads the exact
+application plus the terminally paginated collection, rejects overlapping
+hostname/name ownership and every unclassified field, binds the complete prior
+snapshot including optional absence, and verifies every intended field by exact
+ID. Restoration is a separate snapshot-bound update plan.
+
+Generic polymorphic Access policy create/update also remain blocked. The
+specialized operator-group capabilities accept only `allow`, exactly one
+`include.group.id`, empty `exclude` and `require`, and the closed optional field
+set. Create requires zero exact-name or group-overlap candidates and can derive
+only deletion of the returned policy ID as compensation. Update binds one exact
+non-reusable policy and its complete prior snapshot; restoration is a separate
+plan. Creating, updating, or deleting Access authority always requires explicit
+approval.
 
 Worker script deletion is governed: verification reads the script's `/settings`
 sub-path, which returns not-found once the script is gone (the script's own GET

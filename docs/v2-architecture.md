@@ -78,6 +78,13 @@ requires a clean canonical HEAD and origin, committed pack and Wrangler
 template, closed migration inputs where applicable, pinned Wrangler version,
 compiler-owned verification identifiers, and exact recovery capabilities.
 
+Workspace-owned body-free D1 evidence uses the same authority boundary without
+creating a mutation plan: the repository owns a fixed query and result-column
+declaration, while cfctl owns bounds, execution, and reduction into the public
+`MaildeskD1EvidenceV1` type. This keeps application semantics with the consumer
+and makes arbitrary SQL or private provider rows impossible at the cfctl call
+surface.
+
 The D1 migration adapter delegates only the apply boundary to the operation
 pack's pinned Wrangler. cfctl binds the registered repository, clean HEAD,
 pack/template/migration hashes, account, database, mode-restricted production
@@ -95,6 +102,14 @@ policy/desired-state/projection digests, expected route count, and fresh
 bookmark. Post-write verification returns only compiler-owned route-count and
 digest readbacks. Recovery for either operation is a separately approved
 exact-bookmark restore, never an automatic compensating write.
+
+Provider-generic private R2 evidence is similarly reduced at the adapter
+boundary. `r2-get-private-object-digest` streams one exact object into a digest
+state and publishes only typed identity metadata; the raw object GET remains
+catalogued but blocked. The same consumer-first pattern is used for Access:
+closed whole-host and operator-group lifecycles are derived only while the
+official schemas retain their reviewed shapes, while the polymorphic parent
+mutations stay unavailable.
 
 Five pre-operation-pack D1 contracts are acknowledged as frozen
 `legacy_embedded` migration debt: two MLNavigator schema proofs, its approved
