@@ -8651,7 +8651,8 @@ fn exact_resource_readback_identity_matches(
             "/accounts/{account_id}/access/apps/{app_id}",
         ) => Some("app_id"),
         (
-            "access-policies-update-human-access-controls",
+            "access-policies-update-human-access-controls"
+            | "access-policies-update-operator-group-allow-policy",
             "PUT",
             "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
         ) => Some("policy_id"),
@@ -8694,8 +8695,11 @@ fn mismatched_verifiable_planned_fields(
                     planned_value,
                 );
             }
-            if capability.id == "access-policies-update-human-access-controls"
-                && capability.method == "PUT"
+            if matches!(
+                capability.id.as_str(),
+                "access-policies-update-human-access-controls"
+                    | "access-policies-update-operator-group-allow-policy"
+            ) && capability.method == "PUT"
                 && capability.path
                     == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
                 && matches!(name.as_str(), "include" | "exclude" | "mfa_config")
@@ -8821,8 +8825,11 @@ fn access_human_policy_complete_snapshot_mismatches(
     capability: &CapabilityV1,
     actual: &Value,
 ) -> Vec<String> {
-    if capability.id != "access-policies-update-human-access-controls"
-        || capability.method != "PUT"
+    if !matches!(
+        capability.id.as_str(),
+        "access-policies-update-human-access-controls"
+            | "access-policies-update-operator-group-allow-policy"
+    ) || capability.method != "PUT"
         || capability.path != "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
     {
         return Vec::new();
@@ -8830,6 +8837,7 @@ fn access_human_policy_complete_snapshot_mismatches(
     let Some(actual) = actual.as_object() else {
         return vec!["human_policy_snapshot".to_owned(), "reusable".to_owned()];
     };
+    let permits_mfa_config = capability.id == "access-policies-update-human-access-controls";
     let mut mismatches = actual
         .keys()
         .filter(|field| {
@@ -8840,7 +8848,6 @@ fn access_human_policy_complete_snapshot_mismatches(
                     | "exclude"
                     | "id"
                     | "include"
-                    | "mfa_config"
                     | "name"
                     | "precedence"
                     | "require"
@@ -8848,7 +8855,7 @@ fn access_human_policy_complete_snapshot_mismatches(
                     | "session_duration"
                     | "uid"
                     | "updated_at"
-            )
+            ) && !(permits_mfa_config && field.as_str() == "mfa_config")
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -8870,8 +8877,11 @@ fn access_exact_snapshot_optional_absence_mismatches(
             | "access-applications-update-app-launcher-login-methods"
     ) && capability.method == "PUT"
         && capability.path == "/accounts/{account_id}/access/apps/{app_id}";
-    let is_policy_snapshot = capability.id == "access-policies-update-human-access-controls"
-        && capability.method == "PUT"
+    let is_policy_snapshot = matches!(
+        capability.id.as_str(),
+        "access-policies-update-human-access-controls"
+            | "access-policies-update-operator-group-allow-policy"
+    ) && capability.method == "PUT"
         && capability.path == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
     let is_exact_access_snapshot = is_application_snapshot || is_policy_snapshot;
     if !is_exact_access_snapshot {

@@ -1463,7 +1463,11 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     };
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
-    if is_access_application_owned_whole_host_mutation(&capability) {
+    if is_access_operator_group_policy_create(&capability)
+        || is_access_operator_group_policy_update(&capability)
+    {
+        validate_access_operator_group_policy_input(&capability, &prepared.input)?;
+    } else if is_access_application_owned_whole_host_mutation(&capability) {
         validate_access_application_owned_whole_host_input(&capability, &prepared.input)?;
     } else if is_access_application_login_methods_mutation(&capability) {
         validate_access_application_login_methods_desired_input(&capability, &prepared.input)?;
@@ -8036,9 +8040,17 @@ const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id
 const ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING: &str = "the prior implicit-open identity-provider state cannot be restored automatically; manual rollback requires a separately reviewed Cloudflare Access application change";
 const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
     "access-policies-update-human-access-controls";
+const ACCESS_OPERATOR_GROUP_POLICY_CREATE_CAPABILITY_ID: &str =
+    "access-policies-create-operator-group-allow-policy";
+const ACCESS_OPERATOR_GROUP_POLICY_UPDATE_CAPABILITY_ID: &str =
+    "access-policies-update-operator-group-allow-policy";
+const ACCESS_POLICY_LIST_CAPABILITY_ID: &str = "access-policies-list-access-policies";
+const ACCESS_POLICY_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies";
 const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
 const ACCESS_POLICY_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+const ACCESS_OPERATOR_GROUP_POLICY_OWNERSHIP_PRECONDITION: &str =
+    "access_operator_group_policy_ownership";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
 const OAUTH_CLIENT_CREATE_CAPABILITY_ID: &str = "oauth-clients-create";
 const OAUTH_CLIENT_UPDATE_CAPABILITY_ID: &str = "oauth-clients-update";
@@ -8707,6 +8719,183 @@ fn is_access_human_policy_mutation(capability: &CapabilityV1) -> bool {
         && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
         && capability.verification_contract_supported()
         && capability.rollback_contract_supported()
+}
+
+fn is_access_operator_group_policy_create(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_OPERATOR_GROUP_POLICY_CREATE_CAPABILITY_ID
+        && capability.method == "POST"
+        && capability.path == ACCESS_POLICY_COLLECTION_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.risk == RiskClass::IdentityOrOwnership
+        && capability.effect == EffectClass::IdentityOrOwnership
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "created_resource_contains_planned_fields_by_returned_id"
+        && capability.created_resource.as_ref().is_some_and(|created| {
+            created.detail_path == ACCESS_POLICY_DETAIL_PATH
+                && created.identity_selector == "policy_id"
+                && created.response_result_identity_pointer == "/id"
+                && created.read_capability_id == ACCESS_POLICY_READ_CAPABILITY_ID
+                && created.delete_capability_id == "access-policies-delete-an-access-policy"
+        })
+        && capability.rollback.supported
+        && capability.rollback.strategy.as_deref() == Some("delete_created_resource_by_returned_id")
+        && capability.mutation_contract_gaps().is_empty()
+}
+
+fn is_access_operator_group_policy_update(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_OPERATOR_GROUP_POLICY_UPDATE_CAPABILITY_ID
+        && capability.method == "PUT"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.risk == RiskClass::IdentityOrOwnership
+        && capability.effect == EffectClass::IdentityOrOwnership
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == ACCESS_POLICY_DETAIL_PATH
+                && read.read_capability_id == ACCESS_POLICY_READ_CAPABILITY_ID
+        })
+        && capability.rollback.supported
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        && capability.mutation_contract_gaps().is_empty()
+}
+
+fn access_operator_group_policy_identity(input: &CallInput) -> Result<(&str, &str)> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input(
+                "operator-group Access policy requires a complete object body".to_owned(),
+            )
+        })?;
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("operator-group Access policy requires an exact policy name".to_owned())
+        })?;
+    let group_id = body
+        .get("include")
+        .and_then(Value::as_array)
+        .filter(|include| include.len() == 1)
+        .and_then(|include| include[0].pointer("/group/id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "operator-group Access policy requires exactly one operator-group eligibility rule"
+                    .to_owned(),
+            )
+        })?;
+    Ok((name, group_id))
+}
+
+fn validate_access_operator_group_policy_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_access_operator_group_policy_create(capability)
+        && !is_access_operator_group_policy_update(capability)
+    {
+        return Err(CliError::Input(
+            "operator-group Access policy capability drifted from its governed closed contract"
+                .to_owned(),
+        ));
+    }
+    preflight_call_input(capability, input, None)?;
+    access_operator_group_policy_identity(input)?;
+    Ok(())
+}
+
+fn access_operator_group_policy_restorable_body(result: &Value) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "operator-group Access policy read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let known = [
+        "created_at",
+        "decision",
+        "exclude",
+        "id",
+        "include",
+        "name",
+        "precedence",
+        "require",
+        "reusable",
+        "session_duration",
+        "uid",
+        "updated_at",
+    ];
+    let unknown = result
+        .keys()
+        .filter(|field| !known.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(CliError::Input(format!(
+            "live operator-group Access policy contains unclassified field(s) {}; the mutation boundary was not crossed",
+            unknown.join(",")
+        )));
+    }
+    if result.get("reusable").and_then(Value::as_bool) != Some(false)
+        || result.get("decision").and_then(Value::as_str) != Some("allow")
+        || result
+            .get("exclude")
+            .and_then(Value::as_array)
+            .is_none_or(|rules| !rules.is_empty())
+        || result
+            .get("require")
+            .and_then(Value::as_array)
+            .is_none_or(|rules| !rules.is_empty())
+    {
+        return Err(CliError::Input(
+            "live policy is not one application-scoped operator-group allow policy; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let mut body = serde_json::Map::new();
+    for field in [
+        "name",
+        "decision",
+        "include",
+        "exclude",
+        "require",
+        "precedence",
+        "session_duration",
+    ] {
+        if let Some(value) = result.get(field) {
+            if field == "session_duration" && value.as_str() == Some("") {
+                continue;
+            }
+            body.insert(field.to_owned(), value.clone());
+        }
+    }
+    let body = Value::Object(body);
+    let probe = CallInput {
+        body: Some(body.clone()),
+        ..CallInput::default()
+    };
+    access_operator_group_policy_identity(&probe)?;
+    Ok(body)
 }
 
 fn access_human_policy_identity_rule_schema() -> Value {
@@ -10339,6 +10528,35 @@ fn project_same_path_prior_state(
     input: &CallInput,
     result: &Value,
 ) -> Result<Value> {
+    if is_access_operator_group_policy_update(capability) {
+        let policy_id = input
+            .selectors
+            .get("policy_id")
+            .and_then(Value::as_str)
+            .filter(|policy_id| !policy_id.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "operator-group Access policy prior-state read omitted its exact policy selector"
+                        .to_owned(),
+                )
+            })?;
+        if result.get("id").and_then(Value::as_str) != Some(policy_id) {
+            return Err(CliError::Input(
+                "operator-group Access policy prior-state read returned a different policy id; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+        let prior = access_operator_group_policy_restorable_body(result)?;
+        let mut restore_input = input.clone();
+        restore_input.query = json!({});
+        restore_input.body = Some(prior.clone());
+        preflight_call_input(capability, &restore_input, None).map_err(|error| {
+            CliError::Input(format!(
+                "live operator-group Access policy is outside the exact restorable request contract; the mutation boundary was not crossed: {error}"
+            ))
+        })?;
+        return Ok(prior);
+    }
     if is_access_human_policy_mutation(capability) {
         let policy_id = input
             .selectors
@@ -10696,6 +10914,198 @@ fn owned_whole_host_access_application_receipt(
         "collection_digest": hash_value(&response.result)?,
         "terminal_pagination": true,
     }))
+}
+
+fn access_policy_collection_source_contract_supported(source: &CapabilityV1) -> bool {
+    source.id == ACCESS_POLICY_LIST_CAPABILITY_ID
+        && source.method == "GET"
+        && source.path == ACCESS_POLICY_COLLECTION_PATH
+        && source.product == "Access application-scoped policies"
+        && source.account_scope == "account"
+        && !source.mutating
+        && source.request_schema.is_none()
+        && matches!(
+            source.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && source.selectors.len() == 2
+        && ["account_id", "app_id"].iter().all(|name| {
+            source.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && source.response_contract.as_ref().is_some_and(|contract| {
+            contract.body_mode == cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                && contract.success_statuses == ["200"]
+                && contract.success_media_types == ["application/json"]
+        })
+}
+
+fn policy_operator_group_id(policy: &Value) -> Option<&str> {
+    policy
+        .get("include")
+        .and_then(Value::as_array)
+        .filter(|include| include.len() == 1)
+        .and_then(|include| include[0].as_object())
+        .filter(|rule| rule.len() == 1)
+        .and_then(|rule| rule.get("group"))
+        .and_then(Value::as_object)
+        .filter(|group| group.len() == 1)
+        .and_then(|group| group.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn access_operator_group_policy_ownership_receipt(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Access policy ownership collection read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if !collection_read_complete(response) {
+        return Err(CliError::Input(
+            "Access policy ownership collection read was not terminally paginated; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let policies = response.result.as_array().ok_or_else(|| {
+        CliError::Input(
+            "Access policy ownership collection read did not return an array; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let (name, group_id) = access_operator_group_policy_identity(input)?;
+    let selected_id = input.selectors.get("policy_id").and_then(Value::as_str);
+    let mut candidates = Vec::new();
+    let mut selected = Vec::new();
+    for policy in policies {
+        let object = policy.as_object().ok_or_else(|| {
+            CliError::Input(
+                "Access policy ownership collection contained a non-object entry; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Access policy ownership collection contained a policy without an id; the mutation boundary was not crossed"
+                        .to_owned(),
+                )
+            })?;
+        if selected_id == Some(id) {
+            selected.push(policy);
+        }
+        if object.get("name").and_then(Value::as_str) == Some(name)
+            || policy_operator_group_id(policy) == Some(group_id)
+        {
+            candidates.push(id);
+        }
+    }
+
+    let (expected_candidates, selected_policy_id) = if is_access_operator_group_policy_create(
+        capability,
+    ) {
+        if selected_id.is_some() || !selected.is_empty() || !candidates.is_empty() {
+            return Err(CliError::Input(format!(
+                "Access policy create requires zero exact-name and operator-group overlap candidates, but found {}; the mutation boundary was not crossed",
+                candidates.len()
+            )));
+        }
+        (0_u64, Value::Null)
+    } else if is_access_operator_group_policy_update(capability) {
+        let selected_id = selected_id.ok_or_else(|| {
+            CliError::Input("operator-group policy update omitted policy_id".to_owned())
+        })?;
+        if selected.len() != 1
+            || candidates.len() != 1
+            || candidates[0] != selected_id
+            || selected[0].get("name").and_then(Value::as_str) != Some(name)
+            || policy_operator_group_id(selected[0]) != Some(group_id)
+            || selected[0].get("decision").and_then(Value::as_str) != Some("allow")
+            || selected[0].get("reusable").and_then(Value::as_bool) != Some(false)
+        {
+            return Err(CliError::Input(format!(
+                "Access policy update ownership is ambiguous across {} exact-name or operator-group candidates; the mutation boundary was not crossed",
+                candidates.len()
+            )));
+        }
+        (1_u64, Value::String(selected_id.to_owned()))
+    } else {
+        return Err(CliError::Input(
+            "Access policy ownership read was requested for an unrelated capability".to_owned(),
+        ));
+    };
+
+    Ok(json!({
+        "schema_version":1,
+        "source_capability_id":ACCESS_POLICY_LIST_CAPABILITY_ID,
+        "source_path":ACCESS_POLICY_COLLECTION_PATH,
+        "target_capability_id":capability.id,
+        "target_method":capability.method,
+        "target_path":capability.path,
+        "account_id":account_id,
+        "app_id":input.selectors.get("app_id"),
+        "selected_policy_id":selected_policy_id,
+        "policy_name":name,
+        "operator_group_id":group_id,
+        "candidate_count":expected_candidates,
+        "collection_count":policies.len(),
+        "collection_digest":hash_value(&response.result)?,
+        "terminal_pagination":true,
+    }))
+}
+
+async fn read_live_access_operator_group_policy_ownership(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    let source = catalog
+        .get(ACCESS_POLICY_LIST_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ACCESS_POLICY_LIST_CAPABILITY_ID))?;
+    if !access_policy_collection_source_contract_supported(source) {
+        return Err(CliError::Input(
+            "Access policy ownership source capability drifted from the governed complete collection read"
+                .to_owned(),
+        ));
+    }
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("operator-group policy omitted app_id".to_owned()))?;
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: json!({"account_id":account_id,"app_id":app_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt =
+        access_operator_group_policy_ownership_receipt(capability, input, account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
 }
 
 async fn read_live_same_path_prior_state(
@@ -12265,6 +12675,9 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_r2_parent_token(capability)
         || is_access_application_login_methods_mutation(capability)
         || is_access_human_policy_mutation(capability)
+        || is_access_operator_group_policy_update(capability)
+        || is_access_operator_group_policy_create(capability)
+        || is_access_operator_group_policy_update(capability)
 }
 
 #[expect(
@@ -12299,8 +12712,24 @@ async fn create_plan(
     } else {
         None
     };
-    let access_state_precondition = if is_access_application_owned_whole_host_mutation(&capability)
-    {
+    let access_state_precondition = if is_access_operator_group_policy_update(&capability) {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "operator-group Access policy prior-state credential was not resolved".to_owned(),
+            )
+        })?;
+        Some(
+            read_live_same_path_prior_state(
+                store,
+                catalog,
+                &capability,
+                &input,
+                account_id,
+                credential,
+            )
+            .await?,
+        )
+    } else if is_access_application_owned_whole_host_mutation(&capability) {
         let credential = credential.as_ref().ok_or_else(|| {
             CliError::Input(
                 "owned whole-host Access application state precondition credential was not resolved"
@@ -12351,6 +12780,29 @@ async fn create_plan(
     } else {
         None
     };
+    let access_operator_group_policy_ownership =
+        if is_access_operator_group_policy_create(&capability)
+            || is_access_operator_group_policy_update(&capability)
+        {
+            let credential = credential.as_ref().ok_or_else(|| {
+                CliError::Input(
+                    "operator-group Access policy ownership credential was not resolved".to_owned(),
+                )
+            })?;
+            Some(
+                read_live_access_operator_group_policy_ownership(
+                    store,
+                    catalog,
+                    &capability,
+                    &input,
+                    account_id,
+                    credential,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
     let r2_parent_token_precondition = if should_bind_r2_parent_token(&capability) {
         if profile.kind != ProfileKind::ApiToken {
             return Err(CliError::Input(
@@ -12424,6 +12876,8 @@ async fn create_plan(
     live_preconditions.r2_parent_token = r2_parent_token_precondition;
     live_preconditions.same_path_prior_state =
         access_state_precondition.or(live_preconditions.same_path_prior_state);
+    live_preconditions.access_operator_group_policy_ownership =
+        access_operator_group_policy_ownership;
     resolve_kv_empty_namespace_delete_cost(&mut capability, &live_preconditions);
     persist_prepared_plan(
         store,
@@ -13342,6 +13796,7 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        access_operator_group_policy_ownership: None,
         security_action_state: prepare_security_action_state_precondition(
             store,
             catalog,
@@ -13396,6 +13851,7 @@ struct LivePlanPreconditions {
     web_analytics_rum_state: Option<(Value, EvidenceV1)>,
     dns_record_state: Option<(Value, EvidenceV1)>,
     same_path_prior_state: Option<(Value, EvidenceV1)>,
+    access_operator_group_policy_ownership: Option<(Value, EvidenceV1)>,
     security_action_state: Option<(Value, EvidenceV1)>,
     oauth_client_secret_state: Option<(Value, EvidenceV1)>,
     oauth_client_update_state: Option<(Value, EvidenceV1)>,
@@ -13449,6 +13905,10 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.same_path_prior_state {
         targets["live_preconditions"][SAME_PATH_PRIOR_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.access_operator_group_policy_ownership {
+        targets["live_preconditions"][ACCESS_OPERATOR_GROUP_POLICY_OWNERSHIP_PRECONDITION] =
+            receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.security_action_state {
         targets["live_preconditions"][SECURITY_ACTION_STATE_PRECONDITION] = receipt.clone();
@@ -13522,6 +13982,10 @@ fn bind_live_plan_preconditions(
         (
             SAME_PATH_PRIOR_STATE_PRECONDITION,
             &live_preconditions.same_path_prior_state,
+        ),
+        (
+            ACCESS_OPERATOR_GROUP_POLICY_OWNERSHIP_PRECONDITION,
+            &live_preconditions.access_operator_group_policy_ownership,
         ),
         (
             SECURITY_ACTION_STATE_PRECONDITION,
@@ -13887,6 +14351,7 @@ fn prepend_prepared_plan_evidence(
         live_preconditions.web_analytics_rum_state,
         live_preconditions.dns_record_state,
         live_preconditions.same_path_prior_state,
+        live_preconditions.access_operator_group_policy_ownership,
         live_preconditions.security_action_state,
         live_preconditions.oauth_client_secret_state,
         live_preconditions.oauth_client_update_state,
@@ -15981,6 +16446,7 @@ struct LivePreconditionEvidence {
     web_analytics_rum_state: Option<EvidenceV1>,
     dns_record_state: Option<EvidenceV1>,
     same_path_prior_state: Option<EvidenceV1>,
+    access_operator_group_policy_ownership: Option<EvidenceV1>,
     security_action_state: Option<EvidenceV1>,
     oauth_client_secret_state: Option<EvidenceV1>,
     oauth_client_update_state: Option<EvidenceV1>,
@@ -16060,6 +16526,11 @@ async fn validate_live_plan_precondition_evidence(
             store, catalog, plan, input, credential,
         )
         .await?,
+        access_operator_group_policy_ownership:
+            validate_live_access_operator_group_policy_ownership_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
         security_action_state: validate_live_security_action_state_precondition(
             store, catalog, plan, input, credential,
         )
@@ -16168,6 +16639,7 @@ fn prepend_live_precondition_evidence(
         evidence.worker_deployment_state,
         evidence.dns_record_state,
         evidence.same_path_prior_state,
+        evidence.access_operator_group_policy_ownership,
         evidence.security_action_state,
         evidence.web_analytics_rum_state,
         evidence.warp_connector_configuration_state,
@@ -17894,7 +18366,10 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
     let prior_state = Value::Object(prior_state);
     let access_application_concurrency_only =
         is_access_application_implicit_open_concurrency_plan(&plan.capability);
-    let valid_state_shape = if is_access_human_policy_mutation(&plan.capability) {
+    let valid_state_shape = if is_access_operator_group_policy_update(&plan.capability) {
+        access_operator_group_policy_restorable_body(&prior_state)
+            .is_ok_and(|normalized| normalized == prior_state)
+    } else if is_access_human_policy_mutation(&plan.capability) {
         access_human_policy_restorable_body(&prior_state)
             .is_ok_and(|normalized| normalized == prior_state)
     } else if access_application_login_methods_contract_supported(&plan.capability) {
@@ -18060,6 +18535,134 @@ async fn validate_live_same_path_prior_state_precondition(
     )
     .await?;
     validate_same_path_prior_state_receipt_precondition(expected_hash, &receipt)?;
+    Ok(Some(evidence))
+}
+
+fn validate_access_operator_group_policy_ownership_receipt(
+    plan: &PlanV1,
+    receipt: &Value,
+) -> Result<()> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let (name, group_id) = access_operator_group_policy_identity(&input)?;
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let create = is_access_operator_group_policy_create(&plan.capability);
+    let update = is_access_operator_group_policy_update(&plan.capability);
+    let selected_policy_matches = if create {
+        receipt.get("selected_policy_id") == Some(&Value::Null)
+    } else {
+        receipt.get("selected_policy_id") == input.selectors.get("policy_id")
+    };
+    let valid = (create || update)
+        && receipt.as_object().is_some_and(|object| object.len() == 15)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(ACCESS_POLICY_LIST_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str)
+            == Some(ACCESS_POLICY_COLLECTION_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("app_id").and_then(Value::as_str) == app_id
+        && selected_policy_matches
+        && receipt.get("policy_name").and_then(Value::as_str) == Some(name)
+        && receipt.get("operator_group_id").and_then(Value::as_str) == Some(group_id)
+        && receipt.get("candidate_count").and_then(Value::as_u64)
+            == Some(if create { 0 } else { 1 })
+        && receipt
+            .get("collection_count")
+            .and_then(Value::as_u64)
+            .is_some()
+        && receipt
+            .get("collection_digest")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| {
+                digest.len() == 71
+                    && digest.starts_with("sha256:")
+                    && digest[7..]
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+            })
+        && receipt.get("terminal_pagination").and_then(Value::as_bool) == Some(true);
+    if !valid {
+        return Err(CliError::Input(
+            "operator-group Access policy ownership receipt has an invalid source, target, identity, or collection shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_access_operator_group_policy_ownership_precondition(
+    plan: &PlanV1,
+) -> Result<Option<&str>> {
+    if !is_access_operator_group_policy_create(&plan.capability)
+        && !is_access_operator_group_policy_update(&plan.capability)
+    {
+        return Ok(None);
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(ACCESS_OPERATOR_GROUP_POLICY_OWNERSHIP_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "operator-group Access policy plan predates the ownership contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/access_operator_group_policy_ownership")
+        .ok_or_else(|| {
+            CliError::Input(
+                "operator-group Access policy plan omitted its ownership receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_access_operator_group_policy_ownership_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "operator-group Access policy ownership receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_access_operator_group_policy_ownership_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_access_operator_group_policy_ownership_precondition(plan)?
+    else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_access_operator_group_policy_ownership(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live operator-group Access policy ownership drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
     Ok(Some(evidence))
 }
 
@@ -36858,6 +37461,7 @@ mod tests {
             web_analytics_rum_state: None,
             dns_record_state: None,
             same_path_prior_state: None,
+            access_operator_group_policy_ownership: None,
             security_action_state: None,
             oauth_client_secret_state: None,
             oauth_client_update_state: None,
@@ -38088,6 +38692,7 @@ mod tests {
                 web_analytics_rum_state: None,
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: Some((receipt.clone(), evidence)),
@@ -38477,6 +39082,7 @@ mod tests {
                 web_analytics_rum_state: None,
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: Some((receipt.clone(), evidence)),
                 oauth_client_update_state: None,
@@ -39447,6 +40053,7 @@ mod tests {
                 web_analytics_rum_state: None,
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
@@ -39541,6 +40148,7 @@ mod tests {
                 web_analytics_rum_state: None,
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
@@ -39640,6 +40248,7 @@ mod tests {
                 web_analytics_rum_state: None,
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
@@ -39735,6 +40344,7 @@ mod tests {
                 web_analytics_rum_state: None,
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
@@ -39824,6 +40434,7 @@ mod tests {
                 web_analytics_rum_state: Some((receipt.clone(), evidence)),
                 dns_record_state: None,
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
@@ -39929,6 +40540,7 @@ mod tests {
                 kv_empty_namespace_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
                 same_path_prior_state: None,
+                access_operator_group_policy_ownership: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
@@ -46799,6 +47411,266 @@ mod tests {
             }),
             etag: None,
             cf_ray: None,
+        }
+    }
+
+    fn operator_group_policy_capability(create: bool) -> CapabilityV1 {
+        let (id, method, path) = if create {
+            (
+                super::ACCESS_OPERATOR_GROUP_POLICY_CREATE_CAPABILITY_ID,
+                "POST",
+                super::ACCESS_POLICY_COLLECTION_PATH,
+            )
+        } else {
+            (
+                super::ACCESS_OPERATOR_GROUP_POLICY_UPDATE_CAPABILITY_ID,
+                "PUT",
+                super::ACCESS_POLICY_DETAIL_PATH,
+            )
+        };
+        let mut capability = CapabilityV1::new(id, "Operator group allow policy", method, path);
+        capability.product = "Access application-scoped policies".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.permissions = vec!["Access: Apps and Policies Write".to_owned()];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.entitlement.available = Some(true);
+        capability.selectors = if create {
+            ["account_id", "app_id"].as_slice()
+        } else {
+            ["account_id", "app_id", "policy_id"].as_slice()
+        }
+        .iter()
+        .map(|name| SelectorV1 {
+            name: (*name).to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+        capability.request_schema =
+            Some(cfctl_catalog::access_operator_group_allow_policy_schema());
+        capability.verification.required = true;
+        if create {
+            capability.verification.strategy =
+                "created_resource_contains_planned_fields_by_returned_id".to_owned();
+            capability.created_resource = Some(CreatedResourceContractV1 {
+                detail_path: super::ACCESS_POLICY_DETAIL_PATH.to_owned(),
+                identity_selector: "policy_id".to_owned(),
+                response_result_identity_pointer: "/id".to_owned(),
+                read_capability_id: super::ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+                delete_capability_id: "access-policies-delete-an-access-policy".to_owned(),
+                verified_response_fields: [
+                    "decision",
+                    "exclude",
+                    "include",
+                    "name",
+                    "precedence",
+                    "require",
+                    "session_duration",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            });
+            capability.rollback.supported = true;
+            capability.rollback.strategy =
+                Some("delete_created_resource_by_returned_id".to_owned());
+        } else {
+            capability.verification.strategy =
+                "same_path_result_contains_planned_fields_after_update".to_owned();
+            capability.same_path_read = Some(SamePathReadContractV1 {
+                path: super::ACCESS_POLICY_DETAIL_PATH.to_owned(),
+                read_capability_id: super::ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+                verified_response_fields: [
+                    "decision",
+                    "exclude",
+                    "include",
+                    "name",
+                    "precedence",
+                    "require",
+                    "session_duration",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            });
+            capability.rollback.supported = true;
+            capability.rollback.strategy =
+                Some(super::SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY.to_owned());
+        }
+        capability
+    }
+
+    fn operator_group_policy_input(update: bool) -> CallInput {
+        let mut selectors = json!({"account_id":"account-a","app_id":"application-a"});
+        if update {
+            selectors["policy_id"] = json!("policy-a");
+        }
+        CallInput {
+            selectors,
+            body: Some(json!({
+                "name":"Allow operators",
+                "decision":"allow",
+                "include":[{"group":{"id":"7b0bc477-5d42-4dab-b0ea-c97d0aef7810"}}],
+                "exclude":[],
+                "require":[],
+                "precedence":1,
+                "session_duration":"24h"
+            })),
+            ..CallInput::default()
+        }
+    }
+
+    fn operator_group_policy_collection(result: Value, complete: bool) -> CloudflareResponseV1 {
+        access_application_collection(result, complete)
+    }
+
+    #[test]
+    fn operator_group_policy_schema_rejects_every_alternate_rule_shape() {
+        for create in [true, false] {
+            let capability = operator_group_policy_capability(create);
+            let input = operator_group_policy_input(!create);
+            super::validate_access_operator_group_policy_input(&capability, &input)
+                .expect("exact operator group policy");
+            for drift in [
+                json!({"email":{"email":"operator@example.com"}}),
+                json!({"service_token":{"token_id":"token-a"}}),
+                json!({"device_posture":{"integration_uid":"device-a"}}),
+                json!({"external_evaluation":{"evaluate_url":"https://example.com"}}),
+            ] {
+                let mut drifted = input.clone();
+                drifted.body.as_mut().expect("body")["include"] = json!([drift]);
+                assert!(
+                    super::validate_access_operator_group_policy_input(&capability, &drifted)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operator_group_policy_ownership_distinguishes_create_update_and_ambiguity() {
+        let create = operator_group_policy_capability(true);
+        let create_input = operator_group_policy_input(false);
+        let empty = super::access_operator_group_policy_ownership_receipt(
+            &create,
+            &create_input,
+            "account-a",
+            &operator_group_policy_collection(json!([]), true),
+        )
+        .expect("zero-candidate create");
+        assert_eq!(empty["candidate_count"], json!(0));
+        assert_eq!(empty["selected_policy_id"], Value::Null);
+
+        let existing = json!({
+            "id":"policy-a",
+            "name":"Allow operators",
+            "decision":"allow",
+            "include":[{"group":{"id":"7b0bc477-5d42-4dab-b0ea-c97d0aef7810"}}],
+            "exclude":[],
+            "require":[],
+            "precedence":1,
+            "reusable":false
+        });
+        assert!(
+            super::access_operator_group_policy_ownership_receipt(
+                &create,
+                &create_input,
+                "account-a",
+                &operator_group_policy_collection(json!([existing.clone()]), true),
+            )
+            .expect_err("create overlap must fail")
+            .to_string()
+            .contains("zero")
+        );
+
+        let update = operator_group_policy_capability(false);
+        let update_input = operator_group_policy_input(true);
+        let exact = super::access_operator_group_policy_ownership_receipt(
+            &update,
+            &update_input,
+            "account-a",
+            &operator_group_policy_collection(json!([existing.clone()]), true),
+        )
+        .expect("one exact update candidate");
+        assert_eq!(exact["candidate_count"], json!(1));
+        assert_eq!(exact["selected_policy_id"], json!("policy-a"));
+
+        let overlapping = json!({
+            "id":"policy-b",
+            "name":"Another policy",
+            "decision":"bypass",
+            "include":[{"group":{"id":"7b0bc477-5d42-4dab-b0ea-c97d0aef7810"}}],
+            "reusable":false
+        });
+        assert!(
+            super::access_operator_group_policy_ownership_receipt(
+                &update,
+                &update_input,
+                "account-a",
+                &operator_group_policy_collection(json!([existing, overlapping]), true),
+            )
+            .expect_err("overlapping group must fail")
+            .to_string()
+            .contains("ambiguous")
+        );
+        assert!(
+            super::access_operator_group_policy_ownership_receipt(
+                &create,
+                &create_input,
+                "account-a",
+                &operator_group_policy_collection(json!([]), false),
+            )
+            .expect_err("partial collection must fail")
+            .to_string()
+            .contains("terminally paginated")
+        );
+    }
+
+    #[test]
+    fn operator_group_policy_prior_snapshot_is_complete_closed_and_absence_preserving() {
+        let base = json!({
+            "id":"policy-a",
+            "uid":"policy-a",
+            "name":"Allow operators",
+            "decision":"allow",
+            "include":[{"group":{"id":"7b0bc477-5d42-4dab-b0ea-c97d0aef7810"}}],
+            "exclude":[],
+            "require":[],
+            "precedence":1,
+            "reusable":false,
+            "created_at":"2026-08-20T12:00:00Z",
+            "updated_at":"2026-08-20T12:00:00Z"
+        });
+        let prior = super::access_operator_group_policy_restorable_body(&base)
+            .expect("closed restorable policy");
+        assert!(prior.get("session_duration").is_none());
+        assert!(prior.get("id").is_none());
+        assert_eq!(prior["include"], base["include"]);
+
+        for (field, value) in [
+            ("reusable", json!(true)),
+            ("decision", json!("bypass")),
+            ("require", json!([{"device_posture":{"id":"device-a"}}])),
+            ("future_rule_mode", json!("provider-added")),
+            (
+                "mfa_config",
+                json!({"allowed_authenticators":["totp"],"mfa_disabled":false}),
+            ),
+        ] {
+            let mut drifted = base.clone();
+            drifted[field] = value;
+            assert!(
+                super::access_operator_group_policy_restorable_body(&drifted).is_err(),
+                "{field} drift must fail closed"
+            );
         }
     }
 
