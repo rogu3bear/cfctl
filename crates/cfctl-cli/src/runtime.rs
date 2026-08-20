@@ -6,6 +6,7 @@ mod plan_set;
 mod r2_private_upload;
 mod worker_custom_domain;
 mod worker_deployment;
+mod workspace_d1_evidence;
 mod workspace_d1_migration;
 mod workspace_d1_projection;
 
@@ -6237,26 +6238,56 @@ async fn execute_delegated_read(
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let receipt = run_delegated_cli(
-        capability,
-        input,
-        &credential,
-        account_id.as_deref(),
-        &store.paths().cache_dir,
-        None,
-        None,
-    )
-    .await?;
+    let receipt = if capability.workspace_d1_evidence.is_some() {
+        let account_id = account_id.as_deref().ok_or_else(|| {
+            CliError::Input("workspace D1 evidence requires an exact account".to_owned())
+        })?;
+        workspace_d1_evidence::execute(store, capability, input, &credential, account_id).await?
+    } else {
+        run_delegated_cli(
+            capability,
+            input,
+            &credential,
+            account_id.as_deref(),
+            &store.paths().cache_dir,
+            None,
+            None,
+        )
+        .await?
+    };
+    let workspace_d1_evidence_passed = capability.workspace_d1_evidence.is_some()
+        && receipt.get("success").and_then(Value::as_bool) == Some(true)
+        && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
+        && receipt
+            .pointer("/evidence/schema_version")
+            .and_then(Value::as_u64)
+            == Some(1)
+        && receipt
+            .pointer("/evidence/body_returned")
+            .and_then(Value::as_bool)
+            == Some(false);
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let mut envelope = delegated_read_envelope(
+        &catalog.schema_hash,
+        &capability.id,
+        &profile.id,
+        account_id,
+        receipt,
+        evidence,
+    );
+    if capability.workspace_d1_evidence.is_some() {
+        envelope.verification.state = if workspace_d1_evidence_passed {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis = Some(
+            "clean-repository fixed D1 projection reduced to MaildeskD1EvidenceV1 without provider rows or message bodies"
+                .to_owned(),
+        );
+    }
     Ok(ExecutedRead {
-        envelope: delegated_read_envelope(
-            &catalog.schema_hash,
-            &capability.id,
-            &profile.id,
-            account_id,
-            receipt,
-            evidence,
-        ),
+        envelope,
         credential_generation_id: Some(credential_generation_id),
     })
 }
@@ -29854,7 +29885,10 @@ fn load_workspace_capability(
     if let Some(capability) = workspace_d1_migration::load(store, capability_id)? {
         return Ok(Some(capability));
     }
-    workspace_d1_projection::load(store, capability_id)
+    if let Some(capability) = workspace_d1_projection::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
+    workspace_d1_evidence::load(store, capability_id)
 }
 
 fn is_secret_path(path: &Path) -> bool {

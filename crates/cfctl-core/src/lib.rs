@@ -1872,6 +1872,48 @@ pub struct WorkspaceD1PolicyProjectionContractV1 {
     pub rollback_capability_id: String,
 }
 
+/// Repository-bound, caller-invariant D1 evidence projection. The committed
+/// query is executed only inside cfctl and its rows are reduced to the typed,
+/// body-free `MaildeskD1EvidenceV1` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1EvidenceContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub query_path: String,
+    pub query_sha256: String,
+    pub result_columns: Vec<String>,
+}
+
+/// Body-free operational evidence emitted by a workspace-owned Maildesk D1
+/// projection. No message, address, recipient, subject, arbitrary row, or SQL
+/// field exists in this public type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaildeskD1EvidenceV1 {
+    pub schema_version: u8,
+    pub active_policy_digest: String,
+    pub desired_state_digest: String,
+    pub semantic_projection_digest: String,
+    pub immutable_policy_object_key: String,
+    pub expected_domain_count: u64,
+    pub projected_domain_count: u64,
+    pub expected_route_count: u64,
+    pub projected_route_count: u64,
+    pub approved_schema_present: bool,
+    pub approved_table_presence: BTreeMap<String, bool>,
+    pub audit_event_counts: BTreeMap<String, u64>,
+    pub queue_correlation_count: u64,
+    pub dlq_correlation_count: u64,
+    pub body_returned: bool,
+}
+
 /// A create-only private local file upload to one exact R2 object key. The
 /// bytes remain in a mode-0600 managed stage; plans and receipts carry only
 /// content identity and bounded metadata.
@@ -2126,6 +2168,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_evidence: Option<WorkspaceD1EvidenceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email_sending_dns_repair: Option<EmailSendingDnsRepairContractV1>,
@@ -2244,6 +2288,7 @@ impl CapabilityV1 {
             d1_restore_exact_bookmark: None,
             workspace_d1_migration: None,
             workspace_d1_policy_projection: None,
+            workspace_d1_evidence: None,
             r2_private_file_upload: None,
             email_sending_dns_repair: None,
             email_routing_subdomain_dns: None,
@@ -2477,6 +2522,26 @@ impl CapabilityV1 {
                                 && contract.recovery_max_age_seconds <= 600
                                 && contract.rollback_capability_id == "d1-restore-exact-bookmark"
                         })
+            }
+            "workspace_d1_maildesk_body_free_evidence" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self.workspace_d1_evidence.as_ref().is_some_and(|contract| {
+                        !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.production_config_path.is_empty()
+                            && !contract.database_binding.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && !contract.query_path.is_empty()
+                            && contract.query_sha256.starts_with("sha256:")
+                            && !contract.result_columns.is_empty()
+                    })
             }
             "r2_private_file_upload_etag_and_conditional_read" => {
                 self.id == "r2-put-object"
