@@ -354,3 +354,14 @@ release's Homebrew formula, or a source build.
 Cloudflare OAuth promotion, and release publication each require explicit
 operator action and are never silently performed or claimed. Publishing the
 site does not enable public OAuth.
+
+After a governed site deployment, verify the named live origin with:
+
+```bash
+bun site/scripts/verify-live-site.mjs https://<exact-production-origin>
+```
+
+This checks public routes, security and cache headers, callback SSR privacy,
+the live asset manifest, and immutable JS/Wasm/CSS delivery. It proves HTTP
+behavior for that origin; the active Worker version and traffic allocation
+still require the separate governed `cfctl` provider readback.

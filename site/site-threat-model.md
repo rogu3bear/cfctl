@@ -228,6 +228,7 @@ change to those assumptions raises TM-001, TM-003, or TM-004.
 | `site/scripts/verify-hashed-assets.mjs` | Enforces immutable asset-reference consistency | TM-004 |
 | `site/scripts/verify-worker-runtime.mjs` | Guards zero-storage and runtime configuration invariants | TM-005, TM-006 |
 | `site/scripts/verify-site-contract.mjs` | Guards route, callback, privacy, and accessibility contracts | TM-001, TM-002, TM-003 |
+| `site/scripts/verify-live-site.mjs` | Fails closed on deployed route, header, callback SSR, manifest, or immutable-asset drift | TM-001, TM-002, TM-003, TM-005 |
 | `site/wrangler.toml` | Declares Worker entrypoint, Workers Assets, observability, and absence of storage bindings | TM-004, TM-005, TM-006 |
 | `site/Cargo.lock` | Pins the Rust/WASM dependency graph used by the trusted origin | TM-004 |
 | `site/SECURITY.md` | Defines invariants and the governed deployment closure condition | TM-001, TM-004, TM-007 |
