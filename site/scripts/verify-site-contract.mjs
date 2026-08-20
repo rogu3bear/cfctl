@@ -7,6 +7,7 @@ const root = process.cwd();
 const contractFiles = [
   "Cargo.toml",
   "wrangler.toml",
+  "scripts/verify-live-site.mjs",
 ];
 
 async function filesUnder(relative) {

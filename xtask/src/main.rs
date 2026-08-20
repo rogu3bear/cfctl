@@ -249,6 +249,15 @@ fn verify_site() -> Result<(), TaskError> {
         "cargo test --all-targets --features ssr --locked (site)",
     )?;
 
+    let mut live_verifier = Command::new("bun");
+    live_verifier
+        .args(["test", "./scripts/verify-live-site.test.mjs"])
+        .current_dir(&root);
+    run_command(
+        &mut live_verifier,
+        "bun test ./scripts/verify-live-site.test.mjs (site)",
+    )?;
+
     let mut edge = Command::new("bash");
     edge.arg("./scripts/verify-reproducible-edge.sh")
         .current_dir(&root);
