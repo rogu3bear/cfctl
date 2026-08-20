@@ -6867,6 +6867,61 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
 }
 
 #[test]
+fn owned_whole_host_access_application_update_is_closed_and_governed() {
+    let snapshot = normalize_openapi(&access_application_login_methods_fixture())
+        .expect("Access whole-host catalog");
+    let update = snapshot
+        .get("access-applications-update-owned-self-hosted-whole-host")
+        .expect("derived owned whole-host update");
+
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(update.effect, EffectClass::IdentityOrOwnership);
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("additionalProperties"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/type/enum/0"))
+            .and_then(serde_json::Value::as_str),
+        Some("self_hosted")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/destinations/maxItems"))
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/self_hosted_domains/maxItems"))
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert!(update.mutation_contract_gaps().is_empty());
+
+    let generic = snapshot
+        .get("access-applications-update-an-access-application")
+        .expect("generic update remains present");
+    assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+}
+
+#[test]
 fn access_app_launcher_login_methods_update_is_full_snapshot_governed() {
     let snapshot = normalize_openapi(&access_application_login_methods_fixture())
         .expect("Access login-method catalog");

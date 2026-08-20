@@ -8645,6 +8645,7 @@ fn exact_resource_readback_identity_matches(
     ) {
         (
             "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-owned-self-hosted-whole-host"
             | "access-applications-update-app-launcher-login-methods",
             "PUT",
             "/accounts/{account_id}/access/apps/{app_id}",
@@ -8734,7 +8735,8 @@ fn mismatched_verifiable_planned_fields(
 
 fn access_application_field_is_order_insensitive(capability_id: &str, field: &str) -> bool {
     match capability_id {
-        "access-applications-update-self-hosted-login-methods" => {
+        "access-applications-update-self-hosted-login-methods"
+        | "access-applications-update-owned-self-hosted-whole-host" => {
             matches!(field, "allowed_idps" | "policies" | "self_hosted_domains")
         }
         "access-applications-update-app-launcher-login-methods" => {
@@ -8757,6 +8759,7 @@ fn access_application_complete_snapshot_mismatches(
     ) {
         (
             "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-owned-self-hosted-whole-host"
             | "access-applications-update-app-launcher-login-methods",
             "PUT",
             "/accounts/{account_id}/access/apps/{app_id}",
@@ -8863,6 +8866,7 @@ fn access_exact_snapshot_optional_absence_mismatches(
     let is_application_snapshot = matches!(
         capability.id.as_str(),
         "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-owned-self-hosted-whole-host"
             | "access-applications-update-app-launcher-login-methods"
     ) && capability.method == "PUT"
         && capability.path == "/accounts/{account_id}/access/apps/{app_id}";
@@ -9146,6 +9150,10 @@ mod access_application_projection_tests {
         for (capability_id, field) in [
             (
                 "access-applications-update-self-hosted-login-methods",
+                "self_hosted_domains",
+            ),
+            (
+                "access-applications-update-owned-self-hosted-whole-host",
                 "self_hosted_domains",
             ),
             (
@@ -9473,6 +9481,30 @@ mod access_application_projection_tests {
     }
 
     #[test]
+    fn owned_whole_host_readback_requires_the_exact_planned_application_identity() {
+        let capability = CapabilityV1::new(
+            "access-applications-update-owned-self-hosted-whole-host",
+            "Update owned whole-host Access application",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        let input = CallInput {
+            selectors: json!({"app_id":"application-a"}),
+            ..CallInput::default()
+        };
+        assert!(exact_resource_readback_identity_matches(
+            &capability,
+            &input,
+            &json!({"id":"application-a"})
+        ));
+        assert!(!exact_resource_readback_identity_matches(
+            &capability,
+            &input,
+            &json!({"id":"application-b"})
+        ));
+    }
+
+    #[test]
     fn access_exact_snapshot_verification_matches_optional_presence_and_absence() {
         let mut launcher = CapabilityV1::new(
             "access-applications-update-app-launcher-login-methods",
@@ -9544,6 +9576,18 @@ mod access_application_projection_tests {
                 }]),
                 "tags",
                 json!(["customer:unexpected"]),
+            ),
+            (
+                "access-applications-update-owned-self-hosted-whole-host",
+                "destinations",
+                json!([{"type":"public","uri":"https://health.example.com"}]),
+                json!([{
+                    "type":"public",
+                    "uri":"https://health.example.com",
+                    "future_routing_flag":true
+                }]),
+                "tags",
+                json!(["unexpected"]),
             ),
             (
                 "access-applications-update-app-launcher-login-methods",

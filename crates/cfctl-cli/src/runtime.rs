@@ -1463,7 +1463,9 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     };
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
-    if is_access_application_login_methods_mutation(&capability) {
+    if is_access_application_owned_whole_host_mutation(&capability) {
+        validate_access_application_owned_whole_host_input(&capability, &prepared.input)?;
+    } else if is_access_application_login_methods_mutation(&capability) {
         validate_access_application_login_methods_desired_input(&capability, &prepared.input)?;
     } else if is_access_human_policy_mutation(&capability) {
         validate_access_human_policy_desired_input(&capability, &prepared.input)?;
@@ -4000,6 +4002,10 @@ fn security_collection_complete(response: &CloudflareResponseV1) -> bool {
                 .and_then(Value::as_bool)
                 == Some(true)
     })
+}
+
+fn collection_read_complete(response: &CloudflareResponseV1) -> bool {
+    security_collection_complete(response)
 }
 
 fn security_rule_planned_body(plan: &PlanV1) -> Result<Value> {
@@ -8019,8 +8025,12 @@ const SAME_PATH_PRIOR_STATE_PRECONDITION: &str = "same_path_prior_state";
 const SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY: &str = "restore_same_path_prior_snapshot";
 const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID: &str =
+    "access-applications-update-owned-self-hosted-whole-host";
 const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-app-launcher-login-methods";
+const ACCESS_APP_LIST_CAPABILITY_ID: &str = "access-applications-list-access-applications";
+const ACCESS_APP_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps";
 const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
 const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
 const ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING: &str = "the prior implicit-open identity-provider state cannot be restored automatically; manual rollback requires a separately reviewed Cloudflare Access application change";
@@ -8159,12 +8169,14 @@ fn access_application_login_methods_variant(
     capability_id: &str,
 ) -> Option<AccessApplicationLoginMethodsVariant> {
     match capability_id {
-        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
-            app_type: "self_hosted",
-            mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
-            required_fields: &ACCESS_APP_REQUIRED_FIELDS,
-            read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
-        }),
+        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID | ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID => {
+            Some(AccessApplicationLoginMethodsVariant {
+                app_type: "self_hosted",
+                mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
+                required_fields: &ACCESS_APP_REQUIRED_FIELDS,
+                read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
+            })
+        }
         ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID => {
             Some(AccessApplicationLoginMethodsVariant {
                 app_type: "app_launcher",
@@ -8794,12 +8806,91 @@ fn access_human_policy_desired_schema() -> Value {
 
 fn caller_facing_capability(capability: &CapabilityV1) -> CapabilityV1 {
     let mut public = capability.clone();
-    if is_access_application_login_methods_mutation(capability) {
+    if is_access_application_owned_whole_host_mutation(capability) {
+        public.request_schema = Some(cfctl_catalog::access_application_owned_whole_host_schema());
+    } else if is_access_application_login_methods_mutation(capability) {
         public.request_schema = Some(access_application_login_methods_desired_schema());
     } else if is_access_human_policy_mutation(capability) {
         public.request_schema = Some(access_human_policy_desired_schema());
     }
     public
+}
+
+fn is_access_application_owned_whole_host_mutation(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID
+        && is_access_application_login_methods_mutation(capability)
+}
+
+fn validate_access_application_owned_whole_host_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_access_application_owned_whole_host_mutation(capability) {
+        return Err(CliError::Input(
+            "owned whole-host Access application capability drifted from its governed exact-update contract"
+                .to_owned(),
+        ));
+    }
+    preflight_call_input(capability, input, None)?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input(
+                "owned whole-host Access application requires a complete object body".to_owned(),
+            )
+        })?;
+    if body.get("type").and_then(Value::as_str) != Some("self_hosted") {
+        return Err(CliError::Input(
+            "owned whole-host Access application type must be exactly `self_hosted`".to_owned(),
+        ));
+    }
+    let domain = body
+        .get("domain")
+        .and_then(Value::as_str)
+        .filter(|value| *value == value.to_ascii_lowercase() && !value.contains('*'))
+        .ok_or_else(|| {
+            CliError::Input(
+                "owned whole-host Access application domain must be a normalized lowercase hostname without wildcards"
+                    .to_owned(),
+            )
+        })?;
+    let self_hosted_domains = body
+        .get("self_hosted_domains")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values[0].as_str())
+        .filter(|value| *value == domain)
+        .ok_or_else(|| {
+            CliError::Input(
+                "owned whole-host Access application must declare exactly its selected domain in self_hosted_domains"
+                    .to_owned(),
+            )
+        })?;
+    let destination = body
+        .get("destinations")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values[0].as_object())
+        .filter(|value| {
+            value.len() == 2 && value.get("type").and_then(Value::as_str) == Some("public")
+        })
+        .and_then(|value| value.get("uri"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "owned whole-host Access application requires exactly one public destination"
+                    .to_owned(),
+            )
+        })?;
+    if destination != format!("https://{self_hosted_domains}") {
+        return Err(CliError::Input(
+            "owned whole-host Access application destination must be the exact HTTPS whole-host origin"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_access_human_policy_desired_input(
@@ -10414,6 +10505,199 @@ fn apply_same_path_prior_state_response(
     }))
 }
 
+fn access_application_collection_source_contract_supported(source: &CapabilityV1) -> bool {
+    source.id == ACCESS_APP_LIST_CAPABILITY_ID
+        && source.method == "GET"
+        && source.path == ACCESS_APP_COLLECTION_PATH
+        && source.account_scope == "account"
+        && !source.mutating
+        && matches!(
+            source.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && source.request_schema.is_none()
+        && source.selectors.iter().any(|selector| {
+            selector.name == "account_id" && selector.location == "path" && selector.required
+        })
+        && source.response_contract.as_ref().is_some_and(|contract| {
+            contract.body_mode == cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                && contract.success_statuses == ["200"]
+                && contract.success_media_types == ["application/json"]
+        })
+}
+
+fn normalized_access_application_hostname(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    let value = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(&value);
+    let hostname = value.split('/').next().unwrap_or_default();
+    if hostname.is_empty() || hostname.contains(':') {
+        return None;
+    }
+    Some(hostname.to_owned())
+}
+
+fn access_application_hostname_overlaps(candidate: &str, target: &str) -> bool {
+    let Some(candidate) = normalized_access_application_hostname(candidate) else {
+        return false;
+    };
+    candidate == target
+        || candidate
+            .strip_prefix("*.")
+            .is_some_and(|suffix| target.ends_with(&format!(".{suffix}")))
+}
+
+fn access_application_mentions_hostname(application: &Value, hostname: &str) -> bool {
+    application
+        .get("domain")
+        .and_then(Value::as_str)
+        .is_some_and(|value| access_application_hostname_overlaps(value, hostname))
+        || application
+            .get("self_hosted_domains")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| access_application_hostname_overlaps(value, hostname))
+                })
+            })
+        || application
+            .get("destinations")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.iter().any(|value| {
+                    value
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| access_application_hostname_overlaps(value, hostname))
+                })
+            })
+}
+
+fn owned_whole_host_access_application_receipt(
+    input: &CallInput,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Access application ownership collection read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if !collection_read_complete(response) {
+        return Err(CliError::Input(
+            "Access application ownership collection read was not terminally paginated; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let applications = response.result.as_array().ok_or_else(|| {
+        CliError::Input(
+            "Access application ownership collection read did not return an array; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("owned Access application omitted app_id".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("owned Access application omitted its complete body".to_owned())
+        })?;
+    let name = body.get("name").and_then(Value::as_str).ok_or_else(|| {
+        CliError::Input("owned Access application omitted its exact name".to_owned())
+    })?;
+    let hostname = body.get("domain").and_then(Value::as_str).ok_or_else(|| {
+        CliError::Input("owned Access application omitted its exact hostname".to_owned())
+    })?;
+
+    let mut selected = Vec::new();
+    let mut candidates = Vec::new();
+    for application in applications {
+        let object = application.as_object().ok_or_else(|| {
+            CliError::Input(
+                "Access application ownership collection contained a non-object entry; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+        let id = object.get("id").and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or_else(|| {
+            CliError::Input(
+                "Access application ownership collection contained an application without an id; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+        let app_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Access application ownership collection contained an application without a type; the mutation boundary was not crossed"
+                        .to_owned(),
+                )
+            })?;
+        if id == app_id {
+            selected.push(application);
+        }
+        if object.get("name").and_then(Value::as_str) == Some(name)
+            || access_application_mentions_hostname(application, hostname)
+        {
+            candidates.push((id, app_type));
+        }
+    }
+
+    if selected.len() != 1 {
+        return Err(CliError::Input(format!(
+            "Access application ownership collection contained {} entries for the exact application id; the mutation boundary was not crossed",
+            selected.len()
+        )));
+    }
+    let selected = selected[0];
+    if selected.get("type").and_then(Value::as_str) != Some("self_hosted")
+        || selected.get("name").and_then(Value::as_str) != Some(name)
+        || selected
+            .get("domain")
+            .and_then(Value::as_str)
+            .and_then(normalized_access_application_hostname)
+            .as_deref()
+            != Some(hostname)
+    {
+        return Err(CliError::Input(
+            "the exact Access application id does not already own the requested self-hosted name and whole hostname; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    if candidates.len() != 1 || candidates[0].0 != app_id || candidates[0].1 != "self_hosted" {
+        return Err(CliError::Input(format!(
+            "Access application ownership is ambiguous across {} exact or overlapping name/hostname candidates; the mutation boundary was not crossed",
+            candidates.len()
+        )));
+    }
+
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": ACCESS_APP_LIST_CAPABILITY_ID,
+        "source_path": ACCESS_APP_COLLECTION_PATH,
+        "selected_application_id": app_id,
+        "selected_application_type": "self_hosted",
+        "selected_name": name,
+        "selected_hostname": hostname,
+        "selected_id_count": 1,
+        "candidate_count": candidates.len(),
+        "collection_count": applications.len(),
+        "collection_digest": hash_value(&response.result)?,
+        "terminal_pagination": true,
+    }))
+}
+
 async fn read_live_same_path_prior_state(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -10454,7 +10738,33 @@ async fn read_live_same_path_prior_state(
             credential,
         )
         .await?;
-    let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
+    let mut receipt =
+        apply_same_path_prior_state_response(capability, input, account_id, &response)?;
+    if is_access_application_owned_whole_host_mutation(capability) {
+        let collection_source = catalog
+            .get(ACCESS_APP_LIST_CAPABILITY_ID)
+            .ok_or_else(|| capability_missing(ACCESS_APP_LIST_CAPABILITY_ID))?;
+        if !access_application_collection_source_contract_supported(collection_source) {
+            return Err(CliError::Input(
+                "Access application ownership source capability drifted from the governed complete collection read"
+                    .to_owned(),
+            ));
+        }
+        let collection_response = executor
+            .execute_read(
+                collection_source,
+                &CallInput {
+                    selectors: json!({"account_id": account_id}),
+                    query: json!({}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await?;
+        receipt["ownership"] =
+            owned_whole_host_access_application_receipt(input, &collection_response)?;
+    }
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
@@ -11989,7 +12299,26 @@ async fn create_plan(
     } else {
         None
     };
-    let access_state_precondition = if is_access_application_login_methods_mutation(&capability) {
+    let access_state_precondition = if is_access_application_owned_whole_host_mutation(&capability)
+    {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "owned whole-host Access application state precondition credential was not resolved"
+                    .to_owned(),
+            )
+        })?;
+        Some(
+            read_live_same_path_prior_state(
+                store,
+                catalog,
+                &capability,
+                &input,
+                account_id,
+                credential,
+            )
+            .await?,
+        )
+    } else if is_access_application_login_methods_mutation(&capability) {
         let credential = credential.as_ref().ok_or_else(|| {
             CliError::Input(
                 "Access application state precondition credential was not resolved".to_owned(),
@@ -17472,7 +17801,15 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
         )
     })?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
-    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 10)
+    let expected_receipt_fields =
+        if is_access_application_owned_whole_host_mutation(&plan.capability) {
+            11
+        } else {
+            10
+        };
+    let exact_identity = receipt
+        .as_object()
+        .is_some_and(|object| object.len() == expected_receipt_fields)
         && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
         && receipt.get("source_capability_id").and_then(Value::as_str)
             == Some(target.read_capability_id.as_str())
@@ -17487,6 +17824,63 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
             == Some(plan.capability.account_scope.as_str())
         && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
         && receipt.get("selectors") == Some(&input.selectors);
+    let ownership_identity = if is_access_application_owned_whole_host_mutation(&plan.capability) {
+        let app_id = input.selectors.get("app_id").and_then(Value::as_str);
+        let name = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("name"))
+            .and_then(Value::as_str);
+        let hostname = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("domain"))
+            .and_then(Value::as_str);
+        receipt.get("ownership").is_some_and(|ownership| {
+            ownership
+                .as_object()
+                .is_some_and(|object| object.len() == 12)
+                && ownership.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && ownership
+                    .get("source_capability_id")
+                    .and_then(Value::as_str)
+                    == Some(ACCESS_APP_LIST_CAPABILITY_ID)
+                && ownership.get("source_path").and_then(Value::as_str)
+                    == Some(ACCESS_APP_COLLECTION_PATH)
+                && ownership
+                    .get("selected_application_id")
+                    .and_then(Value::as_str)
+                    == app_id
+                && ownership
+                    .get("selected_application_type")
+                    .and_then(Value::as_str)
+                    == Some("self_hosted")
+                && ownership.get("selected_name").and_then(Value::as_str) == name
+                && ownership.get("selected_hostname").and_then(Value::as_str) == hostname
+                && ownership.get("selected_id_count").and_then(Value::as_u64) == Some(1)
+                && ownership.get("candidate_count").and_then(Value::as_u64) == Some(1)
+                && ownership
+                    .get("collection_count")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count >= 1)
+                && ownership
+                    .get("collection_digest")
+                    .and_then(Value::as_str)
+                    .is_some_and(|digest| {
+                        digest.len() == 71
+                            && digest.starts_with("sha256:")
+                            && digest[7..]
+                                .chars()
+                                .all(|character| character.is_ascii_hexdigit())
+                    })
+                && ownership
+                    .get("terminal_pagination")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+    } else {
+        receipt.get("ownership").is_none()
+    };
     let prior_state = receipt
         .get("prior_state")
         .and_then(Value::as_object)
@@ -17548,7 +17942,7 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
             .unwrap_or_default();
         observed_fields == expected_fields
     };
-    if !exact_identity || !valid_state_shape {
+    if !exact_identity || !ownership_identity || !valid_state_shape {
         return Err(CliError::Input(
             "same-path prior-state receipt has an invalid source, target, selector, or field set; create a new plan"
                 .to_owned(),
@@ -46356,6 +46750,218 @@ mod tests {
         capability.rollback.warning =
             Some("restoration requires a separate approved plan".to_owned());
         capability
+    }
+
+    fn owned_whole_host_access_application_capability() -> CapabilityV1 {
+        let mut capability = access_application_login_methods_capability();
+        capability.id = super::ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID.to_owned();
+        capability.title = "Update owned whole-host Access application".to_owned();
+        capability.request_schema =
+            Some(cfctl_catalog::access_application_owned_whole_host_schema());
+        capability
+    }
+
+    fn owned_whole_host_access_application_input() -> CallInput {
+        let capability = owned_whole_host_access_application_capability();
+        let variant = super::access_application_login_methods_variant(&capability.id)
+            .expect("owned self-hosted variant");
+        let mut live = access_application_live_result();
+        live["domain"] = json!("health.example.com");
+        live["name"] = json!("Routing health");
+        live["self_hosted_domains"] = json!(["health.example.com"]);
+        live["destinations"] = json!([{"type":"public","uri":"https://health.example.com"}]);
+        let body = super::access_application_mutable_body(
+            &live,
+            &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+            variant,
+        )
+        .expect("complete whole-host body");
+        CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(body),
+            ..CallInput::default()
+        }
+    }
+
+    fn access_application_collection(result: Value, complete: bool) -> CloudflareResponseV1 {
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result,
+            errors: Vec::new(),
+            result_info: Some(if complete {
+                json!({"cfctl_cursor_complete":true,"cfctl_pages":1})
+            } else {
+                json!({"cursor":"next-page"})
+            }),
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    #[test]
+    fn owned_whole_host_access_application_requires_exact_closed_shape() {
+        let capability = owned_whole_host_access_application_capability();
+        let input = owned_whole_host_access_application_input();
+        super::validate_access_application_owned_whole_host_input(&capability, &input)
+            .expect("exact whole-host body");
+
+        for (pointer, drifted, expected) in [
+            ("/domain", json!("*.example.com"), "hostname format"),
+            (
+                "/self_hosted_domains",
+                json!(["other.example.com"]),
+                "selected domain",
+            ),
+            (
+                "/destinations/0/uri",
+                json!("https://health.example.com/path"),
+                "exact HTTPS whole-host origin",
+            ),
+            ("/type", json!("saas"), "pinned enum values"),
+        ] {
+            let mut drifted_input = input.clone();
+            let body = drifted_input.body.as_mut().expect("body");
+            *body.pointer_mut(pointer).expect("test pointer") = drifted;
+            let error = super::validate_access_application_owned_whole_host_input(
+                &capability,
+                &drifted_input,
+            )
+            .expect_err("drifted whole-host body must fail closed");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn owned_whole_host_access_application_binds_unique_terminal_collection() {
+        let input = owned_whole_host_access_application_input();
+        let selected = json!({
+            "id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+            "name":"Routing health",
+            "type":"self_hosted",
+            "domain":"health.example.com",
+            "self_hosted_domains":["health.example.com"],
+            "destinations":[{"type":"public","uri":"https://health.example.com"}]
+        });
+        let receipt = super::owned_whole_host_access_application_receipt(
+            &input,
+            &access_application_collection(json!([selected.clone()]), true),
+        )
+        .expect("unique exact ownership");
+        assert_eq!(receipt["candidate_count"], json!(1));
+        assert_eq!(receipt["selected_id_count"], json!(1));
+        assert_eq!(receipt["terminal_pagination"], json!(true));
+        assert!(
+            receipt["collection_digest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
+
+        let incomplete = super::owned_whole_host_access_application_receipt(
+            &input,
+            &access_application_collection(json!([selected.clone()]), false),
+        )
+        .expect_err("incomplete collection must fail closed");
+        assert!(incomplete.to_string().contains("terminally paginated"));
+
+        let ambiguous_name = json!({
+            "id":"alternate-app",
+            "name":"Routing health",
+            "type":"saas",
+            "domain":"unrelated.example.net"
+        });
+        let ambiguous = super::owned_whole_host_access_application_receipt(
+            &input,
+            &access_application_collection(json!([selected.clone(), ambiguous_name]), true),
+        )
+        .expect_err("alternate-type name collision must fail closed");
+        assert!(ambiguous.to_string().contains("ambiguous"));
+
+        let wildcard_overlap = json!({
+            "id":"overlapping-app",
+            "name":"Other application",
+            "type":"self_hosted",
+            "domain":"*.example.com"
+        });
+        let overlapping = super::owned_whole_host_access_application_receipt(
+            &input,
+            &access_application_collection(json!([selected, wildcard_overlap]), true),
+        )
+        .expect_err("wildcard hostname collision must fail closed");
+        assert!(overlapping.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn owned_whole_host_access_application_receipt_binds_ownership_and_prior_snapshot() {
+        let capability = owned_whole_host_access_application_capability();
+        let input = owned_whole_host_access_application_input();
+        let mut live = access_application_live_result();
+        live["domain"] = json!("health.example.com");
+        live["name"] = json!("Routing health");
+        live["self_hosted_domains"] = json!(["health.example.com"]);
+        live["destinations"] = json!([{"type":"public","uri":"https://health.example.com"}]);
+        let mut receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: live,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("complete prior snapshot");
+        let selected = json!({
+            "id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+            "name":"Routing health",
+            "type":"self_hosted",
+            "domain":"health.example.com",
+            "self_hosted_domains":["health.example.com"],
+            "destinations":[{"type":"public","uri":"https://health.example.com"}]
+        });
+        receipt["ownership"] = super::owned_whole_host_access_application_receipt(
+            &input,
+            &access_application_collection(json!([selected]), true),
+        )
+        .expect("ownership receipt");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-a",
+            capability,
+            json!({
+                "selectors":input.selectors,
+                "live_preconditions":{"same_path_prior_state":receipt}
+            }),
+        )
+        .expect("plan draft");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+
+        let restored = super::validate_same_path_prior_state_receipt(
+            &plan,
+            plan.targets
+                .pointer("/live_preconditions/same_path_prior_state")
+                .expect("receipt"),
+        )
+        .expect("receipt contract");
+        assert_eq!(restored["name"], json!("Routing health"));
+        assert_eq!(restored["domain"], json!("health.example.com"));
+
+        let mut tampered = plan.targets["live_preconditions"]["same_path_prior_state"].clone();
+        tampered["ownership"]["candidate_count"] = json!(2);
+        assert!(
+            super::validate_same_path_prior_state_receipt(&plan, &tampered)
+                .expect_err("ambiguous ownership receipt must not authorize rollback")
+                .to_string()
+                .contains("invalid source, target, selector, or field set")
+        );
     }
 
     fn assert_access_application_optional_fields(body: &Value) {

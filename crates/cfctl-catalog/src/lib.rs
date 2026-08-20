@@ -17524,6 +17524,8 @@ const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id
 const ACCESS_APP_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/put/requestBody/content/application~1json/schema";
 const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID: &str =
+    "access-applications-update-owned-self-hosted-whole-host";
 const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-app-launcher-login-methods";
 const ACCESS_APP_UPDATE_CAPABILITY_ID: &str = "access-applications-update-an-access-application";
@@ -17640,6 +17642,56 @@ pub fn access_application_login_methods_materialized_schema() -> Value {
         },
         "x-cfctl-body-required":true
     })
+}
+
+/// Complete caller-visible body for one owned whole-host self-hosted Access
+/// application. The runtime additionally proves collection uniqueness and
+/// exact hostname ownership before it permits the generic PUT adapter.
+#[must_use]
+pub fn access_application_owned_whole_host_schema() -> Value {
+    let mut schema = access_application_login_methods_materialized_schema();
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("closed Access application schema has properties");
+    properties.insert(
+        "domain".to_owned(),
+        serde_json::json!({
+            "type":"string",
+            "format":"hostname",
+            "minLength":1,
+            "maxLength":253,
+            "pattern":"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+        }),
+    );
+    properties.insert(
+        "destinations".to_owned(),
+        serde_json::json!({
+            "type":"array",
+            "minItems":1,
+            "maxItems":1,
+            "items":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","uri"],
+                "properties":{
+                    "type":{"type":"string","enum":["public"]},
+                    "uri":{"type":"string","format":"uri","minLength":9,"maxLength":261}
+                }
+            }
+        }),
+    );
+    properties.insert(
+        "self_hosted_domains".to_owned(),
+        serde_json::json!({
+            "type":"array",
+            "minItems":1,
+            "maxItems":1,
+            "uniqueItems":true,
+            "items":{"type":"string","format":"hostname","minLength":1,"maxLength":253}
+        }),
+    );
+    schema
 }
 
 fn access_app_launcher_login_methods_schema() -> Value {
@@ -19319,6 +19371,23 @@ fn finalize_access_application_login_methods_contract(
     let Some(source) = capabilities.get(ACCESS_APP_UPDATE_CAPABILITY_ID).cloned() else {
         return;
     };
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID,
+            app_type: "self_hosted",
+            title: "Update one owned whole-host self-hosted Access application",
+            description: "Updates one exact owned self-hosted Access application using a complete closed whole-host body. cfctl proves the selected application is the unique collection candidate for the requested name and hostname, rejects alternate application types and unclassified live fields, binds the complete prior snapshot, and verifies the same exact application after apply.",
+            aliases: &[
+                "update Maildesk routing health Access application",
+                "replace owned whole host Access application settings",
+                "configure exact self hosted Access application",
+            ],
+            request_schema: access_application_owned_whole_host_schema(),
+        },
+    );
     insert_access_application_login_methods_contract(
         document,
         capabilities,
