@@ -30,13 +30,10 @@ secrets-out/
 *.local
 local.*
 
-# Local operator/agent strategy files. Keep these useful in private checkouts
-# but out of public control-plane releases.
+# Local operator adapters and private evidence. Repository doctrine lives in
+# the tracked NORTH_STAR.md, ANCHOR.md, and LAYERS.md files.
 AGENTS.md
 CLAUDE.md
-NORTH_STAR.md
-ANCHOR.md
-LAYERS.md
 NUANCE.md
 # Live-estate map: account structure and identifiers belong in a private
 # checkout, not in a public control-plane repository.

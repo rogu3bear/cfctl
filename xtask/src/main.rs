@@ -1444,22 +1444,19 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         })?;
     // First-load agent doctrine must not re-teach archived v1 verbs or layout.
     // Historical material below compat/v1 is governed by the quarantine manifest instead.
-    // Tracked public guidance is always required. Local strategy files are gitignored for
-    // public releases but, when present in a private checkout, must stay v2-aligned.
+    // Tracked public guidance and constitutional doctrine are always required. Local
+    // operator adapters are gitignored but, when present, must stay v2-aligned.
     let required_guidance = [
         "CFCTL_PROMPT.md",
         "docs/agent-landing.md",
         "skills/cfctl-operator/SKILL.md",
         "CONTRIBUTING.md",
         "SECURITY.md",
-    ];
-    let optional_local_guidance = [
-        "AGENTS.md",
-        "CLAUDE.md",
         "ANCHOR.md",
         "NORTH_STAR.md",
         "LAYERS.md",
     ];
+    let optional_local_guidance = ["AGENTS.md", "CLAUDE.md"];
     let stale_v1_guidance = [
         // Archived public verbs / auth lanes
         "./scripts/",
