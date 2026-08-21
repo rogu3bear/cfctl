@@ -10588,6 +10588,10 @@ fn same_path_prior_state_fields(
     Ok(fields)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Access application and policy snapshot variants remain visible in one prior-state projection boundary"
+)]
 fn project_same_path_prior_state(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -10860,6 +10864,10 @@ fn access_application_mentions_hostname(application: &Value, hostname: &str) -> 
             })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the complete ownership collection, overlap rejection, and prior-snapshot receipt remain visible at one admission boundary"
+)]
 fn owned_whole_host_access_application_receipt(
     input: &CallInput,
     response: &CloudflareResponseV1,
@@ -11009,7 +11017,7 @@ fn access_policy_collection_source_contract_supported(source: &CapabilityV1) -> 
         })
 }
 
-fn policy_operator_group_id(policy: &Value) -> Option<&str> {
+fn exact_policy_operator_group_id(policy: &Value) -> Option<&str> {
     policy
         .get("include")
         .and_then(Value::as_array)
@@ -11022,6 +11030,47 @@ fn policy_operator_group_id(policy: &Value) -> Option<&str> {
         .and_then(|group| group.get("id"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn policy_contains_operator_group(policy: &Value, expected_group_id: &str) -> Result<bool> {
+    let Some(include) = policy.get("include") else {
+        return Ok(false);
+    };
+    let include = include.as_array().ok_or_else(|| {
+        CliError::Input(
+            "Access policy ownership collection contained a non-array include rule set; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let expected_group_id = Uuid::parse_str(expected_group_id).map_err(|_| {
+        CliError::Input("operator-group policy input contained an invalid group id".to_owned())
+    })?;
+    for rule in include {
+        let rule = rule.as_object().ok_or_else(|| {
+            CliError::Input(
+                "Access policy ownership collection contained a non-object include rule; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+        let Some(group) = rule.get("group") else {
+            continue;
+        };
+        let group_id = group
+            .as_object()
+            .and_then(|group| group.get("id"))
+            .and_then(Value::as_str)
+            .and_then(|group_id| Uuid::parse_str(group_id).ok())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Access policy ownership collection contained an unclassified operator-group include rule; the mutation boundary was not crossed"
+                        .to_owned(),
+                )
+            })?;
+        if group_id == expected_group_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn access_operator_group_policy_ownership_receipt(
@@ -11073,7 +11122,7 @@ fn access_operator_group_policy_ownership_receipt(
             selected.push(policy);
         }
         if object.get("name").and_then(Value::as_str) == Some(name)
-            || policy_operator_group_id(policy) == Some(group_id)
+            || policy_contains_operator_group(policy, group_id)?
         {
             candidates.push(id);
         }
@@ -11097,7 +11146,7 @@ fn access_operator_group_policy_ownership_receipt(
             || candidates.len() != 1
             || candidates[0] != selected_id
             || selected[0].get("name").and_then(Value::as_str) != Some(name)
-            || policy_operator_group_id(selected[0]) != Some(group_id)
+            || exact_policy_operator_group_id(selected[0]) != Some(group_id)
             || selected[0].get("decision").and_then(Value::as_str) != Some("allow")
             || selected[0].get("reusable").and_then(Value::as_bool) != Some(false)
         {
@@ -18331,6 +18380,10 @@ fn dns_record_prior_snapshot(plan: &PlanV1) -> Result<Value> {
     validate_dns_record_prior_state_receipt(plan, receipt)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the compensation validator keeps every receipt identity and complete prior-state invariant visible at one rollback boundary"
+)]
 fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<Value> {
     let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
         CliError::Input(
@@ -18639,8 +18692,7 @@ fn validate_access_operator_group_policy_ownership_receipt(
         && selected_policy_matches
         && receipt.get("policy_name").and_then(Value::as_str) == Some(name)
         && receipt.get("operator_group_id").and_then(Value::as_str) == Some(group_id)
-        && receipt.get("candidate_count").and_then(Value::as_u64)
-            == Some(if create { 0 } else { 1 })
+        && receipt.get("candidate_count").and_then(Value::as_u64) == Some(u64::from(!create))
         && receipt
             .get("collection_count")
             .and_then(Value::as_u64)
@@ -47624,6 +47676,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one matrix proves create, update, broader overlap, malformed-rule, and pagination ownership failures"
+    )]
     fn operator_group_policy_ownership_distinguishes_create_update_and_ambiguity() {
         let create = operator_group_policy_capability(true);
         let create_input = operator_group_policy_input(false);
@@ -47683,12 +47739,73 @@ mod tests {
                 &update,
                 &update_input,
                 "account-a",
-                &operator_group_policy_collection(json!([existing, overlapping]), true),
+                &operator_group_policy_collection(json!([existing.clone(), overlapping]), true),
             )
             .expect_err("overlapping group must fail")
             .to_string()
             .contains("ambiguous")
         );
+        let broader_overlap = json!({
+            "id":"policy-b",
+            "name":"Broader policy",
+            "decision":"allow",
+            "include":[
+                {"group":{"id":"7b0bc477-5d42-4dab-b0ea-c97d0aef7810"}},
+                {"email_domain":{"domain":"example.com"}}
+            ],
+            "reusable":false
+        });
+        assert!(
+            super::access_operator_group_policy_ownership_receipt(
+                &create,
+                &create_input,
+                "account-a",
+                &operator_group_policy_collection(json!([broader_overlap.clone()]), true),
+            )
+            .expect_err("group inside broader policy must count as overlap")
+            .to_string()
+            .contains("zero")
+        );
+        assert!(
+            super::access_operator_group_policy_ownership_receipt(
+                &update,
+                &update_input,
+                "account-a",
+                &operator_group_policy_collection(json!([existing.clone(), broader_overlap]), true),
+            )
+            .expect_err("broader second group policy must make update ownership ambiguous")
+            .to_string()
+            .contains("ambiguous")
+        );
+        for malformed in [
+            json!({
+                "id":"policy-malformed",
+                "name":"Other policy",
+                "include":"concealed"
+            }),
+            json!({
+                "id":"policy-malformed",
+                "name":"Other policy",
+                "include":["concealed"]
+            }),
+            json!({
+                "id":"policy-malformed",
+                "name":"Other policy",
+                "include":[{"group":{"future_id":"concealed"}}]
+            }),
+        ] {
+            assert!(
+                super::access_operator_group_policy_ownership_receipt(
+                    &create,
+                    &create_input,
+                    "account-a",
+                    &operator_group_policy_collection(json!([malformed]), true),
+                )
+                .expect_err("unclassified include shapes must fail closed")
+                .to_string()
+                .contains("mutation boundary was not crossed")
+            );
+        }
         assert!(
             super::access_operator_group_policy_ownership_receipt(
                 &create,

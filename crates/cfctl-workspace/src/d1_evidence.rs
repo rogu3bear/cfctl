@@ -15,7 +15,7 @@ use super::{RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, gi
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-evidence.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
-const RESULT_COLUMNS: &[&str] = &[
+pub const MAILDESK_D1_EVIDENCE_COLUMNS_V1: &[&str] = &[
     "active_policy_digest",
     "desired_state_digest",
     "semantic_projection_digest",
@@ -31,13 +31,59 @@ const RESULT_COLUMNS: &[&str] = &[
     "dlq_correlation_count",
 ];
 
+/// Compiler-owned Maildesk readiness projection. Every source table, column,
+/// expression, predicate, action key, and output alias is fixed here; a
+/// workspace declaration cannot supply or modify SQL.
+pub const MAILDESK_D1_EVIDENCE_SQL_V1: &str = r"SELECT
+  'sha256:' || rs.active_policy_sha256 AS active_policy_digest,
+  'sha256:' || (SELECT value FROM policy_projection_state WHERE key = 'active_desired_state_sha256') AS desired_state_digest,
+  'sha256:' || (SELECT value FROM policy_projection_state WHERE key = 'active_projection_sha256') AS semantic_projection_digest,
+  rs.active_policy_r2_key AS immutable_policy_object_key,
+  pr.expected_domain_count AS expected_domain_count,
+  (SELECT COUNT(DISTINCT ar.domain_id) FROM alias_routes ar WHERE ar.enabled = 1 AND ar.policy_sha256 = rs.active_policy_sha256) AS projected_domain_count,
+  pr.expected_route_count AS expected_route_count,
+  (SELECT COUNT(*) FROM alias_routes ar WHERE ar.enabled = 1 AND ar.policy_sha256 = rs.active_policy_sha256) AS projected_route_count,
+  CASE WHEN (SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('alias_routes','audit_events','domains','inbound_deliveries','inbound_recipient_deliveries','policy_projection_state','policy_revisions','relay_attempts','route_health','runtime_state')) = 10 THEN 1 ELSE 0 END AS approved_schema_present,
+  json_object(
+    'alias_routes', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'alias_routes'),
+    'audit_events', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'audit_events'),
+    'domains', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'domains'),
+    'inbound_deliveries', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'inbound_deliveries'),
+    'inbound_recipient_deliveries', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'inbound_recipient_deliveries'),
+    'policy_projection_state', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'policy_projection_state'),
+    'policy_revisions', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'policy_revisions'),
+    'relay_attempts', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_attempts'),
+    'route_health', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'route_health'),
+    'runtime_state', EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'runtime_state')
+  ) AS approved_table_presence_json,
+  json_object(
+    'inbound_email_accepted', (SELECT COUNT(*) FROM audit_events WHERE action = 'inbound_email_accepted'),
+    'operator_delivery_provider_accepted', (SELECT COUNT(*) FROM audit_events WHERE action = 'operator_delivery_provider_accepted'),
+    'inbox_reply_authorized', (SELECT COUNT(*) FROM audit_events WHERE action = 'inbox_reply_authorized'),
+    'outbound_reply_delivered', (SELECT COUNT(*) FROM audit_events WHERE action = 'outbound_reply_delivered'),
+    'outbound_reply_retry_scheduled', (SELECT COUNT(*) FROM audit_events WHERE action = 'outbound_reply_retry_scheduled'),
+    'outbound_reply_recovery_required', (SELECT COUNT(*) FROM audit_events WHERE action = 'outbound_reply_recovery_required'),
+    'outbound_reply_failed', (SELECT COUNT(*) FROM audit_events WHERE action = 'outbound_reply_failed')
+  ) AS audit_event_counts_json,
+  (SELECT COUNT(*) FROM relay_attempts WHERE status IN ('receiving','queued','authorized')) +
+    (SELECT COUNT(*) FROM inbound_deliveries WHERE status IN ('pending','sending')) +
+    (SELECT COUNT(*) FROM inbound_recipient_deliveries WHERE status IN ('pending','sending')) AS queue_correlation_count,
+  (SELECT COUNT(*) FROM relay_attempts WHERE status IN ('failed','recovery_required')) +
+    (SELECT COUNT(*) FROM inbound_deliveries WHERE status IN ('failed','recovery_required')) +
+    (SELECT COUNT(*) FROM inbound_recipient_deliveries WHERE status IN ('failed','recovery_required')) AS dlq_correlation_count
+FROM runtime_state rs
+JOIN policy_revisions pr ON pr.policy_sha256 = rs.active_policy_sha256
+WHERE rs.singleton = 1;";
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OperationPack {
     schema_version: u8,
     operation: Vec<OperationDeclaration>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OperationDeclaration {
     id: String,
     title: String,
@@ -46,9 +92,7 @@ struct OperationDeclaration {
     production_config: String,
     database_binding: String,
     wrangler_version: String,
-    query_path: String,
-    query_sha256: String,
-    result_columns: Vec<String>,
+    projection: String,
 }
 
 /// Load one clean-repository-owned, fixed-query D1 evidence capability.
@@ -136,13 +180,6 @@ fn load_from_repository(
         &repository.path,
         &safe_relative(&operation.config_template)?,
     )?;
-    let query = committed_file(&repository.path, &safe_relative(&operation.query_path)?)?;
-    validate_fixed_query(&query)?;
-    if operation.query_sha256 != sha256(&query) {
-        return Err(invariant(
-            "workspace D1 evidence query does not match its declared SHA-256",
-        ));
-    }
     let contract = WorkspaceD1EvidenceContractV1 {
         repository_root: repository.path.display().to_string(),
         repository_head: head.to_owned(),
@@ -156,72 +193,19 @@ fn load_from_repository(
             .to_string(),
         database_binding: operation.database_binding.clone(),
         wrangler_version: operation.wrangler_version.clone(),
-        query_path: operation.query_path.clone(),
-        query_sha256: operation.query_sha256.clone(),
-        result_columns: operation.result_columns.clone(),
+        projection: operation.projection.clone(),
+        query_sha256: sha256(MAILDESK_D1_EVIDENCE_SQL_V1.as_bytes()),
     };
     Ok(Some(capability(operation, contract)))
 }
 
-fn validate_fixed_query(query: &[u8]) -> Result<()> {
-    if query.is_empty() || query.len() > 65_536 {
-        return Err(invariant(
-            "workspace D1 evidence query must be between 1 byte and 64 KiB",
-        ));
-    }
-    let text = std::str::from_utf8(query)
-        .map_err(|_| invariant("workspace D1 evidence query is not UTF-8"))?;
-    let normalized = text.trim().to_ascii_lowercase();
-    if (!normalized.starts_with("select ") && !normalized.starts_with("with "))
-        || normalized.contains("--")
-        || normalized.contains("/*")
-        || normalized.contains('?')
-        || normalized.matches(';').count() > 1
-        || (normalized.contains(';') && !normalized.ends_with(';'))
-    {
-        return Err(invariant(
-            "workspace D1 evidence query must be one parameter-free SELECT without comments",
-        ));
-    }
-    for forbidden in [
-        "insert",
-        "update",
-        "delete",
-        "replace",
-        "pragma",
-        "attach",
-        "detach",
-        "alter",
-        "drop",
-        "create",
-        "vacuum",
-        "reindex",
-        "load_extension",
-    ] {
-        if normalized
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .any(|token| token == forbidden)
-        {
-            return Err(invariant(format!(
-                "workspace D1 evidence query contains forbidden token `{forbidden}`"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn validate_operation(operation: &OperationDeclaration) -> Result<()> {
-    let expected_columns = RESULT_COLUMNS
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect::<Vec<_>>();
-    if !valid_operation_id(&operation.id)
+    if operation.id != "star-maildesk-cf.d1-evidence-read"
         || operation.title.trim().is_empty()
         || operation.description.trim().is_empty()
         || !safe_identifier(&operation.database_binding)
         || !valid_wrangler_version(&operation.wrangler_version)
-        || !sha256_value(&operation.query_sha256)
-        || operation.result_columns != expected_columns
+        || operation.projection != "maildesk_v1"
     {
         return Err(invariant(
             "workspace D1 evidence declaration is not the fixed Maildesk projection contract",
@@ -242,9 +226,9 @@ fn capability(
     );
     capability.description = Some(operation.description.clone());
     capability.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
-    capability.product = "D1".to_owned();
-    capability.source = "workspace-d1-evidence-pack-v1".to_owned();
-    capability.account_scope = "account".to_owned();
+    "D1".clone_into(&mut capability.product);
+    "workspace-d1-evidence-pack-v1".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
     capability.selectors = vec![
         selector("account_id", "path"),
         selector("database_id", "path"),
@@ -351,19 +335,6 @@ fn safe_relative(value: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn valid_operation_id(value: &str) -> bool {
-    let Some((namespace, operation)) = value.split_once('.') else {
-        return false;
-    };
-    [namespace, operation].into_iter().all(|part| {
-        !part.is_empty()
-            && part.len() <= 63
-            && part
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    })
-}
-
 fn safe_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -385,12 +356,6 @@ fn lower_hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn sha256_value(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(|digest| lower_hex(digest, 64))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -418,10 +383,6 @@ mod tests {
         assert!(status.success());
     }
 
-    fn query() -> &'static str {
-        "SELECT 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' AS active_policy_digest, 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' AS desired_state_digest, 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' AS semantic_projection_digest, 'policies/sha256-aaaa.json' AS immutable_policy_object_key, 2 AS expected_domain_count, 2 AS projected_domain_count, 141 AS expected_route_count, 141 AS projected_route_count, 1 AS approved_schema_present, '{\"alias_routes\":true}' AS approved_table_presence_json, '{\"route_decision\":4}' AS audit_event_counts_json, 0 AS queue_correlation_count, 0 AS dlq_correlation_count;\n"
-    }
-
     fn fixture() -> TempDir {
         let root = tempfile::tempdir().expect("temp repository");
         git(root.path(), &["init", "-q"]);
@@ -438,19 +399,9 @@ mod tests {
         );
         fs::create_dir_all(root.path().join(".cfctl/operations")).expect("pack dir");
         fs::write(root.path().join("wrangler.toml"), "name = \"template\"\n[[d1_databases]]\nbinding = \"DB\"\ndatabase_name = \"template-db\"\ndatabase_id = \"00000000-0000-0000-0000-000000000000\"\n").expect("config");
-        fs::write(root.path().join("evidence.sql"), query()).expect("query");
-        let columns = RESULT_COLUMNS
-            .iter()
-            .map(|column| format!("  \"{column}\","))
-            .collect::<Vec<_>>()
-            .join("\n");
         fs::write(
             root.path().join(PACK_RELATIVE_PATH),
-            format!(
-                "schema_version = 1\n\n[[operation]]\nid = \"star-maildesk-cf.d1-evidence-read\"\ntitle = \"Read Maildesk D1 evidence\"\ndescription = \"Read one fixed body-free evidence projection.\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nquery_path = \"evidence.sql\"\nquery_sha256 = \"{}\"\nresult_columns = [\n{}\n]\n",
-                sha256(query().as_bytes()),
-                columns
-            ),
+            "schema_version = 1\n\n[[operation]]\nid = \"star-maildesk-cf.d1-evidence-read\"\ntitle = \"Read Maildesk D1 evidence\"\ndescription = \"Read one compiler-owned body-free evidence projection.\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nprojection = \"maildesk_v1\"\n",
         )
         .expect("pack");
         git(root.path(), &["add", "."]);
@@ -471,6 +422,15 @@ mod tests {
         assert!(!capability.mutating);
         assert!(capability.request_schema.is_none());
         assert!(capability.verification_contract_supported());
+        let contract = capability
+            .workspace_d1_evidence
+            .as_ref()
+            .expect("evidence contract");
+        assert_eq!(contract.projection, "maildesk_v1");
+        assert_eq!(
+            contract.query_sha256,
+            sha256(MAILDESK_D1_EVIDENCE_SQL_V1.as_bytes())
+        );
         let rendered = serde_json::to_string(&capability).expect("capability JSON");
         for private in ["email", "subject", "recipient", "message_content"] {
             assert!(!rendered.contains(private));
@@ -478,9 +438,10 @@ mod tests {
     }
 
     #[test]
-    fn dirty_query_and_mutating_sql_fail_closed() {
+    fn dirty_authority_and_repository_supplied_sql_fail_closed() {
         let root = fixture();
-        fs::write(root.path().join("evidence.sql"), "DELETE FROM messages;").expect("query drift");
+        fs::write(root.path().join(PACK_RELATIVE_PATH), "schema_version = 1\n")
+            .expect("pack drift");
         let error = load_workspace_d1_evidence_capability(
             &[root.path().to_path_buf()],
             "star-maildesk-cf.d1-evidence-read",
@@ -488,8 +449,52 @@ mod tests {
         .expect_err("dirty authority fails closed");
         assert!(error.to_string().contains("must be clean"));
 
-        assert!(validate_fixed_query(b"DELETE FROM messages;").is_err());
-        assert!(validate_fixed_query(b"PRAGMA table_info(messages);").is_err());
-        assert!(validate_fixed_query(b"SELECT ? AS active_policy_digest;").is_err());
+        let root = fixture();
+        let pack = root.path().join(PACK_RELATIVE_PATH);
+        let mut declaration = fs::read_to_string(&pack).expect("pack");
+        declaration.push_str(
+            "query_path = \"recipient.sql\"\nquery_sha256 = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        );
+        fs::write(&pack, declaration).expect("alias-smuggling declaration");
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "attempt query injection"]);
+        let error = load_workspace_d1_evidence_capability(
+            &[root.path().to_path_buf()],
+            "star-maildesk-cf.d1-evidence-read",
+        )
+        .expect_err("repository SQL fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn operation_identity_and_projection_are_exact() {
+        for (field, replacement) in [
+            (
+                "id = \"star-maildesk-cf.d1-evidence-read\"",
+                "id = \"other-repository.d1-evidence-read\"",
+            ),
+            (
+                "projection = \"maildesk_v1\"",
+                "projection = \"caller_sql\"",
+            ),
+        ] {
+            let root = fixture();
+            let pack = root.path().join(PACK_RELATIVE_PATH);
+            let declaration = fs::read_to_string(&pack)
+                .expect("pack")
+                .replace(field, replacement);
+            fs::write(&pack, declaration).expect("drifted pack");
+            git(root.path(), &["add", "."]);
+            git(root.path(), &["commit", "-qm", "drift operation"]);
+            let capability_id = if replacement.contains("other-repository") {
+                "other-repository.d1-evidence-read"
+            } else {
+                "star-maildesk-cf.d1-evidence-read"
+            };
+            let error =
+                load_workspace_d1_evidence_capability(&[root.path().to_path_buf()], capability_id)
+                    .expect_err("identity or projection drift");
+            assert!(error.to_string().contains("fixed Maildesk projection"));
+        }
     }
 }

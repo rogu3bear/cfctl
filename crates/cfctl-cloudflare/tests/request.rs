@@ -147,7 +147,7 @@ fn r2_private_digest_capability(max_object_bytes: u64) -> CapabilityV1 {
         "GET",
         "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}",
     );
-    capability.product = "R2 Object".to_owned();
+    "R2 Object".clone_into(&mut capability.product);
     capability.adapter_status = AdapterStatus::Native;
     capability.risk = RiskClass::Read;
     capability.effect = EffectClass::ReadOnly;
@@ -168,7 +168,7 @@ fn r2_private_digest_capability(max_object_bytes: u64) -> CapabilityV1 {
         body_mode: ResponseBodyModeV1::R2PrivateObjectDigest,
     });
     capability.verification.required = true;
-    capability.verification.strategy = "r2_private_object_digest".to_owned();
+    "r2_private_object_digest".clone_into(&mut capability.verification.strategy);
     capability.r2_private_object_digest =
         Some(R2PrivateObjectDigestContractV1 { max_object_bytes });
     capability

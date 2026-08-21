@@ -1888,9 +1888,8 @@ pub struct WorkspaceD1EvidenceContractV1 {
     pub production_config_path: String,
     pub database_binding: String,
     pub wrangler_version: String,
-    pub query_path: String,
+    pub projection: String,
     pub query_sha256: String,
-    pub result_columns: Vec<String>,
 }
 
 /// Body-free operational evidence emitted by a workspace-owned Maildesk D1
@@ -2561,9 +2560,8 @@ impl CapabilityV1 {
                             && !contract.production_config_path.is_empty()
                             && !contract.database_binding.is_empty()
                             && !contract.wrangler_version.is_empty()
-                            && !contract.query_path.is_empty()
+                            && contract.projection == "maildesk_v1"
                             && contract.query_sha256.starts_with("sha256:")
-                            && !contract.result_columns.is_empty()
                     })
             }
             "r2_private_file_upload_etag_and_conditional_read" => {

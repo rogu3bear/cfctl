@@ -2605,6 +2605,10 @@ impl Executor {
     /// Streams one exact private R2 object into an in-memory digest state. The
     /// object bytes are never materialized as a serializable value or retained
     /// in a file, error, response, receipt, or log.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the private stream, retry, byte bound, ETag validation, and body-free receipt remain visible at one provider boundary"
+    )]
     pub async fn execute_r2_private_object_digest(
         &self,
         capability: &CapabilityV1,
@@ -8897,9 +8901,20 @@ fn mismatched_verifiable_planned_fields(
             }
             if matches!(
                 capability.id.as_str(),
-                "access-policies-update-human-access-controls"
-                    | "access-policies-update-operator-group-allow-policy"
+                "access-policies-update-operator-group-allow-policy"
             ) && capability.method == "PUT"
+                && capability.path
+                    == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
+                && matches!(name.as_str(), "include" | "exclude")
+            {
+                return !access_operator_group_policy_field_matches(
+                    name,
+                    actual.get(name.as_str()),
+                    planned_value,
+                );
+            }
+            if capability.id == "access-policies-update-human-access-controls"
+                && capability.method == "PUT"
                 && capability.path
                     == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
                 && matches!(name.as_str(), "include" | "exclude" | "mfa_config")
@@ -9041,7 +9056,7 @@ fn access_human_policy_complete_snapshot_mismatches(
     let mut mismatches = actual
         .keys()
         .filter(|field| {
-            !matches!(
+            !(matches!(
                 field.as_str(),
                 "created_at"
                     | "decision"
@@ -9055,7 +9070,7 @@ fn access_human_policy_complete_snapshot_mismatches(
                     | "session_duration"
                     | "uid"
                     | "updated_at"
-            ) && !(permits_mfa_config && field.as_str() == "mfa_config")
+            ) || permits_mfa_config && field.as_str() == "mfa_config")
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -9223,6 +9238,38 @@ fn access_human_policy_field_matches(name: &str, actual: Option<&Value>, planned
     }
 }
 
+fn access_operator_group_policy_field_matches(
+    name: &str,
+    actual: Option<&Value>,
+    planned: &Value,
+) -> bool {
+    let Some(actual) = actual.and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(planned) = planned.as_array() else {
+        return false;
+    };
+    match name {
+        "exclude" => actual.is_empty() && planned.is_empty(),
+        "include" => exact_operator_group_rule(actual)
+            .zip(exact_operator_group_rule(planned))
+            .is_some_and(|(actual, planned)| actual == planned),
+        _ => false,
+    }
+}
+
+fn exact_operator_group_rule(values: &[Value]) -> Option<String> {
+    let [rule] = values else {
+        return None;
+    };
+    let rule = rule.as_object().filter(|rule| rule.len() == 1)?;
+    let group = rule
+        .get("group")?
+        .as_object()
+        .filter(|group| group.len() == 1)?;
+    canonical_cloudflare_uuid(group.get("id")?.as_str()?)
+}
+
 fn normalized_access_human_mfa_config(
     config: &serde_json::Map<String, Value>,
     tolerate_empty_provider_duration: bool,
@@ -9318,7 +9365,7 @@ mod access_application_projection_tests {
     use super::{
         CallInput, access_application_set_field_matches,
         access_exact_snapshot_optional_absence_mismatches, access_human_policy_field_matches,
-        exact_resource_readback_identity_matches,
+        access_operator_group_policy_field_matches, exact_resource_readback_identity_matches,
     };
     use cfctl_core::CapabilityV1;
     use serde_json::{Value, json};
@@ -9556,6 +9603,98 @@ mod access_application_projection_tests {
     }
 
     #[test]
+    fn operator_group_policy_readback_accepts_only_one_exact_group_rule() {
+        let group = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810";
+        let compact = "7b0bc4775d424dabb0eac97d0aef7810";
+        assert!(access_operator_group_policy_field_matches(
+            "include",
+            Some(&json!([{"group":{"id":compact}}])),
+            &json!([{"group":{"id":group}}]),
+        ));
+        assert!(access_operator_group_policy_field_matches(
+            "exclude",
+            Some(&json!([])),
+            &json!([]),
+        ));
+        for invalid in [
+            json!([{"group":{"id":"wrong"}}]),
+            json!([
+                {"group":{"id":group}},
+                {"email_domain":{"domain":"example.com"}}
+            ]),
+            json!([{"group":{"id":group,"extra":true}}]),
+            json!([{"group":{"id":group},"extra":true}]),
+        ] {
+            assert!(!access_operator_group_policy_field_matches(
+                "include",
+                Some(&invalid),
+                &json!([{"group":{"id":group}}]),
+            ));
+        }
+    }
+
+    #[test]
+    fn operator_group_policy_update_verifies_the_complete_exact_provider_shape() {
+        let mut policy = CapabilityV1::new(
+            "access-policies-update-operator-group-allow-policy",
+            "Update one owned operator-group allow policy",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        );
+        policy.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: policy.path.clone(),
+            read_capability_id: "access-policies-get-an-access-policy".to_owned(),
+            verified_response_fields: [
+                "decision",
+                "exclude",
+                "include",
+                "name",
+                "precedence",
+                "require",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        });
+        let group = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810";
+        let Value::Object(planned) = json!({
+            "decision":"allow",
+            "exclude":[],
+            "include":[{"group":{"id":group}}],
+            "name":"Allow operators",
+            "precedence":1,
+            "require":[]
+        }) else {
+            unreachable!("literal operator-group policy body must be an object");
+        };
+        let mut matching = Value::Object(planned.clone());
+        matching["include"] = json!([{"group":{"id":"7b0bc4775d424dabb0eac97d0aef7810"}}]);
+        matching["reusable"] = json!(false);
+        assert!(
+            super::mismatched_verifiable_planned_fields(&policy, &planned, &matching).is_empty(),
+            "the exact operator-group update must survive provider readback normalization"
+        );
+
+        for (field, value) in [
+            ("include", json!([{"group":{"id":"wrong"}}])),
+            (
+                "include",
+                json!([{"group":{"id":group}},{"email_domain":{"domain":"example.com"}}]),
+            ),
+            ("reusable", json!(true)),
+            ("future_policy_mode", json!("provider-added")),
+        ] {
+            let mut drifted = matching.clone();
+            drifted[field] = value;
+            assert!(
+                !super::mismatched_verifiable_planned_fields(&policy, &planned, &drifted)
+                    .is_empty(),
+                "{field} drift must fail exact operator-group readback"
+            );
+        }
+    }
+
+    #[test]
     fn human_policy_complete_readback_rejects_reusable_or_unclassified_snapshot() {
         let mut policy = CapabilityV1::new(
             "access-policies-update-human-access-controls",
@@ -9773,6 +9912,10 @@ mod access_application_projection_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one matrix proves top-level and nested provider drift across every supported Access application variant"
+    )]
     fn access_application_complete_readback_rejects_unplanned_top_level_and_nested_drift() {
         let variants = [
             (

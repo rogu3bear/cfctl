@@ -8247,8 +8247,8 @@ fn finalize_r2_private_object_digest_contract(capabilities: &mut BTreeMap<String
         && selectors_are_exact;
     if raw_supported {
         let mut digest = raw;
-        digest.id = "r2-get-private-object-digest".to_owned();
-        digest.title = "Read one private R2 object digest without returning bytes".to_owned();
+        "r2-get-private-object-digest".clone_into(&mut digest.id);
+        "Read one private R2 object digest without returning bytes".clone_into(&mut digest.title);
         digest.description = Some(
             "Streams one exact private object only inside cfctl and returns bounded identity, ETag, byte count, and SHA-256 evidence; object bytes never enter stdout, plans, receipts, logs, or files."
                 .to_owned(),
@@ -17789,10 +17789,9 @@ pub fn access_application_login_methods_materialized_schema() -> Value {
 #[must_use]
 pub fn access_application_owned_whole_host_schema() -> Value {
     let mut schema = access_application_login_methods_materialized_schema();
-    let properties = schema
-        .get_mut("properties")
-        .and_then(Value::as_object_mut)
-        .expect("closed Access application schema has properties");
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return Value::Null;
+    };
     properties.insert(
         "domain".to_owned(),
         serde_json::json!({
@@ -19942,6 +19941,10 @@ fn access_policy_delete_identity_supported(capabilities: &BTreeMap<String, Capab
         })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the create and update variants share one visible fail-closed schema and companion-operation derivation"
+)]
 fn finalize_access_operator_group_policy_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
