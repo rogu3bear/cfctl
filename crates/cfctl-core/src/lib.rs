@@ -924,6 +924,7 @@ pub enum ResponseBodyModeV1 {
     JsonValue,
     GraphqlJson,
     NegotiatedRows,
+    R2PrivateObjectDigest,
     Empty,
     Unsupported,
 }
@@ -1872,6 +1873,47 @@ pub struct WorkspaceD1PolicyProjectionContractV1 {
     pub rollback_capability_id: String,
 }
 
+/// Repository-bound, caller-invariant D1 evidence projection. The committed
+/// query is executed only inside cfctl and its rows are reduced to the typed,
+/// body-free `MaildeskD1EvidenceV1` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1EvidenceContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub projection: String,
+    pub query_sha256: String,
+}
+
+/// Body-free operational evidence emitted by a workspace-owned Maildesk D1
+/// projection. No message, address, recipient, subject, arbitrary row, or SQL
+/// field exists in this public type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaildeskD1EvidenceV1 {
+    pub schema_version: u8,
+    pub active_policy_digest: String,
+    pub desired_state_digest: String,
+    pub semantic_projection_digest: String,
+    pub immutable_policy_object_key: String,
+    pub expected_domain_count: u64,
+    pub projected_domain_count: u64,
+    pub expected_route_count: u64,
+    pub projected_route_count: u64,
+    pub approved_schema_present: bool,
+    pub approved_table_presence: BTreeMap<String, bool>,
+    pub audit_event_counts: BTreeMap<String, u64>,
+    pub queue_correlation_count: u64,
+    pub dlq_correlation_count: u64,
+    pub body_returned: bool,
+}
+
 /// A create-only private local file upload to one exact R2 object key. The
 /// bytes remain in a mode-0600 managed stage; plans and receipts carry only
 /// content identity and bounded metadata.
@@ -1883,6 +1925,25 @@ pub struct R2PrivateFileUploadContractV1 {
     pub read_capability_id: String,
     pub delete_capability_id: String,
     pub etag_algorithm: String,
+}
+
+/// A bounded R2 object read whose bytes may exist only inside the executor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R2PrivateObjectDigestContractV1 {
+    pub max_object_bytes: u64,
+}
+
+/// Body-free identity receipt for one exact private R2 object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R2PrivateObjectDigestV1 {
+    pub schema_version: u8,
+    pub account_id: String,
+    pub bucket_name: String,
+    pub object_key: String,
+    pub byte_count: u64,
+    pub etag: String,
+    pub sha256: String,
+    pub body_returned: bool,
 }
 
 /// Provider readback used after Email Sending DNS repair. The verifier reads
@@ -2126,7 +2187,11 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_evidence: Option<WorkspaceD1EvidenceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r2_private_object_digest: Option<R2PrivateObjectDigestContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email_sending_dns_repair: Option<EmailSendingDnsRepairContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2244,7 +2309,9 @@ impl CapabilityV1 {
             d1_restore_exact_bookmark: None,
             workspace_d1_migration: None,
             workspace_d1_policy_projection: None,
+            workspace_d1_evidence: None,
             r2_private_file_upload: None,
+            r2_private_object_digest: None,
             email_sending_dns_repair: None,
             email_routing_subdomain_dns: None,
             d1_approved_mln_import: None,
@@ -2478,6 +2545,25 @@ impl CapabilityV1 {
                                 && contract.rollback_capability_id == "d1-restore-exact-bookmark"
                         })
             }
+            "workspace_d1_maildesk_body_free_evidence" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self.workspace_d1_evidence.as_ref().is_some_and(|contract| {
+                        !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.production_config_path.is_empty()
+                            && !contract.database_binding.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && contract.projection == "maildesk_v1"
+                            && contract.query_sha256.starts_with("sha256:")
+                    })
+            }
             "r2_private_file_upload_etag_and_conditional_read" => {
                 self.id == "r2-put-object"
                     && self.method == "PUT"
@@ -2499,6 +2585,25 @@ impl CapabilityV1 {
                                 && contract.delete_capability_id == "r2-delete-object"
                                 && contract.etag_algorithm == "md5"
                         })
+            }
+            "r2_private_object_digest" => {
+                self.id == "r2-get-private-object-digest"
+                    && self.method == "GET"
+                    && self.path
+                        == "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self.permissions == ["Workers R2 Storage Read"]
+                    && self.request_schema.is_none()
+                    && self.r2_private_object_digest.as_ref().is_some_and(|contract| {
+                        contract.max_object_bytes > 0
+                            && contract.max_object_bytes <= 300_000_000
+                    })
+                    && self.response_contract.as_ref().is_some_and(|response| {
+                        response.success_statuses == ["200"]
+                            && response.body_mode == ResponseBodyModeV1::R2PrivateObjectDigest
+                    })
             }
             "email_sending_dns_status_reports_ready" => {
                 self.id == "email-sending-subdomains-fix-sending-subdomain-dns"

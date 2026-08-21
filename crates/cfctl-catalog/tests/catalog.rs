@@ -6304,6 +6304,11 @@ fn access_human_policy_fixture() -> serde_json::Value {
         expected_effect: EffectClass::ReversibleWrite,
     };
     let mut document = access_configuration_fixture(&case);
+    let collection_parameters = json!([
+        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+        {"in":"path","name":"app_id","required":true,"schema":{"type":"string"}}
+    ]);
+    document["paths"][case.collection_path]["post"]["parameters"] = collection_parameters.clone();
     document["paths"][case.detail_path]["parameters"]
         .as_array_mut()
         .expect("detail parameters")
@@ -6329,6 +6334,26 @@ fn access_human_policy_fixture() -> serde_json::Value {
     });
     document["paths"][case.detail_path]["put"]["requestBody"]["content"]["application/json"]["schema"] =
         compatible_access_human_policy_put_schema();
+    document["paths"][case.collection_path]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"] = compatible_access_human_policy_put_schema();
+    document["paths"][case.collection_path]["get"] = json!({
+        "operationId":"access-policies-list-access-policies",
+        "summary":"List Access policies",
+        "tags":["Access application-scoped policies"],
+        "parameters":collection_parameters,
+        "responses":{
+            "200":{
+                "description":"Access policies",
+                "content":{"application/json":{"schema":{
+                    "type":"object",
+                    "properties":{
+                        "success":{"type":"boolean"},
+                        "result":{"type":"array","items":{"$ref":"#/components/schemas/Widget"}}
+                    }
+                }}}
+            }
+        }
+    });
     document
 }
 
@@ -6396,6 +6421,88 @@ fn access_human_policy_update_is_closed_and_exact_resource_verified() {
     assert!(!rendered_schema.contains("\"token\""));
     assert!(!rendered_schema.contains("\"client_secret\""));
     assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn access_operator_group_policy_create_and_update_are_closed_and_exact() {
+    let snapshot = normalize_openapi(&access_human_policy_fixture())
+        .expect("operator-group Access policy catalog");
+    let create = snapshot
+        .get("access-policies-create-operator-group-allow-policy")
+        .expect("derived operator-group create");
+    let update = snapshot
+        .get("access-policies-update-operator-group-allow-policy")
+        .expect("derived operator-group update");
+
+    for capability in [create, update] {
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{} blocked: {:?}",
+            capability.id,
+            capability.blocked_reason
+        );
+        assert_eq!(capability.risk, RiskClass::IdentityOrOwnership);
+        assert_eq!(capability.effect, EffectClass::IdentityOrOwnership);
+        let schema = capability.request_schema.as_ref().expect("closed schema");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["decision"]["enum"], json!(["allow"]));
+        assert_eq!(schema["properties"]["include"]["minItems"], 1);
+        assert_eq!(schema["properties"]["include"]["maxItems"], 1);
+        assert_eq!(schema["properties"]["exclude"]["maxItems"], 0);
+        assert_eq!(schema["properties"]["require"]["maxItems"], 0);
+        assert!(
+            schema
+                .pointer("/properties/include/items/properties/group/properties/id")
+                .is_some()
+        );
+        let rendered = serde_json::to_string(schema).expect("schema JSON");
+        for forbidden in [
+            "bypass",
+            "service_token",
+            "device_posture",
+            "external_evaluation",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert!(capability.mutation_contract_gaps().is_empty());
+    }
+
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let created = create.created_resource.as_ref().expect("created resource");
+    assert_eq!(created.identity_selector, "policy_id");
+    assert_eq!(
+        created.delete_capability_id,
+        "access-policies-delete-an-access-policy"
+    );
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert_eq!(
+        update.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    for generic_id in [
+        "access-policies-create-an-access-policy",
+        "access-policies-update-an-access-policy",
+    ] {
+        let generic = snapshot.get(generic_id).expect("generic policy mutation");
+        assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+        assert!(
+            generic
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("polymorphic"))
+        );
+    }
 }
 
 #[test]
@@ -6863,6 +6970,61 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
     let generic = snapshot
         .get("access-applications-update-an-access-application")
         .expect("generic update");
+    assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+}
+
+#[test]
+fn owned_whole_host_access_application_update_is_closed_and_governed() {
+    let snapshot = normalize_openapi(&access_application_login_methods_fixture())
+        .expect("Access whole-host catalog");
+    let update = snapshot
+        .get("access-applications-update-owned-self-hosted-whole-host")
+        .expect("derived owned whole-host update");
+
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(update.effect, EffectClass::IdentityOrOwnership);
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("additionalProperties"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/type/enum/0"))
+            .and_then(serde_json::Value::as_str),
+        Some("self_hosted")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/destinations/maxItems"))
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/self_hosted_domains/maxItems"))
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert!(update.mutation_contract_gaps().is_empty());
+
+    let generic = snapshot
+        .get("access-applications-update-an-access-application")
+        .expect("generic update remains present");
     assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
 }
 

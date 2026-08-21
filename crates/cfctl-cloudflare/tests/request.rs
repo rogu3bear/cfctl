@@ -16,12 +16,13 @@ use cfctl_core::{
     GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
     PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
     QuerySerializationV1, R2LogRetrievalContractV1, R2PrivateFileUploadContractV1,
-    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1,
-    SelectorV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
-    UpdatedResourceContractV1,
+    R2PrivateObjectDigestContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
+    TransactionStageV1, UpdatedResourceContractV1,
 };
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -139,6 +140,81 @@ fn r2_private_upload_capability() -> CapabilityV1 {
     capability
 }
 
+fn r2_private_digest_capability(max_object_bytes: u64) -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "r2-get-private-object-digest",
+        "Read private object digest",
+        "GET",
+        "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}",
+    );
+    "R2 Object".clone_into(&mut capability.product);
+    capability.adapter_status = AdapterStatus::Native;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.permissions = vec!["Workers R2 Storage Read".to_owned()];
+    capability.selectors = ["account_id", "bucket_name", "object_key"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/octet-stream".to_owned()],
+        body_mode: ResponseBodyModeV1::R2PrivateObjectDigest,
+    });
+    capability.verification.required = true;
+    "r2_private_object_digest".clone_into(&mut capability.verification.strategy);
+    capability.r2_private_object_digest =
+        Some(R2PrivateObjectDigestContractV1 { max_object_bytes });
+    capability
+}
+
+async fn single_private_object_server(
+    body: &'static [u8],
+    etag: Option<&str>,
+) -> (String, tokio::task::JoinHandle<String>) {
+    let etag = etag.map(str::to_owned);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept request");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let etag = etag.map_or_else(String::new, |value| format!("ETag: {value}\r\n"));
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n{etag}Connection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write headers");
+        stream.write_all(body).await.expect("write private object");
+        request
+    });
+    (address.to_string(), server)
+}
+
+fn r2_private_digest_input() -> CallInput {
+    CallInput {
+        selectors: json!({
+            "account_id":"account",
+            "bucket_name":"bucket",
+            "object_key":"config/policy/sha256.json"
+        }),
+        query: json!({}),
+        ..CallInput::default()
+    }
+}
+
 #[test]
 fn r2_object_keys_preserve_literal_slash_segments() {
     let request = RequestBuilder::new("https://api.cloudflare.test/client/v4")
@@ -184,6 +260,118 @@ fn r2_object_keys_reject_empty_and_dot_segments() {
             .expect_err("unsafe object key must fail closed");
         assert!(matches!(error, CloudflareError::InvalidSelector(name) if name == "object_key"));
     }
+}
+
+#[tokio::test]
+async fn r2_private_digest_streams_identity_without_returning_object_bytes() {
+    let private = b"private-object-bytes";
+    let (address, server) = single_private_object_server(private, Some("\"object-etag\"")).await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_r2_private_object_digest(
+        &r2_private_digest_capability(300_000_000),
+        &r2_private_digest_input(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("digest read");
+
+    assert!(response.success);
+    assert_eq!(
+        response.result.get("byte_count"),
+        Some(&json!(private.len()))
+    );
+    assert_eq!(response.result.get("etag"), Some(&json!("\"object-etag\"")));
+    assert_eq!(
+        response.result.get("sha256"),
+        Some(&json!(format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(private))
+        )))
+    );
+    assert_eq!(response.result.get("body_returned"), Some(&json!(false)));
+    let receipt = serde_json::to_string(&response).expect("receipt");
+    assert!(!receipt.contains("private-object-bytes"));
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with(
+        "GET /client/v4/accounts/account/r2/buckets/bucket/objects/config/policy/sha256.json "
+    ));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer selected-token")
+    );
+}
+
+#[tokio::test]
+async fn r2_private_digest_rejects_size_and_etag_drift_without_disclosure() {
+    let (address, server) = single_private_object_server(b"four", Some("\"etag\"")).await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_r2_private_object_digest(
+        &r2_private_digest_capability(3),
+        &r2_private_digest_input(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect_err("oversized object");
+    assert!(error.to_string().contains("byte bound"));
+    assert!(!error.to_string().contains("four"));
+    server.await.expect("server joins");
+
+    let (address, server) = single_private_object_server(b"secret", None).await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_r2_private_object_digest(
+        &r2_private_digest_capability(300_000_000),
+        &r2_private_digest_input(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect_err("missing ETag");
+    assert!(error.to_string().contains("exactly one ETag"));
+    assert!(!error.to_string().contains("secret"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn r2_private_digest_transport_failure_returns_no_object_material() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let address = listener.local_addr().expect("ephemeral address");
+    drop(listener);
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .with_max_retries(0)
+    .execute_r2_private_object_digest(
+        &r2_private_digest_capability(300_000_000),
+        &r2_private_digest_input(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect_err("transport failure");
+    assert!(matches!(error, CloudflareError::Http(_)));
 }
 
 #[tokio::test]

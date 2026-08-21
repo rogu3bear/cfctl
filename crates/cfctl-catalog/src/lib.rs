@@ -16,10 +16,11 @@ use cfctl_core::{
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
     Maturity, Mln0142PostImportSchemaContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1,
     PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
-    R2PrivateFileUploadContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
-    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
+    R2PrivateFileUploadContractV1, R2PrivateObjectDigestContractV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, RollbackSpecV1, SamePathReadContractV1,
+    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+    SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
+    UpdatedResourceContractV1, VerificationSpecV1, WorkflowContractV1, WorkflowStepV1, hash_value,
     request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
@@ -163,6 +164,64 @@ mod maildesk_provider_contract_tests {
                         && contract.read_capability_id == "r2-get-object"
                         && contract.delete_capability_id == "r2-delete-object"
                 })
+        );
+    }
+
+    #[test]
+    fn r2_private_digest_is_body_free_and_generic_read_remains_blocked() {
+        let mut capabilities = BTreeMap::new();
+        let mut raw = read("r2-get-object", R2_OBJECT_PATH, "R2 Object");
+        raw.selectors = vec![
+            SelectorV1 {
+                name: "account_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+            SelectorV1 {
+                name: "bucket_name".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+            object_key_selector("Slashes MUST NOT be percent-encoded"),
+        ];
+        capabilities.insert(raw.id.clone(), raw);
+
+        finalize_r2_private_object_digest_contract(&mut capabilities);
+
+        let raw = &capabilities["r2-get-object"];
+        assert_eq!(raw.adapter_status, AdapterStatus::Blocked);
+        assert!(
+            raw.blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("raw R2 object bytes"))
+        );
+        let digest = &capabilities["r2-get-private-object-digest"];
+        assert_eq!(digest.adapter_status, AdapterStatus::Native);
+        assert_eq!(digest.risk, RiskClass::Read);
+        assert_eq!(digest.effect, EffectClass::ReadOnly);
+        assert!(!digest.mutating);
+        assert!(digest.request_schema.is_none());
+        assert!(digest.verification_contract_supported());
+        assert!(digest.r2_private_file_upload.is_none());
+        assert_eq!(
+            digest
+                .r2_private_object_digest
+                .as_ref()
+                .map(|contract| contract.max_object_bytes),
+            Some(300_000_000)
+        );
+        assert_eq!(
+            digest
+                .response_contract
+                .as_ref()
+                .map(|contract| contract.body_mode),
+            Some(ResponseBodyModeV1::R2PrivateObjectDigest)
         );
     }
 
@@ -8166,6 +8225,76 @@ fn finalize_r2_private_file_upload_contract(capabilities: &mut BTreeMap<String, 
     refresh_dynamic_mutation_contract(capability);
 }
 
+fn finalize_r2_private_object_digest_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let Some(raw) = capabilities.get("r2-get-object").cloned() else {
+        return;
+    };
+    let selectors_are_exact = ["account_id", "bucket_name", "object_key"]
+        .iter()
+        .all(|name| {
+            raw.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        });
+    let raw_supported = raw.method == "GET"
+        && raw.path == R2_OBJECT_PATH
+        && raw.product == "R2 Object"
+        && !raw.mutating
+        && raw.request_schema.is_none()
+        && selectors_are_exact;
+    if raw_supported {
+        let mut digest = raw;
+        "r2-get-private-object-digest".clone_into(&mut digest.id);
+        "Read one private R2 object digest without returning bytes".clone_into(&mut digest.title);
+        digest.description = Some(
+            "Streams one exact private object only inside cfctl and returns bounded identity, ETag, byte count, and SHA-256 evidence; object bytes never enter stdout, plans, receipts, logs, or files."
+                .to_owned(),
+        );
+        digest.permissions = vec!["Workers R2 Storage Read".to_owned()];
+        digest.risk = RiskClass::Read;
+        digest.effect = EffectClass::ReadOnly;
+        digest.adapter_status = AdapterStatus::Native;
+        digest.blocked_reason = None;
+        digest.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/octet-stream".to_owned()],
+            body_mode: ResponseBodyModeV1::R2PrivateObjectDigest,
+        });
+        digest.verification = VerificationSpecV1 {
+            required: true,
+            strategy: "r2_private_object_digest".to_owned(),
+        };
+        digest.rollback = RollbackSpecV1 {
+            supported: false,
+            strategy: None,
+            warning: None,
+        };
+        digest.r2_private_file_upload = None;
+        digest.r2_private_object_digest = Some(R2PrivateObjectDigestContractV1 {
+            max_object_bytes: 300_000_000,
+        });
+        zero_direct_usage_cost(
+            &mut digest,
+            "the digest is one R2 Class B read with no direct configuration charge and never retains object bytes",
+            vec![official_reference(
+                "R2 pricing",
+                "https://developers.cloudflare.com/r2/pricing/",
+            )],
+        );
+        capabilities.insert(digest.id.clone(), digest);
+    }
+    if let Some(raw) = capabilities.get_mut("r2-get-object") {
+        raw.adapter_status = AdapterStatus::Blocked;
+        raw.blocked_reason = Some(
+            "raw R2 object bytes are intentionally unavailable; use r2-get-private-object-digest for body-free identity evidence"
+                .to_owned(),
+        );
+    }
+}
+
 fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
     let read_supported = capabilities
         .get("r2-get-bucket-lifecycle-configuration")
@@ -8542,6 +8671,7 @@ fn apply_post_normalization_contracts(
     finalize_dns_record_delete_response_contract(capabilities);
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_r2_private_file_upload_contract(capabilities);
+    finalize_r2_private_object_digest_contract(capabilities);
     finalize_r2_lifecycle_contract(capabilities);
     finalize_email_sending_contracts(capabilities);
     finalize_email_routing_subdomain_contract(capabilities);
@@ -8550,6 +8680,7 @@ fn apply_post_normalization_contracts(
     finalize_access_application_create_contract(document, capabilities);
     finalize_access_application_login_methods_contract(document, capabilities);
     finalize_access_human_policy_contract(document, capabilities);
+    finalize_access_operator_group_policy_contracts(document, capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -17524,16 +17655,26 @@ const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id
 const ACCESS_APP_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/put/requestBody/content/application~1json/schema";
 const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID: &str =
+    "access-applications-update-owned-self-hosted-whole-host";
 const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-app-launcher-login-methods";
 const ACCESS_APP_UPDATE_CAPABILITY_ID: &str = "access-applications-update-an-access-application";
 const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
 const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
     "access-policies-update-human-access-controls";
+const ACCESS_OPERATOR_GROUP_POLICY_CREATE_CAPABILITY_ID: &str =
+    "access-policies-create-operator-group-allow-policy";
+const ACCESS_OPERATOR_GROUP_POLICY_UPDATE_CAPABILITY_ID: &str =
+    "access-policies-update-operator-group-allow-policy";
+const ACCESS_POLICY_CREATE_CAPABILITY_ID: &str = "access-policies-create-an-access-policy";
 const ACCESS_POLICY_UPDATE_CAPABILITY_ID: &str = "access-policies-update-an-access-policy";
 const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
+const ACCESS_POLICY_DELETE_CAPABILITY_ID: &str = "access-policies-delete-an-access-policy";
+const ACCESS_POLICY_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies";
 const ACCESS_POLICY_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+const ACCESS_POLICY_CREATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}~1policies/post/requestBody/content/application~1json/schema";
 const ACCESS_POLICY_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}~1policies~1{policy_id}/put/requestBody/content/application~1json/schema";
 
 /// Exact Cloudflare Access identity-provider identifier renderings accepted by
@@ -17640,6 +17781,55 @@ pub fn access_application_login_methods_materialized_schema() -> Value {
         },
         "x-cfctl-body-required":true
     })
+}
+
+/// Complete caller-visible body for one owned whole-host self-hosted Access
+/// application. The runtime additionally proves collection uniqueness and
+/// exact hostname ownership before it permits the generic PUT adapter.
+#[must_use]
+pub fn access_application_owned_whole_host_schema() -> Value {
+    let mut schema = access_application_login_methods_materialized_schema();
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return Value::Null;
+    };
+    properties.insert(
+        "domain".to_owned(),
+        serde_json::json!({
+            "type":"string",
+            "format":"hostname",
+            "minLength":1,
+            "maxLength":253,
+            "pattern":"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+        }),
+    );
+    properties.insert(
+        "destinations".to_owned(),
+        serde_json::json!({
+            "type":"array",
+            "minItems":1,
+            "maxItems":1,
+            "items":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","uri"],
+                "properties":{
+                    "type":{"type":"string","enum":["public"]},
+                    "uri":{"type":"string","format":"uri","minLength":9,"maxLength":261}
+                }
+            }
+        }),
+    );
+    properties.insert(
+        "self_hosted_domains".to_owned(),
+        serde_json::json!({
+            "type":"array",
+            "minItems":1,
+            "maxItems":1,
+            "uniqueItems":true,
+            "items":{"type":"string","format":"hostname","minLength":1,"maxLength":253}
+        }),
+    );
+    schema
 }
 
 fn access_app_launcher_login_methods_schema() -> Value {
@@ -19324,6 +19514,23 @@ fn finalize_access_application_login_methods_contract(
         capabilities,
         &source,
         AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID,
+            app_type: "self_hosted",
+            title: "Update one owned whole-host self-hosted Access application",
+            description: "Updates one exact owned self-hosted Access application using a complete closed whole-host body. cfctl proves the selected application is the unique collection candidate for the requested name and hostname, rejects alternate application types and unclassified live fields, binds the complete prior snapshot, and verifies the same exact application after apply.",
+            aliases: &[
+                "update Maildesk routing health Access application",
+                "replace owned whole host Access application settings",
+                "configure exact self hosted Access application",
+            ],
+            request_schema: access_application_owned_whole_host_schema(),
+        },
+    );
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
             capability_id: ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
             app_type: "self_hosted",
             title: "Update self-hosted Access application login methods",
@@ -19453,6 +19660,44 @@ fn access_human_policy_schema() -> Value {
                     "session_duration":{"type":"string","minLength":2,"maxLength":16}
                 }
             }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+/// Closed application-scoped allow policy that delegates eligibility to one
+/// exact Access group and admits no other rule union.
+#[must_use]
+pub fn access_operator_group_allow_policy_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["name","decision","include","exclude","require","precedence"],
+        "properties":{
+            "name":{"type":"string","minLength":1,"maxLength":350},
+            "decision":{"type":"string","enum":["allow"]},
+            "include":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["group"],
+                    "properties":{
+                        "group":{
+                            "type":"object",
+                            "additionalProperties":false,
+                            "required":["id"],
+                            "properties":{"id":access_identity_provider_id_schema()}
+                        }
+                    }
+                }
+            },
+            "exclude":{"type":"array","maxItems":0},
+            "require":{"type":"array","maxItems":0},
+            "precedence":{"type":"integer","minimum":1},
+            "session_duration":{"type":"string","minLength":2,"maxLength":16}
         },
         "x-cfctl-body-required":true
     })
@@ -19648,6 +19893,190 @@ fn finalize_access_human_policy_contract(
         ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.to_owned(),
         capability,
     );
+}
+
+fn access_policy_create_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.method == "POST"
+        && capability.path == ACCESS_POLICY_COLLECTION_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.selectors.len() == 2
+        && ["account_id", "app_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["201"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+fn access_policy_delete_identity_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(ACCESS_POLICY_DELETE_CAPABILITY_ID)
+        .is_some_and(|delete| {
+            delete.method == "DELETE"
+                && delete.path == ACCESS_POLICY_DETAIL_PATH
+                && delete.product == "Access application-scoped policies"
+                && delete.account_scope == "account"
+                && delete.permissions == ["Access: Apps and Policies Write"]
+                && delete.selectors.len() == 3
+                && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+                    delete.selectors.iter().any(|selector| {
+                        selector.name == *name
+                            && selector.location == "path"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+                })
+        })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the create and update variants share one visible fail-closed schema and companion-operation derivation"
+)]
+fn finalize_access_operator_group_policy_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let schema = access_operator_group_allow_policy_schema();
+    let fields = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let source_body_compatible = |pointer: &str| {
+        document.pointer(pointer).is_some_and(|source_schema| {
+            access_application_source_request_body_compatible(document, source_schema, &schema)
+        })
+    };
+    let read_supported = access_policy_read_identity_supported(capabilities)
+        && access_policy_missing_readback_fields(document, &fields).is_empty();
+    let delete_supported = access_policy_delete_identity_supported(capabilities);
+
+    if let Some(source) = capabilities
+        .get(ACCESS_POLICY_CREATE_CAPABILITY_ID)
+        .cloned()
+    {
+        let mut capability = source;
+        ACCESS_OPERATOR_GROUP_POLICY_CREATE_CAPABILITY_ID.clone_into(&mut capability.id);
+        "Create one operator-group Access allow policy".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Creates one exact application-scoped allow policy whose sole eligibility rule references one exact operator group. cfctl proves the complete policy collection contains no exact-name or group-overlap candidate before creation, then verifies the returned policy ID and every intended field. Bypass, service-token, device-posture, external-evaluation, reusable, and arbitrary rule-union variants are impossible."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "create Maildesk operator group allow policy".to_owned(),
+            "add exact Access group policy".to_owned(),
+        ];
+        capability.request_schema = Some(schema.clone());
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.verification.required = true;
+        "created_resource_contains_planned_fields_by_returned_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: ACCESS_POLICY_DETAIL_PATH.to_owned(),
+            identity_selector: "policy_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            read_capability_id: ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+            delete_capability_id: ACCESS_POLICY_DELETE_CAPABILITY_ID.to_owned(),
+            verified_response_fields: fields.clone(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback deletes only the exact policy ID returned by this create operation through a separately reviewed approval-required plan; sessions already issued are not invalidated"
+                .to_owned(),
+        );
+        let supported = access_policy_create_identity_supported(&capability)
+            && source_body_compatible(ACCESS_POLICY_CREATE_REQUEST_SCHEMA_POINTER)
+            && read_supported
+            && delete_supported
+            && !fields.is_empty();
+        capability.adapter_status = if supported {
+            AdapterStatus::DynamicApi
+        } else {
+            AdapterStatus::Blocked
+        };
+        capability.blocked_reason = (!supported).then(|| {
+            "schema drift: the Access policy create/read/delete set no longer supports the closed operator-group allow contract"
+                .to_owned()
+        });
+        refresh_dynamic_mutation_contract(&mut capability);
+        capabilities.insert(capability.id.clone(), capability);
+    }
+
+    if let Some(source) = capabilities
+        .get(ACCESS_POLICY_UPDATE_CAPABILITY_ID)
+        .cloned()
+    {
+        let mut capability = source;
+        ACCESS_OPERATOR_GROUP_POLICY_UPDATE_CAPABILITY_ID.clone_into(&mut capability.id);
+        "Update one operator-group Access allow policy".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Updates one exact application-scoped allow policy using the complete closed operator-group shape. cfctl rejects ambiguous policy ownership, reusable or unrelated policies, alternate rule unions, and unclassified provider fields; it binds the complete prior snapshot including optional-field absence and verifies the exact policy ID after apply."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "update Maildesk operator group allow policy".to_owned(),
+            "replace exact Access group policy".to_owned(),
+        ];
+        capability.request_schema = Some(schema.clone());
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.verification.required = true;
+        "same_path_result_contains_planned_fields_after_update"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: ACCESS_POLICY_DETAIL_PATH.to_owned(),
+            read_capability_id: ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: fields,
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+        capability.rollback.warning = Some(
+            "cfctl binds the complete prior policy and optional-field absence; rollback restores only that exact policy ID through a separately reviewed approval-required plan and does not invalidate sessions already issued"
+                .to_owned(),
+        );
+        let supported = access_policy_update_identity_supported(&capability)
+            && source_body_compatible(ACCESS_POLICY_UPDATE_REQUEST_SCHEMA_POINTER)
+            && read_supported;
+        capability.adapter_status = if supported {
+            AdapterStatus::DynamicApi
+        } else {
+            AdapterStatus::Blocked
+        };
+        capability.blocked_reason = (!supported).then(|| {
+            "schema drift: the Access policy update/read pair no longer supports the closed operator-group allow contract"
+                .to_owned()
+        });
+        refresh_dynamic_mutation_contract(&mut capability);
+        capabilities.insert(capability.id.clone(), capability);
+    }
+
+    for source_id in [
+        ACCESS_POLICY_CREATE_CAPABILITY_ID,
+        ACCESS_POLICY_UPDATE_CAPABILITY_ID,
+    ] {
+        if let Some(source) = capabilities.get_mut(source_id) {
+            source.adapter_status = AdapterStatus::Blocked;
+            source.blocked_reason = Some(
+                "the polymorphic Access policy mutation surface is intentionally blocked; use a closed specialized policy capability"
+                    .to_owned(),
+            );
+        }
+    }
 }
 
 /// Govern Access application creation. The delete side is already governed by
