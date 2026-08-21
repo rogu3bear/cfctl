@@ -13,7 +13,7 @@ drift at the lowest layer that owns the disputed claim.
 | L2 — Public contract | supported commands, types, and operator semantics | `README.md`, `CFCTL_PROMPT.md`, `docs/runtime-policy.md`, `docs/v2-architecture.md` |
 | L3 — Capability | exact supported operations, schemas, adapters, and guidance | catalog metadata consumed by `cfctl catalog`, `resolve`, `guide`, and `call` |
 | L4 — Implementation | behavior that realizes the contract | `crates/*`, `site/*`, the public `cfctl` binary |
-| Gate — Proof | checks required before integration or release | `LOCAL_CI.md`, `cargo xtask verify`, `cargo xtask release` |
+| Gate — Proof | checks required before integration or release | `CONTRIBUTING.md`, `cargo xtask verify`, `cargo xtask release` |
 
 The catalog is authoritative for whether a capability exists and how it is
 called. It does not outrank the product and safety boundaries above it. A new
