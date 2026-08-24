@@ -10323,6 +10323,7 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
             {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
             {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
             {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+            ,{"type":"object","additionalProperties":false,"required":["assertion","migrations"],"properties":{"assertion":{"type":"string","enum":["migration_ledger_equals"]},"migrations":{"type":"array","minItems":1,"maxItems":64,"uniqueItems":true,"items":{"type":"string","minLength":5,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+\\.sql$"}}}}
         ]
     }));
     capability.response_contract = Some(ResponseContractV1 {
@@ -10799,13 +10800,16 @@ fn d1_schema_introspection_supports_every_closed_migration_assertion() {
         json!({"assertion":"trigger_exists","trigger":"document_render_jobs_terminal_generation_guard"}),
         json!({"assertion":"schema_contains","object_type":"table","name":"equity_issuance_evidence_links","fragment":"advisor_equity_instrument"}),
         json!({"assertion":"foreign_key_check_empty"}),
+        json!({"assertion":"migration_ledger_equals","migrations":["0001_init.sql","0002_routes.sql"]}),
     ] {
         let prepared = builder
             .build(&capability, &d1_schema_input(body))
             .expect("supported assertion");
         let wire = prepared.body.expect("compiler-owned D1 body");
         assert!(wire["sql"].as_str().is_some_and(|sql| {
-            sql.starts_with("SELECT ") && !sql.contains(';') && !sql.contains("--")
+            (sql.starts_with("SELECT ") || sql.starts_with("WITH expected("))
+                && !sql.contains(';')
+                && !sql.contains("--")
         }));
         assert!(wire["params"].is_array());
     }
