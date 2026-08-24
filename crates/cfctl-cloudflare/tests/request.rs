@@ -4889,6 +4889,97 @@ async fn execute_paginated_workers_read(
     .await
 }
 
+fn queue_consumers_single_page_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "queues-list-consumers",
+        "List Queue Consumers",
+        "GET",
+        "/accounts/{account_id}/queues/{queue_id}/consumers",
+    );
+    capability.selectors = ["account_id", "queue_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    capability
+}
+
+async fn execute_queue_consumers_single_page_read(
+    address: &str,
+) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &queue_consumers_single_page_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1","queue_id":"queue-1"}),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn queue_consumers_accepts_provider_single_page_metadata_without_inventing_pagination() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":1}}"#,
+    ])
+    .await;
+
+    let response = execute_queue_consumers_single_page_read(&address)
+        .await
+        .expect("documented single-page consumer inventory");
+
+    assert_eq!(response.result, json!([{"consumer_id":"consumer-1"}]));
+    let info = response.result_info.expect("normalized completeness proof");
+    assert_eq!(info["count"], json!(1));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn queue_consumers_marks_the_documented_metadata_free_response_complete() {
+    let (address, server) =
+        json_response_sequence_server(vec![r#"{"success":true,"result":[],"errors":[]}"#]).await;
+
+    let response = execute_queue_consumers_single_page_read(&address)
+        .await
+        .expect("metadata-free documented single page");
+
+    assert_eq!(response.result, json!([]));
+    let info = response.result_info.expect("normalized completeness proof");
+    assert_eq!(info["count"], json!(0));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn queue_consumers_rejects_metadata_that_claims_an_incomplete_single_page() {
+    for body in [
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":2}}"#,
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"cursors":{"after":"next"}}}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = execute_queue_consumers_single_page_read(&address)
+            .await
+            .expect_err("incomplete single-page inventory must fail closed");
+        assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
+}
+
 #[tokio::test]
 async fn executor_normalizes_a_provider_capped_terminal_page() {
     let (address, server) = json_response_sequence_server(vec![
