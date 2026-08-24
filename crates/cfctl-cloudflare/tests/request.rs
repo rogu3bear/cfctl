@@ -4965,10 +4965,30 @@ async fn queue_consumers_marks_the_documented_metadata_free_response_complete() 
 }
 
 #[tokio::test]
+async fn queue_consumers_accepts_zero_total_pages_only_for_an_empty_single_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":20,"count":0,"total_count":0,"total_pages":0}}"#,
+    ])
+    .await;
+
+    let response = execute_queue_consumers_single_page_read(&address)
+        .await
+        .expect("empty single-page consumer inventory");
+
+    assert_eq!(response.result, json!([]));
+    let info = response.result_info.expect("normalized completeness proof");
+    assert_eq!(info["count"], json!(0));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
 async fn queue_consumers_rejects_metadata_that_claims_an_incomplete_single_page() {
     for body in [
         r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
         r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":2}}"#,
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":1,"total_count":1,"total_pages":0}}"#,
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":20,"count":0,"total_count":0,"total_pages":2}}"#,
         r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"cursors":{"after":"next"}}}"#,
     ] {
         let (address, server) = json_response_sequence_server(vec![body]).await;
