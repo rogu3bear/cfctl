@@ -693,7 +693,7 @@ pub(super) fn validate_recovery_target(
     Ok(())
 }
 
-fn validate_recovery_target_identity<'a>(
+pub(super) fn validate_recovery_target_identity<'a>(
     store: &StateStore,
     target: &'a Map<String, Value>,
     catalog_hash: &str,

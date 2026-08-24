@@ -98,6 +98,21 @@ pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<V
 }
 
 pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    validate_bound_plan_inner(store, plan, true)
+}
+
+pub(super) fn validate_bound_plan_for_rectification(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<()> {
+    validate_bound_plan_inner(store, plan, false)
+}
+
+fn validate_bound_plan_inner(
+    store: &StateStore,
+    plan: &PlanV1,
+    require_fresh_recovery: bool,
+) -> Result<()> {
     let Some(contract) = plan.capability.workspace_d1_policy_projection.as_ref() else {
         return Ok(());
     };
@@ -141,13 +156,23 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
         ));
     }
     validate_private_stage(store, target)?;
-    workspace_d1_migration::validate_recovery_target(
-        store,
-        target,
-        &plan.catalog_hash,
-        contract.recovery_max_age_seconds,
-        Utc::now(),
-    )
+    if require_fresh_recovery {
+        workspace_d1_migration::validate_recovery_target(
+            store,
+            target,
+            &plan.catalog_hash,
+            contract.recovery_max_age_seconds,
+            Utc::now(),
+        )
+    } else {
+        workspace_d1_migration::validate_recovery_target_identity(
+            store,
+            target,
+            &plan.catalog_hash,
+            Utc::now(),
+        )
+        .map(|_| ())
+    }
 }
 
 pub(super) async fn run(
@@ -236,16 +261,39 @@ pub(super) async fn verify(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "verification keeps the route-count and three digest readbacks in one body-free consistency decision"
-)]
+pub(super) async fn verify_rectification(
+    store: &StateStore,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+) -> Value {
+    match verify_inner_with_authority(store, plan, credential, false).await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "passed": false,
+            "basis": format!("workspace D1 policy projection rectification readback failed closed: {error}"),
+        }),
+    }
+}
+
 async fn verify_inner(
     store: &StateStore,
     plan: &PlanV1,
     credential: &AuthCredential,
 ) -> Result<Value> {
-    validate_bound_plan(store, plan)?;
+    verify_inner_with_authority(store, plan, credential, true).await
+}
+
+async fn verify_inner_with_authority(
+    store: &StateStore,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+    require_fresh_recovery: bool,
+) -> Result<Value> {
+    if require_fresh_recovery {
+        validate_bound_plan(store, plan)?;
+    } else {
+        validate_bound_plan_for_rectification(store, plan)?;
+    }
     let contract = plan
         .capability
         .workspace_d1_policy_projection
@@ -266,11 +314,7 @@ async fn verify_inner(
         .ok_or_else(|| {
             CliError::Input("workspace D1 target omitted expected_route_count".to_owned())
         })?;
-    let count_sql = format!(
-        "SELECT COUNT(*) AS route_count FROM {route_table} WHERE {policy_column} = '{policy_sha}'",
-        route_table = identifier(&contract.route_table)?,
-        policy_column = identifier(&contract.route_policy_sha_column)?,
-    );
+    let count_sql = route_count_sql(contract, policy_sha)?;
     let count_rows = workspace_d1_migration::execute_json_query(
         database_name,
         config,
@@ -316,19 +360,8 @@ async fn verify_inner(
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let digests_passed = observed.len() == 3
-        && observed
-            .get(&contract.active_policy_key)
-            .map(String::as_str)
-            == Some(policy_sha)
-        && observed
-            .get(&contract.desired_state_digest_key)
-            .map(String::as_str)
-            == Some(desired_sha)
-        && observed
-            .get(&contract.projection_digest_key)
-            .map(String::as_str)
-            == Some(projection_sha);
+    let digests_passed =
+        digest_readbacks_match(contract, &observed, policy_sha, desired_sha, projection_sha)?;
     let passed = observed_count == expected_count && digests_passed;
     Ok(json!({
         "passed": passed,
@@ -345,6 +378,52 @@ async fn verify_inner(
         "recovery": target.get("recovery").cloned().unwrap_or(Value::Null),
         "private_rows_returned": false,
     }))
+}
+
+fn route_count_sql(
+    contract: &cfctl_core::WorkspaceD1PolicyProjectionContractV1,
+    policy_sha256: &str,
+) -> Result<String> {
+    Ok(format!(
+        "SELECT COUNT(*) AS route_count FROM {route_table} WHERE {policy_column} = '{policy_sha256}'",
+        route_table = identifier(&contract.route_table)?,
+        policy_column = identifier(&contract.route_policy_sha_column)?,
+        policy_sha256 = raw_sha256(policy_sha256)?,
+    ))
+}
+
+fn digest_readbacks_match(
+    contract: &cfctl_core::WorkspaceD1PolicyProjectionContractV1,
+    observed: &BTreeMap<String, String>,
+    policy_sha256: &str,
+    desired_state_sha256: &str,
+    projection_sha256: &str,
+) -> Result<bool> {
+    Ok(observed.len() == 3
+        && observed
+            .get(&contract.active_policy_key)
+            .map(String::as_str)
+            == Some(raw_sha256(policy_sha256)?)
+        && observed
+            .get(&contract.desired_state_digest_key)
+            .map(String::as_str)
+            == Some(raw_sha256(desired_state_sha256)?)
+        && observed
+            .get(&contract.projection_digest_key)
+            .map(String::as_str)
+            == Some(raw_sha256(projection_sha256)?))
+}
+
+fn raw_sha256(value: &str) -> Result<&str> {
+    value
+        .strip_prefix("sha256:")
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| CliError::Input("workspace D1 projection digest is invalid".to_owned()))
 }
 
 #[derive(Debug)]
@@ -655,6 +734,32 @@ mod tests {
 
     use super::*;
 
+    fn projection_contract() -> cfctl_core::WorkspaceD1PolicyProjectionContractV1 {
+        cfctl_core::WorkspaceD1PolicyProjectionContractV1 {
+            repository_root: "/repo".to_owned(),
+            repository_head: "a".repeat(40),
+            repository_origin: "https://example.com/repo.git".to_owned(),
+            operation_pack_path: ".cfctl/operations/d1-projection.toml".to_owned(),
+            operation_pack_sha256: format!("sha256:{}", "a".repeat(64)),
+            config_template_path: "wrangler.toml".to_owned(),
+            config_template_sha256: format!("sha256:{}", "b".repeat(64)),
+            production_config_path: "wrangler.production.toml".to_owned(),
+            database_binding: "DB".to_owned(),
+            wrangler_version: "4.120.1".to_owned(),
+            route_table: "alias_routes".to_owned(),
+            route_policy_sha_column: "policy_sha256".to_owned(),
+            runtime_state_table: "runtime_state".to_owned(),
+            runtime_state_key_column: "state_key".to_owned(),
+            runtime_state_value_column: "state_value".to_owned(),
+            active_policy_key: "active_policy_sha256".to_owned(),
+            desired_state_digest_key: "desired_state_sha256".to_owned(),
+            projection_digest_key: "projection_sha256".to_owned(),
+            recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
+            recovery_max_age_seconds: 600,
+            rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        }
+    }
+
     #[test]
     fn expected_projection_accepts_only_bounded_hashes_and_counts() {
         let input: CallInput = serde_json::from_value(json!({
@@ -669,6 +774,35 @@ mod tests {
         .expect("input");
         let expected = expected_projection(&input).expect("projection");
         assert_eq!(expected.route_count, 141);
+    }
+
+    #[test]
+    fn d1_verification_uses_raw_digest_values_and_rejects_state_drift() {
+        let contract = projection_contract();
+        let policy = format!("sha256:{}", "a".repeat(64));
+        let desired = format!("sha256:{}", "b".repeat(64));
+        let projection = format!("sha256:{}", "c".repeat(64));
+
+        let sql = route_count_sql(&contract, &policy).expect("count SQL");
+        assert!(sql.contains(&format!("= '{}'", "a".repeat(64))));
+        assert!(!sql.contains("sha256:"));
+
+        let observed = BTreeMap::from([
+            (contract.active_policy_key.clone(), "a".repeat(64)),
+            (contract.desired_state_digest_key.clone(), "b".repeat(64)),
+            (contract.projection_digest_key.clone(), "c".repeat(64)),
+        ]);
+        assert!(
+            digest_readbacks_match(&contract, &observed, &policy, &desired, &projection)
+                .expect("matching raw digests")
+        );
+
+        let mut drifted = observed;
+        drifted.insert(contract.projection_digest_key.clone(), "d".repeat(64));
+        assert!(
+            !digest_readbacks_match(&contract, &drifted, &policy, &desired, &projection)
+                .expect("drift decision")
+        );
     }
 
     #[cfg(unix)]
