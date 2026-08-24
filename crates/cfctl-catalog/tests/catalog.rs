@@ -139,6 +139,12 @@ fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
     );
     assert!(
         capability
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("exact update or delete plans"))
+    );
+    assert!(
+        capability
             .aliases
             .iter()
             .any(|alias| alias == "privacy-safe Email Routing inventory")

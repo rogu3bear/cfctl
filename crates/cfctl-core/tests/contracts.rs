@@ -4516,3 +4516,32 @@ fn schema_redaction_preserves_property_names_without_exempting_secret_values() {
         "cyclic local references must terminate and retain the sensitive-property context"
     );
 }
+
+#[test]
+fn email_routing_projection_preserves_only_a_bounded_rule_identifier() {
+    let valid = json!([{
+        "tag": "rule_001",
+        "enabled": true,
+        "matchers": [{"type": "literal", "field": "to", "value": "security@example.com"}],
+        "actions": [{"type": "worker", "value": ["maildesk-router"]}]
+    }]);
+    let projection = cfctl_core::normalize_email_routing_rule_set(&valid, 1)
+        .expect("bounded provider identity should remain actionable");
+    assert_eq!(projection.rules[0].rule_identifier, "rule_001");
+    let serialized = serde_json::to_string(&projection).expect("serialize projection");
+    assert!(!serialized.contains("security@example.com"));
+
+    for tag in [
+        json!(null),
+        json!(""),
+        json!("bad identifier"),
+        json!("x".repeat(33)),
+    ] {
+        let mut rejected = valid.clone();
+        rejected[0]["tag"] = tag;
+        let diagnostic = cfctl_core::normalize_email_routing_rule_set(&rejected, 1)
+            .expect_err("missing or unbounded provider identity must fail closed");
+        assert_eq!(diagnostic.code, "rule_identifier_invalid");
+        assert_eq!(diagnostic.component, "rule.tag");
+    }
+}

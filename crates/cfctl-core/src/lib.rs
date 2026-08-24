@@ -946,6 +946,7 @@ const EMAIL_ROUTING_RULES_MAX_MATCHERS: usize = 32;
 const EMAIL_ROUTING_RULES_MAX_ACTIONS: usize = 32;
 const EMAIL_ROUTING_RULES_MAX_ACTION_VALUES: usize = 100;
 const EMAIL_ROUTING_RULES_MAX_STRING_BYTES: usize = 4_096;
+const EMAIL_ROUTING_RULE_IDENTIFIER_MAX_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailRoutingRuleSetV1 {
@@ -959,6 +960,7 @@ pub struct EmailRoutingRuleSetV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailRoutingRuleV1 {
+    pub rule_identifier: String,
     pub enabled: bool,
     pub matchers: Vec<EmailRoutingMatcherV1>,
     pub actions: Vec<EmailRoutingActionV1>,
@@ -1063,6 +1065,20 @@ fn normalize_email_routing_rule(
     let rule = value.as_object().ok_or_else(|| {
         EmailRoutingRuleDiagnosticV1::new("rule_not_object", Some(rule_index), "rule")
     })?;
+    let rule_identifier = bounded_email_routing_string(rule.get("tag"))
+        .filter(|identifier| {
+            identifier.len() <= EMAIL_ROUTING_RULE_IDENTIFIER_MAX_BYTES
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .ok_or_else(|| {
+            EmailRoutingRuleDiagnosticV1::new(
+                "rule_identifier_invalid",
+                Some(rule_index),
+                "rule.tag",
+            )
+        })?;
     let enabled = rule
         .get("enabled")
         .and_then(Value::as_bool)
@@ -1092,6 +1108,7 @@ fn normalize_email_routing_rule(
         .map(|action| normalize_email_routing_action(action, rule_index))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(EmailRoutingRuleV1 {
+        rule_identifier,
         enabled,
         matchers,
         actions,
