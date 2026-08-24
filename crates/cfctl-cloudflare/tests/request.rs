@@ -4845,6 +4845,7 @@ async fn executor_normalizes_a_provider_capped_terminal_page() {
     let info = response.result_info.expect("normalized result info");
     assert_eq!(info["per_page"], json!(50));
     assert_eq!(info["count"], json!(2));
+    assert_eq!(info["total_pages"], json!(1));
     assert_eq!(info["cfctl_pages"], json!(1));
     assert_eq!(info["cfctl_page_complete"], json!(true));
     let requests = server.await.expect("server joins");
@@ -4871,6 +4872,7 @@ async fn executor_collects_pages_when_total_pages_is_derived() {
     let info = response.result_info.expect("normalized result info");
     assert_eq!(info["page"], json!(2));
     assert_eq!(info["count"], json!(2));
+    assert_eq!(info["total_pages"], json!(2));
     assert_eq!(info["cfctl_pages"], json!(2));
     assert_eq!(info["cfctl_page_complete"], json!(true));
     let requests = server.await.expect("server joins");
