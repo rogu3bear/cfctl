@@ -31,6 +31,11 @@ pub const MAILDESK_D1_EVIDENCE_COLUMNS_V1: &[&str] = &[
     "dlq_correlation_count",
 ];
 
+/// Additive route-health columns carried by the same compiler-owned query.
+/// The V1 aggregate column contract above remains unchanged.
+pub const MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2: &[&str] =
+    &["active_route_health_count", "route_health_rows_json"];
+
 /// Compiler-owned Maildesk readiness projection. Every source table, column,
 /// expression, predicate, action key, and output alias is fixed here; a
 /// workspace declaration cannot supply or modify SQL.
@@ -70,7 +75,37 @@ pub const MAILDESK_D1_EVIDENCE_SQL_V1: &str = r"SELECT
     (SELECT COUNT(*) FROM inbound_recipient_deliveries WHERE status IN ('pending','sending')) AS queue_correlation_count,
   (SELECT COUNT(*) FROM relay_attempts WHERE status IN ('failed','recovery_required')) +
     (SELECT COUNT(*) FROM inbound_deliveries WHERE status IN ('failed','recovery_required')) +
-    (SELECT COUNT(*) FROM inbound_recipient_deliveries WHERE status IN ('failed','recovery_required')) AS dlq_correlation_count
+    (SELECT COUNT(*) FROM inbound_recipient_deliveries WHERE status IN ('failed','recovery_required')) AS dlq_correlation_count,
+  (SELECT COUNT(*)
+   FROM alias_routes ar
+   JOIN route_health rh ON rh.route_id = ar.id AND rh.policy_sha256 = ar.policy_sha256 AND rh.decision_kind = ar.decision_kind
+   WHERE ar.enabled = 1 AND ar.policy_sha256 = rs.active_policy_sha256) AS active_route_health_count,
+  (SELECT json_group_array(json(route_row))
+   FROM (
+     SELECT json_object(
+       'route_id', substr(ar.id, 1, 257),
+       'domain', substr(lower(d.domain), 1, 254),
+       'policy_sha256', substr(ar.policy_sha256, 1, 65),
+       'route_kind', substr(rh.decision_kind, 1, 33),
+       'enabled', ar.enabled,
+       'desired_provider', substr(rh.desired_provider, 1, 65),
+       'observed_provider', substr(rh.observed_provider, 1, 65),
+       'inbound_status', substr(rh.inbound_status, 1, 65),
+       'reply_status', substr(rh.reply_status, 1, 65),
+       'provider_accepted_at', substr(rh.last_inbound_provider_accepted_at, 1, 65),
+       'inbox_received_at', substr(rh.last_inbox_verified_at, 1, 65),
+       'reply_provider_accepted_at', substr(rh.last_reply_provider_accepted_at, 1, 65),
+       'reply_proven_at', substr(rh.last_reply_verified_at, 1, 65),
+       'last_error_code', substr(rh.last_error_code, 1, 129),
+       'updated_at', substr(rh.updated_at, 1, 65)
+     ) AS route_row
+     FROM alias_routes ar
+     JOIN domains d ON d.id = ar.domain_id
+     JOIN route_health rh ON rh.route_id = ar.id AND rh.policy_sha256 = ar.policy_sha256 AND rh.decision_kind = ar.decision_kind
+     WHERE ar.enabled = 1 AND ar.policy_sha256 = rs.active_policy_sha256
+     ORDER BY ar.id
+     LIMIT 1001
+   )) AS route_health_rows_json
 FROM runtime_state rs
 JOIN policy_revisions pr ON pr.policy_sha256 = rs.active_policy_sha256
 WHERE rs.singleton = 1;";
@@ -427,6 +462,19 @@ mod tests {
             .as_ref()
             .expect("evidence contract");
         assert_eq!(contract.projection, "maildesk_v1");
+        assert_eq!(MAILDESK_D1_EVIDENCE_COLUMNS_V1.len(), 13);
+        assert!(!MAILDESK_D1_EVIDENCE_COLUMNS_V1.contains(&"route_health_rows_json"));
+        assert_eq!(
+            MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2,
+            ["active_route_health_count", "route_health_rows_json"]
+        );
+        assert_eq!(
+            MAILDESK_D1_EVIDENCE_SQL_V1
+                .matches("rh.decision_kind = ar.decision_kind")
+                .count(),
+            2,
+            "both the completeness count and emitted rows must reject route-kind drift"
+        );
         assert_eq!(
             contract.query_sha256,
             sha256(MAILDESK_D1_EVIDENCE_SQL_V1.as_bytes())

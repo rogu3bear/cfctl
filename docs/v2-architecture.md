@@ -81,9 +81,18 @@ compiler-owned verification identifiers, and exact recovery capabilities.
 Workspace-owned body-free D1 evidence uses the same authority boundary without
 creating a mutation plan: the repository owns a fixed query and result-column
 declaration, while cfctl owns bounds, execution, and reduction into the public
-`MaildeskD1EvidenceV1` type. This keeps application semantics with the consumer
-and makes arbitrary SQL or private provider rows impossible at the cfctl call
-surface.
+`MaildeskD1EvidenceV1` type. The same call additively emits a bounded
+`MaildeskD1RouteHealthEvidenceV2` projection beside the unchanged V1 aggregate:
+each active route is represented only by cfctl-computed route and domain
+SHA-256 references, closed policy/provider/readiness codes, body-free proof
+timestamps, and a bounded error code. cfctl accepts the V2 projection only when
+its record count exactly matches both the policy-, kind-, and enabled-bound
+active route-health join and the V1 projected-route count. More than 1,000
+routes, a missing or drifted health row, a duplicate route reference, an
+unknown code, a malformed timestamp, or an extra field fails the entire read.
+This keeps application semantics with the consumer and
+makes partial inventory, arbitrary SQL, raw addresses, private identities, and
+provider rows impossible at the cfctl call surface.
 
 The D1 migration adapter delegates only the apply boundary to the operation
 pack's pinned Wrangler. cfctl binds the registered repository, clean HEAD,
