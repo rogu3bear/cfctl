@@ -413,7 +413,7 @@ pub(super) fn validated_config(
     normalize_production_identity(&mut production, &template, &contract.database_binding)?;
     if production != template {
         return Err(CliError::Input(
-            "production Wrangler config differs from the tracked template outside the allowed Worker and D1 identity fields"
+            "production Wrangler config differs from the tracked template outside the allowed Worker, D1 identity, sender restriction, and split relay activation fields"
                 .to_owned(),
         ));
     }
@@ -489,6 +489,39 @@ fn normalize_production_identity(
     let template_database = d1_entry(template, binding)?.clone();
     *d1_entry_mut(production, binding)? = template_database;
     normalize_sender_identity(production, template)?;
+    normalize_relay_activation(production, template)?;
+    Ok(())
+}
+
+fn normalize_relay_activation(production: &mut toml::Value, template: &toml::Value) -> Result<()> {
+    let Some(production_vars) = production
+        .get_mut("vars")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return Ok(());
+    };
+    let template_vars = template.get("vars").and_then(toml::Value::as_table);
+    for key in ["MAILDESK_INBOUND_RELAY_MODE", "MAILDESK_REPLY_RELAY_MODE"] {
+        let Some(production_mode) = production_vars.get(key) else {
+            continue;
+        };
+        let valid_mode =
+            |value: &toml::Value| matches!(value.as_str(), Some("disabled" | "enabled"));
+        if !valid_mode(production_mode) {
+            return Err(CliError::Input(format!(
+                "workspace D1 production {key} must be disabled or enabled"
+            )));
+        }
+        let template_mode = template_vars
+            .and_then(|values| values.get(key))
+            .filter(|value| valid_mode(value))
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "workspace D1 production {key} has no canonical tracked-template authority"
+                ))
+            })?;
+        production_vars.insert(key.to_owned(), template_mode.clone());
+    }
     Ok(())
 }
 
@@ -1329,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn production_config_normalizes_worker_d1_and_sender_identity() {
+    fn production_config_normalizes_worker_d1_sender_identity_and_split_relay_activation() {
         let template: toml::Value = toml::from_str(
             r#"
 name = "template"
@@ -1341,6 +1374,10 @@ send_email = [
 
 [observability]
 enabled = true
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
 
 [[d1_databases]]
 binding = "DB"
@@ -1362,6 +1399,10 @@ send_email = [
 [observability]
 enabled = true
 
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "enabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "production-db"
@@ -1378,6 +1419,39 @@ preview_database_id = "11111111-1111-4111-8111-111111111111"
         production["main"] = toml::Value::String("other.js".to_owned());
         normalize_production_identity(&mut production, &template, "DB").expect("normalize");
         assert_ne!(production, template);
+    }
+
+    #[test]
+    fn production_relay_activation_rejects_invalid_values_and_legacy_authority() {
+        let template: toml::Value = toml::from_str(
+            r#"
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+"#,
+        )
+        .expect("template");
+
+        for invalid in [
+            toml::Value::String("preview".to_owned()),
+            toml::Value::Boolean(true),
+            toml::Value::Integer(1),
+        ] {
+            let mut production = template.clone();
+            production["vars"]["MAILDESK_INBOUND_RELAY_MODE"] = invalid;
+            assert!(normalize_relay_activation(&mut production, &template).is_err());
+        }
+
+        let mut legacy = template.clone();
+        legacy["vars"].as_table_mut().expect("vars table").insert(
+            "MAILDESK_RELAY_PROCESSING_MODE".to_owned(),
+            toml::Value::String("enabled".to_owned()),
+        );
+        normalize_relay_activation(&mut legacy, &template).expect("normalize allowed fields");
+        assert_ne!(
+            legacy, template,
+            "legacy combined activation must remain forbidden drift"
+        );
     }
 
     #[test]
