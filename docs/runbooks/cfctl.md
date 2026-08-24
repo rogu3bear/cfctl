@@ -43,6 +43,15 @@ binary directly with `cfctl version --json` if its self-reported identity is
 needed. Unknown source identity, missing or different PATH executables, and
 managed-instruction drift are unhealthy installation states.
 
+Source bootstrap applies that same tracked-and-untracked non-ignored
+cleanliness invariant before verification or installation. Its current `cargo
+install --force` flow still replaces the install-root binary before checking
+the new binary's exact commit. A failed post-install identity check can
+therefore leave that PATH binary unhealthy; recover by rerunning bootstrap from
+an exact clean checkout. Staging the executable without losing Cargo's
+install-root tracking, then promoting it atomically only after identity
+verification, remains a separate installer hardening boundary.
+
 If a command reports `catalog content hash mismatch`, do not edit the stored
 hash. Run `cfctl catalog sync --json` to fetch a fresh official snapshot and
 inspect `previous_catalog`. `discarded_invalid` means the corrupt current file

@@ -31,8 +31,9 @@ if [ "$checkout_root" != "$root" ]; then
   echo "bootstrap must run from the tracked cfctl checkout rooted at $root" >&2
   exit 1
 fi
-if ! git -C "$root" diff --quiet HEAD --; then
-  echo "bootstrap requires a tracked-clean checkout; commit or remove tracked changes first" >&2
+checkout_status=$(git -C "$root" status --porcelain=v1 --untracked-files=normal)
+if [ -n "$checkout_status" ]; then
+  echo "bootstrap requires a tracked-and-untracked clean checkout; commit, move, or ignore local changes first" >&2
   exit 1
 fi
 head=$(git -C "$root" rev-parse --verify HEAD)

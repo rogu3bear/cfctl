@@ -445,8 +445,11 @@ fn verify_source_contract() -> Result<(), TaskError> {
             "cfctl",
             "packaging/install.sh",
             "tests/account-backed-smoke.sh",
+            "tests/bootstrap-cleanliness.sh",
         ],
     )?;
+
+    run("sh", &["tests/bootstrap-cleanliness.sh"])?;
 
     verify_bootstrap_contract()?;
     verify_local_only_ci_contract()?;
@@ -618,6 +621,12 @@ fn validate_bootstrap_contract(source: &str) -> Result<(), TaskError> {
     if !source.contains("cargo xtask verify") {
         return Err(TaskError::InvalidSourceContract(
             "bootstrap.sh must invoke the repository's cargo xtask verify entrypoint".to_owned(),
+        ));
+    }
+    if !source.contains("status --porcelain=v1 --untracked-files=normal") {
+        return Err(TaskError::InvalidSourceContract(
+            "bootstrap.sh must use the build identity resolver's tracked-and-untracked cleanliness invariant"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -2924,7 +2933,9 @@ mod tests {
 
     #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
-        validate_bootstrap_contract("(cd \"$root\" && cargo xtask verify)\n")
+        validate_bootstrap_contract(
+            "git status --porcelain=v1 --untracked-files=normal\n(cd \"$root\" && cargo xtask verify)\n",
+        )
             .expect("the public xtask entrypoint is safe for nested Cargo commands");
 
         let error = validate_bootstrap_contract(
@@ -2933,6 +2944,15 @@ mod tests {
         .expect_err("an outer cargo run gate would deadlock nested proof commands");
         assert!(
             error.to_string().contains("must not hold a Cargo run gate"),
+            "unexpected error: {error}"
+        );
+
+        let error = validate_bootstrap_contract("(cd \"$root\" && cargo xtask verify)\n")
+            .expect_err("bootstrap must reject untracked compiler inputs before installation");
+        assert!(
+            error
+                .to_string()
+                .contains("tracked-and-untracked cleanliness invariant"),
             "unexpected error: {error}"
         );
     }

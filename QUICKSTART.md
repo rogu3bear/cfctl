@@ -3,8 +3,9 @@
 ## Build and install
 
 Rust 1.97 or newer is pinned by `rust-toolchain.toml`. The guided bootstrap
-requires a tracked-clean checkout, runs the full verification lane, installs
-with `cargo install --force`, proves the installed commit equals `HEAD`,
+requires a checkout clean of tracked and untracked non-ignored files, runs the
+full verification lane, installs with `cargo install --force`, proves the
+installed commit equals `HEAD`,
 synchronizes only already-managed agent integrations (`--skip-agent-sync`
 leaves them untouched), and runs both doctors:
 
