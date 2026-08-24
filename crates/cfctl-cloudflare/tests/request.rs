@@ -4975,7 +4975,10 @@ async fn queue_consumers_rejects_metadata_that_claims_an_incomplete_single_page(
         let error = execute_queue_consumers_single_page_read(&address)
             .await
             .expect_err("incomplete single-page inventory must fail closed");
-        assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+        assert!(matches!(
+            error,
+            CloudflareError::QueueConsumersSinglePageMetadataInvalid { .. }
+        ));
         assert_eq!(server.await.expect("server joins").len(), 1);
     }
 }
