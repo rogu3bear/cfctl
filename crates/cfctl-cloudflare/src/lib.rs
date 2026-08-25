@@ -7214,6 +7214,10 @@ impl Executor {
         if !combined.success || !request.method.eq_ignore_ascii_case("GET") {
             return Ok(combined);
         }
+        if request_is_queue_consumers_single_page(request) {
+            normalize_queue_consumers_single_page(&mut combined)?;
+            return Ok(combined);
+        }
         if let Some(pagination) = page_pagination(combined.result_info.as_ref())? {
             return self
                 .complete_page_pagination(request, credential, combined, pagination)
@@ -8994,6 +8998,79 @@ fn validate_page_item_count(
 
 fn request_expects_page_pagination(request: &PreparedRequest) -> bool {
     request.url.query_pairs().any(|(name, _)| name == "page")
+}
+
+fn request_is_queue_consumers_single_page(request: &PreparedRequest) -> bool {
+    if !request.method.eq_ignore_ascii_case("GET") || request.url.query().is_some() {
+        return false;
+    }
+    let segments = request
+        .url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    let Some(tail) = segments
+        .len()
+        .checked_sub(5)
+        .map(|start| &segments[start..])
+    else {
+        return false;
+    };
+    tail[0] == "accounts"
+        && !tail[1].is_empty()
+        && tail[2] == "queues"
+        && !tail[3].is_empty()
+        && tail[4] == "consumers"
+}
+
+fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) -> Result<()> {
+    let results = response
+        .result
+        .as_array()
+        .ok_or(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        })?;
+    let count = results.len() as u64;
+    if response.result_info.is_none() {
+        response.result_info = Some(serde_json::json!({}));
+    }
+    let info = response
+        .result_info
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+    if info.contains_key("cursor") || info.contains_key("cursors") {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    let metadata_u64 = |field: &str| {
+        info.get(field)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or(CloudflareError::PaginationMetadataInvalid)
+            })
+            .transpose()
+    };
+    for (field, expected) in [
+        ("page", 1),
+        ("total_pages", 1),
+        ("count", count),
+        ("total_count", count),
+    ] {
+        if let Some(actual) = metadata_u64(field)?
+            && actual != expected
+        {
+            return Err(CloudflareError::PaginationMetadataInvalid);
+        }
+    }
+    if let Some(per_page) = metadata_u64("per_page")?
+        && (per_page == 0 || count > per_page)
+    {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    info.insert("count".to_owned(), Value::from(count));
+    info.insert("cfctl_single_page_complete".to_owned(), Value::Bool(true));
+    Ok(())
 }
 
 fn is_r2_buckets_list_capability(capability: &CapabilityV1) -> bool {
