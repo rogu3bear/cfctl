@@ -40,6 +40,78 @@ const AUDIT_EVENT_KEYS: &[&str] = &[
     "outbound_reply_failed",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureStage {
+    Preflight,
+    WranglerVersion,
+    ProviderQuery,
+    ProviderProjection,
+}
+
+impl FailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::WranglerVersion => "wrangler_version",
+            Self::ProviderQuery => "provider_query",
+            Self::ProviderProjection => "provider_projection",
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Preflight => "CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED",
+            Self::WranglerVersion => "CFCTL_WORKSPACE_D1_EVIDENCE_WRANGLER_VERSION_FAILED",
+            Self::ProviderQuery => "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED",
+            Self::ProviderProjection => "CFCTL_WORKSPACE_D1_EVIDENCE_PROJECTION_FAILED",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct WorkspaceD1EvidenceFailure {
+    stage: FailureStage,
+    boundary_crossed: bool,
+}
+
+impl WorkspaceD1EvidenceFailure {
+    fn before_boundary(stage: FailureStage, _source: CliError) -> Self {
+        Self {
+            stage,
+            boundary_crossed: false,
+        }
+    }
+
+    fn after_boundary(stage: FailureStage, _source: CliError) -> Self {
+        Self {
+            stage,
+            boundary_crossed: true,
+        }
+    }
+
+    pub(super) fn receipt(&self) -> Value {
+        json!({
+            "adapter":"workspace_d1_evidence_v1",
+            "success":false,
+            "boundary_crossed":self.boundary_crossed,
+            "failure_code":self.stage.code(),
+            "failure_stage":self.stage.as_str(),
+            "provider_output_retained":false,
+            "body_returned":false,
+        })
+    }
+
+    pub(super) const fn boundary_crossed(&self) -> bool {
+        self.boundary_crossed
+    }
+}
+
+impl From<CliError> for WorkspaceD1EvidenceFailure {
+    fn from(source: CliError) -> Self {
+        Self::before_boundary(FailureStage::Preflight, source)
+    }
+}
+
 pub(super) fn load(store: &StateStore, capability_id: &str) -> Result<Option<CapabilityV1>> {
     Ok(cfctl_workspace::load_workspace_d1_evidence_capability(
         &store.workspace_roots()?,
@@ -47,13 +119,17 @@ pub(super) fn load(store: &StateStore, capability_id: &str) -> Result<Option<Cap
     )?)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the preflight, version, provider-query, and body-free projection stages remain visible at one evidence boundary"
+)]
 pub(super) async fn execute(
     store: &StateStore,
     capability: &CapabilityV1,
     input: &CallInput,
     credential: &AuthCredential,
     account_id: &str,
-) -> Result<Value> {
+) -> std::result::Result<Value, WorkspaceD1EvidenceFailure> {
     let contract = capability
         .workspace_d1_evidence
         .as_ref()
@@ -67,20 +143,23 @@ pub(super) async fn execute(
         return Err(CliError::Input(
             "workspace D1 evidence repository authority drifted; repeat the read from the clean committed declaration"
                 .to_owned(),
-        ));
+        )
+        .into());
     }
     if input.body.is_some() || input.query.as_object().is_none_or(|query| query.len() != 2) {
         return Err(CliError::Input(
             "workspace D1 evidence accepts only exact config and binding selectors; SQL, parameters, PRAGMAs, bodies, and arbitrary projections are impossible"
                 .to_owned(),
-        ));
+        )
+        .into());
     }
     let binding = input.query.get("binding").and_then(Value::as_str);
     if binding != Some(contract.database_binding.as_str()) {
         return Err(CliError::Input(
             "workspace D1 evidence binding selector differs from the committed declaration"
                 .to_owned(),
-        ));
+        )
+        .into());
     }
     let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
     if contract.projection != "maildesk_v1"
@@ -89,7 +168,8 @@ pub(super) async fn execute(
         return Err(CliError::Input(
             "workspace D1 evidence compiler projection drifted from its catalog contract"
                 .to_owned(),
-        ));
+        )
+        .into());
     }
     let version = workspace_d1_migration::run_wrangler(
         &["--version".to_owned()],
@@ -99,13 +179,22 @@ pub(super) async fn execute(
         &store.paths().cache_dir,
         QUERY_TIMEOUT,
     )
-    .await?;
-    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
+    .await
+    .map_err(|error| {
+        WorkspaceD1EvidenceFailure::before_boundary(FailureStage::WranglerVersion, error)
+    })?;
+    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)
+        .map_err(|error| {
+            WorkspaceD1EvidenceFailure::before_boundary(FailureStage::WranglerVersion, error)
+        })?;
     if !version.success || observed_version != contract.wrangler_version {
-        return Err(CliError::Input(format!(
-            "workspace D1 evidence requires Wrangler {}, observed {}",
-            contract.wrangler_version, observed_version
-        )));
+        return Err(WorkspaceD1EvidenceFailure::before_boundary(
+            FailureStage::WranglerVersion,
+            CliError::Input(format!(
+                "workspace D1 evidence requires Wrangler {}, observed {}",
+                contract.wrangler_version, observed_version
+            )),
+        ));
     }
     let query = workspace_d1_migration::run_wrangler(
         &compiler_query_arguments(&config.database_name, &config.path),
@@ -115,17 +204,27 @@ pub(super) async fn execute(
         &store.paths().cache_dir,
         QUERY_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderQuery, error)
+    })?;
     if !query.success {
-        return Err(CliError::Input(format!(
-            "workspace D1 evidence query failed with exit status {}; provider output was not retained",
-            query
-                .exit_status
-                .map_or_else(|| "signal".to_owned(), |status| status.to_string())
-        )));
+        return Err(WorkspaceD1EvidenceFailure::after_boundary(
+            FailureStage::ProviderQuery,
+            CliError::Input(format!(
+                "workspace D1 evidence query failed with exit status {}; provider output was not retained",
+                query
+                    .exit_status
+                    .map_or_else(|| "signal".to_owned(), |status| status.to_string())
+            )),
+        ));
     }
-    let rows = workspace_d1_migration::parse_query_rows(&query.stdout)?;
-    let evidence = project_evidence(contract, rows)?;
+    let rows = workspace_d1_migration::parse_query_rows(&query.stdout).map_err(|error| {
+        WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderProjection, error)
+    })?;
+    let evidence = project_evidence(contract, rows).map_err(|error| {
+        WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderProjection, error)
+    })?;
     Ok(json!({
         "adapter":"workspace_d1_evidence_v1",
         "success":true,
@@ -536,5 +635,44 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn failure_receipts_preserve_stage_and_boundary_without_source_material() {
+        let private_source = "subject=private recipient=operator@example.com provider_payload=raw";
+        let cases = [
+            (
+                WorkspaceD1EvidenceFailure::before_boundary(
+                    FailureStage::Preflight,
+                    CliError::Input(private_source.to_owned()),
+                ),
+                "CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED",
+                "preflight",
+                false,
+            ),
+            (
+                WorkspaceD1EvidenceFailure::after_boundary(
+                    FailureStage::ProviderQuery,
+                    CliError::Input(private_source.to_owned()),
+                ),
+                "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED",
+                "provider_query",
+                true,
+            ),
+        ];
+
+        for (failure, code, stage, boundary_crossed) in cases {
+            let receipt = failure.receipt();
+            assert_eq!(receipt["failure_code"], code);
+            assert_eq!(receipt["failure_stage"], stage);
+            assert_eq!(receipt["boundary_crossed"], boundary_crossed);
+            assert_eq!(receipt["provider_output_retained"], false);
+            assert_eq!(receipt["body_returned"], false);
+            assert_eq!(failure.boundary_crossed(), boundary_crossed);
+            let encoded = serde_json::to_string(&receipt).expect("failure receipt JSON");
+            assert!(!encoded.contains(private_source));
+            assert!(!encoded.contains("operator@example.com"));
+            assert!(!encoded.contains("provider_payload"));
+        }
     }
 }

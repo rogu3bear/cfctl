@@ -6280,7 +6280,36 @@ async fn execute_delegated_read(
         let account_id = account_id.as_deref().ok_or_else(|| {
             CliError::Input("workspace D1 evidence requires an exact account".to_owned())
         })?;
-        workspace_d1_evidence::execute(store, capability, input, &credential, account_id).await?
+        match workspace_d1_evidence::execute(store, capability, input, &credential, account_id)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(failure) => {
+                let receipt = failure.receipt();
+                let evidence = if failure.boundary_crossed() {
+                    Some(store.write_evidence(EvidenceClass::LiveRead, &receipt)?)
+                } else {
+                    None
+                };
+                let mut envelope = delegated_read_envelope(
+                    &catalog.schema_hash,
+                    &capability.id,
+                    &profile.id,
+                    Some(account_id.to_owned()),
+                    receipt,
+                    evidence,
+                );
+                envelope.verification.state = VerificationState::Failed;
+                envelope.verification.basis = Some(
+                    "workspace D1 evidence failed closed without retaining provider rows or message bodies"
+                        .to_owned(),
+                );
+                return Ok(ExecutedRead {
+                    envelope,
+                    credential_generation_id: Some(credential_generation_id),
+                });
+            }
+        }
     } else {
         run_delegated_cli(
             capability,
@@ -6311,7 +6340,7 @@ async fn execute_delegated_read(
         &profile.id,
         account_id,
         receipt,
-        evidence,
+        Some(evidence),
     );
     if capability.workspace_d1_evidence.is_some() {
         envelope.verification.state = if workspace_d1_evidence_passed {
@@ -6352,28 +6381,99 @@ fn delegated_read_envelope(
     profile_id: &str,
     account_id: Option<String>,
     receipt: Value,
-    evidence: EvidenceV1,
+    evidence: Option<EvidenceV1>,
 ) -> ResultEnvelopeV2 {
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut envelope = ResultEnvelopeV2::success("call", receipt).with_evidence(evidence);
+    let workspace_failure = workspace_d1_evidence_failure(&receipt);
+    let mut envelope = ResultEnvelopeV2::success("call", receipt);
+    if let Some(evidence) = evidence {
+        envelope = envelope.with_evidence(evidence);
+    }
     envelope.ok = success;
-    envelope.performed = true;
+    envelope.performed = workspace_failure
+        .as_ref()
+        .is_none_or(|failure| failure.boundary_crossed);
     envelope.capability_id = Some(capability_id.to_owned());
     envelope.profile_id = Some(profile_id.to_owned());
     envelope.account_id = account_id;
-    envelope.verification.state = VerificationState::NotApplicable;
-    envelope.verification.basis = Some(format!(
-        "governed CLI read pinned to catalog {catalog_hash}"
-    ));
+    if let Some(failure) = workspace_failure {
+        envelope.verification.state = VerificationState::Failed;
+        envelope.verification.basis = Some(format!(
+            "workspace D1 evidence failed closed at `{}` without retaining provider output",
+            failure.stage
+        ));
+        let next_step = if failure.boundary_crossed {
+            "Do not replay or infer D1 readiness from lower planes; preserve this receipt, repair the exact provider-read or projection blocker, then run one fresh coherent transaction."
+        } else {
+            "Repair the exact workspace D1 evidence preflight blocker, re-admit the bound cfctl build, then run one fresh coherent transaction; do not bypass cfctl with Wrangler."
+        };
+        envelope.error = Some(ErrorV1 {
+            code: failure.code.clone(),
+            message: format!(
+                "workspace D1 evidence failed at governed stage `{}`; provider output was not retained",
+                failure.stage
+            ),
+            next_step: Some(next_step.to_owned()),
+        });
+    } else {
+        envelope.verification.state = VerificationState::NotApplicable;
+        envelope.verification.basis = Some(format!(
+            "governed CLI read pinned to catalog {catalog_hash}"
+        ));
+    }
     envelope
+}
+
+struct WorkspaceD1EvidenceFailureReceipt {
+    code: String,
+    stage: String,
+    boundary_crossed: bool,
+}
+
+fn workspace_d1_evidence_failure(receipt: &Value) -> Option<WorkspaceD1EvidenceFailureReceipt> {
+    if receipt.get("adapter").and_then(Value::as_str) != Some("workspace_d1_evidence_v1")
+        || receipt.get("success").and_then(Value::as_bool) != Some(false)
+        || receipt
+            .get("provider_output_retained")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || receipt.get("body_returned").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let code = receipt.get("failure_code").and_then(Value::as_str)?;
+    if !matches!(
+        code,
+        "CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED"
+            | "CFCTL_WORKSPACE_D1_EVIDENCE_WRANGLER_VERSION_FAILED"
+            | "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED"
+            | "CFCTL_WORKSPACE_D1_EVIDENCE_PROJECTION_FAILED"
+    ) {
+        return None;
+    }
+    let stage = receipt.get("failure_stage").and_then(Value::as_str)?;
+    let boundary_crossed = receipt.get("boundary_crossed").and_then(Value::as_bool)?;
+    Some(WorkspaceD1EvidenceFailureReceipt {
+        code: code.to_owned(),
+        stage: stage.to_owned(),
+        boundary_crossed,
+    })
 }
 
 fn apply_operational_proof_index_result(envelope: &mut ResultEnvelopeV2, proof_result: Result<()>) {
     if let Err(error) = proof_result {
         envelope.ok = false;
+        if envelope.error.is_some() {
+            if envelope.result.is_null() {
+                envelope.result = json!({ "operational_proof_indexed": false });
+            } else if let Some(result) = envelope.result.as_object_mut() {
+                result.insert("operational_proof_indexed".to_owned(), Value::Bool(false));
+            }
+            return;
+        }
         envelope.error = Some(ErrorV1 {
             code: "CFCTL_OPERATIONAL_PROOF_INDEX_FAILED".to_owned(),
             message: format!(
@@ -47253,17 +47353,103 @@ mod tests {
             "profile-a",
             Some("account-a".to_owned()),
             json!({"success": true, "bounded": true}),
-            EvidenceV1::new(
+            Some(EvidenceV1::new(
                 EvidenceClass::LiveRead,
                 "sha256:evidence",
                 "/tmp/evidence.json",
-            ),
+            )),
         );
 
         assert!(envelope.ok);
         assert!(envelope.performed);
         assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn delegated_d1_preflight_failure_retains_identity_without_claiming_a_boundary() {
+        let envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "star-maildesk-cf.d1-evidence-read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            json!({
+                "adapter":"workspace_d1_evidence_v1",
+                "success":false,
+                "boundary_crossed":false,
+                "failure_code":"CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED",
+                "failure_stage":"preflight",
+                "provider_output_retained":false,
+                "body_returned":false
+            }),
+            None,
+        );
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(
+            envelope.capability_id.as_deref(),
+            Some("star-maildesk-cf.d1-evidence-read")
+        );
+        assert_eq!(envelope.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(envelope.account_id.as_deref(), Some("account-a"));
+        assert_eq!(envelope.verification.state, VerificationState::Failed);
+        assert!(envelope.evidence.is_empty());
+        assert_eq!(
+            envelope.error.as_ref().map(|error| error.code.as_str()),
+            Some("CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED")
+        );
+    }
+
+    #[test]
+    fn delegated_d1_post_boundary_failure_is_bound_body_free_and_not_retryable_by_inference() {
+        let envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "star-maildesk-cf.d1-evidence-read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            json!({
+                "adapter":"workspace_d1_evidence_v1",
+                "success":false,
+                "boundary_crossed":true,
+                "failure_code":"CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED",
+                "failure_stage":"provider_query",
+                "provider_output_retained":false,
+                "body_returned":false
+            }),
+            Some(EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:evidence",
+                "/tmp/evidence.json",
+            )),
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.verification.state, VerificationState::Failed);
+        let error = envelope.error.as_ref().expect("typed failure");
+        assert_eq!(
+            error.code,
+            "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED"
+        );
+        assert!(
+            error
+                .next_step
+                .as_deref()
+                .is_some_and(|step| step.contains("Do not replay"))
+        );
+        let encoded = serde_json::to_string(&envelope).expect("failure envelope JSON");
+        for prohibited in [
+            "subject",
+            "recipient",
+            "message_content",
+            "provider_payload",
+        ] {
+            assert!(
+                !encoded.contains(prohibited),
+                "prohibited field `{prohibited}`"
+            );
+        }
     }
 
     #[test]
@@ -47453,6 +47639,35 @@ mod tests {
             Some("CFCTL_OPERATIONAL_PROOF_INDEX_FAILED")
         );
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn operational_proof_persistence_failure_does_not_replace_the_first_read_blocker() {
+        let mut envelope = ResultEnvelopeV2::failure(
+            "call",
+            "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED",
+            "workspace D1 evidence failed",
+            Some("Do not replay the read."),
+        )
+        .with_evidence(EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:evidence",
+            "/tmp/evidence.json",
+        ));
+        envelope.performed = true;
+
+        apply_operational_proof_index_result(
+            &mut envelope,
+            Err(CliError::Input("fixture persistence failure".to_owned())),
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(
+            envelope.error.as_ref().map(|error| error.code.as_str()),
+            Some("CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED")
+        );
+        assert_eq!(envelope.result["operational_proof_indexed"], false);
     }
 
     #[test]
