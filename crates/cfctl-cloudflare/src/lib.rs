@@ -12288,6 +12288,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "subdomain_id" && pointer == "/tag")
         || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()
@@ -12310,6 +12311,12 @@ mod identity_pointer_parity_tests {
             "oauth_client_id",
             "/client_id"
         ));
+        // Email Service returns the sending-subdomain identity as `tag`, while
+        // the detail endpoint consumes it as `subdomain_id`. The core catalog
+        // gate already admits this provider-native mapping, so the executor
+        // must admit the same exact pair before a governed create can cross
+        // the provider boundary.
+        assert!(response_identity_pointer_supported("subdomain_id", "/tag"));
         // Standard identities still hold.
         assert!(response_identity_pointer_supported("id", "/id"));
         assert!(response_identity_pointer_supported("widget_name", "/name"));
