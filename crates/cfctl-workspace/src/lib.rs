@@ -17,6 +17,7 @@ mod d1_evidence;
 mod d1_operation;
 mod d1_policy_projection;
 mod d1_reply_admission;
+mod reply_subdomain_ingress;
 
 pub use d1_evidence::{
     MAILDESK_D1_EVIDENCE_COLUMNS_V1, MAILDESK_D1_EVIDENCE_SQL_V1,
@@ -25,6 +26,11 @@ pub use d1_evidence::{
 pub use d1_operation::load_workspace_d1_migration_capability;
 pub use d1_policy_projection::load_workspace_d1_policy_projection_capability;
 pub use d1_reply_admission::load_workspace_d1_reply_admission_capability;
+pub use reply_subdomain_ingress::{
+    CAPABILITY_ID as MAILDESK_REPLY_SUBDOMAIN_INGRESS_CAPABILITY_ID,
+    PROJECTION as MAILDESK_REPLY_SUBDOMAIN_INGRESS_PROJECTION,
+    load_workspace_reply_subdomain_ingress_capability,
+};
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {

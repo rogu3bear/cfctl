@@ -486,6 +486,7 @@ impl CatalogSnapshot {
             let legacy_contract_matches = legacy_embedded_contract_matches(capability);
             let embeds_workspace_contract = capability.mln_0142_post_import_schema.is_some()
                 || capability.mln_0143_data_invariants.is_some()
+                || capability.workspace_reply_subdomain_ingress.is_some()
                 || capability
                     .d1_approved_mln_import
                     .as_ref()
