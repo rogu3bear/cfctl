@@ -27702,7 +27702,7 @@ fn health_envelope(
             code: code.to_owned(),
             message: message.to_owned(),
             next_step: Some(
-                "Run ./bootstrap.sh from a tracked-clean checkout, then synchronize managed agents."
+                "Run ./bootstrap.sh from a checkout clean of tracked and untracked non-ignored files, then synchronize managed agents."
                     .to_owned(),
             ),
         });
