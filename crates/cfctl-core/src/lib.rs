@@ -1119,20 +1119,30 @@ fn normalize_email_routing_rule(
     let rule = value.as_object().ok_or_else(|| {
         EmailRoutingRuleDiagnosticV1::new("rule_not_object", Some(rule_index), "rule")
     })?;
-    let rule_identifier = bounded_email_routing_string(rule.get("id").or_else(|| rule.get("tag")))
-        .filter(|identifier| {
+    let bounded_identifier = |value| {
+        bounded_email_routing_string(value).filter(|identifier| {
             identifier.len() <= EMAIL_ROUTING_RULE_IDENTIFIER_MAX_BYTES
                 && identifier
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         })
-        .ok_or_else(|| {
-            EmailRoutingRuleDiagnosticV1::new(
-                "rule_identifier_invalid",
-                Some(rule_index),
-                "rule.tag",
-            )
-        })?;
+    };
+    let rule_identifier = if account_scoped {
+        bounded_identifier(rule.get("id")).or_else(|| bounded_identifier(rule.get("tag")))
+    } else {
+        bounded_identifier(rule.get("tag"))
+    }
+    .ok_or_else(|| {
+        EmailRoutingRuleDiagnosticV1::new(
+            "rule_identifier_invalid",
+            Some(rule_index),
+            if account_scoped {
+                "rule.id_or_tag"
+            } else {
+                "rule.tag"
+            },
+        )
+    })?;
     let enabled = rule
         .get("enabled")
         .and_then(Value::as_bool)

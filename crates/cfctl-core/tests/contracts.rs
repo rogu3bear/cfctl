@@ -4531,6 +4531,23 @@ fn email_routing_projection_preserves_only_a_bounded_rule_identifier() {
     let serialized = serde_json::to_string(&projection).expect("serialize projection");
     assert!(!serialized.contains("security@example.com"));
 
+    let both_fields = json!([{
+        "id": "new-account-style-id",
+        "tag": "legacy-zone-tag",
+        "enabled": true,
+        "matchers": [{"type": "all"}],
+        "actions": [{"type": "worker", "value": ["maildesk-router"]}]
+    }]);
+    let projection = cfctl_core::normalize_email_routing_rule_set(&both_fields, 1)
+        .expect("zone projection must retain its legacy tag identity");
+    assert_eq!(projection.rules[0].rule_identifier, "legacy-zone-tag");
+
+    let mut malformed_id = both_fields;
+    malformed_id[0]["id"] = json!("malformed account id");
+    let projection = cfctl_core::normalize_email_routing_rule_set(&malformed_id, 1)
+        .expect("zone projection must ignore malformed account-only id when tag is valid");
+    assert_eq!(projection.rules[0].rule_identifier, "legacy-zone-tag");
+
     for tag in [
         json!(null),
         json!(""),
@@ -4572,4 +4589,11 @@ fn account_email_routing_projection_hashes_exact_rule_domain_without_retaining_p
     let serialized = serde_json::to_string(&projection).expect("serialize projection");
     assert!(!serialized.contains("reply.example.com"));
     assert!(!serialized.contains("parent-zone-tag"));
+
+    let mut fallback = rules;
+    fallback[0]["id"] = json!("malformed account id");
+    fallback[0]["tag"] = json!("bounded-tag-fallback");
+    let projection = cfctl_core::normalize_email_routing_account_rule_set(&fallback, 1)
+        .expect("account projection may fall back from malformed id to bounded tag");
+    assert_eq!(projection.rules[0].rule_identifier, "bounded-tag-fallback");
 }
