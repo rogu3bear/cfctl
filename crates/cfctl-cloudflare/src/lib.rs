@@ -9061,7 +9061,6 @@ fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) ->
     };
     for (field, expected, reason) in [
         ("page", 1, "page_one"),
-        ("total_pages", 1, "total_pages_one"),
         ("count", count, "count_matches_items"),
         ("total_count", count, "total_count_matches_items"),
     ] {
@@ -9070,6 +9069,14 @@ fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) ->
         {
             return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid { reason });
         }
+    }
+    if let Some(total_pages) = metadata_u64("total_pages")?
+        && total_pages != 1
+        && !(total_pages == 0 && count == 0)
+    {
+        return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "total_pages_complete",
+        });
     }
     if let Some(per_page) = metadata_u64("per_page")?
         && (per_page == 0 || count > per_page)
