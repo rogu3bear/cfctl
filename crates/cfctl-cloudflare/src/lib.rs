@@ -1033,6 +1033,7 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
         "trigger_exists" => &["assertion", "trigger"],
         "schema_contains" => &["assertion", "object_type", "name", "fragment"],
         "foreign_key_check_empty" => &["assertion"],
+        "migration_ledger_equals" => &["assertion", "migrations"],
         "mln_0142_trigger_definition" => &[
             "assertion",
             "import_operation_id",
@@ -1071,28 +1072,28 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
                 ))
             })
     };
-    let (sql, params) = match assertion {
+    let (sql, params): (String, Vec<Value>) = match assertion {
         "table_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1) AS present".to_owned(),
             vec![Value::String(bounded("table", 255)?)],
         ),
         "column_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2) AS present",
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2) AS present".to_owned(),
             vec![
                 Value::String(bounded("table", 255)?),
                 Value::String(bounded("column", 255)?),
             ],
         ),
         "index_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1) AS present".to_owned(),
             vec![Value::String(bounded("index", 255)?)],
         ),
         "trigger_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present".to_owned(),
             vec![Value::String(bounded("trigger", 255)?)],
         ),
         "schema_contains" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present".to_owned(),
             vec![
                 Value::String(
                     body.get("object_type")
@@ -1110,16 +1111,76 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
             ],
         ),
         "foreign_key_check_empty" => (
-            "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present",
+            "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present".to_owned(),
             Vec::new(),
         ),
+        "migration_ledger_equals" => migration_ledger_assertion(body)?,
         "mln_0142_trigger_definition" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present".to_owned(),
             vec![Value::String(MLN_0142_TERMINAL_TRIGGER_SQL.to_owned())],
         ),
         _ => unreachable!("assertion variants were closed above"),
     };
     Ok(serde_json::json!({"sql":sql,"params":params}))
+}
+
+fn migration_ledger_assertion(
+    body: &serde_json::Map<String, Value>,
+) -> Result<(String, Vec<Value>)> {
+    let migrations = body
+        .get("migrations")
+        .and_then(Value::as_array)
+        .filter(|migrations| (1..=64).contains(&migrations.len()))
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "D1 migration ledger assertion requires one to 64 filenames".to_owned(),
+            )
+        })?;
+    let mut unique = BTreeSet::new();
+    let names = migrations
+        .iter()
+        .map(|migration| {
+            migration
+                .as_str()
+                .filter(|name| {
+                    (5..=128).contains(&name.len())
+                        && Path::new(name).extension() == Some(std::ffi::OsStr::new("sql"))
+                        && !name.contains("..")
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(
+                        "D1 migration ledger filenames must be bounded SQL basenames".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !names.iter().all(|name| unique.insert(name.clone())) {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "D1 migration ledger filenames must be unique".to_owned(),
+        ));
+    }
+
+    let mut params = Vec::with_capacity(names.len() * 2);
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let position = index + 1;
+            params.push(Value::from(u64::try_from(position).unwrap_or(u64::MAX)));
+            params.push(Value::String(name.clone()));
+            format!("(?{}, ?{})", position * 2 - 1, position * 2)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH expected(position,name) AS (VALUES {values}), observed AS (SELECT ROW_NUMBER() OVER (ORDER BY id) AS position,name FROM d1_migrations) SELECT ((SELECT COUNT(*) FROM observed) = {} AND NOT EXISTS(SELECT 1 FROM expected LEFT JOIN observed USING(position,name) WHERE observed.name IS NULL)) AS present",
+        names.len()
+    );
+    Ok((sql, params))
 }
 
 fn d1_schema_introspection_request_schema() -> Value {
@@ -1134,6 +1195,7 @@ fn d1_schema_introspection_request_schema() -> Value {
             {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
             {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
             {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+            ,{"type":"object","additionalProperties":false,"required":["assertion","migrations"],"properties":{"assertion":{"type":"string","enum":["migration_ledger_equals"]},"migrations":{"type":"array","minItems":1,"maxItems":64,"uniqueItems":true,"items":{"type":"string","minLength":5,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+\\.sql$"}}}}
         ]
     })
 }
@@ -1608,8 +1670,10 @@ pub fn validate_reviewed_schema_migration_sql(sql: &str) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod d1_schema_introspection_tests {
     use super::{d1_schema_introspection_caller_sql, render_d1_schema_introspection_body};
+    use rusqlite::{Connection, params};
     use serde_json::json;
 
     #[test]
@@ -1621,9 +1685,83 @@ mod d1_schema_introspection_tests {
             json!({"assertion":"trigger_exists","trigger":"users_guard","unexpected":true}),
             json!({"assertion":"schema_contains","object_type":"table","name":"users","fragment":"id","unexpected":true}),
             json!({"assertion":"foreign_key_check_empty","unexpected":true}),
+            json!({"assertion":"migration_ledger_equals","migrations":["0001_init.sql"],"sql":"SELECT 1"}),
         ] {
             assert!(render_d1_schema_introspection_body(&body).is_err());
         }
+    }
+
+    #[test]
+    fn migration_ledger_renderer_accepts_only_one_bounded_unique_ordered_filename_set() {
+        let rendered = render_d1_schema_introspection_body(&json!({
+            "assertion":"migration_ledger_equals",
+            "migrations":["0001_init.sql","0002_routes.sql"],
+        }))
+        .expect("closed migration ledger assertion");
+        assert!(rendered["sql"].as_str().is_some_and(|sql| {
+            sql.contains("d1_migrations") && sql.contains("ROW_NUMBER() OVER (ORDER BY id)")
+        }));
+        assert_eq!(
+            rendered["params"],
+            json!([1, "0001_init.sql", 2, "0002_routes.sql"])
+        );
+
+        for migrations in [
+            json!([]),
+            json!(["0001_init.sql", "0001_init.sql"]),
+            json!(["../0001_init.sql"]),
+            json!(["not-sql.txt"]),
+        ] {
+            assert!(
+                render_d1_schema_introspection_body(&json!({
+                    "assertion":"migration_ledger_equals",
+                    "migrations":migrations,
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn migration_ledger_assertion_requires_the_exact_ordered_remote_ledger() {
+        let rendered = render_d1_schema_introspection_body(&json!({
+            "assertion":"migration_ledger_equals",
+            "migrations":["0001_init.sql","0002_routes.sql"],
+        }))
+        .expect("closed migration ledger assertion");
+        let sql = rendered["sql"].as_str().unwrap_or_default();
+        let connection = Connection::open_in_memory().expect("in-memory D1 model");
+        connection
+            .execute_batch(
+                "CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\
+                 INSERT INTO d1_migrations(id,name) VALUES (1,'0001_init.sql'),(2,'0002_routes.sql');",
+            )
+            .expect("exact ledger");
+        let present = connection
+            .query_row(
+                sql,
+                params![1_i64, "0001_init.sql", 2_i64, "0002_routes.sql"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("exact assertion");
+        assert_eq!(present, 1);
+
+        connection
+            .execute("DELETE FROM d1_migrations", [])
+            .expect("clear ledger");
+        connection
+            .execute_batch(
+                "INSERT INTO d1_migrations(id,name) VALUES (1,'0002_routes.sql'),(2,'0001_init.sql');",
+            )
+            .expect("reordered ledger");
+        let present = connection
+            .query_row(
+                sql,
+                params![1_i64, "0001_init.sql", 2_i64, "0002_routes.sql"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reordered assertion");
+        assert_eq!(present, 0);
     }
 
     #[test]

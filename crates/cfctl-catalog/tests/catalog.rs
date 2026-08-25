@@ -14219,7 +14219,7 @@ fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
         .as_ref()
         .expect("closed assertion schema");
     let variants = schema["oneOf"].as_array().expect("assertion variants");
-    assert_eq!(variants.len(), 6);
+    assert_eq!(variants.len(), 7);
     assert!(
         variants
             .iter()
@@ -14228,6 +14228,7 @@ fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
     let encoded = serde_json::to_string(schema).expect("schema JSON");
     assert!(!encoded.contains("\"sql\""));
     assert!(!encoded.contains("\"params\""));
+    assert!(encoded.contains("migration_ledger_equals"));
     let contract = capability
         .d1_schema_introspection
         .as_ref()

@@ -3863,6 +3863,7 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
         "check D1 migration schema".to_owned(),
         "inspect D1 table column index trigger check constraint".to_owned(),
         "verify D1 foreign keys".to_owned(),
+        "verify exact D1 migration ledger".to_owned(),
     ];
     capability.permissions = vec!["D1 Read".to_owned()];
     capability.mutating = false;
@@ -3989,6 +3990,21 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
                 "required":["assertion"],
                 "properties":{
                     "assertion":{"type":"string","enum":["foreign_key_check_empty"]}
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","migrations"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["migration_ledger_equals"]},
+                    "migrations":{
+                        "type":"array",
+                        "minItems":1,
+                        "maxItems":64,
+                        "uniqueItems":true,
+                        "items":{"type":"string","minLength":5,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+\\.sql$"}
+                    }
                 }
             }
         ]
