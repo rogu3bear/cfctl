@@ -12,8 +12,8 @@ use super::{API_BASE_URL, CliError, Result, http_client};
 
 const ZONE_LIST_PATH: &str = "/zones";
 const ZONE_LIST_ID: &str = "zones-get";
-const DNS_LIST_ID: &str = "dns-records-for-a-zone-list-dns-records";
-const DNS_LIST_PATH: &str = "/zones/{zone_id}/dns_records";
+const SUBDOMAIN_DNS_ID: &str = "email-routing-settings-email-routing-dns-settings";
+const SUBDOMAIN_DNS_PATH: &str = "/zones/{zone_id}/email/routing/dns";
 const CATCH_ALL_ID: &str = "email-routing-routing-rules-get-catch-all-rule";
 const CATCH_ALL_PATH: &str = "/zones/{zone_id}/email/routing/rules/catch_all";
 const CANONICAL_MX: [&str; 3] = [
@@ -82,7 +82,6 @@ pub(super) fn receipt_is_complete(receipt: &Value) -> bool {
 
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "profile, account, credential generation, catalog, credential, and workspace contract stay explicit at the composed provider-read boundary"
 )]
 pub(super) async fn read(
@@ -119,40 +118,55 @@ pub(super) async fn read(
     }
     let target = target(input, account_id)?;
     let zone_capability = exact_zone_list_capability(catalog)?;
-    let dns_capability = exact_capability(catalog, DNS_LIST_ID, DNS_LIST_PATH)?;
+    let dns_capability = exact_capability(catalog, SUBDOMAIN_DNS_ID, SUBDOMAIN_DNS_PATH)?;
     let catch_all_capability = exact_capability(catalog, CATCH_ALL_ID, CATCH_ALL_PATH)?;
     validate_provider_contracts(zone_capability, dns_capability, catch_all_capability)?;
 
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
-    let Ok(zone) = executor
-        .execute_read(
-            zone_capability,
-            &CallInput {
-                query: json!({
-                    "account.id":account_id,
-                    "name":target.reply_domain,
-                    "page":1,
-                    "per_page":50,
-                }),
-                ..CallInput::default()
-            },
-            credential,
-        )
-        .await
-    else {
-        return Ok(failure("zone_read_failed", "zone", true, None));
-    };
-    let zone_state = match project_zone(&zone, &target) {
-        Ok(state) => state,
-        Err(receipt) => return Ok(receipt),
-    };
-    let ZoneState::Active(zone_id) = zone_state else {
-        let state = if zone_state == ZoneState::Missing {
-            "missing"
-        } else {
-            "drift"
+    let mut zone_id = None;
+    for parent_zone in parent_zone_candidates(&target.reply_domain) {
+        let Ok(zone) = executor
+            .execute_read(
+                zone_capability,
+                &CallInput {
+                    query: json!({
+                        "account.id":account_id,
+                        "name":parent_zone,
+                        "page":1,
+                        "per_page":50,
+                    }),
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await
+        else {
+            return Ok(failure(
+                "parent_zone_read_failed",
+                "parent_zone",
+                true,
+                None,
+            ));
         };
-        return Ok(success(&target, state, state));
+        match project_zone(&zone, &target.account_id, &parent_zone) {
+            Ok(ZoneState::Missing) => {}
+            Ok(ZoneState::Drift) => {
+                return Ok(failure(
+                    "parent_zone_inactive",
+                    "parent_zone",
+                    true,
+                    Some(1),
+                ));
+            }
+            Ok(ZoneState::Active(id)) => {
+                zone_id = Some(id);
+                break;
+            }
+            Err(receipt) => return Ok(receipt),
+        }
+    }
+    let Some(zone_id) = zone_id else {
+        return Ok(failure("parent_zone_missing", "parent_zone", true, Some(0)));
     };
 
     let Ok(dns) = executor
@@ -160,13 +174,7 @@ pub(super) async fn read(
             dns_capability,
             &CallInput {
                 selectors: json!({"zone_id":zone_id}),
-                query: json!({
-                    "name.exact":target.reply_domain,
-                    "type":"MX",
-                    "match":"all",
-                    "page":1,
-                    "per_page":50,
-                }),
+                query: json!({"subdomain":target.reply_domain}),
                 ..CallInput::default()
             },
             credential,
@@ -175,29 +183,12 @@ pub(super) async fn read(
     else {
         return Ok(failure("dns_read_failed", "dns", true, None));
     };
-    let dns_state = match project_dns(&dns, &target.reply_domain) {
+    let dns_state = match project_subdomain_dns(&dns, &target.reply_domain) {
         Ok(state) => state,
         Err(receipt) => return Ok(receipt),
     };
-
-    let Ok(catch_all) = executor
-        .execute_read(
-            catch_all_capability,
-            &CallInput {
-                selectors: json!({"zone_id":zone_id}),
-                ..CallInput::default()
-            },
-            credential,
-        )
-        .await
-    else {
-        return Ok(failure("catch_all_read_failed", "routing_rule", true, None));
-    };
-    let routing_state = match project_catch_all(&catch_all, &target.worker_script_name) {
-        Ok(state) => state,
-        Err(receipt) => return Ok(receipt),
-    };
-    Ok(success(&target, dns_state, routing_state))
+    debug_assert!(!subdomain_rule_read_supported(catch_all_capability));
+    Ok(unsupported_rule(&target, dns_state))
 }
 
 #[derive(Debug)]
@@ -251,7 +242,8 @@ enum ZoneState {
 
 fn project_zone(
     response: &CloudflareResponseV1,
-    target: &Target,
+    account_id: &str,
+    expected_zone: &str,
 ) -> std::result::Result<ZoneState, Value> {
     if !successful_complete_page(response) {
         return Err(failure("zone_read_incomplete", "zone", true, None));
@@ -276,8 +268,8 @@ fn project_zone(
         .and_then(Value::as_str)
         .and_then(normalize_domain)
         .as_deref()
-        == Some(target.reply_domain.as_str())
-        && zone.pointer("/account/id").and_then(Value::as_str) == Some(target.account_id.as_str())
+        == Some(expected_zone)
+        && zone.pointer("/account/id").and_then(Value::as_str) == Some(account_id)
         && zone
             .get("id")
             .and_then(Value::as_str)
@@ -297,28 +289,53 @@ fn project_zone(
     ))
 }
 
-fn project_dns(
+fn project_subdomain_dns(
     response: &CloudflareResponseV1,
     reply_domain: &str,
 ) -> std::result::Result<&'static str, Value> {
-    if !successful_complete_page(response) {
+    if !response.success || response.status != 200 || !response.errors.is_empty() {
         return Err(failure("dns_read_incomplete", "dns", true, None));
     }
-    let Some(records) = response.result.as_array() else {
+    let Some(result) = response.result.as_object() else {
         return Err(failure("dns_projection_malformed", "dns", true, None));
     };
+    let Some(errors) = result.get("errors").and_then(Value::as_array) else {
+        return Err(failure("dns_projection_malformed", "dns", true, None));
+    };
+    if !errors.is_empty() {
+        return Ok("drift");
+    }
+    let Some(records) = result.get("record").and_then(Value::as_array) else {
+        return Err(failure("dns_projection_malformed", "dns", true, None));
+    };
+    if !coherent_optional_result_info(response.result_info.as_ref(), records.len()) {
+        return Err(failure("dns_read_incomplete", "dns", true, None));
+    }
     if records.is_empty() {
         return Ok("missing");
     }
     let mut observed = BTreeSet::new();
+    let mut mx_count = 0_usize;
+    let mut duplicate_mx = false;
     for record in records {
-        let exact = record.get("type").and_then(Value::as_str) == Some("MX")
-            && record
-                .get("name")
-                .and_then(Value::as_str)
-                .and_then(normalize_domain)
-                .as_deref()
-                == Some(reply_domain);
+        let Some(record_type) = record.get("type").and_then(Value::as_str) else {
+            return Err(failure(
+                "dns_projection_malformed",
+                "dns",
+                true,
+                Some(records.len()),
+            ));
+        };
+        if record_type != "MX" {
+            continue;
+        }
+        mx_count += 1;
+        let exact = record
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(normalize_domain)
+            .as_deref()
+            == Some(reply_domain);
         let Some(content) = record
             .get("content")
             .and_then(Value::as_str)
@@ -339,11 +356,11 @@ fn project_dns(
                 Some(records.len()),
             ));
         }
-        observed.insert(content);
+        duplicate_mx |= !observed.insert(content);
     }
     let expected = CANONICAL_MX.into_iter().map(str::to_owned).collect();
     Ok(
-        if records.len() == CANONICAL_MX.len() && observed == expected {
+        if mx_count == CANONICAL_MX.len() && !duplicate_mx && observed == expected {
             "ok"
         } else {
             "drift"
@@ -351,82 +368,47 @@ fn project_dns(
     )
 }
 
-fn project_catch_all(
-    response: &CloudflareResponseV1,
-    worker_script_name: &str,
-) -> std::result::Result<&'static str, Value> {
-    if !response.success || response.status != 200 || !response.errors.is_empty() {
-        return Err(failure(
-            "catch_all_read_incomplete",
-            "routing_rule",
-            true,
-            None,
-        ));
-    }
-    if response.result.is_null() {
-        return Ok("missing");
-    }
-    let Some(rule) = response.result.as_object() else {
-        return Err(failure(
-            "catch_all_projection_malformed",
-            "routing_rule",
-            true,
-            None,
-        ));
+fn coherent_optional_result_info(result_info: Option<&Value>, record_count: usize) -> bool {
+    let Some(info) = result_info else {
+        return true;
     };
-    let Some(enabled) = rule.get("enabled").and_then(Value::as_bool) else {
-        return Err(failure(
-            "catch_all_projection_malformed",
-            "routing_rule",
-            true,
-            Some(1),
-        ));
-    };
-    let Some(matchers) = rule.get("matchers").and_then(Value::as_array) else {
-        return Err(failure(
-            "catch_all_projection_malformed",
-            "routing_rule",
-            true,
-            Some(1),
-        ));
-    };
-    let Some(actions) = rule.get("actions").and_then(Value::as_array) else {
-        return Err(failure(
-            "catch_all_projection_malformed",
-            "routing_rule",
-            true,
-            Some(1),
-        ));
-    };
-    let matcher_exact =
-        matchers.len() == 1 && matchers[0].get("type").and_then(Value::as_str) == Some("all");
-    let worker_exact = actions.len() == 1
-        && actions[0].get("type").and_then(Value::as_str) == Some("worker")
-        && actions[0]
-            .get("value")
-            .and_then(Value::as_array)
-            .is_some_and(|values| {
-                values.len() == 1 && values[0].as_str() == Some(worker_script_name)
-            });
-    Ok(if enabled && matcher_exact && worker_exact {
-        "ok"
-    } else {
-        "drift"
-    })
+    info.get("cfctl_page_complete").and_then(Value::as_bool) == Some(true)
+        && info.get("page").and_then(Value::as_u64) == Some(1)
+        && info.get("total_pages").and_then(Value::as_u64) == Some(1)
+        && info.get("cfctl_pages").and_then(Value::as_u64) == Some(1)
+        && info.get("count").and_then(Value::as_u64) == Some(record_count as u64)
+        && info.get("total_count").and_then(Value::as_u64) == Some(record_count as u64)
 }
 
-fn success(target: &Target, dns: &str, routing_rule: &str) -> Value {
+fn parent_zone_candidates(reply_domain: &str) -> Vec<String> {
+    let labels = reply_domain.split('.').collect::<Vec<_>>();
+    (1..labels.len().saturating_sub(1))
+        .map(|index| labels[index..].join("."))
+        .collect()
+}
+
+fn subdomain_rule_read_supported(capability: &CapabilityV1) -> bool {
+    capability.method == "GET"
+        && capability.path == CATCH_ALL_PATH
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "subdomain" && selector.location == "query" && selector.required
+        })
+}
+
+fn unsupported_rule(target: &Target, dns: &str) -> Value {
     json!({
         "adapter":cfctl_workspace::MAILDESK_REPLY_SUBDOMAIN_INGRESS_PROJECTION,
-        "success":true,
+        "success":false,
         "boundary_crossed":true,
         "schema_version":1,
+        "status":"subdomain_worker_rule_read_unsupported",
+        "stage":"routing_rule",
         "reply_domain_sha256":sha256(target.reply_domain.as_bytes()),
         "worker_target_sha256":sha256(target.worker_script_name.as_bytes()),
-        "dns_scope":"exact_reply_subdomain",
-        "routing_scope":"exact_reply_subdomain_catch_all_to_worker",
+        "dns_scope":"exact_reply_subdomain_dns_settings",
+        "routing_scope":"subdomain_scoped_worker_rule_unavailable",
         "dns":dns,
-        "routing_rule":routing_rule,
+        "routing_rule":"unproved",
         "provider_output_retained":false,
         "body_returned":false,
     })
@@ -526,21 +508,23 @@ fn validate_provider_contracts(
         && dns
             .permissions
             .iter()
-            .any(|permission| permission == "DNS Read")
+            .any(|permission| permission == "Zone Settings Read")
         && selector(dns, "zone_id", "path")
-        && ["name.exact", "type", "match", "page", "per_page"]
-            .iter()
-            .all(|name| selector(dns, name, "query"));
+        && selector(dns, "subdomain", "query");
     let catch_all_ok = common(catch_all)
         && catch_all.id == CATCH_ALL_ID
         && catch_all
             .permissions
             .iter()
             .any(|permission| permission == "Email Routing Rules Read")
-        && selector(catch_all, "zone_id", "path");
+        && selector(catch_all, "zone_id", "path")
+        && !catch_all
+            .selectors
+            .iter()
+            .any(|selector| selector.name == "subdomain");
     if !zone_ok || !dns_ok || !catch_all_ok {
         return Err(CliError::Input(
-            "reply-subdomain ingress zone, exact MX, or dedicated catch-all source contract drifted"
+            "reply-subdomain ingress parent-zone, subdomain DNS, or zone-only catch-all source contract drifted"
                 .to_owned(),
         ));
     }
@@ -624,39 +608,34 @@ mod tests {
     }
 
     #[test]
-    fn exact_zone_dns_and_dedicated_catch_all_project_to_closed_result() {
+    fn parent_zone_and_exact_subdomain_dns_project_without_apex_rule_inference() {
         let target = target();
         let zone = response(
-            json!([{"id":"private-zone","name":"reply.example.com","status":"active","account":{"id":"private-account"}}]),
+            json!([{"id":"private-zone","name":"example.com","status":"active","account":{"id":"private-account"}}]),
             1,
         );
         assert_eq!(
-            project_zone(&zone, &target).expect("zone"),
+            project_zone(&zone, &target.account_id, "example.com").expect("zone"),
             ZoneState::Active("private-zone".to_owned())
         );
-        let dns = response(
-            json!(CANONICAL_MX.map(|content| json!({
-                "type":"MX","name":"reply.example.com","content":content,
-            }))),
-            3,
-        );
-        assert_eq!(project_dns(&dns, &target.reply_domain).expect("dns"), "ok");
-        let catch_all = CloudflareResponseV1 {
+        let dns = CloudflareResponseV1 {
             result: json!({
-                "enabled":true,
-                "matchers":[{"type":"all"}],
-                "actions":[{"type":"worker","value":["maildesk-relay-router"]}],
+                "errors":[],
+                "record":CANONICAL_MX.map(|content| json!({
+                    "type":"MX","name":"reply.example.com","content":content,
+                })),
             }),
             result_info: None,
             ..response(Value::Null, 0)
         };
         assert_eq!(
-            project_catch_all(&catch_all, &target.worker_script_name).expect("rule"),
+            project_subdomain_dns(&dns, &target.reply_domain).expect("dns"),
             "ok"
         );
-        let receipt = success(&target, "ok", "ok");
-        assert!(receipt_is_complete(&receipt));
-        assert_eq!(receipt.as_object().map(serde_json::Map::len), Some(12));
+        let receipt = unsupported_rule(&target, "ok");
+        assert!(!receipt_is_complete(&receipt));
+        assert_eq!(receipt["status"], "subdomain_worker_rule_read_unsupported");
+        assert_eq!(receipt["routing_rule"], "unproved");
         let serialized = serde_json::to_string(&receipt).expect("receipt");
         assert!(!serialized.contains("reply.example.com"));
         assert!(!serialized.contains("maildesk-relay-router"));
@@ -668,60 +647,51 @@ mod tests {
     fn typed_missing_and_drift_remain_distinct_from_ambiguous_or_incomplete_reads() {
         let target = target();
         assert_eq!(
-            project_zone(&response(json!([]), 0), &target).expect("missing"),
+            project_zone(&response(json!([]), 0), &target.account_id, "example.com")
+                .expect("missing"),
             ZoneState::Missing
         );
         let ambiguous = project_zone(
             &response(
                 json!([
-                    {"id":"one","name":"reply.example.com","status":"active","account":{"id":"private-account"}},
-                    {"id":"two","name":"reply.example.com","status":"active","account":{"id":"private-account"}},
+                    {"id":"one","name":"example.com","status":"active","account":{"id":"private-account"}},
+                    {"id":"two","name":"example.com","status":"active","account":{"id":"private-account"}},
                 ]),
                 2,
             ),
-            &target,
+            &target.account_id,
+            "example.com",
         )
         .expect_err("ambiguous");
         assert_eq!(ambiguous["status"], "zone_cardinality_ambiguous");
         assert_eq!(ambiguous["match_count"], 2);
         assert!(!receipt_is_complete(&ambiguous));
 
-        let mut incomplete = response(json!([]), 0);
-        incomplete.result_info = None;
-        let failure = project_dns(&incomplete, &target.reply_domain).expect_err("incomplete");
+        let mut incomplete = response(json!({"errors":[],"record":[]}), 0);
+        incomplete.success = false;
+        let failure =
+            project_subdomain_dns(&incomplete, &target.reply_domain).expect_err("incomplete");
         assert_eq!(failure["status"], "dns_read_incomplete");
         assert_eq!(failure["provider_output_retained"], false);
     }
 
     #[test]
-    fn wrong_worker_and_noncanonical_mx_are_drift_without_provider_retention() {
+    fn noncanonical_subdomain_mx_is_drift_without_provider_retention() {
         let target = target();
-        let dns = response(
-            json!([
+        let dns = CloudflareResponseV1 {
+            result: json!({"errors":[],"record":[
                 {"type":"MX","name":"reply.example.com","content":"route1.mx.cloudflare.net"},
-                {"type":"MX","name":"reply.example.com","content":"wrong.mx.example.net"},
-            ]),
-            2,
-        );
-        assert_eq!(
-            project_dns(&dns, &target.reply_domain).expect("dns"),
-            "drift"
-        );
-        let rule = CloudflareResponseV1 {
-            result: json!({
-                "enabled":true,
-                "matchers":[{"type":"all"}],
-                "actions":[{"type":"worker","value":["wrong-worker"]}],
-            }),
+                {"type":"MX","name":"reply.example.com","content":"wrong.mx.example.net"}
+            ]}),
             result_info: None,
             ..response(Value::Null, 0)
         };
         assert_eq!(
-            project_catch_all(&rule, &target.worker_script_name).expect("rule"),
+            project_subdomain_dns(&dns, &target.reply_domain).expect("dns"),
             "drift"
         );
-        let receipt = success(&target, "drift", "drift");
-        assert!(receipt_is_complete(&receipt));
+        let receipt = unsupported_rule(&target, "drift");
+        assert!(!receipt_is_complete(&receipt));
         assert!(
             !serde_json::to_string(&receipt)
                 .expect("receipt")
@@ -738,15 +708,168 @@ mod tests {
             code: Some(9109),
             message: "private provider marker".to_owned(),
         }];
-        let failure = project_zone(&denied, &target).expect_err("denied");
+        let failure = project_zone(&denied, &target.account_id, "example.com").expect_err("denied");
         let serialized = serde_json::to_string(&failure).expect("failure");
         assert!(!serialized.contains("provider-payload"));
         assert!(!serialized.contains("provider marker"));
         assert_eq!(failure["provider_output_retained"], false);
         assert_eq!(failure["body_returned"], false);
 
-        let mut expanded = success(&target, "ok", "ok");
+        let mut expanded = json!({
+            "adapter":cfctl_workspace::MAILDESK_REPLY_SUBDOMAIN_INGRESS_PROJECTION,
+            "success":true,
+            "boundary_crossed":true,
+            "schema_version":1,
+            "reply_domain_sha256":sha256(target.reply_domain.as_bytes()),
+            "worker_target_sha256":sha256(target.worker_script_name.as_bytes()),
+            "dns_scope":"exact_reply_subdomain",
+            "routing_scope":"exact_reply_subdomain_catch_all_to_worker",
+            "dns":"ok",
+            "routing_rule":"ok",
+            "provider_output_retained":false,
+            "body_returned":false,
+        });
+        assert!(receipt_is_complete(&expanded));
         expanded["provider_payload"] = json!({"raw":true});
         assert!(!receipt_is_complete(&expanded));
+    }
+
+    #[test]
+    fn incomplete_dns_metadata_and_duplicate_mx_fail_closed() {
+        let target = target();
+        let records = CANONICAL_MX
+            .map(|content| json!({"type":"MX","name":"reply.example.com","content":content}));
+        let mut incomplete = CloudflareResponseV1 {
+            result: json!({"errors":[],"record":records}),
+            result_info: Some(json!({
+                "page":1,
+                "total_pages":2,
+                "total_count":3,
+                "count":3,
+                "cfctl_pages":1,
+                "cfctl_page_complete":false,
+            })),
+            ..response(Value::Null, 0)
+        };
+        let failure =
+            project_subdomain_dns(&incomplete, &target.reply_domain).expect_err("incomplete");
+        assert_eq!(failure["status"], "dns_read_incomplete");
+        assert_eq!(failure["provider_output_retained"], false);
+
+        incomplete.result_info = Some(json!({
+            "page":2,
+            "total_pages":2,
+            "total_count":3,
+            "count":3,
+            "cfctl_pages":2,
+            "cfctl_page_complete":true,
+        }));
+        let later_page =
+            project_subdomain_dns(&incomplete, &target.reply_domain).expect_err("later page");
+        assert_eq!(later_page["status"], "dns_read_incomplete");
+        assert_eq!(later_page["provider_output_retained"], false);
+
+        incomplete.result_info = None;
+        incomplete.result = json!({"errors":[],"record":[
+            {"type":"MX","name":"reply.example.com","content":"route1.mx.cloudflare.net"},
+            {"type":"MX","name":"reply.example.com","content":"route1.mx.cloudflare.net"},
+            {"type":"MX","name":"reply.example.com","content":"route2.mx.cloudflare.net"},
+            {"type":"MX","name":"reply.example.com","content":"route3.mx.cloudflare.net"}
+        ]});
+        assert_eq!(
+            project_subdomain_dns(&incomplete, &target.reply_domain).expect("duplicate drift"),
+            "drift"
+        );
+    }
+
+    #[test]
+    fn subdomain_dns_permission_drift_is_rejected_by_preflight_contract() {
+        let mut zone = provider_capability(
+            ZONE_LIST_ID,
+            ZONE_LIST_PATH,
+            &["Zone Zone Read"],
+            &[
+                ("name", "query"),
+                ("account.id", "query"),
+                ("page", "query"),
+                ("per_page", "query"),
+            ],
+        );
+        let mut dns = provider_capability(
+            SUBDOMAIN_DNS_ID,
+            SUBDOMAIN_DNS_PATH,
+            &["Zone Settings Read"],
+            &[("zone_id", "path"), ("subdomain", "query")],
+        );
+        let catch_all = provider_capability(
+            CATCH_ALL_ID,
+            CATCH_ALL_PATH,
+            &["Email Routing Rules Read"],
+            &[("zone_id", "path")],
+        );
+        assert!(validate_provider_contracts(&zone, &dns, &catch_all).is_ok());
+        dns.permissions.clear();
+        assert!(validate_provider_contracts(&zone, &dns, &catch_all).is_err());
+        zone.permissions.clear();
+        dns.permissions.push("Zone Settings Read".to_owned());
+        assert!(validate_provider_contracts(&zone, &dns, &catch_all).is_err());
+    }
+
+    #[test]
+    fn parent_candidates_exclude_reply_domain_and_zone_only_catch_all_is_unsupported() {
+        assert_eq!(
+            parent_zone_candidates("reply.mail.example.com"),
+            ["mail.example.com", "example.com"]
+        );
+        let mut catch_all = CapabilityV1::new(CATCH_ALL_ID, "catch all", "GET", CATCH_ALL_PATH);
+        catch_all.selectors.push(cfctl_core::SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        });
+        assert!(!subdomain_rule_read_supported(&catch_all));
+        catch_all.selectors.push(cfctl_core::SelectorV1 {
+            name: "subdomain".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        });
+        assert!(subdomain_rule_read_supported(&catch_all));
+    }
+
+    fn provider_capability(
+        id: &str,
+        path: &str,
+        permissions: &[&str],
+        selectors: &[(&str, &str)],
+    ) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, id, "GET", path);
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.permissions = permissions
+            .iter()
+            .map(|permission| (*permission).to_owned())
+            .collect();
+        capability.selectors = selectors
+            .iter()
+            .map(|(name, location)| cfctl_core::SelectorV1 {
+                name: (*name).to_owned(),
+                location: (*location).to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.response_contract = Some(cfctl_core::ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
+        capability
     }
 }

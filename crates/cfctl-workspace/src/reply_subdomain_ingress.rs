@@ -80,7 +80,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
         "workspace maildesk reply-subdomain ingress",
     );
     capability.description = Some(
-        "Proves the exact reply-domain DNS and catch-all Worker target through a closed body-free projection."
+        "Proves exact reply-subdomain DNS under its authoritative parent zone and fails closed until Cloudflare exposes a conclusive subdomain-scoped Worker-rule read."
             .to_owned(),
     );
     capability.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
@@ -98,11 +98,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
             contract: None,
         })
         .collect();
-    capability.permissions = vec![
-        "Zone Zone Read".to_owned(),
-        "DNS Read".to_owned(),
-        "Email Routing Rules Read".to_owned(),
-    ];
+    capability.permissions = vec!["Zone Zone Read".to_owned(), "Zone Settings Read".to_owned()];
     capability.mutating = false;
     capability.risk = RiskClass::Read;
     capability.effect = EffectClass::ReadOnly;
@@ -110,7 +106,8 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
     capability.entitlement = EntitlementV1 {
         available: Some(true),
         source: Some(
-            "workspace source requires exact active-zone, DNS, and Email Routing reads".to_owned(),
+            "workspace source requires exact parent-zone and Email Routing subdomain-DNS reads; Worker routing remains unavailable until a subdomain-scoped read exists"
+                .to_owned(),
         ),
         ..EntitlementV1::default()
     };
@@ -118,7 +115,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
         incremental: false,
         currency: None,
         maximum: None,
-        basis: Some("three bounded Cloudflare control-plane reads".to_owned()),
+        basis: Some("bounded parent-zone resolution and one exact subdomain-DNS read".to_owned()),
         known: true,
         billing_model: BillingModelV1::None,
         exposure: CostExposureV1::None,
@@ -270,7 +267,7 @@ mod tests {
         .expect("capability");
         assert_eq!(
             capability.permissions,
-            ["Zone Zone Read", "DNS Read", "Email Routing Rules Read"]
+            ["Zone Zone Read", "Zone Settings Read"]
         );
         assert!(!capability.mutating);
         assert_eq!(capability.effect, EffectClass::ReadOnly);
