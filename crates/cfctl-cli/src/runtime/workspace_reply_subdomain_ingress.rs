@@ -35,6 +35,15 @@ const RESULT_KEYS: [&str; 12] = [
     "provider_output_retained",
     "body_returned",
 ];
+const DNS_RESULT_INFO_KEYS: [&str; 7] = [
+    "page",
+    "per_page",
+    "total_pages",
+    "count",
+    "total_count",
+    "cfctl_pages",
+    "cfctl_page_complete",
+];
 
 pub(super) fn load(store: &StateStore, id: &str) -> Result<Option<CapabilityV1>> {
     Ok(
@@ -318,16 +327,27 @@ fn project_subdomain_dns(
     if !response.success || response.status != 200 || !response.errors.is_empty() {
         return Err(failure("dns_read_incomplete", "dns", true, None));
     }
-    let Some(result) = response.result.as_object() else {
-        return Err(failure("dns_projection_malformed", "dns", true, None));
-    };
-    let Some(errors) = result.get("errors").and_then(Value::as_array) else {
-        return Err(failure("dns_projection_malformed", "dns", true, None));
-    };
-    if !errors.is_empty() {
-        return Ok("drift");
-    }
-    let Some(records) = result.get("record").and_then(Value::as_array) else {
+    let records = if let Some(records) = response.result.as_array() {
+        records
+    } else if let Some(result) = response.result.as_object() {
+        if result
+            .get("errors")
+            .is_some_and(|errors| !errors.is_array())
+        {
+            return Err(failure("dns_projection_malformed", "dns", true, None));
+        }
+        if result
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            return Ok("drift");
+        }
+        let Some(records) = result.get("record").and_then(Value::as_array) else {
+            return Err(failure("dns_projection_malformed", "dns", true, None));
+        };
+        records
+    } else {
         return Err(failure("dns_projection_malformed", "dns", true, None));
     };
     if !coherent_optional_result_info(response.result_info.as_ref(), records.len()) {
@@ -394,12 +414,33 @@ fn coherent_optional_result_info(result_info: Option<&Value>, record_count: usiz
     let Some(info) = result_info else {
         return true;
     };
-    info.get("cfctl_page_complete").and_then(Value::as_bool) == Some(true)
-        && info.get("page").and_then(Value::as_u64) == Some(1)
-        && info.get("total_pages").and_then(Value::as_u64) == Some(1)
-        && info.get("cfctl_pages").and_then(Value::as_u64) == Some(1)
-        && info.get("count").and_then(Value::as_u64) == Some(record_count as u64)
-        && info.get("total_count").and_then(Value::as_u64) == Some(record_count as u64)
+    let Some(info) = info.as_object() else {
+        return false;
+    };
+    if info
+        .keys()
+        .any(|key| !DNS_RESULT_INFO_KEYS.contains(&key.as_str()))
+    {
+        return false;
+    }
+    let optional_u64_is = |key: &str, expected: u64| {
+        info.get(key)
+            .is_none_or(|value| value.as_u64() == Some(expected))
+    };
+    let count = record_count as u64;
+    optional_u64_is("page", 1)
+        && optional_u64_is("total_pages", 1)
+        && optional_u64_is("cfctl_pages", 1)
+        && optional_u64_is("count", count)
+        && optional_u64_is("total_count", count)
+        && info.get("per_page").is_none_or(|value| {
+            value
+                .as_u64()
+                .is_some_and(|per_page| per_page > 0 && count <= per_page)
+        })
+        && info
+            .get("cfctl_page_complete")
+            .is_none_or(|value| value.as_bool() == Some(true))
 }
 
 fn parent_zone_candidates(reply_domain: &str) -> Vec<String> {
@@ -752,6 +793,92 @@ mod tests {
         assert!(!serialized.contains("maildesk-relay-router"));
         assert!(!serialized.contains("private-zone"));
         assert!(!serialized.contains("private-account"));
+    }
+
+    #[test]
+    fn documented_dns_response_variants_project_with_coherent_optional_metadata() {
+        let target = target();
+        let records = CANONICAL_MX.map(|content| {
+            json!({
+                "type":"MX",
+                "name":"reply.example.com",
+                "content":content,
+            })
+        });
+        let collection = CloudflareResponseV1 {
+            result: json!(records),
+            result_info: Some(json!({
+                "page":1,
+                "per_page":20,
+                "total_pages":1,
+                "total_count":3,
+                "count":3,
+            })),
+            ..response(Value::Null, 0)
+        };
+        assert_eq!(
+            project_subdomain_dns(&collection, &target.reply_domain).expect("collection"),
+            "ok"
+        );
+
+        let object_without_optional_errors = CloudflareResponseV1 {
+            result: json!({"record":records}),
+            result_info: None,
+            ..response(Value::Null, 0)
+        };
+        assert_eq!(
+            project_subdomain_dns(&object_without_optional_errors, &target.reply_domain)
+                .expect("object response"),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn collection_dns_metadata_conflicts_and_unknown_cursors_fail_closed() {
+        let target = target();
+        let records = CANONICAL_MX.map(|content| {
+            json!({
+                "type":"MX",
+                "name":"reply.example.com",
+                "content":content,
+            })
+        });
+        for result_info in [
+            json!({
+                "page":1,
+                "per_page":20,
+                "total_pages":2,
+                "total_count":3,
+                "count":3,
+            }),
+            json!({
+                "page":1,
+                "per_page":20,
+                "total_pages":1,
+                "total_count":4,
+                "count":3,
+            }),
+            json!({
+                "page":1,
+                "per_page":20,
+                "total_pages":1,
+                "total_count":3,
+                "count":3,
+                "cursor":"private-provider-cursor",
+            }),
+        ] {
+            let response = CloudflareResponseV1 {
+                result: json!(records),
+                result_info: Some(result_info),
+                ..response(Value::Null, 0)
+            };
+            let failure =
+                project_subdomain_dns(&response, &target.reply_domain).expect_err("incomplete");
+            assert_eq!(failure["status"], "dns_read_incomplete");
+            let serialized = serde_json::to_string(&failure).expect("body-free failure");
+            assert!(!serialized.contains("provider-cursor"));
+            assert_eq!(failure["provider_output_retained"], false);
+        }
     }
 
     #[test]
