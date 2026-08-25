@@ -940,6 +940,10 @@ pub struct ResponseContractV1 {
 pub const EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID: &str =
     "email-routing-routing-rules-list-routing-rules";
 pub const EMAIL_ROUTING_RULES_LIST_PATH: &str = "/zones/{zone_id}/email/routing/rules";
+pub const EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID: &str =
+    "email-routing-account-rules-list-routing-rules";
+pub const EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH: &str =
+    "/accounts/{account_id}/email/routing/rules";
 pub const EMAIL_ROUTING_RULES_PAGE_SIZE: u64 = 50;
 pub const EMAIL_ROUTING_RULES_MAX_PAGES: u64 = 100;
 const EMAIL_ROUTING_RULES_MAX_MATCHERS: usize = 32;
@@ -962,6 +966,10 @@ pub struct EmailRoutingRuleSetV1 {
 pub struct EmailRoutingRuleV1 {
     pub rule_identifier: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_name_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_tag_sha256: Option<String>,
     pub matchers: Vec<EmailRoutingMatcherV1>,
     pub actions: Vec<EmailRoutingActionV1>,
 }
@@ -1006,9 +1014,11 @@ impl EmailRoutingRuleDiagnosticV1 {
 
 #[must_use]
 pub fn is_email_routing_rules_list_capability(capability: &CapabilityV1) -> bool {
-    capability.id == EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID
+    ((capability.id == EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID
+        && capability.path == EMAIL_ROUTING_RULES_LIST_PATH)
+        || (capability.id == EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID
+            && capability.path == EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH))
         && capability.method == "GET"
-        && capability.path == EMAIL_ROUTING_RULES_LIST_PATH
         && !capability.mutating
         && capability
             .response_contract
@@ -1022,9 +1032,52 @@ pub fn normalize_email_routing_rule_set(
     value: &Value,
     pages: u64,
 ) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_rule_set_with_page_size(value, pages, EMAIL_ROUTING_RULES_PAGE_SIZE)
+}
+
+pub fn normalize_email_routing_rule_set_with_page_size(
+    value: &Value,
+    pages: u64,
+    page_size: u64,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_rule_set_with_scope(value, pages, page_size, false)
+}
+
+pub fn normalize_email_routing_account_rule_set(
+    value: &Value,
+    pages: u64,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_account_rule_set_with_page_size(
+        value,
+        pages,
+        EMAIL_ROUTING_RULES_PAGE_SIZE,
+    )
+}
+
+pub fn normalize_email_routing_account_rule_set_with_page_size(
+    value: &Value,
+    pages: u64,
+    page_size: u64,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_rule_set_with_scope(value, pages, page_size, true)
+}
+
+fn normalize_email_routing_rule_set_with_scope(
+    value: &Value,
+    pages: u64,
+    page_size: u64,
+    account_scoped: bool,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
     if !(1..=EMAIL_ROUTING_RULES_MAX_PAGES).contains(&pages) {
         return Err(EmailRoutingRuleDiagnosticV1::new(
             "page_bound_invalid",
+            None,
+            "pagination",
+        ));
+    }
+    if !(1..=EMAIL_ROUTING_RULES_PAGE_SIZE).contains(&page_size) {
+        return Err(EmailRoutingRuleDiagnosticV1::new(
+            "page_size_invalid",
             None,
             "pagination",
         ));
@@ -1046,12 +1099,12 @@ pub fn normalize_email_routing_rule_set(
     let normalized = rules
         .iter()
         .enumerate()
-        .map(|(rule_index, rule)| normalize_email_routing_rule(rule, rule_index))
+        .map(|(rule_index, rule)| normalize_email_routing_rule(rule, rule_index, account_scoped))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(EmailRoutingRuleSetV1 {
         schema_version: 1,
         complete: true,
-        page_size: EMAIL_ROUTING_RULES_PAGE_SIZE,
+        page_size,
         pages,
         rule_count: normalized.len(),
         rules: normalized,
@@ -1061,11 +1114,12 @@ pub fn normalize_email_routing_rule_set(
 fn normalize_email_routing_rule(
     value: &Value,
     rule_index: usize,
+    account_scoped: bool,
 ) -> std::result::Result<EmailRoutingRuleV1, EmailRoutingRuleDiagnosticV1> {
     let rule = value.as_object().ok_or_else(|| {
         EmailRoutingRuleDiagnosticV1::new("rule_not_object", Some(rule_index), "rule")
     })?;
-    let rule_identifier = bounded_email_routing_string(rule.get("tag"))
+    let rule_identifier = bounded_email_routing_string(rule.get("id").or_else(|| rule.get("tag")))
         .filter(|identifier| {
             identifier.len() <= EMAIL_ROUTING_RULE_IDENTIFIER_MAX_BYTES
                 && identifier
@@ -1085,6 +1139,35 @@ fn normalize_email_routing_rule(
         .ok_or_else(|| {
             EmailRoutingRuleDiagnosticV1::new("enabled_not_boolean", Some(rule_index), "enabled")
         })?;
+    let (zone_name_sha256, zone_tag_sha256) = if account_scoped {
+        let zone = rule.get("zone").and_then(Value::as_object).ok_or_else(|| {
+            EmailRoutingRuleDiagnosticV1::new("zone_not_object", Some(rule_index), "zone")
+        })?;
+        let zone_name = bounded_email_routing_string(zone.get("name"))
+            .and_then(|name| normalize_email_routing_domain(&name))
+            .ok_or_else(|| {
+                EmailRoutingRuleDiagnosticV1::new(
+                    "zone_name_invalid",
+                    Some(rule_index),
+                    "zone.name",
+                )
+            })?;
+        let zone_tag = bounded_email_routing_string(zone.get("tag")).ok_or_else(|| {
+            EmailRoutingRuleDiagnosticV1::new("zone_tag_invalid", Some(rule_index), "zone.tag")
+        })?;
+        (
+            Some(format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(zone_name.as_bytes()))
+            )),
+            Some(format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(zone_tag.as_bytes()))
+            )),
+        )
+    } else {
+        (None, None)
+    };
     let matcher_values = bounded_email_routing_array(
         rule.get("matchers"),
         EMAIL_ROUTING_RULES_MAX_MATCHERS,
@@ -1110,9 +1193,32 @@ fn normalize_email_routing_rule(
     Ok(EmailRoutingRuleV1 {
         rule_identifier,
         enabled,
+        zone_name_sha256,
+        zone_tag_sha256,
         matchers,
         actions,
     })
+}
+
+fn normalize_email_routing_domain(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.contains('.')
+        || normalized.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn bounded_email_routing_array<'a>(

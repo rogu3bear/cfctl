@@ -4545,3 +4545,31 @@ fn email_routing_projection_preserves_only_a_bounded_rule_identifier() {
         assert_eq!(diagnostic.component, "rule.tag");
     }
 }
+
+#[test]
+fn account_email_routing_projection_hashes_exact_rule_domain_without_retaining_plaintext() {
+    let rules = json!([{
+        "id": "rule_001",
+        "enabled": true,
+        "zone": {"name": "reply.example.com", "tag": "parent-zone-tag"},
+        "matchers": [{"type": "all"}],
+        "actions": [{"type": "worker", "value": ["maildesk-router"]}],
+        "priority": 0
+    }]);
+    let projection = cfctl_core::normalize_email_routing_account_rule_set(&rules, 2)
+        .expect("complete account inventory should retain only body-free domain identity");
+    assert_eq!(projection.pages, 2);
+    assert_eq!(
+        projection.rules[0].zone_name_sha256.as_deref(),
+        Some("sha256:ee551193ff63e4819a1f4333a425488c2980fe91b67f1d6b3d66faaa24f4e708")
+    );
+    assert!(projection.rules[0].zone_tag_sha256.is_some());
+    assert_eq!(projection.rules[0].matchers[0].matcher_type, "all");
+    assert_eq!(
+        projection.rules[0].actions[0].worker_targets,
+        ["maildesk-router"]
+    );
+    let serialized = serde_json::to_string(&projection).expect("serialize projection");
+    assert!(!serialized.contains("reply.example.com"));
+    assert!(!serialized.contains("parent-zone-tag"));
+}
