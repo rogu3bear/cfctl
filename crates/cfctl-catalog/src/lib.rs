@@ -2590,6 +2590,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
     for capability in vec![
+        worker_version_rollback_capability(),
         mln_0143_data_invariants_capability(),
         mln_0142_post_import_schema_capability(),
         d1_schema_introspection_capability(),
@@ -2609,6 +2610,98 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+fn worker_version_rollback_capability() -> CapabilityV1 {
+    let uuid = serde_json::json!({
+        "type":"string","format":"uuid","minLength":36,"maxLength":36
+    });
+    let mut capability = CapabilityV1::new(
+        "worker-version-rollback",
+        "Roll one Worker back to one exact prior version",
+        "POST",
+        "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+    );
+    capability.description = Some(
+        "Create one new 100 percent Worker deployment for an exact prior version after cfctl binds and rechecks the current deployment, proves the target was previously the sole version at 100 percent, serializes concurrent local cfctl writers, and verifies the new latest deployment. Cloudflare's force bypass is never exposed or sent; external deployers must be quiesced because the provider exposes no conditional deployment write."
+            .to_owned(),
+    );
+    "Cloudflare Workers".clone_into(&mut capability.product);
+    "cfctl native exact Worker version rollback adapter".clone_into(&mut capability.source);
+    capability.aliases = vec![
+        "rollback Worker to exact version".to_owned(),
+        "restore prior Worker deployment".to_owned(),
+    ];
+    capability.selectors = [
+        ("account_id", "Exact Cloudflare account identifier"),
+        ("script_name", "Exact Worker service name"),
+    ]
+    .into_iter()
+    .map(|(name, description)| SelectorV1 {
+        name: name.to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: Some(description.to_owned()),
+        contract: Some(SelectorContractV1 {
+            schema: if name == "account_id" {
+                serde_json::json!({"type":"string","minLength":32,"maxLength":32})
+            } else {
+                serde_json::json!({"type":"string","minLength":1,"maxLength":255})
+            },
+            query: None,
+        }),
+    })
+    .collect();
+    capability.permissions = vec![
+        "Workers Scripts Write".to_owned(),
+        "Workers Scripts Read".to_owned(),
+    ];
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":["target_version_id","expected_current_deployment_id","message"],
+        "properties":{
+            "target_version_id":uuid,
+            "expected_current_deployment_id":uuid,
+            "message":{"type":"string","minLength":1,"maxLength":900}
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.adapter_status = AdapterStatus::Native;
+    capability.blocked_reason = None;
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.entitlement.available = Some(true);
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "creating a Worker deployment has no direct per-operation charge; the selected version can create ordinary downstream Worker usage"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Workers pricing".to_owned(),
+        url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    "worker_latest_deployment_is_exact_rollback_target"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some(
+        "compensation is a separate reviewed worker-version-rollback plan targeting the pre-change active version captured by this plan; Worker storage and external side effects are outside traffic rollback, and provider-external deployment writers must remain frozen throughout the operation"
+            .to_owned(),
+    );
+    capability
 }
 
 fn d1_import_database_capability() -> CapabilityV1 {
