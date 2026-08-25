@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use cfctl_auth::{AuthCredential, ProfileMetadata};
+use cfctl_auth::{AuthCredential, ProfileKind, ProfileMetadata};
 use cfctl_catalog::CatalogSnapshot;
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1, Executor};
 use cfctl_core::{AdapterStatus, CapabilityV1, ResponseBodyModeV1};
@@ -102,6 +102,7 @@ pub(super) async fn read(
     credential: &AuthCredential,
     profile: &ProfileMetadata,
     account_id: &str,
+    requested_account: Option<&str>,
     credential_generation_id: &str,
 ) -> Result<Value> {
     let contract = capability
@@ -118,9 +119,12 @@ pub(super) async fn read(
             "reply-subdomain ingress repository authority drifted".to_owned(),
         ));
     }
-    if profile.account_id.as_deref() != Some(account_id)
-        || profile.credential_generation_id.as_deref() != Some(credential_generation_id)
-    {
+    if !profile_is_bound_for_read(
+        profile,
+        account_id,
+        requested_account,
+        credential_generation_id,
+    ) {
         return Err(CliError::Input(
             "reply-subdomain ingress profile, account, or credential generation binding drifted"
                 .to_owned(),
@@ -220,6 +224,24 @@ pub(super) async fn read(
         Err(receipt) => return Ok(receipt),
     };
     Ok(success(&target, dns_state, routing_state))
+}
+
+fn profile_is_bound_for_read(
+    profile: &ProfileMetadata,
+    account_id: &str,
+    requested_account: Option<&str>,
+    credential_generation_id: &str,
+) -> bool {
+    let account_is_bound = match profile.kind {
+        ProfileKind::GlobalKey => {
+            profile.emergency_only
+                && profile.account_id.is_none()
+                && requested_account == Some(account_id)
+        }
+        _ => profile.account_id.as_deref() == Some(account_id),
+    };
+    account_is_bound
+        && profile.credential_generation_id.as_deref() == Some(credential_generation_id)
 }
 
 #[derive(Debug)]
@@ -1111,6 +1133,84 @@ mod tests {
             parent_zone_candidates("reply.mail.example.com"),
             ["mail.example.com", "example.com"]
         );
+    }
+
+    #[test]
+    fn profile_binding_admits_only_exact_account_or_explicit_emergency_global_key() {
+        let generation = "11111111-1111-4111-8111-111111111111";
+        let mut account_token =
+            ProfileMetadata::new("account-token", ProfileKind::ApiToken, Some("account-a"));
+        account_token.credential_generation_id = Some(generation.to_owned());
+        assert!(profile_is_bound_for_read(
+            &account_token,
+            "account-a",
+            None,
+            generation
+        ));
+        assert!(!profile_is_bound_for_read(
+            &account_token,
+            "account-b",
+            Some("account-b"),
+            generation
+        ));
+
+        let mut emergency = ProfileMetadata::new("emergency-read", ProfileKind::GlobalKey, None);
+        emergency.credential_generation_id = Some(generation.to_owned());
+        assert!(profile_is_bound_for_read(
+            &emergency,
+            "explicit-account",
+            Some("explicit-account"),
+            generation
+        ));
+        assert!(!profile_is_bound_for_read(
+            &emergency,
+            "explicit-account",
+            None,
+            generation
+        ));
+        assert!(!profile_is_bound_for_read(
+            &emergency,
+            "explicit-account",
+            Some("another-account"),
+            generation
+        ));
+        emergency.emergency_only = false;
+        assert!(!profile_is_bound_for_read(
+            &emergency,
+            "explicit-account",
+            Some("explicit-account"),
+            generation
+        ));
+
+        emergency.account_id = Some("explicit-account".to_owned());
+        assert!(!profile_is_bound_for_read(
+            &emergency,
+            "explicit-account",
+            Some("explicit-account"),
+            generation
+        ));
+        emergency.emergency_only = true;
+        assert!(!profile_is_bound_for_read(
+            &emergency,
+            "explicit-account",
+            Some("explicit-account"),
+            generation
+        ));
+
+        let mut unbound_token = ProfileMetadata::new("unbound-token", ProfileKind::ApiToken, None);
+        unbound_token.credential_generation_id = Some(generation.to_owned());
+        assert!(!profile_is_bound_for_read(
+            &unbound_token,
+            "explicit-account",
+            Some("explicit-account"),
+            generation
+        ));
+        assert!(!profile_is_bound_for_read(
+            &account_token,
+            "account-a",
+            Some("account-a"),
+            "22222222-2222-4222-8222-222222222222"
+        ));
     }
 
     #[test]

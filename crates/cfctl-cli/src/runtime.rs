@@ -6336,6 +6336,7 @@ async fn execute_delegated_read(
             &credential,
             profile,
             account_id,
+            requested_account,
             &credential_generation_id,
         )
         .await?
