@@ -152,6 +152,8 @@ pub enum CloudflareError {
     PaginationLimit(u64),
     #[error("Cloudflare page pagination metadata is invalid or internally inconsistent")]
     PaginationMetadataInvalid,
+    #[error("Cloudflare queue-consumer single-page metadata failed the body-free `{reason}` check")]
+    QueueConsumersSinglePageMetadataInvalid { reason: &'static str },
     #[error(
         "Cloudflare page pagination result count {actual} did not match the declared total count {expected}"
     )]
@@ -9038,16 +9040,22 @@ fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) ->
         .result_info
         .as_mut()
         .and_then(Value::as_object_mut)
-        .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+        .ok_or(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "result_info_object",
+        })?;
     if info.contains_key("cursor") || info.contains_key("cursors") {
-        return Err(CloudflareError::PaginationMetadataInvalid);
+        return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "cursor_absent",
+        });
     }
     let metadata_u64 = |field: &str| {
         info.get(field)
             .map(|value| {
                 value
                     .as_u64()
-                    .ok_or(CloudflareError::PaginationMetadataInvalid)
+                    .ok_or(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+                        reason: "metadata_unsigned_integer",
+                    })
             })
             .transpose()
     };
@@ -9060,13 +9068,17 @@ fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) ->
         if let Some(actual) = metadata_u64(field)?
             && actual != expected
         {
-            return Err(CloudflareError::PaginationMetadataInvalid);
+            return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+                reason: "metadata_value_consistent",
+            });
         }
     }
     if let Some(per_page) = metadata_u64("per_page")?
         && (per_page == 0 || count > per_page)
     {
-        return Err(CloudflareError::PaginationMetadataInvalid);
+        return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "per_page_capacity",
+        });
     }
     info.insert("count".to_owned(), Value::from(count));
     info.insert("cfctl_single_page_complete".to_owned(), Value::Bool(true));
