@@ -114,6 +114,11 @@ pub enum StorageError {
     AuthorityRevocationRollback(String),
     #[error("plan `{0}` is already locked")]
     PlanLocked(String),
+    #[error("Worker deployment target `{account_id}/{script_name}` is already locked")]
+    WorkerDeploymentLocked {
+        account_id: String,
+        script_name: String,
+    },
     #[error("system clock is before the Unix epoch")]
     Clock,
     #[error("operational proof is invalid: {0}")]
@@ -939,6 +944,48 @@ impl StateStore {
                 Err(StorageError::PlanLocked(operation_id.to_owned()))
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Serializes cfctl deployment writes for one exact account and Worker.
+    /// Cloudflare's deployment-create endpoint has no documented conditional
+    /// request field, so this local lock narrows the reread-to-POST race across
+    /// concurrent cfctl processes. External deployers still require an
+    /// operator-enforced quiescent change window.
+    pub fn lock_worker_deployment(
+        &self,
+        account_id: &str,
+        script_name: &str,
+    ) -> Result<WorkerDeploymentLock> {
+        if account_id.len() != 32
+            || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || script_name.is_empty()
+            || script_name.len() > 255
+        {
+            return Err(StorageError::UnsafeManagedDocument {
+                path: "worker-deployment-lock".to_owned(),
+                reason: "account_id or script_name is outside the closed Worker deployment selector contract"
+                    .to_owned(),
+            });
+        }
+        let key = hex::encode(Sha256::digest(
+            format!("{account_id}\0{script_name}").as_bytes(),
+        ));
+        let path = self
+            .paths
+            .data_dir
+            .join("locks")
+            .join("worker-deployments")
+            .join(format!("{key}.lock"));
+        let _existing_regular_file = validate_existing_managed_file(&path)?;
+        let file = open_lock_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(WorkerDeploymentLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(StorageError::WorkerDeploymentLocked {
+                account_id: account_id.to_owned(),
+                script_name: script_name.to_owned(),
+            }),
+            Err(std::fs::TryLockError::Error(source)) => Err(io_error(&path, source)),
         }
     }
 
@@ -1868,6 +1915,11 @@ pub struct AuthorityLock {
 }
 
 #[derive(Debug)]
+pub struct WorkerDeploymentLock {
+    _file: fs::File,
+}
+
+#[derive(Debug)]
 struct AdmissionPolicyLock {
     _file: fs::File,
 }
@@ -2107,6 +2159,31 @@ mod durability_tests {
         assert_eq!(
             fs::read(&path).expect("rename completed before injected sync failure"),
             b"revoked authority"
+        );
+    }
+
+    #[test]
+    fn worker_deployment_lock_serializes_one_exact_account_and_script() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let account = "a".repeat(32);
+        let first = store
+            .lock_worker_deployment(&account, "jkca-web-drop")
+            .expect("first exact target lock");
+        assert!(matches!(
+            store.lock_worker_deployment(&account, "jkca-web-drop"),
+            Err(StorageError::WorkerDeploymentLocked { .. })
+        ));
+        assert!(
+            store
+                .lock_worker_deployment(&account, "jkca-web-sign")
+                .is_ok()
+        );
+        drop(first);
+        assert!(
+            store
+                .lock_worker_deployment(&account, "jkca-web-drop")
+                .is_ok()
         );
     }
 }

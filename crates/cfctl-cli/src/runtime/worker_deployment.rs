@@ -22,6 +22,10 @@ pub(super) const SETTINGS_PATH: &str =
 pub(super) const DEPLOYMENTS_CAPABILITY_ID: &str = "worker-deployments-list-deployments";
 pub(super) const DEPLOYMENTS_PATH: &str =
     "/accounts/{account_id}/workers/scripts/{script_name}/deployments";
+pub(super) const VERSION_CAPABILITY_ID: &str = "worker-versions-get-version-detail";
+pub(super) const VERSION_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/versions/{version_id}";
+pub(super) const ROLLBACK_CAPABILITY_ID: &str = "worker-version-rollback";
 const NOT_FOUND_ERROR_CODE: i64 = 10_007;
 
 pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
@@ -32,7 +36,22 @@ pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
 }
 
 pub(super) fn binds_live_state(capability: &CapabilityV1) -> bool {
-    binds_artifact(capability) || capability.id == "wrangler.versions-deploy"
+    binds_artifact(capability)
+        || matches!(
+            capability.id.as_str(),
+            "wrangler.versions-deploy" | ROLLBACK_CAPABILITY_ID
+        )
+}
+
+/// Identifies every cfctl lane that can replace the production traffic
+/// deployment for one Worker. All of these lanes must share the same
+/// account/script lock; a rollback-only lock would still permit a local
+/// deploy to race the rollback's final read, POST, or verification.
+pub(super) fn mutates_traffic(capability: &CapabilityV1) -> bool {
+    matches!(
+        capability.id.as_str(),
+        "wrangler.deploy" | "wrangler.versions-deploy" | ROLLBACK_CAPABILITY_ID
+    )
 }
 
 pub(super) fn artifact_paths(
@@ -98,6 +117,9 @@ pub(super) fn prepare_target(
 ) -> Result<Option<Value>, CliError> {
     if !binds_live_state(capability) {
         return Ok(None);
+    }
+    if capability.id == ROLLBACK_CAPABILITY_ID {
+        return prepare_rollback_target(capability, input).map(Some);
     }
     let config = canonical_config(input)?;
     let snapshot = load_wrangler_config_snapshot(&config)?;
@@ -221,6 +243,65 @@ pub(super) fn prepare_target(
     })?;
     target_object.extend(operation_object.clone());
     Ok(Some(target))
+}
+
+pub(super) fn prepare_rollback_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<Value, CliError> {
+    if capability.method != "POST"
+        || capability.path != DEPLOYMENTS_PATH
+        || capability.adapter_status != cfctl_core::AdapterStatus::Native
+    {
+        return Err(CliError::Input(
+            "Worker rollback capability identity drifted".to_owned(),
+        ));
+    }
+    let service_name = input
+        .selectors
+        .get("script_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("Worker rollback script_name is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("Worker rollback body is missing".to_owned()))?;
+    let canonical_uuid = |key: &str| -> Result<&str, CliError> {
+        let raw = body
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input(format!("Worker rollback {key} is missing")))?;
+        let parsed = uuid::Uuid::parse_str(raw)
+            .map_err(|_| CliError::Input(format!("Worker rollback {key} is not a UUID")))?;
+        if parsed.to_string() != raw {
+            return Err(CliError::Input(format!(
+                "Worker rollback {key} must be a canonical lowercase UUID"
+            )));
+        }
+        Ok(raw)
+    };
+    let target_version_id = canonical_uuid("target_version_id")?;
+    let expected_current_deployment_id = canonical_uuid("expected_current_deployment_id")?;
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 900)
+        .ok_or_else(|| {
+            CliError::Input("Worker rollback message must contain 1 to 900 characters".to_owned())
+        })?;
+    Ok(json!({
+        "schema_version":1,
+        "service_name":service_name,
+        "rollback":{
+            "target_version_id":target_version_id,
+            "expected_current_deployment_id":expected_current_deployment_id,
+            "message":message,
+            "traffic_percentage":100,
+            "force":false,
+        }
+    }))
 }
 
 #[derive(Debug)]
@@ -473,6 +554,29 @@ pub(super) fn validate_current_target(
     Ok(())
 }
 
+pub(super) fn validate_current_rollback_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+) -> Result<(), CliError> {
+    if capability.id != ROLLBACK_CAPABILITY_ID {
+        return Err(CliError::Input(
+            "Worker rollback target validator received another capability".to_owned(),
+        ));
+    }
+    let planned = target(adapter_targets).ok_or_else(|| {
+        CliError::Input("Worker rollback plan omitted its exact target".to_owned())
+    })?;
+    let current = prepare_rollback_target(capability, input)?;
+    if &current != planned {
+        return Err(CliError::Input(
+            "Worker rollback service, expected deployment, target version, or message drifted after planning; the provider boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn delegated_execution_input(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -570,9 +674,217 @@ pub(super) fn apply_state_responses(
     )))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fail-closed admission function binds current deployment, active version, retained prior history, and exact target-version detail into one receipt"
+)]
+pub(super) fn apply_rollback_state_responses(
+    account_id: &str,
+    service_name: &str,
+    target: &Value,
+    settings: &CloudflareResponseV1,
+    deployments: &CloudflareResponseV1,
+    version: &CloudflareResponseV1,
+) -> Result<Value, CliError> {
+    if !settings.success
+        || !(200..300).contains(&settings.status)
+        || !deployments.success
+        || !(200..300).contains(&deployments.status)
+        || !version.success
+        || !(200..300).contains(&version.status)
+    {
+        return Err(CliError::Input(format!(
+            "Worker rollback preflight reads for `{service_name}` returned HTTP {}/{}/{} and cannot prove exact current state",
+            settings.status, deployments.status, version.status
+        )));
+    }
+    let rollback = target
+        .get("rollback")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker rollback target omitted its closed rollback contract".to_owned(),
+            )
+        })?;
+    let target_version_id = rollback
+        .get("target_version_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("Worker rollback target version is missing".to_owned()))?;
+    let expected_current_deployment_id = rollback
+        .get("expected_current_deployment_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("Worker rollback expected current deployment is missing".to_owned())
+        })?;
+    let history = deployments
+        .result
+        .get("deployments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input("Worker deployments readback omitted result.deployments".to_owned())
+        })?;
+    if !(2..=100).contains(&history.len()) {
+        return Err(CliError::Input(
+            "Worker rollback requires 2 to 100 retained deployments".to_owned(),
+        ));
+    }
+    let current = history.first().ok_or_else(|| {
+        CliError::Input("Worker deployment history has no current deployment".to_owned())
+    })?;
+    let current_deployment_id = current
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("Worker current deployment has no identity".to_owned()))?;
+    if current_deployment_id != expected_current_deployment_id {
+        return Err(CliError::Input(format!(
+            "Worker current deployment is `{current_deployment_id}`, not reviewed expected deployment `{expected_current_deployment_id}`"
+        )));
+    }
+    let current_versions = current
+        .get("versions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input("Worker current deployment has no version allocation".to_owned())
+        })?;
+    if current_versions.len() != 1
+        || current_versions[0]
+            .get("percentage")
+            .and_then(Value::as_f64)
+            != Some(100.0)
+    {
+        return Err(CliError::Input(
+            "Worker rollback requires one current version serving exactly 100 percent".to_owned(),
+        ));
+    }
+    let current_version_id = current_versions[0]
+        .get("version_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("Worker current version has no identity".to_owned()))?;
+    if current_version_id == target_version_id {
+        return Err(CliError::Input(
+            "Worker rollback target is already the active version".to_owned(),
+        ));
+    }
+    let prior_deployment_id = history.iter().skip(1).find_map(|deployment| {
+        deployment
+            .get("versions")
+            .and_then(Value::as_array)
+            .filter(|versions| {
+                versions.len() == 1
+                    && versions[0].get("version_id").and_then(Value::as_str)
+                        == Some(target_version_id)
+                    && versions[0].get("percentage").and_then(Value::as_f64) == Some(100.0)
+            })
+            .and_then(|_| deployment.get("id"))
+            .and_then(Value::as_str)
+    });
+    let prior_deployment_id = prior_deployment_id.ok_or_else(|| {
+        CliError::Input(
+            "Worker rollback target does not appear as the sole 100 percent version in retained prior deployment history"
+                .to_owned(),
+        )
+    })?;
+    if version.result.get("id").and_then(Value::as_str) != Some(target_version_id) {
+        return Err(CliError::Input(
+            "Worker target-version detail readback did not return the exact target identity"
+                .to_owned(),
+        ));
+    }
+    Ok(json!({
+        "schema_version":2,
+        "source_capability_id":SETTINGS_CAPABILITY_ID,
+        "source_path":SETTINGS_PATH,
+        "deployment_source_capability_id":DEPLOYMENTS_CAPABILITY_ID,
+        "deployment_source_path":DEPLOYMENTS_PATH,
+        "version_source_capability_id":VERSION_CAPABILITY_ID,
+        "version_source_path":VERSION_PATH,
+        "account_id":account_id,
+        "service_name":service_name,
+        "exists":true,
+        "current_deployment_id":current_deployment_id,
+        "current_version_id":current_version_id,
+        "target_version_id":target_version_id,
+        "target_prior_deployment_id":prior_deployment_id,
+        "target_version_detail_id":target_version_id,
+        "retained_deployment_count":history.len(),
+        "redacted_settings_hash":hash_value(&redact_json(&settings.result))?,
+        "redacted_deployments_hash":hash_value(&redact_json(&deployments.result))?,
+        "redacted_target_version_hash":hash_value(&redact_json(&version.result))?,
+        "force":false,
+        "traffic_percentage":100,
+    }))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "legacy deployment receipts and the stricter rollback receipt share one dispatcher while retaining distinct exact-shape validation"
+)]
 pub(super) fn validate_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<(), CliError> {
     let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let expected_service = service_name(adapter)?;
+    if plan.capability.id == ROLLBACK_CAPABILITY_ID {
+        let target = target(adapter).ok_or_else(|| {
+            CliError::Input("Worker rollback plan omitted its exact target".to_owned())
+        })?;
+        let rollback = target
+            .get("rollback")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                CliError::Input("Worker rollback plan omitted its closed target".to_owned())
+            })?;
+        let exact = receipt.as_object().is_some_and(|object| object.len() == 21)
+            && receipt.get("schema_version").and_then(Value::as_u64) == Some(2)
+            && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+            && receipt.get("service_name").and_then(Value::as_str) == Some(expected_service)
+            && receipt.get("exists").and_then(Value::as_bool) == Some(true)
+            && receipt.get("source_capability_id").and_then(Value::as_str)
+                == Some(SETTINGS_CAPABILITY_ID)
+            && receipt.get("source_path").and_then(Value::as_str) == Some(SETTINGS_PATH)
+            && receipt
+                .get("deployment_source_capability_id")
+                .and_then(Value::as_str)
+                == Some(DEPLOYMENTS_CAPABILITY_ID)
+            && receipt
+                .get("deployment_source_path")
+                .and_then(Value::as_str)
+                == Some(DEPLOYMENTS_PATH)
+            && receipt
+                .get("version_source_capability_id")
+                .and_then(Value::as_str)
+                == Some(VERSION_CAPABILITY_ID)
+            && receipt.get("version_source_path").and_then(Value::as_str) == Some(VERSION_PATH)
+            && receipt.get("current_deployment_id")
+                == rollback.get("expected_current_deployment_id")
+            && receipt.get("target_version_id") == rollback.get("target_version_id")
+            && receipt.get("target_version_detail_id") == rollback.get("target_version_id")
+            && receipt.get("force").and_then(Value::as_bool) == Some(false)
+            && receipt.get("traffic_percentage").and_then(Value::as_u64) == Some(100)
+            && receipt
+                .get("retained_deployment_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| (2..=100).contains(&count))
+            && [
+                "current_version_id",
+                "target_prior_deployment_id",
+                "redacted_settings_hash",
+                "redacted_deployments_hash",
+                "redacted_target_version_hash",
+            ]
+            .iter()
+            .all(|field| {
+                receipt
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            });
+        if !exact {
+            return Err(CliError::Input(
+                "Worker rollback live-state receipt is malformed or targets another service, deployment, or version"
+                    .to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     let exists = receipt.get("exists").and_then(Value::as_bool);
     let exact_field_count = match exists {
         Some(false) => 7,
@@ -802,6 +1114,28 @@ mod tests {
     use cfctl_core::{AdapterStatus, EffectClass, PlanStatus, RiskClass};
     use cfctl_workspace::RegisteredRoot;
     use std::process::Command;
+
+    #[test]
+    fn every_local_worker_traffic_mutation_resolves_to_one_shared_lock_target() {
+        let adapter = json!({"worker_deployment":{"service_name":"drop"}});
+        for capability_id in [
+            "wrangler.deploy",
+            "wrangler.versions-deploy",
+            ROLLBACK_CAPABILITY_ID,
+        ] {
+            let capability = CapabilityV1::new(capability_id, "Worker write", "CLI", "worker");
+            assert!(mutates_traffic(&capability));
+            assert_eq!(service_name(&adapter).expect("shared lock target"), "drop");
+        }
+        let upload = CapabilityV1::new(
+            "wrangler.versions-upload",
+            "Upload Worker version",
+            "CLI",
+            "worker",
+        );
+        assert!(binds_live_state(&upload));
+        assert!(!mutates_traffic(&upload));
+    }
 
     #[test]
     #[cfg(unix)]
@@ -1719,5 +2053,158 @@ database_id = "11111111-1111-4111-8111-111111111111"
         assert!(existing["redacted_deployments_hash"].as_str().is_some());
         assert_ne!(existing, existing_b);
         assert!(!existing.to_string().contains("hidden"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one preflight contract test covers valid history plus current, missing, split, partial, and wire-shape drift"
+    )]
+    fn rollback_preflight_binds_current_and_prior_versions_and_rejects_drift() {
+        let current_deployment = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let current_version = "11111111-2222-4333-8444-555555555555";
+        let target_version = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        let prior_deployment = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+        let target = json!({
+            "schema_version":1,
+            "service_name":"drop",
+            "rollback":{
+                "target_version_id":target_version,
+                "expected_current_deployment_id":current_deployment,
+                "message":"restore known good",
+                "traffic_percentage":100,
+                "force":false,
+            }
+        });
+        let settings = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"compatibility_date":"2026-08-25"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let deployments = CloudflareResponseV1 {
+            result: json!({"deployments":[
+                {"id":current_deployment,"versions":[{"version_id":current_version,"percentage":100}]},
+                {"id":prior_deployment,"versions":[{"version_id":target_version,"percentage":100}]}
+            ]}),
+            ..settings.clone()
+        };
+        let version = CloudflareResponseV1 {
+            result: json!({"id":target_version,"metadata":{"created_on":"2026-08-24T00:00:00Z"}}),
+            ..settings.clone()
+        };
+        let receipt = apply_rollback_state_responses(
+            "account-a",
+            "drop",
+            &target,
+            &settings,
+            &deployments,
+            &version,
+        )
+        .expect("exact rollback preflight");
+        assert_eq!(receipt["current_deployment_id"], current_deployment);
+        assert_eq!(receipt["current_version_id"], current_version);
+        assert_eq!(receipt["target_version_id"], target_version);
+        assert_eq!(receipt["target_prior_deployment_id"], prior_deployment);
+        assert_eq!(receipt["force"], false);
+        assert_eq!(receipt["traffic_percentage"], 100);
+
+        let drifted_target = json!({
+            "schema_version":1,
+            "service_name":"drop",
+            "rollback":{
+                "target_version_id":target_version,
+                "expected_current_deployment_id":"cccccccc-dddd-4eee-8fff-000000000000",
+                "message":"restore known good",
+                "traffic_percentage":100,
+                "force":false,
+            }
+        });
+        assert!(
+            apply_rollback_state_responses(
+                "account-a",
+                "drop",
+                &drifted_target,
+                &settings,
+                &deployments,
+                &version,
+            )
+            .is_err()
+        );
+        let missing_history = CloudflareResponseV1 {
+            result: json!({"deployments":[
+                {"id":current_deployment,"versions":[{"version_id":current_version,"percentage":100}]},
+                {"id":prior_deployment,"versions":[{"version_id":"dddddddd-eeee-4fff-8000-111111111111","percentage":100}]}
+            ]}),
+            ..settings.clone()
+        };
+        assert!(
+            apply_rollback_state_responses(
+                "account-a",
+                "drop",
+                &target,
+                &settings,
+                &missing_history,
+                &version,
+            )
+            .is_err()
+        );
+        let split_prior = CloudflareResponseV1 {
+            result: json!({"deployments":[
+                {"id":current_deployment,"versions":[{"version_id":current_version,"percentage":100}]},
+                {"id":prior_deployment,"versions":[
+                    {"version_id":target_version,"percentage":50},
+                    {"version_id":"dddddddd-eeee-4fff-8000-111111111111","percentage":50}
+                ]}
+            ]}),
+            ..settings.clone()
+        };
+        assert!(
+            apply_rollback_state_responses(
+                "account-a",
+                "drop",
+                &target,
+                &settings,
+                &split_prior,
+                &version,
+            )
+            .is_err()
+        );
+        let partial_prior = CloudflareResponseV1 {
+            result: json!({"deployments":[
+                {"id":current_deployment,"versions":[{"version_id":current_version,"percentage":100}]},
+                {"id":prior_deployment,"versions":[{"version_id":target_version,"percentage":99}]}
+            ]}),
+            ..settings.clone()
+        };
+        assert!(
+            apply_rollback_state_responses(
+                "account-a",
+                "drop",
+                &target,
+                &settings,
+                &partial_prior,
+                &version,
+            )
+            .is_err()
+        );
+        let undocumented_bare_array = CloudflareResponseV1 {
+            result: deployments.result["deployments"].clone(),
+            ..settings
+        };
+        assert!(
+            apply_rollback_state_responses(
+                "account-a",
+                "drop",
+                &target,
+                &undocumented_bare_array,
+                &undocumented_bare_array,
+                &version,
+            )
+            .is_err()
+        );
     }
 }

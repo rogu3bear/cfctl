@@ -41,7 +41,8 @@ use cfctl_catalog::{
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
     OperationVerificationV1, R2LogRetrievalCredentials, R2PrivateUploadPayload,
-    validate_request_contract, validate_reviewed_schema_migration_sql,
+    project_worker_version_rollback_readback, validate_request_contract,
+    validate_reviewed_schema_migration_sql, worker_version_rollback_annotation,
 };
 use cfctl_core::{
     AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
@@ -1524,11 +1525,14 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         adapter_targets.insert("pages_deployment".to_owned(), target);
     }
     if worker_deployment::binds_live_state(&capability) {
-        let graph = discover_registered(store)?;
-        let target = worker_deployment::prepare_target(&graph, &capability, &prepared.input)?
-            .ok_or_else(|| {
-                CliError::Input("Worker deployment target could not be derived".to_owned())
-            })?;
+        let target = if capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
+            worker_deployment::prepare_rollback_target(&capability, &prepared.input)?
+        } else {
+            let graph = discover_registered(store)?;
+            worker_deployment::prepare_target(&graph, &capability, &prepared.input)?.ok_or_else(
+                || CliError::Input("Worker deployment target could not be derived".to_owned()),
+            )?
+        };
         adapter_targets.insert("worker_deployment".to_owned(), target);
     }
     if let Some(security_action) = security_action {
@@ -13730,12 +13734,51 @@ async fn read_live_worker_deployment_state(
     } else {
         None
     };
-    let receipt = worker_deployment::apply_state_responses(
-        account_id,
-        service_name,
-        &settings,
-        deployments.as_ref(),
-    )?;
+    let receipt = if capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
+        let target = worker_deployment::target(adapter_targets)
+            .ok_or_else(|| CliError::Input("Worker rollback target is missing".to_owned()))?;
+        let target_version_id = target
+            .pointer("/rollback/target_version_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("Worker rollback target version is missing".to_owned())
+            })?;
+        let version_source = exact_worker_deployment_read_capability(
+            catalog,
+            worker_deployment::VERSION_CAPABILITY_ID,
+            worker_deployment::VERSION_PATH,
+        )?;
+        let version_input = CallInput {
+            selectors: json!({
+                "account_id": account_id,
+                "script_name": service_name,
+                "version_id": target_version_id,
+            }),
+            query: json!({}),
+            body: None,
+            ..CallInput::default()
+        };
+        let version = executor
+            .execute_read(version_source, &version_input, credential)
+            .await?;
+        worker_deployment::apply_rollback_state_responses(
+            account_id,
+            service_name,
+            target,
+            &settings,
+            deployments.as_ref().ok_or_else(|| {
+                CliError::Input("Worker rollback deployments read is missing".to_owned())
+            })?,
+            &version,
+        )?
+    } else {
+        worker_deployment::apply_state_responses(
+            account_id,
+            service_name,
+            &settings,
+            deployments.as_ref(),
+        )?
+    };
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
@@ -16095,6 +16138,19 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
+        validate_request_contract(&plan.capability, &execution_input)?;
+    }
+    let _worker_deployment_lock = if worker_deployment::mutates_traffic(&plan.capability) {
+        let script_name = worker_deployment::service_name(adapter_targets)?;
+        Some(
+            store
+                .lock_worker_deployment(&plan.account_id, script_name)
+                .map_err(CliError::Storage)?,
+        )
+    } else {
+        None
+    };
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
@@ -16182,6 +16238,19 @@ async fn run_plan_under_standing_authority(
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
+        validate_request_contract(&plan.capability, &execution_input)?;
+    }
+    let _worker_deployment_lock = if worker_deployment::mutates_traffic(&plan.capability) {
+        let script_name = worker_deployment::service_name(adapter_targets)?;
+        Some(
+            store
+                .lock_worker_deployment(&plan.account_id, script_name)
+                .map_err(CliError::Storage)?,
+        )
+    } else {
+        None
+    };
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
@@ -23415,6 +23484,41 @@ async fn verify_api_plan(
     credential: &AuthCredential,
 ) -> Result<ApiVerificationOutcome> {
     if !response.success {
+        if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID
+            && (response.status == 429 || response.status >= 500)
+        {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_transaction_stage(
+                store,
+                plan,
+                TransactionStageV1::VerificationAttemptPersisted,
+            )?;
+            let outcome = ApiVerificationOutcome {
+                state: VerificationState::Pending,
+                basis: format!(
+                    "Cloudflare returned HTTP {} after the one permitted rollback POST; the remote outcome is ambiguous and must be reconciled by GET without replay",
+                    response.status
+                ),
+                evidence: None,
+                error: Some(ErrorV1 {
+                    code: "CFCTL_ROLLBACK_OUTCOME_AMBIGUOUS".to_owned(),
+                    message: "The Worker rollback response does not prove whether the deployment was committed"
+                        .to_owned(),
+                    next_step: Some(format!(
+                        "Keep the deployment lane frozen and run `cfctl plans rectify {}`; never replay the POST.",
+                        plan.operation_id
+                    )),
+                }),
+                correlated_resource_id: None,
+            };
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::VerificationResponsePersisted,
+                verification_response_artifact(&outcome)?,
+            )?;
+            return Ok(outcome);
+        }
         plan.status = PlanStatus::Failed;
         return Ok(ApiVerificationOutcome {
             state: VerificationState::NotApplicable,
@@ -24100,6 +24204,9 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, &mut plan);
     }
+    if worker_version_rollback_rectification_eligible(&plan) {
+        return rectify_worker_version_rollback(store, &mut plan).await;
+    }
     if workspace_d1_migration_rectification_eligible(&plan) {
         return rectify_workspace_d1_migration(store, &mut plan).await;
     }
@@ -24220,6 +24327,169 @@ fn workspace_d1_migration_rectification_eligible(plan: &PlanV1) -> bool {
             checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted
                 && checkpoint.artifact_hash.is_some()
         })
+}
+
+fn worker_version_rollback_rectification_eligible(plan: &PlanV1) -> bool {
+    plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID
+        && plan.status == PlanStatus::RectificationRequired
+        && plan
+            .transaction_journal
+            .iter()
+            .any(|checkpoint| checkpoint.stage == TransactionStageV1::BoundaryAttemptPersisted)
+}
+
+async fn rectify_worker_version_rollback(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    let secrets = platform_secrets(store);
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "Worker rollback rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let script_name = input
+        .selectors
+        .get("script_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("Worker rollback rectification omitted script_name".to_owned())
+        })?;
+    if input.selectors.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "Worker rollback rectification account selector drifted".to_owned(),
+        ));
+    }
+    let target_version_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("target_version_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("Worker rollback rectification target version is missing".to_owned())
+        })?;
+    let reason = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("message"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("Worker rollback rectification reason is missing".to_owned())
+        })?;
+    let annotation = worker_version_rollback_annotation(reason, &plan.operation_id)?;
+    let _worker_deployment_lock = store
+        .lock_worker_deployment(&plan.account_id, script_name)
+        .map_err(CliError::Storage)?;
+    let catalog = ensure_catalog(store).await?;
+    let read = exact_worker_deployment_read_capability(
+        &catalog,
+        worker_deployment::DEPLOYMENTS_CAPABILITY_ID,
+        worker_deployment::DEPLOYMENTS_PATH,
+    )?;
+    let credential = fresh_credential(profile, &secrets).await?;
+    let read_input = CallInput {
+        selectors: json!({
+            "account_id":plan.account_id,
+            "script_name":script_name,
+        }),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    };
+    let readback = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(read, &read_input, &credential)
+        .await?;
+    persist_worker_version_rollback_rectification(
+        store,
+        plan,
+        target_version_id,
+        &annotation,
+        &readback,
+    )
+}
+
+/// Applies one already-completed GET-only rollback readback to the durable
+/// plan. Kept separate from transport so tests can prove closure and retained
+/// evidence without constructing any mutation-capable client.
+fn persist_worker_version_rollback_rectification(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    target_version_id: &str,
+    annotation: &str,
+    readback: &CloudflareResponseV1,
+) -> Result<ResultEnvelopeV2> {
+    let (passed, latest_deployment_id, projected) =
+        project_worker_version_rollback_readback(target_version_id, annotation, readback)?;
+    let basis = if passed {
+        "the GET-only deployment read found exactly one operation marker on the current deployment with the exact target at 100 percent"
+    } else {
+        "the GET-only deployment read did not prove this operation marker on the current exact target; the POST was not replayed"
+    };
+    let verification = json!({
+        "strategy":"worker_version_rollback_get_only_rectification",
+        "passed":passed,
+        "basis":basis,
+        "latest_deployment_id":latest_deployment_id,
+        "readback":projected,
+        "verification_only":true,
+        "boundary_replayed":false,
+    });
+    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    if passed {
+        plan.status = PlanStatus::Verified;
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::Closed,
+            json!({
+                "rectification_verification_hash":evidence.content_hash,
+                "retry":false,
+                "boundary_replayed":false,
+            }),
+        )?;
+    } else {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+    }
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id":plan.operation_id,
+            "status":plan.status,
+            "verification_only":true,
+            "boundary_replayed":false,
+            "message":basis,
+        }),
+    )
+    .with_evidence(evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.to_owned());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis.to_owned(),
+            next_step: Some(
+                "Keep the Worker deployment lane frozen, inspect the projected readback, and create a new reviewed plan only after current authority is rebound."
+                    .to_owned(),
+            ),
+        });
+    }
+    Ok(envelope)
 }
 
 async fn rectify_workspace_d1_migration(
@@ -27853,6 +28123,13 @@ fn validate_worker_deployment_local_authority(
     {
         return Ok(());
     }
+    if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
+        return worker_deployment::validate_current_rollback_target(
+            &plan.capability,
+            input,
+            adapter,
+        );
+    }
     let graph = discover_registered(store)?;
     worker_deployment::validate_current_target(&graph, &plan.capability, input, adapter)
 }
@@ -29727,6 +30004,26 @@ fn redact_secret_result(value: &Value) -> Value {
 }
 
 fn redact_response_for_capability(capability: &CapabilityV1, value: &Value) -> Value {
+    if capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
+        let error_codes = value
+            .get("errors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|error| error.get("code").cloned())
+            .collect::<Vec<_>>();
+        return json!({
+            "status":value.get("status").cloned().unwrap_or(Value::Null),
+            "success":value.get("success").cloned().unwrap_or(Value::Bool(false)),
+            "result":{
+                "id":value.pointer("/result/id").cloned().unwrap_or(Value::Null),
+                "provider_output_retained":false,
+            },
+            "error_codes":error_codes,
+            "etag":value.get("etag").cloned().unwrap_or(Value::Null),
+            "cf_ray":value.get("cf_ray").cloned().unwrap_or(Value::Null),
+        });
+    }
     let redacted = if should_redact_secret_response(capability) {
         redact_secret_result(value)
     } else {
@@ -30062,16 +30359,16 @@ mod tests {
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        persist_workspace_d1_rectification_result, plan_impact, plan_local_artifact_paths,
-        plan_requires_live_credential, plan_state_next_step, plan_status_label,
-        preflight_call_input, preflight_secret_sink, preflight_standing_authority,
-        prepare_r2_temporary_credentials_input, prepare_security_action_input,
-        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
-        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
-        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
-        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
-        repair_keychain_access_with_warning, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        persist_worker_version_rollback_rectification, persist_workspace_d1_rectification_result,
+        plan_impact, plan_local_artifact_paths, plan_requires_live_credential,
+        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        prepare_security_action_input, prepare_wrangler_deployment_status_command,
+        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
+        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
+        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -44241,6 +44538,327 @@ mod tests {
                 .minted_token_ids,
             vec!["token-in-flight"]
         );
+    }
+
+    fn rollback_rectification_plan(target_version: &str) -> PlanV1 {
+        let mut capability = CapabilityV1::new(
+            "worker-version-rollback",
+            "Rollback Worker version",
+            "POST",
+            "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+        );
+        capability.adapter_status = AdapterStatus::Native;
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "script_name":"drop",
+            }),
+            query: json!({}),
+            body: Some(json!({
+                "target_version_id":target_version,
+                "expected_current_deployment_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "message":"restore known good",
+            })),
+            ..CallInput::default()
+        };
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:rollback-catalog",
+            capability,
+            json!({"adapter":{"worker_deployment":{
+                "schema_version":1,
+                "service_name":"drop",
+                "rollback":{
+                    "target_version_id":target_version,
+                    "expected_current_deployment_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "message":"restore known good",
+                    "traffic_percentage":100,
+                    "force":false,
+                }
+            }}}),
+        )
+        .expect("rollback plan");
+        plan.input = serde_json::to_value(input).expect("rollback input");
+        plan.refresh_hash().expect("bind rollback input");
+        plan.approve(true, None).expect("rollback approval");
+        plan.mark_consumed().expect("rollback consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("rollback boundary attempt");
+        plan
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one persistence test proves unique-marker closure, projected evidence, duplicate rejection, and durable open state"
+    )]
+    fn worker_rollback_get_only_rectification_closes_only_unique_current_marker() {
+        let target_version = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        let deployment_id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+        let root = tempfile::tempdir().expect("rollback rectification root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut plan = rollback_rectification_plan(target_version);
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"outcome":"transport_error","receipt_available":false}),
+        )
+        .expect("unknown rollback boundary");
+        store.save_plan(&plan).expect("persist ambiguous rollback");
+        let annotation = cfctl_cloudflare::worker_version_rollback_annotation(
+            "restore known good",
+            &plan.operation_id,
+        )
+        .expect("operation marker");
+        let readback = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"deployments":[{
+                "id":deployment_id,
+                "versions":[{"version_id":target_version,"percentage":100}],
+                "annotations":{"workers/message":annotation},
+            }]}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let envelope = persist_worker_version_rollback_rectification(
+            &store,
+            &mut plan,
+            target_version,
+            &annotation,
+            &readback,
+        )
+        .expect("GET-only rectification");
+        assert!(envelope.ok);
+        assert!(
+            !envelope.performed,
+            "rectification must not replay the POST"
+        );
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        let evidence = store
+            .read_evidence_value(&envelope.evidence[0].content_hash)
+            .expect("projected rectification evidence");
+        assert_eq!(evidence["verification_only"], true);
+        assert_eq!(evidence["boundary_replayed"], false);
+        assert_eq!(
+            evidence["readback"]["result"]["provider_output_retained"],
+            false
+        );
+        assert!(evidence["readback"]["result"].get("deployments").is_none());
+        assert!(!evidence.to_string().contains("restore known good"));
+
+        let mut duplicate = rollback_rectification_plan(target_version);
+        duplicate.status = PlanStatus::RectificationRequired;
+        duplicate
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::BoundaryResponsePersisted,
+                json!({"outcome":"transport_error","receipt_available":false}),
+            )
+            .expect("unknown duplicate-marker boundary");
+        store
+            .save_plan(&duplicate)
+            .expect("persist duplicate-marker rollback");
+        let duplicate_annotation = cfctl_cloudflare::worker_version_rollback_annotation(
+            "restore known good",
+            &duplicate.operation_id,
+        )
+        .expect("duplicate operation marker");
+        let duplicate_readback = CloudflareResponseV1 {
+            result: json!({"deployments":[
+                {
+                    "id":deployment_id,
+                    "versions":[{"version_id":target_version,"percentage":100}],
+                    "annotations":{"workers/message":duplicate_annotation},
+                },
+                {
+                    "id":"cccccccc-dddd-4eee-8fff-000000000000",
+                    "versions":[{"version_id":target_version,"percentage":100}],
+                    "annotations":{"workers/message":duplicate_annotation},
+                }
+            ]}),
+            ..readback
+        };
+        let envelope = persist_worker_version_rollback_rectification(
+            &store,
+            &mut duplicate,
+            target_version,
+            &duplicate_annotation,
+            &duplicate_readback,
+        )
+        .expect("failed GET-only rectification remains inspectable");
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(duplicate.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            store
+                .load_plan(&duplicate.operation_id)
+                .expect("reload open rollback")
+                .status,
+            PlanStatus::RectificationRequired
+        );
+    }
+
+    #[test]
+    fn worker_rollback_apply_receipt_discards_provider_annotations_and_author_metadata() {
+        let capability = CapabilityV1::new(
+            "worker-version-rollback",
+            "Rollback Worker version",
+            "POST",
+            "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+        );
+        let projected = redact_response_for_capability(
+            &capability,
+            &json!({
+                "status":200,
+                "success":true,
+                "result":{
+                    "id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "annotations":{"workers/message":"private reviewed reason"},
+                    "author_email":"operator@example.com",
+                },
+                "errors":[],
+                "result_info":{"page":1},
+                "etag":"etag-a",
+                "cf_ray":"ray-a",
+            }),
+        );
+        assert_eq!(
+            projected["result"]["id"],
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        );
+        assert_eq!(projected["result"]["provider_output_retained"], false);
+        assert!(!projected.to_string().contains("private reviewed reason"));
+        assert!(!projected.to_string().contains("operator@example.com"));
+        assert!(projected.get("result_info").is_none());
+    }
+
+    #[test]
+    fn oversized_worker_rollback_reason_fails_before_consumption_or_boundary_attempt() {
+        let mut capability = CapabilityV1::new(
+            "worker-version-rollback",
+            "Rollback Worker version",
+            "POST",
+            "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+        );
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "x-cfctl-body-required":true,
+            "required":["target_version_id","expected_current_deployment_id","message"],
+            "properties":{
+                "target_version_id":{"type":"string"},
+                "expected_current_deployment_id":{"type":"string"},
+                "message":{"type":"string","minLength":1,"maxLength":900}
+            }
+        }));
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "script_name":"drop",
+            }),
+            query: json!({}),
+            body: Some(json!({
+                "target_version_id":"66666666-7777-4888-8999-aaaaaaaaaaaa",
+                "expected_current_deployment_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "message":"x".repeat(901),
+            })),
+            ..CallInput::default()
+        };
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:rollback-catalog",
+            capability,
+            json!({}),
+        )
+        .expect("rollback plan");
+        plan.input = serde_json::to_value(&input).expect("rollback input");
+        plan.refresh_hash().expect("bind rollback input");
+        plan.approve(true, None).expect("approval");
+
+        assert!(validate_request_contract(&plan.capability, &input).is_err());
+        assert_eq!(plan.status, PlanStatus::Approved);
+        assert!(plan.transaction_journal.iter().all(|checkpoint| {
+            checkpoint.stage != TransactionStageV1::ConsumptionPersisted
+                && checkpoint.stage != TransactionStageV1::BoundaryAttemptPersisted
+        }));
+    }
+
+    #[tokio::test]
+    async fn worker_rollback_retryable_http_response_enters_no_replay_rectification() {
+        let target_version = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        for status in [429, 500] {
+            let root = tempfile::tempdir().expect("ambiguous rollback root");
+            let store =
+                StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+            let mut plan = rollback_rectification_plan(target_version);
+            plan.status = PlanStatus::Failed;
+            plan.record_transaction_stage_with_artifact(
+                TransactionStageV1::BoundaryResponsePersisted,
+                json!({"http_status":status,"success":false}),
+            )
+            .expect("ambiguous boundary response");
+            plan.record_transaction_stage_with_artifact(
+                TransactionStageV1::SecretSinkPersisted,
+                json!({"completed":true,"output_sink":{"required":false}}),
+            )
+            .expect("no secret lifecycle");
+            store.save_plan(&plan).expect("persist provider response");
+            let input = CallInput {
+                selectors: json!({
+                    "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "script_name":"drop",
+                }),
+                query: json!({}),
+                body: Some(json!({
+                    "target_version_id":target_version,
+                    "expected_current_deployment_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "message":"restore known good",
+                })),
+                ..CallInput::default()
+            };
+            let response = CloudflareResponseV1 {
+                status,
+                success: false,
+                result: Value::Null,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            };
+            let executor =
+                cfctl_cloudflare::Executor::new(reqwest::Client::new(), "http://127.0.0.1:9")
+                    .expect("unused rollback executor");
+            let outcome = super::verify_api_plan(
+                &store,
+                &executor,
+                &mut plan,
+                &response,
+                &input,
+                &cfctl_auth::AuthCredential::Bearer {
+                    token: "unused".to_owned(),
+                },
+            )
+            .await
+            .expect("classify ambiguous response without readback");
+            assert_eq!(outcome.state, VerificationState::Pending);
+            assert_eq!(plan.status, PlanStatus::RectificationRequired);
+            assert_eq!(
+                plan.transaction_stage,
+                TransactionStageV1::VerificationResponsePersisted
+            );
+            assert_eq!(
+                store
+                    .load_plan(&plan.operation_id)
+                    .expect("reload ambiguous rollback")
+                    .status,
+                PlanStatus::RectificationRequired
+            );
+        }
     }
 
     #[test]
