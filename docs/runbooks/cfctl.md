@@ -495,6 +495,16 @@ A separate reply-domain zone, the parent-zone catch-all, incomplete account
 pagination, ambiguous exact rules, or a merely similar Worker never satisfy
 the contract.
 
+An account-scoped API-token profile remains the normal read credential. If the
+provider denies that exact account inventory to an otherwise correctly scoped
+token, an explicitly named emergency global-key profile may perform this one
+non-mutating workspace read. Global-key profiles are intentionally not selected
+implicitly and carry no stored account pin, so the caller must pass one exact
+`--account` and the same exact `account_id` selector. The adapter still binds
+the active credential generation and rejects ordinary unbound profiles,
+mismatched accounts, or any mutation attempt. This exception does not grant the
+global key standing authority for plans, applies, token minting, or deployment.
+
 The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
 the operation pack and tracked Wrangler template at that HEAD. Migration packs
