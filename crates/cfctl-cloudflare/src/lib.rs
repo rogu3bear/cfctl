@@ -8929,7 +8929,6 @@ fn page_pagination(result_info: Option<&Value>) -> Result<Option<PagePagination>
         .map(|value| {
             value
                 .as_u64()
-                .filter(|total_pages| *total_pages > 0)
                 .ok_or(CloudflareError::PaginationMetadataInvalid)
         })
         .transpose()?;
@@ -8944,6 +8943,11 @@ fn page_pagination(result_info: Option<&Value>) -> Result<Option<PagePagination>
     {
         return Err(CloudflareError::PaginationMetadataInvalid);
     }
+    let explicit_total_pages = match explicit_total_pages {
+        Some(0) if current == 1 && count == Some(0) && total_count == Some(0) => Some(1),
+        Some(0) => return Err(CloudflareError::PaginationMetadataInvalid),
+        other => other,
+    };
     let derived_total_pages = match (per_page, count, total_count) {
         (Some(per_page), Some(_), Some(total_count)) => Some(total_count.div_ceil(per_page).max(1)),
         _ => None,

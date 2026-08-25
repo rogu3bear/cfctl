@@ -5052,11 +5052,33 @@ async fn executor_collects_pages_when_total_pages_is_derived() {
 }
 
 #[tokio::test]
+async fn executor_normalizes_an_empty_zero_total_pages_response() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":50,"count":0,"total_count":0,"total_pages":0}}"#,
+    ])
+    .await;
+    let response = execute_paginated_workers_read(&address)
+        .await
+        .expect("empty inventory is a complete observed page");
+
+    assert_eq!(response.result, json!([]));
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["page"], json!(1));
+    assert_eq!(info["count"], json!(0));
+    assert_eq!(info["total_pages"], json!(1));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
 async fn executor_rejects_missing_or_ambiguous_page_metadata() {
     for body in [
         r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[]}"#,
         r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"total_pages":1,"total_count":1,"cursors":{"after":null}}}"#,
         r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":0,"per_page":50,"total_pages":1,"total_count":1}}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":1,"total_pages":0,"total_count":1}}"#,
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":50,"count":0,"total_pages":0,"total_count":1}}"#,
     ] {
         let (address, server) = json_response_sequence_server(vec![body]).await;
         let error = execute_paginated_workers_read(&address)
