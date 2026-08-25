@@ -488,7 +488,71 @@ fn normalize_production_identity(
     production["name"] = template_name;
     let template_database = d1_entry(template, binding)?.clone();
     *d1_entry_mut(production, binding)? = template_database;
+    normalize_sender_identity(production, template)?;
     Ok(())
+}
+
+fn normalize_sender_identity(production: &mut toml::Value, template: &toml::Value) -> Result<()> {
+    let Some(production_senders) = production
+        .get_mut("send_email")
+        .and_then(toml::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let Some(template_senders) = template.get("send_email").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    if production_senders.len() != template_senders.len() {
+        return Ok(());
+    }
+    for (production_sender, template_sender) in production_senders.iter_mut().zip(template_senders)
+    {
+        let Some(production_table) = production_sender.as_table_mut() else {
+            continue;
+        };
+        let Some(addresses) = production_table.get("allowed_sender_addresses") else {
+            continue;
+        };
+        validate_sender_addresses(addresses)?;
+        if let Some(template_addresses) = template_sender.get("allowed_sender_addresses") {
+            production_table.insert(
+                "allowed_sender_addresses".to_owned(),
+                template_addresses.clone(),
+            );
+        } else {
+            production_table.remove("allowed_sender_addresses");
+        }
+    }
+    Ok(())
+}
+
+fn validate_sender_addresses(value: &toml::Value) -> Result<()> {
+    let valid = value.as_array().is_some_and(|addresses| {
+        (1..=256).contains(&addresses.len())
+            && addresses.iter().all(|address| {
+                address.as_str().is_some_and(|address| {
+                    (3..=320).contains(&address.len())
+                        && !address
+                            .bytes()
+                            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+                        && address.split_once('@').is_some_and(|(local, domain)| {
+                            !local.is_empty()
+                                && !domain.is_empty()
+                                && !domain.contains('@')
+                                && !domain.starts_with('.')
+                                && !domain.ends_with('.')
+                        })
+                })
+            })
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::Input(
+            "workspace D1 production sender identity must be a bounded list of email addresses"
+                .to_owned(),
+        ))
+    }
 }
 
 fn d1_entry<'a>(config: &'a toml::Value, binding: &str) -> Result<&'a toml::Value> {
@@ -1265,11 +1329,15 @@ mod tests {
     }
 
     #[test]
-    fn production_config_normalizes_only_worker_and_d1_identity() {
+    fn production_config_normalizes_worker_d1_and_sender_identity() {
         let template: toml::Value = toml::from_str(
             r#"
 name = "template"
 main = "build/_worker.js"
+
+send_email = [
+  { name = "EMAIL" }
+]
 
 [observability]
 enabled = true
@@ -1286,6 +1354,10 @@ preview_database_id = "00000000-0000-0000-0000-000000000000"
             r#"
 name = "production-worker"
 main = "build/_worker.js"
+
+send_email = [
+  { name = "EMAIL", allowed_sender_addresses = ["security@example.com"] }
+]
 
 [observability]
 enabled = true
@@ -1306,6 +1378,26 @@ preview_database_id = "11111111-1111-4111-8111-111111111111"
         production["main"] = toml::Value::String("other.js".to_owned());
         normalize_production_identity(&mut production, &template, "DB").expect("normalize");
         assert_ne!(production, template);
+    }
+
+    #[test]
+    fn production_sender_identity_rejects_malformed_or_unbounded_addresses() {
+        for addresses in [
+            toml::Value::Array(Vec::new()),
+            toml::Value::Array(vec![toml::Value::String("not-an-address".to_owned())]),
+            toml::Value::Array(vec![toml::Value::String(
+                "bad address@example.com".to_owned(),
+            )]),
+            toml::Value::String("security@example.com".to_owned()),
+        ] {
+            assert!(validate_sender_addresses(&addresses).is_err());
+        }
+        assert!(
+            validate_sender_addresses(&toml::Value::Array(vec![toml::Value::String(
+                "security@example.com".to_owned()
+            )]))
+            .is_ok()
+        );
     }
 
     #[test]
