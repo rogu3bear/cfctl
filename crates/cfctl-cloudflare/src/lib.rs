@@ -7104,6 +7104,7 @@ impl Executor {
         if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut) {
             result_info.insert("page".to_owned(), Value::from(total_pages));
             result_info.insert("count".to_owned(), Value::from(results.len()));
+            result_info.insert("total_pages".to_owned(), Value::from(total_pages));
             result_info.insert("cfctl_pages".to_owned(), Value::from(total_pages));
             result_info.insert("cfctl_page_complete".to_owned(), Value::Bool(true));
         }
