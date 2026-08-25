@@ -25,10 +25,6 @@ struct Pack {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the operation pack states four independent fail-closed privacy and effect invariants"
-)]
 struct Operation {
     id: String,
     title: String,
@@ -44,16 +40,23 @@ struct Operation {
     wrangler_version: String,
     admission_table: String,
     input_contract: String,
-    mutation_projection: String,
+    mutation_projection: Option<String>,
+    projection: Option<String>,
+    #[serde(default)]
+    parameters: Vec<String>,
     caller_sql_allowed: bool,
-    performs_on_call: bool,
+    performs_on_call: Option<bool>,
     provider_output_retained: bool,
     body_returned: bool,
-    recovery_capability_id: String,
-    recovery_max_age_seconds: u64,
-    rollback_capability_id: String,
+    recovery_capability_id: Option<String>,
+    recovery_max_age_seconds: Option<u64>,
+    rollback_capability_id: Option<String>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loader binds the exact clean repository, operation pack, compiler, runtime, config, and closed capability variant"
+)]
 pub fn load_workspace_d1_reply_admission_capability(
     roots: &[PathBuf],
     capability_id: &str,
@@ -124,6 +127,12 @@ pub fn load_workspace_d1_reply_admission_capability(
         }
         let production = safe_relative(&operation.production_config)?;
         let contract = WorkspaceD1ReplyAdmissionContractV1 {
+            operation_kind: if operation.id == "star-maildesk-cf.reply-admission-activate" {
+                "activate"
+            } else {
+                "read"
+            }
+            .to_owned(),
             repository_root: repository.path.display().to_string(),
             repository_head: head.to_owned(),
             repository_origin: origin,
@@ -141,10 +150,12 @@ pub fn load_workspace_d1_reply_admission_capability(
             wrangler_version: operation.wrangler_version.clone(),
             admission_table: operation.admission_table.clone(),
             input_contract: operation.input_contract.clone(),
-            mutation_projection: operation.mutation_projection.clone(),
-            recovery_capability_id: operation.recovery_capability_id.clone(),
-            recovery_max_age_seconds: operation.recovery_max_age_seconds,
-            rollback_capability_id: operation.rollback_capability_id.clone(),
+            mutation_projection: operation.mutation_projection.clone().unwrap_or_default(),
+            read_projection: operation.projection.clone(),
+            read_parameters: operation.parameters.clone(),
+            recovery_capability_id: operation.recovery_capability_id.clone().unwrap_or_default(),
+            recovery_max_age_seconds: operation.recovery_max_age_seconds.unwrap_or_default(),
+            rollback_capability_id: operation.rollback_capability_id.clone().unwrap_or_default(),
         };
         matches.push(capability(operation, contract));
     }
@@ -158,8 +169,7 @@ pub fn load_workspace_d1_reply_admission_capability(
 }
 
 fn validate(o: &Operation) -> Result<()> {
-    if o.id != "star-maildesk-cf.reply-admission-activate"
-        || o.title.trim().is_empty()
+    let common = o.title.trim().is_empty()
         || o.description.trim().is_empty()
         || !identifier(&o.database_binding)
         || !identifier(&o.admission_table)
@@ -169,15 +179,38 @@ fn validate(o: &Operation) -> Result<()> {
         || !version(&o.compiler_runtime_version)
         || !is_sha256(&o.compiler_runtime_sha256)
         || o.input_contract != "maildesk_reply_admission_compiler_input_v1"
-        || o.mutation_projection != "maildesk_reply_admission_insert_v1"
         || o.caller_sql_allowed
-        || o.performs_on_call
         || o.provider_output_retained
-        || o.body_returned
-        || o.recovery_capability_id != "d1-time-travel-get-bookmark"
-        || !(1..=600).contains(&o.recovery_max_age_seconds)
-        || o.rollback_capability_id != "d1-restore-exact-bookmark"
-    {
+        || o.body_returned;
+    let exact = match o.id.as_str() {
+        "star-maildesk-cf.reply-admission-activate" => {
+            o.mutation_projection.as_deref() == Some("maildesk_reply_admission_insert_v1")
+                && o.projection.is_none()
+                && o.parameters.is_empty()
+                && o.performs_on_call == Some(false)
+                && o.recovery_capability_id.as_deref() == Some("d1-time-travel-get-bookmark")
+                && o.recovery_max_age_seconds
+                    .is_some_and(|age| (1..=600).contains(&age))
+                && o.rollback_capability_id.as_deref() == Some("d1-restore-exact-bookmark")
+        }
+        "star-maildesk-cf.reply-admission-read" => {
+            o.mutation_projection.is_none()
+                && o.projection.as_deref() == Some("maildesk_reply_admission_read_v1")
+                && o.parameters
+                    == [
+                        "transaction_sha256",
+                        "activation_record_sha256",
+                        "pre_send_identity_projection_sha256",
+                        "activation_operation_id",
+                    ]
+                && o.performs_on_call.is_none()
+                && o.recovery_capability_id.is_none()
+                && o.recovery_max_age_seconds.is_none()
+                && o.rollback_capability_id.is_none()
+        }
+        _ => false,
+    };
+    if common || !exact {
         return Err(invariant(
             "reply-admission operation declaration is invalid",
         ));
@@ -186,6 +219,9 @@ fn validate(o: &Operation) -> Result<()> {
 }
 
 fn capability(o: &Operation, contract: WorkspaceD1ReplyAdmissionContractV1) -> CapabilityV1 {
+    if o.id == "star-maildesk-cf.reply-admission-read" {
+        return read_capability(o, contract);
+    }
     let mut c = CapabilityV1::new(
         &o.id,
         &o.title,
@@ -237,6 +273,72 @@ fn capability(o: &Operation, contract: WorkspaceD1ReplyAdmissionContractV1) -> C
     c.rollback = RollbackSpecV1 { supported: false, strategy: None, warning: Some("automatic replay and rollback are forbidden; use the separately approved exact recovery bookmark".to_owned()) };
     c.adapter_status = AdapterStatus::DelegatedCli;
     c.blocked_reason = None;
+    c.workspace_d1_reply_admission = Some(contract);
+    c
+}
+
+fn read_capability(o: &Operation, contract: WorkspaceD1ReplyAdmissionContractV1) -> CapabilityV1 {
+    let mut c = CapabilityV1::new(
+        &o.id,
+        &o.title,
+        "GET",
+        "wrangler d1 execute [workspace-fixed-reply-admission-read]",
+    );
+    c.description = Some(o.description.clone());
+    c.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
+    "D1".clone_into(&mut c.product);
+    "workspace-operation-pack-v1".clone_into(&mut c.source);
+    "account".clone_into(&mut c.account_scope);
+    c.selectors = ["account_id", "database_id", "config"]
+        .into_iter()
+        .chain(o.parameters.iter().map(String::as_str))
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: if name == "config" || o.parameters.iter().any(|parameter| parameter == name)
+            {
+                "query"
+            } else {
+                "path"
+            }
+            .to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    c.permissions = vec!["D1 Read".to_owned()];
+    c.mutating = false;
+    c.risk = RiskClass::Read;
+    c.effect = EffectClass::ReadOnly;
+    c.maturity = Maturity::GenerallyAvailable;
+    c.entitlement = EntitlementV1 {
+        available: Some(true),
+        source: Some(
+            "workspace operation requires an existing provider-read D1 database".to_owned(),
+        ),
+        ..EntitlementV1::default()
+    };
+    c.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: None,
+        basis: Some("one fixed bounded D1 reply-admission projection".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![],
+    };
+    c.verification = VerificationSpecV1 {
+        required: true,
+        strategy: "workspace_d1_reply_admission_body_free_read".to_owned(),
+    };
+    c.rollback = RollbackSpecV1 {
+        supported: false,
+        strategy: None,
+        warning: None,
+    };
+    c.adapter_status = AdapterStatus::DelegatedCli;
     c.workspace_d1_reply_admission = Some(contract);
     c
 }
@@ -371,9 +473,11 @@ mod tests {
         fs::write(
             root.path().join(PACK_RELATIVE_PATH),
             format!(
-                "schema_version = 1\n\n[[operation]]\nid = \"star-maildesk-cf.reply-admission-activate\"\ntitle = \"Activate one Maildesk reply admission\"\ndescription = \"Create one PlanV2 for one compiler-owned admission.\"\ncompiler_path = \"scripts/reply-admission-receipt.ts\"\ncompiler_sha256 = \"{}\"\ncompiler_runtime = \"bun\"\ncompiler_runtime_version = \"1.3.14\"\ncompiler_runtime_sha256 = \"sha256:{}\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nadmission_table = \"reply_admissions\"\ninput_contract = \"maildesk_reply_admission_compiler_input_v1\"\nmutation_projection = \"maildesk_reply_admission_insert_v1\"\ncaller_sql_allowed = false\nperforms_on_call = false\nprovider_output_retained = false\nbody_returned = false\nrecovery_capability_id = \"d1-time-travel-get-bookmark\"\nrecovery_max_age_seconds = 600\nrollback_capability_id = \"d1-restore-exact-bookmark\"\n",
+                "schema_version = 1\n\n[[operation]]\nid = \"star-maildesk-cf.reply-admission-activate\"\ntitle = \"Activate one Maildesk reply admission\"\ndescription = \"Create one PlanV2 for one compiler-owned admission.\"\ncompiler_path = \"scripts/reply-admission-receipt.ts\"\ncompiler_sha256 = \"{}\"\ncompiler_runtime = \"bun\"\ncompiler_runtime_version = \"1.3.14\"\ncompiler_runtime_sha256 = \"sha256:{}\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nadmission_table = \"reply_admissions\"\ninput_contract = \"maildesk_reply_admission_compiler_input_v1\"\nmutation_projection = \"maildesk_reply_admission_insert_v1\"\ncaller_sql_allowed = false\nperforms_on_call = false\nprovider_output_retained = false\nbody_returned = false\nrecovery_capability_id = \"d1-time-travel-get-bookmark\"\nrecovery_max_age_seconds = 600\nrollback_capability_id = \"d1-restore-exact-bookmark\"\n\n[[operation]]\nid = \"star-maildesk-cf.reply-admission-read\"\ntitle = \"Read one Maildesk reply admission\"\ndescription = \"Return one exact body-free active reply admission.\"\ncompiler_path = \"scripts/reply-admission-receipt.ts\"\ncompiler_sha256 = \"{}\"\ncompiler_runtime = \"bun\"\ncompiler_runtime_version = \"1.3.14\"\ncompiler_runtime_sha256 = \"sha256:{}\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nadmission_table = \"reply_admissions\"\ninput_contract = \"maildesk_reply_admission_compiler_input_v1\"\nprojection = \"maildesk_reply_admission_read_v1\"\nparameters = [\"transaction_sha256\", \"activation_record_sha256\", \"pre_send_identity_projection_sha256\", \"activation_operation_id\"]\ncaller_sql_allowed = false\nprovider_output_retained = false\nbody_returned = false\n",
                 sha256(compiler),
-                "1".repeat(64)
+                "1".repeat(64),
+                sha256(compiler),
+                "1".repeat(64),
             ),
         )
         .expect("pack");
@@ -401,6 +505,39 @@ mod tests {
         assert_eq!(
             contract.input_contract,
             "maildesk_reply_admission_compiler_input_v1"
+        );
+    }
+
+    #[test]
+    fn loads_one_closed_body_free_reply_admission_read() {
+        let root = fixture();
+        let capability = load_workspace_d1_reply_admission_capability(
+            &[root.path().to_path_buf()],
+            "star-maildesk-cf.reply-admission-read",
+        )
+        .expect("load")
+        .expect("capability");
+        assert!(!capability.mutating);
+        assert_eq!(capability.effect, EffectClass::ReadOnly);
+        assert_eq!(capability.permissions, ["D1 Read"]);
+        assert!(capability.request_schema.is_none());
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let contract = capability
+            .workspace_d1_reply_admission
+            .expect("reply-admission read contract");
+        assert_eq!(contract.operation_kind, "read");
+        assert_eq!(
+            contract.read_projection.as_deref(),
+            Some("maildesk_reply_admission_read_v1")
+        );
+        assert_eq!(
+            contract.read_parameters,
+            [
+                "transaction_sha256",
+                "activation_record_sha256",
+                "pre_send_identity_projection_sha256",
+                "activation_operation_id",
+            ]
         );
     }
 

@@ -240,6 +240,13 @@ inside cfctl. Plan creation never performs the write. Execution crosses the
 provider boundary once, retains no provider or record content, and verifies
 exact cardinality plus the activation-record digest. Ambiguous execution or
 verification requires rectification and is never replayed automatically.
+The same committed operation pack also owns a non-mutating read capability.
+It recompiles the private candidate under the identical pinned compiler,
+requires exact transaction, activation-record, identity-projection, and
+controller activation-operation selectors, and issues only a compiler-owned
+two-row-bounded D1 projection. Zero, multiple, claimed, terminal, expired, or
+digest-mismatched rows fail closed. Only one exact admitted row returns the
+local pre-send identity projection; raw provider rows are always discarded.
 
 ## Executable guidance projection
 

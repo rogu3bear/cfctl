@@ -1359,7 +1359,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         != arguments.source_file.is_some()
     {
         return Err(CliError::Input(
-            "governed D1 imports, workspace policy projections, reply admissions, and create-only private R2 uploads require exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports, workspace policy projections, reply-admission activation/read, and create-only private R2 uploads require exactly one private `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -1503,6 +1503,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             arguments.account.as_deref(),
             arguments.out.as_deref(),
             r2_credentials.as_ref(),
+            arguments.source_file.as_deref(),
         )
         .await?;
         let mut envelope = executed.envelope;
@@ -6104,6 +6105,7 @@ async fn execute_read(
     requested_account: Option<&str>,
     output_path: Option<&Path>,
     r2_credentials: Option<&R2LogRetrievalCredentials>,
+    reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
     if capability.workflow.is_some() {
         return Ok(ExecutedRead::without_credential(execute_native_workflow(
@@ -6119,6 +6121,7 @@ async fn execute_read(
                 input,
                 requested_profile,
                 requested_account,
+                reply_admission_source,
             )
             .await;
         }
@@ -6300,6 +6303,10 @@ async fn execute_read(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "delegated reads keep workspace evidence, reply-admission, and generic CLI receipt handling in one explicit dispatch boundary"
+)]
 async fn execute_delegated_read(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -6307,13 +6314,37 @@ async fn execute_delegated_read(
     input: &CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
+    reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let receipt = if capability.workspace_d1_evidence.is_some() {
+    let receipt = if capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "read")
+    {
+        let account_id = account_id.as_deref().ok_or_else(|| {
+            CliError::Input("workspace reply-admission read requires an exact account".to_owned())
+        })?;
+        let source = reply_admission_source.ok_or_else(|| {
+            CliError::Input(
+                "workspace reply-admission read requires one private source file".to_owned(),
+            )
+        })?;
+        workspace_d1_reply_admission::read(
+            store,
+            capability,
+            input,
+            &credential,
+            profile,
+            account_id,
+            source,
+        )
+        .await?
+    } else if capability.workspace_d1_evidence.is_some() {
         let account_id = account_id.as_deref().ok_or_else(|| {
             CliError::Input("workspace D1 evidence requires an exact account".to_owned())
         })?;
@@ -6361,6 +6392,11 @@ async fn execute_delegated_read(
     };
     let workspace_d1_evidence_passed = capability.workspace_d1_evidence.is_some()
         && workspace_d1_evidence::receipt_is_complete(&receipt);
+    let workspace_reply_admission_read_passed = capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "read")
+        && workspace_d1_reply_admission::read_receipt_is_complete(&receipt);
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     let mut envelope = delegated_read_envelope(
         &catalog.schema_hash,
@@ -6373,10 +6409,48 @@ async fn execute_delegated_read(
     if capability.workspace_d1_evidence.is_some() {
         set_workspace_d1_evidence_verification(&mut envelope, workspace_d1_evidence_passed);
     }
+    if capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "read")
+    {
+        set_workspace_reply_admission_read_verification(
+            &mut envelope,
+            workspace_reply_admission_read_passed,
+        );
+    }
     Ok(ExecutedRead {
         envelope,
         credential_generation_id: Some(credential_generation_id),
     })
+}
+
+fn set_workspace_reply_admission_read_verification(
+    envelope: &mut ResultEnvelopeV2,
+    receipt_is_complete: bool,
+) {
+    envelope.verification.state = if receipt_is_complete {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if receipt_is_complete {
+        "exactly one active reply admission matched the compiler-owned transaction, activation record, identity projection, and activation operation without retaining provider rows"
+            .to_owned()
+    } else {
+        "reply-admission read did not prove one exact active body-free record; later mail planes remain blocked"
+            .to_owned()
+    });
+    if !receipt_is_complete {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_WORKSPACE_D1_REPLY_ADMISSION_READ_FAILED".to_owned(),
+            message: "the governed reply-admission read returned no exact active match".to_owned(),
+            next_step: Some(
+                "Preserve this body-free receipt and reconcile the exact activation transaction; do not retry through caller SQL or infer readiness from the plan."
+                    .to_owned(),
+            ),
+        });
+    }
 }
 
 fn set_workspace_d1_evidence_verification(
@@ -43669,6 +43743,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("live read must not use ambient global-key current profile");
@@ -43685,6 +43760,7 @@ mod tests {
             &capability,
             &input,
             Some("emergency"),
+            None,
             None,
             None,
             None,
