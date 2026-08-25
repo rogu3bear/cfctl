@@ -3008,6 +3008,38 @@ impl CapabilityV1 {
                         })
                     })
             }
+            "worker_latest_deployment_is_exact_rollback_target" => {
+                self.id == "worker-version-rollback"
+                    && self.method == "POST"
+                    && self.path
+                        == "/accounts/{account_id}/workers/scripts/{script_name}/deployments"
+                    && self.adapter_status == AdapterStatus::Native
+                    && self.risk == RiskClass::Recovery
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions
+                        == ["Workers Scripts Write", "Workers Scripts Read"]
+                    && self.selectors.len() == 2
+                    && ["account_id", "script_name"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                        })
+                    })
+                    && self.request_schema.as_ref().is_some_and(|schema| {
+                        schema.get("type").and_then(Value::as_str) == Some("object")
+                            && schema
+                                .get("additionalProperties")
+                                .and_then(Value::as_bool)
+                                == Some(false)
+                            && self.request_object_fields()
+                                == Some(vec![
+                                    "expected_current_deployment_id".to_owned(),
+                                    "message".to_owned(),
+                                    "target_version_id".to_owned(),
+                                ])
+                    })
+            }
             "trycloudflare_https_url_reaches_reviewed_origin" => {
                 self.id == "cloudflared.tunnel"
                     && self.method == "CLI"

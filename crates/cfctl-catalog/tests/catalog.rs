@@ -3238,6 +3238,40 @@ fn catalog_v2_classifies_generic_and_frozen_legacy_authority() {
 }
 
 #[test]
+fn native_worker_rollback_is_closed_force_free_and_plan_gated() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .capabilities
+        .get("worker-version-rollback")
+        .expect("native Worker rollback");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Recovery);
+    assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/workers/scripts/{script_name}/deployments"
+    );
+    assert!(
+        capability
+            .selectors
+            .iter()
+            .all(|selector| { selector.location == "path" && selector.name != "force" })
+    );
+    assert_eq!(
+        capability.request_object_fields(),
+        Some(vec![
+            "expected_current_deployment_id".to_owned(),
+            "message".to_owned(),
+            "target_version_id".to_owned(),
+        ])
+    );
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_declared());
+    assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
 fn catalog_v2_rejects_legacy_authority_disguised_as_generic() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");

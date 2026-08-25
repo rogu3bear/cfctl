@@ -1038,9 +1038,44 @@ approved plan unconsumed. The delegated promotion removes the mutable config
 path, passes the reviewed service explicitly, and runs from a private
 configless directory so a later config edit cannot retarget Wrangler. The
 deployment-status verifier uses that same exact service in a separate private
-configless directory and records it in the readback receipt. Rolling back
-remains a separate reviewed `wrangler.versions-deploy` plan targeting a known
-prior version.
+configless directory and records it in the readback receipt.
+
+Rollback uses the native, approval-required `worker-version-rollback`
+capability, never `wrangler rollback` and never the generic deployment POST.
+Name the current deployment observed during review, one exact prior version,
+and a reason:
+
+```bash
+cfctl call worker-version-rollback \
+  --selector account_id=<account-id> \
+  --selector script_name=<exact-worker-name> \
+  --body-json '{"target_version_id":"<prior-version-uuid>","expected_current_deployment_id":"<current-deployment-uuid>","message":"<reviewed rollback reason>"}' \
+  --json
+```
+
+Planning reads Worker settings, the retained deployment history, and the exact
+target-version detail. It requires one current version at 100 percent, rejects
+an already-active target, proves the target was the sole version at 100 percent
+in a prior retained
+deployment, and binds the complete redacted provider state. Execution rereads
+all three views while holding the same account/Worker-scoped local execution
+lock used by `wrangler.deploy` and `wrangler.versions-deploy`, and consumes the
+plan only if their hash is unchanged. GET-only rectification also holds that
+lock until evidence and closure are durable. cfctl compiles the provider
+body to one version at 100 percent, adds the operation UUID to the deployment
+annotation, omits both the undocumented idempotency header and the `force`
+query, attempts the POST exactly once, and verifies that the returned
+deployment is now the latest deployment with the exact target and operation
+marker. A lost response, HTTP 429, or HTTP 5xx is classified as an ambiguous
+outcome and reconciled only through `cfctl plans rectify`, which performs a
+projected GET and never replays the POST. Provider incompatibility
+blockers fail closed; cfctl never retries with `force=true`. Storage and effects
+outside traffic routing are not reverted. Restoring the pre-rollback version is
+a new reviewed rollback plan using the pre-change version captured in the
+first plan. Cloudflare documents no expected-current or conditional field on
+deployment creation, so the local lock cannot serialize dashboard, Wrangler,
+or another external deployer: the release owner must hold a proven
+single-writer change freeze from the final reread through verification.
 
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate

@@ -375,7 +375,16 @@ impl RequestBuilder {
         )?;
         let (output_format, max_rows, max_bytes, timeout_seconds) =
             read_runtime_options(capability, input)?;
-        let (body, text_body) = if capability.d1_full_export.is_some() {
+        let (body, text_body) = if is_worker_version_rollback_capability(capability) {
+            (
+                Some(render_worker_version_rollback_body(
+                    input.body.as_ref().ok_or_else(|| {
+                        CloudflareError::MissingRequestBody(capability.id.clone())
+                    })?,
+                )?),
+                None,
+            )
+        } else if capability.d1_full_export.is_some() {
             (Some(serde_json::json!({"output_format":"polling"})), None)
         } else if capability.d1_restore_exact_bookmark.is_some() {
             let target = input
@@ -543,6 +552,157 @@ fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput)
 fn d1_schema_introspection_caller_sql(body: &Value) -> bool {
     body.as_object()
         .is_some_and(|body| body.contains_key("sql"))
+}
+
+const WORKER_VERSION_ROLLBACK_CAPABILITY_ID: &str = "worker-version-rollback";
+const WORKER_DEPLOYMENTS_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/deployments";
+
+fn is_worker_version_rollback_capability(capability: &CapabilityV1) -> bool {
+    capability.id == WORKER_VERSION_ROLLBACK_CAPABILITY_ID
+        && capability.method == "POST"
+        && capability.path == WORKER_DEPLOYMENTS_PATH
+        && capability.adapter_status == AdapterStatus::Native
+}
+
+fn render_worker_version_rollback_body(body: &Value) -> Result<Value> {
+    let object = body.as_object().ok_or_else(|| {
+        CloudflareError::InvalidRequestBody(
+            "Worker rollback input must be an exact object".to_owned(),
+        )
+    })?;
+    let target_version_id = object
+        .get("target_version_id")
+        .and_then(Value::as_str)
+        .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "Worker rollback target_version_id must be a UUID".to_owned(),
+            )
+        })?;
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 1000)
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "Worker rollback message must contain 1 to 1000 characters".to_owned(),
+            )
+        })?;
+    Ok(serde_json::json!({
+        "strategy":"percentage",
+        "versions":[{"version_id":target_version_id,"percentage":100}],
+        "annotations":{"workers/message":message}
+    }))
+}
+
+/// Builds the provider-visible correlation marker for one consumed rollback
+/// operation. The caller-supplied reason remains readable, while the canonical
+/// operation UUID makes an uncertain response recoverable by GET alone.
+pub fn worker_version_rollback_annotation(message: &str, operation_id: &str) -> Result<String> {
+    let operation = uuid::Uuid::parse_str(operation_id).map_err(|_| {
+        CloudflareError::InvalidRequestBody(
+            "Worker rollback operation identity must be a UUID".to_owned(),
+        )
+    })?;
+    if operation.to_string() != operation_id || message.is_empty() || message.chars().count() > 900
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "Worker rollback operation identity or 1 to 900 character reason is invalid".to_owned(),
+        ));
+    }
+    Ok(format!("cfctl-operation={operation_id}; {message}"))
+}
+
+/// Projects a deployment-list read to the exact non-sensitive receipt needed
+/// for rollback verification and uncertain-outcome rectification. Full prior
+/// annotations and author metadata are hash-bound but never persisted.
+pub fn project_worker_version_rollback_readback(
+    target_version_id: &str,
+    expected_annotation: &str,
+    readback: &CloudflareResponseV1,
+) -> Result<(bool, Option<String>, CloudflareResponseV1)> {
+    let history = readback
+        .result
+        .get("deployments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "Worker deployment readback omitted result.deployments".to_owned(),
+            )
+        })?;
+    let latest = history.first();
+    let latest_id = latest
+        .and_then(|deployment| deployment.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let latest_versions = latest
+        .and_then(|deployment| deployment.get("versions"))
+        .and_then(Value::as_array);
+    let exact_target = latest_versions.is_some_and(|versions| {
+        versions.len() == 1
+            && versions[0].get("version_id").and_then(Value::as_str) == Some(target_version_id)
+            && versions[0].get("percentage").and_then(Value::as_f64) == Some(100.0)
+    });
+    let latest_annotation = latest
+        .and_then(|deployment| deployment.get("annotations"))
+        .and_then(Value::as_object)
+        .and_then(|annotations| annotations.get("workers/message"))
+        .and_then(Value::as_str);
+    let operation_match_count = history
+        .iter()
+        .filter(|deployment| {
+            deployment
+                .get("annotations")
+                .and_then(Value::as_object)
+                .and_then(|annotations| annotations.get("workers/message"))
+                .and_then(Value::as_str)
+                == Some(expected_annotation)
+        })
+        .count();
+    let current_exact = readback.success
+        && latest_annotation == Some(expected_annotation)
+        && operation_match_count == 1
+        && exact_target;
+    let mut projected = readback.clone();
+    projected.result = serde_json::json!({
+        "schema_version":1,
+        "latest_deployment_id":latest_id,
+        "target_version_id":target_version_id,
+        "traffic_percentage":exact_target.then_some(100),
+        "operation_marker_hash":hash_value(&Value::String(expected_annotation.to_owned()))?,
+        "deployment_history_hash":hash_value(&readback.result)?,
+        "operation_match_count":operation_match_count,
+        "provider_output_retained":false,
+    });
+    projected.result_info = None;
+    projected.errors.clear();
+    Ok((current_exact, latest_id, projected))
+}
+
+fn evaluate_worker_version_rollback_readback(
+    target_version_id: &str,
+    expected_message: &str,
+    apply_response: &CloudflareResponseV1,
+    readback: &CloudflareResponseV1,
+) -> Result<(bool, String, Option<Value>, CloudflareResponseV1)> {
+    let (current_exact, latest_id, projected) =
+        project_worker_version_rollback_readback(target_version_id, expected_message, readback)?;
+    let apply_id = apply_response.result.get("id").and_then(Value::as_str);
+    let identity_matches = apply_id.is_some() && apply_id == latest_id.as_deref();
+    let passed = apply_response.success && identity_matches && current_exact;
+    let basis = if passed {
+        format!(
+            "Cloudflare's new latest deployment `{}` serves only prior version `{target_version_id}` at 100 percent with the reviewed rollback message",
+            latest_id.as_deref().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "Worker rollback was not proven (apply success={}, readback success={}, apply/latest deployment match={identity_matches}, exact target and unique operation marker current={current_exact})",
+            apply_response.success, readback.success
+        )
+    };
+    Ok((passed, basis, latest_id.map(Value::String), projected))
 }
 
 const MLN_0142_TERMINAL_TRIGGER_SQL: &str = r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
@@ -3085,13 +3245,45 @@ impl Executor {
                     .to_owned(),
             ));
         }
+        let single_attempt = plan.capability.id == WORKER_VERSION_ROLLBACK_CAPABILITY_ID;
         let mut request = self.builder.build_unchecked(&plan.capability, input)?;
-        request.headers.insert(
-            HeaderName::from_static("idempotency-key"),
-            HeaderValue::from_str(&plan.operation_id)
-                .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
-        );
-        match self.send(&request, credential).await {
+        if single_attempt {
+            let reason = input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("message"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CloudflareError::InvalidRequestBody(
+                        "Worker rollback reason is missing at execution".to_owned(),
+                    )
+                })?;
+            let annotation = worker_version_rollback_annotation(reason, &plan.operation_id)?;
+            request
+                .body
+                .as_mut()
+                .and_then(|body| body.get_mut("annotations"))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    CloudflareError::InvalidRequestBody(
+                        "Compiled Worker rollback body omitted its annotations object".to_owned(),
+                    )
+                })?
+                .insert("workers/message".to_owned(), Value::String(annotation));
+        }
+        if !single_attempt {
+            request.headers.insert(
+                HeaderName::from_static("idempotency-key"),
+                HeaderValue::from_str(&plan.operation_id)
+                    .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
+            );
+        }
+        let sender = if single_attempt {
+            self.clone().with_max_retries(0)
+        } else {
+            self.clone()
+        };
+        match sender.send(&request, credential).await {
             Ok(response) => {
                 plan.status = if response.success {
                     PlanStatus::Running
@@ -4054,6 +4246,12 @@ impl Executor {
             return self.verify_email_routing_settings(plan, apply_response);
         }
 
+        if strategy == "worker_latest_deployment_is_exact_rollback_target" {
+            return self
+                .verify_worker_version_rollback(plan, apply_response, input, credential)
+                .await;
+        }
+
         if strategy == "r2_private_file_upload_etag_and_conditional_read" {
             return self
                 .verify_r2_private_file_upload(plan, apply_response, input, credential)
@@ -4101,6 +4299,73 @@ impl Executor {
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    async fn verify_worker_version_rollback(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        if !is_worker_version_rollback_capability(&plan.capability) {
+            return Err(CloudflareError::MissingVerificationTarget(
+                "Worker rollback verifier is attached to another capability".to_owned(),
+            ));
+        }
+        let target_version_id = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("target_version_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "Worker rollback target version is absent".to_owned(),
+                )
+            })?;
+        let reason = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("message"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "Worker rollback reason is absent".to_owned(),
+                )
+            })?;
+        let expected_message = worker_version_rollback_annotation(reason, &plan.operation_id)?;
+        let mut read = CapabilityV1::new(
+            "worker-version-rollback-verification-readback",
+            "Worker rollback latest deployment readback",
+            "GET",
+            WORKER_DEPLOYMENTS_PATH,
+        );
+        read.selectors = plan.capability.selectors.clone();
+        read.response_contract = plan.capability.response_contract.clone();
+        let request = self.builder.build(
+            &read,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: serde_json::json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let (passed, basis, correlated_resource_id, projected_readback) =
+            evaluate_worker_version_rollback_readback(
+                target_version_id,
+                &expected_message,
+                apply_response,
+                &readback,
+            )?;
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback: projected_readback,
+            correlated_resource_id,
+        })
     }
 
     async fn verify_r2_private_file_upload(
@@ -11948,6 +12213,437 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_mln_0143_data_invariants_contract(capability, input)?;
     validate_analytics_query_contract(capability, input)?;
     validate_r2_log_retrieval_contract(capability, input)
+        .and_then(|()| validate_worker_version_rollback_contract(capability, input))
+}
+
+fn validate_worker_version_rollback_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if capability.id != WORKER_VERSION_ROLLBACK_CAPABILITY_ID {
+        return Ok(());
+    }
+    let supported = is_worker_version_rollback_capability(capability)
+        && capability.risk == RiskClass::Recovery
+        && capability.permissions == ["Workers Scripts Write", "Workers Scripts Read"]
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+        && capability.selectors.len() == 2
+        && capability
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path" && selector.required)
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "Worker rollback capability identity, permissions, response, selectors, or force-free query contract drifted"
+                .to_owned(),
+        ));
+    }
+    let body = input
+        .body
+        .as_ref()
+        .ok_or_else(|| CloudflareError::MissingRequestBody(capability.id.clone()))?;
+    let object = body.as_object().ok_or_else(|| {
+        CloudflareError::InvalidRequestBody(
+            "Worker rollback input must be an exact object".to_owned(),
+        )
+    })?;
+    if object.len() != 3 {
+        return Err(CloudflareError::InvalidRequestBody(
+            "Worker rollback accepts only target_version_id, expected_current_deployment_id, and message"
+                .to_owned(),
+        ));
+    }
+    for key in ["target_version_id", "expected_current_deployment_id"] {
+        let value = object.get(key).and_then(Value::as_str).ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(format!("Worker rollback {key} must be a UUID"))
+        })?;
+        if uuid::Uuid::parse_str(value).is_err() {
+            return Err(CloudflareError::InvalidRequestBody(format!(
+                "Worker rollback {key} must be a UUID"
+            )));
+        }
+    }
+    render_worker_version_rollback_body(body).map(|_| ())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod worker_version_rollback_tests {
+    use super::*;
+    use cfctl_core::{EffectClass, Maturity, ResponseBodyModeV1};
+    use serde_json::json;
+
+    fn capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            WORKER_VERSION_ROLLBACK_CAPABILITY_ID,
+            "Worker rollback",
+            "POST",
+            WORKER_DEPLOYMENTS_PATH,
+        );
+        capability.adapter_status = AdapterStatus::Native;
+        capability.risk = RiskClass::Recovery;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.maturity = Maturity::GenerallyAvailable;
+        capability.permissions = vec![
+            "Workers Scripts Write".to_owned(),
+            "Workers Scripts Read".to_owned(),
+        ];
+        capability.selectors = ["account_id", "script_name"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.request_schema = Some(json!({
+            "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+            "required":["target_version_id","expected_current_deployment_id","message"],
+            "properties":{
+                "target_version_id":{"type":"string"},
+                "expected_current_deployment_id":{"type":"string"},
+                "message":{"type":"string","minLength":1,"maxLength":900}
+            }
+        }));
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "worker_latest_deployment_is_exact_rollback_target".to_owned();
+        capability
+    }
+
+    fn input() -> CallInput {
+        CallInput {
+            selectors: json!({"account_id":"a".repeat(32),"script_name":"drop"}),
+            query: json!({}),
+            body: Some(json!({
+                "target_version_id":"11111111-2222-4333-8444-555555555555",
+                "expected_current_deployment_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "message":"rollback exact candidate"
+            })),
+            ..CallInput::default()
+        }
+    }
+
+    #[test]
+    fn request_compiler_fixes_full_traffic_and_never_emits_force() {
+        let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+            .expect("builder")
+            .build_unchecked(&capability(), &input())
+            .expect("closed rollback request");
+        assert!(request.url.query().is_none());
+        assert_eq!(
+            request.body.as_ref().expect("body")["strategy"],
+            "percentage"
+        );
+        assert_eq!(
+            request.body.as_ref().expect("body")["versions"][0]["percentage"],
+            100
+        );
+        assert!(
+            !request
+                .body
+                .as_ref()
+                .expect("body")
+                .to_string()
+                .contains("force")
+        );
+    }
+
+    #[test]
+    fn request_contract_rejects_force_and_extra_body_controls() {
+        let mut forced = input();
+        forced.query = json!({"force":true});
+        assert!(validate_request_contract(&capability(), &forced).is_err());
+
+        let mut widened = input();
+        widened.body.as_mut().expect("body")["percentage"] = json!(50);
+        assert!(validate_request_contract(&capability(), &widened).is_err());
+    }
+
+    #[test]
+    fn rollback_reason_bounds_are_character_based_and_leave_marker_headroom() {
+        let operation_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        for length in [846, 847, 900] {
+            let reason = "x".repeat(length);
+            let mut bounded = input();
+            bounded.body.as_mut().expect("body")["message"] = Value::String(reason.clone());
+            validate_request_contract(&capability(), &bounded)
+                .expect("public reason remains within its reviewed bound");
+            let annotation = worker_version_rollback_annotation(&reason, operation_id)
+                .expect("internal operation marker");
+            assert_eq!(annotation.chars().count(), length + 54);
+            assert!(annotation.chars().count() <= 1000);
+        }
+
+        let unicode = "é".repeat(900);
+        let mut bounded_unicode = input();
+        bounded_unicode.body.as_mut().expect("body")["message"] = Value::String(unicode.clone());
+        validate_request_contract(&capability(), &bounded_unicode)
+            .expect("JSON Schema maxLength counts characters");
+        worker_version_rollback_annotation(&unicode, operation_id)
+            .expect("internal marker uses the same character semantics");
+
+        let mut oversized = input();
+        oversized.body.as_mut().expect("body")["message"] = Value::String("x".repeat(901));
+        assert!(validate_request_contract(&capability(), &oversized).is_err());
+    }
+
+    #[test]
+    fn verifier_requires_returned_latest_identity_target_traffic_and_message() {
+        let deployment_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let version_id = "11111111-2222-4333-8444-555555555555";
+        let response = |result: Value| CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let apply = response(json!({"id":deployment_id}));
+        let readback = response(json!({"deployments":[{
+            "id":deployment_id,
+            "versions":[{"version_id":version_id,"percentage":100}],
+            "annotations":{"workers/message":"reviewed rollback"}
+        }]}));
+        assert!(
+            evaluate_worker_version_rollback_readback(
+                version_id,
+                "reviewed rollback",
+                &apply,
+                &readback,
+            )
+            .expect("documented deployment envelope")
+            .0
+        );
+
+        let split = response(json!({"deployments":[{
+            "id":deployment_id,
+            "versions":[
+                {"version_id":version_id,"percentage":50},
+                {"version_id":"66666666-7777-4888-8999-aaaaaaaaaaaa","percentage":50}
+            ],
+            "annotations":{"workers/message":"reviewed rollback"}
+        }]}));
+        assert!(
+            !evaluate_worker_version_rollback_readback(
+                version_id,
+                "reviewed rollback",
+                &apply,
+                &split,
+            )
+            .expect("documented split envelope")
+            .0
+        );
+        assert!(
+            !evaluate_worker_version_rollback_readback(
+                version_id,
+                "different message",
+                &apply,
+                &readback,
+            )
+            .expect("documented deployment envelope")
+            .0
+        );
+        let undocumented_bare_array = response(readback.result["deployments"].clone());
+        assert!(
+            evaluate_worker_version_rollback_readback(
+                version_id,
+                "reviewed rollback",
+                &apply,
+                &undocumented_bare_array,
+            )
+            .is_err()
+        );
+
+        let (_, _, _, projected) = evaluate_worker_version_rollback_readback(
+            version_id,
+            "reviewed rollback",
+            &apply,
+            &readback,
+        )
+        .expect("projected rollback receipt");
+        assert_eq!(projected.result["provider_output_retained"], false);
+        assert!(projected.result.get("deployments").is_none());
+        assert!(
+            !serde_json::to_string(&projected)
+                .expect("projected response JSON")
+                .contains("reviewed rollback")
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fake-provider test binds request bytes and single-attempt behavior for both retryable response classes"
+    )]
+    async fn rollback_attempts_exactly_one_post_on_retryable_provider_failures() {
+        #[expect(
+            clippy::too_many_lines,
+            reason = "the fake provider, raw request capture, plan setup, and response count form one bounded transport witness"
+        )]
+        async fn attempts_for(status: u16) -> (usize, String, String) {
+            use std::sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            fn request_complete(bytes: &[u8]) -> bool {
+                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    return false;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+                content_length.is_some_and(|length| bytes.len() >= header_end + 4 + length)
+            }
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rollback listener");
+            let address = listener.local_addr().expect("rollback listener address");
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&attempts);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            let server = tokio::spawn(async move {
+                loop {
+                    let accepted =
+                        tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+                    let Ok(Ok((mut socket, _))) = accepted else {
+                        break;
+                    };
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let mut request = Vec::new();
+                    while !request_complete(&request) {
+                        let mut chunk = [0_u8; 2048];
+                        let read = socket
+                            .read(&mut chunk)
+                            .await
+                            .expect("read rollback request");
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    captured
+                        .lock()
+                        .expect("rollback request capture")
+                        .push(String::from_utf8(request).expect("HTTP request is UTF-8"));
+                    let body = br#"{"success":false,"errors":[],"messages":[],"result":null}"#;
+                    let reason = if status == 429 {
+                        "Too Many Requests"
+                    } else {
+                        "Internal Server Error"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write rollback response headers");
+                    socket
+                        .write_all(body)
+                        .await
+                        .expect("write rollback response body");
+                }
+            });
+
+            let capability = capability();
+            let input = input();
+            let account_id = "a".repeat(32);
+            let mut plan = PlanV1::draft(
+                "profile-a",
+                &account_id,
+                "sha256:rollback-test",
+                capability,
+                serde_json::to_value(&input).expect("rollback input"),
+            )
+            .expect("rollback plan");
+            plan.status = PlanStatus::Consumed;
+            let operation_id = plan.operation_id.clone();
+            let executor = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+                .expect("rollback executor");
+            let response = executor
+                .execute_consumed_plan_with_input(
+                    &mut plan,
+                    "sha256:rollback-test",
+                    &AuthCredential::Bearer {
+                        token: "test-token".to_owned(),
+                    },
+                    &input,
+                )
+                .await
+                .expect("retryable provider response");
+            assert_eq!(response.status, status);
+            assert!(!response.success);
+            server.await.expect("rollback server");
+            let request = requests
+                .lock()
+                .expect("rollback request capture")
+                .first()
+                .cloned()
+                .expect("one captured rollback request");
+            (attempts.load(Ordering::SeqCst), request, operation_id)
+        }
+
+        for status in [429, 500] {
+            let (attempts, request, operation_id) = Box::pin(attempts_for(status)).await;
+            assert_eq!(attempts, 1);
+            let (headers, body) = request
+                .split_once("\r\n\r\n")
+                .expect("HTTP request has header terminator");
+            assert!(headers.starts_with(
+                "POST /accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/workers/scripts/drop/deployments HTTP/1.1"
+            ));
+            assert!(!headers.lines().next().expect("request line").contains('?'));
+            assert!(!headers.to_ascii_lowercase().contains("idempotency-key"));
+            assert_eq!(
+                serde_json::from_str::<Value>(body).expect("rollback JSON body"),
+                json!({
+                    "strategy":"percentage",
+                    "versions":[{
+                        "version_id":"11111111-2222-4333-8444-555555555555",
+                        "percentage":100
+                    }],
+                    "annotations":{
+                        "workers/message":format!(
+                            "cfctl-operation={operation_id}; rollback exact candidate"
+                        )
+                    }
+                })
+            );
+            assert!(!body.contains("force"));
+        }
+    }
 }
 
 fn mln_0143_request_schema() -> Value {
