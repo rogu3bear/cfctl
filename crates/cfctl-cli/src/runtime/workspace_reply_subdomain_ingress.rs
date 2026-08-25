@@ -330,23 +330,18 @@ fn project_subdomain_dns(
     let records = if let Some(records) = response.result.as_array() {
         records
     } else if let Some(result) = response.result.as_object() {
-        if result
-            .get("errors")
-            .is_some_and(|errors| !errors.is_array())
-        {
-            return Err(failure("dns_projection_malformed", "dns", true, None));
+        match result.get("errors") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(errors)) if errors.is_empty() => {}
+            Some(Value::Array(_)) => return Ok("drift"),
+            Some(_) => return Err(failure("dns_projection_malformed", "dns", true, None)),
         }
-        if result
-            .get("errors")
-            .and_then(Value::as_array)
-            .is_some_and(|errors| !errors.is_empty())
-        {
-            return Ok("drift");
+        let singular = result.get("record");
+        let plural = result.get("records");
+        match (singular, plural) {
+            (Some(Value::Array(records)), None) | (None, Some(Value::Array(records))) => records,
+            _ => return Err(failure("dns_projection_malformed", "dns", true, None)),
         }
-        let Some(records) = result.get("record").and_then(Value::as_array) else {
-            return Err(failure("dns_projection_malformed", "dns", true, None));
-        };
-        records
     } else {
         return Err(failure("dns_projection_malformed", "dns", true, None));
     };
@@ -832,6 +827,45 @@ mod tests {
                 .expect("object response"),
             "ok"
         );
+
+        let live_object_variant = CloudflareResponseV1 {
+            result: json!({"errors":null,"records":records}),
+            result_info: None,
+            ..response(Value::Null, 0)
+        };
+        assert_eq!(
+            project_subdomain_dns(&live_object_variant, &target.reply_domain)
+                .expect("live object response"),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn dns_object_variants_reject_ambiguous_or_malformed_collection_keys() {
+        let target = target();
+        let records = CANONICAL_MX.map(|content| {
+            json!({
+                "type":"MX",
+                "name":"reply.example.com",
+                "content":content,
+            })
+        });
+        for result in [
+            json!({"errors":{},"records":records}),
+            json!({"errors":null,"records":{}}),
+            json!({"errors":null,"record":records,"records":records}),
+            json!({"errors":null}),
+        ] {
+            let response = CloudflareResponseV1 {
+                result,
+                result_info: None,
+                ..response(Value::Null, 0)
+            };
+            let failure =
+                project_subdomain_dns(&response, &target.reply_domain).expect_err("malformed");
+            assert_eq!(failure["status"], "dns_projection_malformed");
+            assert_eq!(failure["provider_output_retained"], false);
+        }
     }
 
     #[test]
