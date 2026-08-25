@@ -949,7 +949,10 @@ pub(super) async fn run_wrangler(
     }
     let output = tokio::time::timeout(timeout, command.output())
         .await
-        .map_err(|_| CliError::SubprocessTimeout("workspace D1 migration Wrangler".to_owned()))?
+        .map_err(|_| CliError::SubprocessTimeout {
+            label: "workspace D1 migration Wrangler".to_owned(),
+            timeout_seconds: timeout.as_secs(),
+        })?
         .map_err(|source| cli_io(Path::new("wrangler"), source))?;
     Ok(WranglerOutput {
         success: output.status.success(),

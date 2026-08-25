@@ -104,6 +104,8 @@ const PAGES_SOURCE_REMOTE_PRECONDITION: &str = "pages_source_remote";
 const PAGES_PROJECT_NOT_FOUND_ERROR_CODE: i64 = 8_000_007;
 const PAGES_GIT_CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGES_GIT_REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
+const DELEGATED_CLI_TIMEOUT: Duration = Duration::from_mins(2);
+const WRANGLER_DEPLOY_TIMEOUT: Duration = Duration::from_mins(10);
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -134,8 +136,8 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("HTTP client construction failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("subprocess `{0}` exceeded the 120-second governed timeout")]
-    SubprocessTimeout(String),
+    #[error("subprocess `{label}` exceeded the {timeout_seconds}-second governed timeout")]
+    SubprocessTimeout { label: String, timeout_seconds: u64 },
     /// A CLI-level blocker that carries its own stable code and a specific,
     /// copy-pasteable next command for the agent. Prefer this over
     /// `Input(String)` whenever the failure has a knowable recovery step.
@@ -7855,9 +7857,13 @@ async fn run_delegated_cli(
         }
     }
     let label = capability.path.clone();
-    let output = tokio::time::timeout(Duration::from_mins(2), command.output())
+    let timeout = governed_delegated_cli_timeout(&capability.id);
+    let output = tokio::time::timeout(timeout, command.output())
         .await
-        .map_err(|_| CliError::SubprocessTimeout(label.clone()))?
+        .map_err(|_| CliError::SubprocessTimeout {
+            label: label.clone(),
+            timeout_seconds: timeout.as_secs(),
+        })?
         .map_err(|source| cli_io(Path::new(program), source))?;
     let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
     let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
@@ -7884,6 +7890,14 @@ async fn run_delegated_cli(
             AuthCredential::GlobalKey { .. } => ["CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"].as_slice(),
         },
     }))
+}
+
+fn governed_delegated_cli_timeout(capability_id: &str) -> Duration {
+    if capability_id == "wrangler.deploy" {
+        WRANGLER_DEPLOY_TIMEOUT
+    } else {
+        DELEGATED_CLI_TIMEOUT
+    }
 }
 
 async fn run_quick_tunnel(store: &StateStore, plan: &PlanV1, input: &CallInput) -> Result<Value> {
@@ -15607,9 +15621,10 @@ fn run_bounded_pages_git_program(
                 CliError::Input("Pages source Git proof could not start or complete".to_owned())
             })?;
             if output.timed_out() {
-                return Err(CliError::SubprocessTimeout(
-                    "Pages source Git proof".to_owned(),
-                ));
+                return Err(CliError::SubprocessTimeout {
+                    label: "Pages source Git proof".to_owned(),
+                    timeout_seconds: timeout.as_secs(),
+                });
             }
             if output.truncated() || output.stdout().len() > 8_192 {
                 return Err(CliError::Input(
@@ -31521,6 +31536,22 @@ mod tests {
         assert!(validate_pages_source_remote_receipt(&plan, &drifted_identity).is_err());
     }
 
+    #[test]
+    fn wrangler_deploy_has_a_bounded_extended_timeout_without_broadening_other_cli_calls() {
+        assert_eq!(
+            super::governed_delegated_cli_timeout("wrangler.deploy"),
+            Duration::from_mins(10)
+        );
+        assert_eq!(
+            super::governed_delegated_cli_timeout("wrangler.versions"),
+            Duration::from_mins(2)
+        );
+        assert_eq!(
+            super::governed_delegated_cli_timeout("arbitrary.delegated-cli"),
+            Duration::from_mins(2)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn pages_git_proof_is_prompt_free_bounded_and_terminates_its_process_group() {
@@ -31609,7 +31640,7 @@ mod tests {
             super::PAGES_GIT_CONFIG_TIMEOUT,
         )
         .expect_err("timeout must fail closed");
-        assert!(matches!(error, CliError::SubprocessTimeout(_)));
+        assert!(matches!(error, CliError::SubprocessTimeout { .. }));
 
         let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
         for pid in pids.split_whitespace() {
@@ -31651,7 +31682,13 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect_err("descendant-held pipe must time out");
-        assert!(matches!(error, CliError::SubprocessTimeout(_)));
+        assert!(matches!(
+            error,
+            CliError::SubprocessTimeout {
+                timeout_seconds: 1,
+                ..
+            }
+        ));
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "Windows Pages Git timeout exceeded its fixed teardown bound"
