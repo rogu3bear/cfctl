@@ -1890,6 +1890,34 @@ pub struct WorkspaceD1PolicyProjectionContractV1 {
     pub rollback_capability_id: String,
 }
 
+/// Repository-owned contract for activating one compiler-produced Maildesk
+/// reply admission. Candidate bytes remain in a private staged file; plans
+/// carry only immutable digests and the distinct logical activation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1ReplyAdmissionContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub compiler_path: String,
+    pub compiler_sha256: String,
+    pub compiler_runtime: String,
+    pub compiler_runtime_version: String,
+    pub compiler_runtime_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub admission_table: String,
+    pub input_contract: String,
+    pub mutation_projection: String,
+    pub recovery_capability_id: String,
+    pub recovery_max_age_seconds: u64,
+    pub rollback_capability_id: String,
+}
+
 /// Repository-bound, caller-invariant D1 evidence projection. The committed
 /// query is executed only inside cfctl and its rows are reduced to the typed,
 /// body-free `MaildeskD1EvidenceV1` result.
@@ -2277,6 +2305,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_reply_admission: Option<WorkspaceD1ReplyAdmissionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_evidence: Option<WorkspaceD1EvidenceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
@@ -2399,6 +2429,7 @@ impl CapabilityV1 {
             d1_restore_exact_bookmark: None,
             workspace_d1_migration: None,
             workspace_d1_policy_projection: None,
+            workspace_d1_reply_admission: None,
             workspace_d1_evidence: None,
             r2_private_file_upload: None,
             r2_private_object_digest: None,
@@ -2634,6 +2665,31 @@ impl CapabilityV1 {
                                 && contract.recovery_max_age_seconds <= 600
                                 && contract.rollback_capability_id == "d1-restore-exact-bookmark"
                         })
+            }
+            "workspace_d1_reply_admission_exact_readback" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::DataWrite
+                    && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
+                        !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.compiler_sha256.is_empty()
+                            && contract.compiler_runtime == "bun"
+                            && !contract.compiler_runtime_version.is_empty()
+                            && !contract.compiler_runtime_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && !contract.admission_table.is_empty()
+                            && contract.input_contract == "maildesk_reply_admission_compiler_input_v1"
+                            && contract.mutation_projection == "maildesk_reply_admission_insert_v1"
+                            && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+                            && contract.recovery_max_age_seconds > 0
+                            && contract.recovery_max_age_seconds <= 600
+                            && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                    })
             }
             "workspace_d1_maildesk_body_free_evidence" => {
                 self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)

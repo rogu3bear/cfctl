@@ -9,6 +9,7 @@ mod worker_deployment;
 mod workspace_d1_evidence;
 mod workspace_d1_migration;
 mod workspace_d1_projection;
+mod workspace_d1_reply_admission;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1347,14 +1348,18 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
     let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
+    let is_workspace_d1_reply_admission = capability.workspace_d1_reply_admission.is_some();
     let is_r2_private_file_upload = capability.r2_private_file_upload.is_some();
     let is_d1_approved_mln_import_poll_resume =
         capability.d1_approved_mln_import_poll_resume.is_some();
-    if (is_d1_approved_mln_import || is_workspace_d1_projection || is_r2_private_file_upload)
+    if (is_d1_approved_mln_import
+        || is_workspace_d1_projection
+        || is_workspace_d1_reply_admission
+        || is_r2_private_file_upload)
         != arguments.source_file.is_some()
     {
         return Err(CliError::Input(
-            "governed D1 imports, workspace policy projections, and create-only private R2 uploads require exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports, workspace policy projections, reply admissions, and create-only private R2 uploads require exactly one plan-creation-only `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -1620,6 +1625,38 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             CliError::Input("workspace D1 policy projection target could not be derived".to_owned())
         })?;
         adapter_targets.insert("workspace_d1_policy_projection".to_owned(), target);
+    }
+    if capability.workspace_d1_reply_admission.is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace reply admission requires an explicit account pin or --account"
+                    .to_owned(),
+            )
+        })?;
+        let source = arguments.source_file.as_deref().ok_or_else(|| {
+            CliError::Input("workspace reply-admission source is missing".to_owned())
+        })?;
+        let target = workspace_d1_reply_admission::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+            source,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("workspace reply-admission target could not be derived".to_owned())
+        })?;
+        adapter_targets.insert("workspace_d1_reply_admission".to_owned(), target);
     }
     if capability.r2_private_file_upload.is_some() {
         let source = arguments
@@ -6671,6 +6708,9 @@ async fn run_delegated_plan_boundary(
     if plan.capability.workspace_d1_policy_projection.is_some() {
         return workspace_d1_projection::run(store, plan, credential).await;
     }
+    if plan.capability.workspace_d1_reply_admission.is_some() {
+        return Box::pin(workspace_d1_reply_admission::run(store, plan, credential)).await;
+    }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let mut delegated_input =
         worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
@@ -6762,6 +6802,12 @@ async fn verify_delegated_cli_plan(
     }
     if plan.capability.workspace_d1_policy_projection.is_some() {
         return workspace_d1_projection::verify(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_reply_admission.is_some() {
+        return Box::pin(workspace_d1_reply_admission::verify(
+            store, plan, credential,
+        ))
+        .await;
     }
     if plan.capability.verification.strategy == "trycloudflare_https_url_reaches_reviewed_origin" {
         return verify_quick_tunnel_plan(input, receipt).await;
@@ -15767,6 +15813,9 @@ fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Re
     if let Some(paths) = workspace_d1_projection::local_artifact_paths(capability)? {
         return Ok(paths);
     }
+    if let Some(paths) = workspace_d1_reply_admission::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
     if worker_deployment::binds_artifact(capability) {
         return worker_deployment::artifact_paths(capability, input);
     }
@@ -19368,14 +19417,14 @@ async fn execute_api_plan(
         .await;
     }
     if plan.capability.d1_approved_mln_import.is_some() && !is_reviewed_schema_migration {
-        return execute_approved_mln_import_plan(
+        return Box::pin(execute_approved_mln_import_plan(
             store,
             &executor,
             plan,
             execution_input,
             credential,
             secrets,
-        )
+        ))
         .await;
     }
     let response_result = if plan.capability.r2_private_file_upload.is_some() {
@@ -22541,17 +22590,16 @@ async fn execute_approved_mln_import_plan(
         })?;
     validate_managed_mln_stage_authority(plan)?;
     let checkpoint_operation_id = plan.operation_id.clone();
-    let response = match executor
-        .execute_d1_approved_mln_import(
-            plan,
-            execution_input,
-            credential,
-            &stage_path,
-            |checkpoint: &D1ImportCheckpointV1| {
-                persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint)
-            },
-        )
-        .await
+    let response = match Box::pin(executor.execute_d1_approved_mln_import(
+        plan,
+        execution_input,
+        credential,
+        &stage_path,
+        |checkpoint: &D1ImportCheckpointV1| {
+            persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint)
+        },
+    ))
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -28555,6 +28603,7 @@ fn current_pages_source_remote_precondition(
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;
+    workspace_d1_reply_admission::validate_bound_plan(store, plan)?;
     r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let graph = discover_registered(store)?;
@@ -30743,6 +30792,9 @@ fn load_workspace_capability(
         return Ok(Some(capability));
     }
     if let Some(capability) = workspace_d1_projection::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
+    if let Some(capability) = workspace_d1_reply_admission::load(store, capability_id)? {
         return Ok(Some(capability));
     }
     workspace_d1_evidence::load(store, capability_id)
