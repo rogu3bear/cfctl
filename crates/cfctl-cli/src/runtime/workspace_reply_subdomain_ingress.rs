@@ -497,7 +497,6 @@ fn project_account_rules(
         .iter()
         .filter(|rule| {
             rule.enabled
-                && rule.zone_tag_sha256.as_deref() == Some(parent_zone_hash.as_str())
                 && rule.matchers.len() == 1
                 && rule.matchers[0].matcher_type == "all"
                 && rule.matchers[0].field.is_none()
@@ -508,7 +507,8 @@ fn project_account_rules(
         0 => Ok("drift"),
         1 => {
             let candidate = all_matcher_candidates[0];
-            if candidate.actions.len() == 1
+            if candidate.zone_tag_sha256.as_deref() == Some(parent_zone_hash.as_str())
+                && candidate.actions.len() == 1
                 && candidate.actions[0].action_type == "worker"
                 && candidate.actions[0].value_count == 1
                 && candidate.actions[0].worker_targets == [target.worker_script_name.as_str()]
@@ -1041,7 +1041,7 @@ mod tests {
         let mut wrong_worker = rule.clone();
         wrong_worker["actions"][0]["worker_targets"] = json!(["another-worker"]);
         let mixed_target = project_account_rules(
-            &projected(vec![rule, wrong_worker]),
+            &projected(vec![rule.clone(), wrong_worker]),
             &target,
             "private-zone",
         )
@@ -1051,6 +1051,19 @@ mod tests {
             "account_rules_cardinality_ambiguous"
         );
         assert_eq!(mixed_target["match_count"], 2);
+        let mut wrong_parent = rule.clone();
+        wrong_parent["zone_tag_sha256"] = json!(sha256(b"different-parent-zone"));
+        let parent_conflict = project_account_rules(
+            &projected(vec![rule, wrong_parent]),
+            &target,
+            "private-zone",
+        )
+        .expect_err("same-domain all-matcher rules cannot hide a parent-zone conflict");
+        assert_eq!(
+            parent_conflict["status"],
+            "account_rules_cardinality_ambiguous"
+        );
+        assert_eq!(parent_conflict["match_count"], 2);
         let serialized = serde_json::to_string(&ambiguous).expect("body-free ambiguity");
         assert!(!serialized.contains("reply.example.com"));
         assert!(!serialized.contains("maildesk-relay-router"));
