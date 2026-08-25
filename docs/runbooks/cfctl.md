@@ -461,15 +461,20 @@ Application repositories may declare ordered migration operations in
 `.cfctl/operations/d1-migrations.toml`, private policy projections in
 `.cfctl/operations/d1-policy-projections.toml`, and fixed body-free readiness
 reads in `.cfctl/operations/d1-evidence.toml`. Maildesk may additionally declare
-the single `star-maildesk-cf.reply-admission-activate` operation in
-`.cfctl/operations/d1-reply-admission.toml`. That operation accepts one exact
+the closed `star-maildesk-cf.reply-admission-activate` and
+`star-maildesk-cf.reply-admission-read` pair in
+`.cfctl/operations/d1-reply-admission.toml`. Activation accepts one exact
 mode-0600 compiler input through `--source-file`, stages the exact committed
 compiler bytes, executes them with the version-and-digest-pinned Bun runtime,
 stages only the compiled candidate,
 derives its SQL internally, and places only hashes and body-free bindings in
-PlanV2 and evidence. The logical activation identity embedded by the Maildesk
-controller remains distinct from cfctl's generated PlanV2 operation UUID; both
-are bound and reported, and neither is rewritten to impersonate the other.
+PlanV2 and evidence. The companion non-mutating read accepts the same private
+compiler input plus the exact transaction, activation-record,
+identity-projection, and controller activation-operation selectors. It executes
+only cfctl's fixed two-row-bounded query, discards provider rows, and proves only
+one exact still-admitted record. The logical D1 admission ID, controller
+activation-operation ID, and cfctl PlanV2 UUID remain distinct; each is bound
+and reported without rewriting one to impersonate another.
 The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
 the operation pack and tracked Wrangler template at that HEAD. Migration packs

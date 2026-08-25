@@ -1895,6 +1895,7 @@ pub struct WorkspaceD1PolicyProjectionContractV1 {
 /// carry only immutable digests and the distinct logical activation identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceD1ReplyAdmissionContractV1 {
+    pub operation_kind: String,
     pub repository_root: String,
     pub repository_head: String,
     pub repository_origin: String,
@@ -1913,6 +1914,10 @@ pub struct WorkspaceD1ReplyAdmissionContractV1 {
     pub admission_table: String,
     pub input_contract: String,
     pub mutation_projection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_projection: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_parameters: Vec<String>,
     pub recovery_capability_id: String,
     pub recovery_max_age_seconds: u64,
     pub rollback_capability_id: String,
@@ -2673,7 +2678,8 @@ impl CapabilityV1 {
                     && self.risk == RiskClass::ScopedWrite
                     && self.effect == EffectClass::DataWrite
                     && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
-                        !contract.repository_root.is_empty()
+                        contract.operation_kind == "activate"
+                            && !contract.repository_root.is_empty()
                             && !contract.repository_head.is_empty()
                             && !contract.operation_pack_sha256.is_empty()
                             && !contract.compiler_sha256.is_empty()
@@ -2685,10 +2691,48 @@ impl CapabilityV1 {
                             && !contract.admission_table.is_empty()
                             && contract.input_contract == "maildesk_reply_admission_compiler_input_v1"
                             && contract.mutation_projection == "maildesk_reply_admission_insert_v1"
+                            && contract.read_projection.is_none()
+                            && contract.read_parameters.is_empty()
                             && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
                             && contract.recovery_max_age_seconds > 0
                             && contract.recovery_max_age_seconds <= 600
                             && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                    })
+            }
+            "workspace_d1_reply_admission_body_free_read" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
+                        contract.operation_kind == "read"
+                            && !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.compiler_sha256.is_empty()
+                            && contract.compiler_runtime == "bun"
+                            && !contract.compiler_runtime_version.is_empty()
+                            && !contract.compiler_runtime_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && !contract.admission_table.is_empty()
+                            && contract.input_contract
+                                == "maildesk_reply_admission_compiler_input_v1"
+                            && contract.mutation_projection.is_empty()
+                            && contract.read_projection.as_deref()
+                                == Some("maildesk_reply_admission_read_v1")
+                            && contract.read_parameters
+                                == [
+                                    "transaction_sha256",
+                                    "activation_record_sha256",
+                                    "pre_send_identity_projection_sha256",
+                                    "activation_operation_id",
+                                ]
+                            && contract.recovery_capability_id.is_empty()
+                            && contract.recovery_max_age_seconds == 0
+                            && contract.rollback_capability_id.is_empty()
                     })
             }
             "workspace_d1_maildesk_body_free_evidence" => {

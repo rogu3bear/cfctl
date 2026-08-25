@@ -10,7 +10,7 @@ use std::{
 };
 
 use cfctl_core::WorkspaceD1ReplyAdmissionContractV1;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Duration;
@@ -188,6 +188,7 @@ pub(super) fn prepare_plan_target(
         "pre_send_identity_projection_sha256":candidate.projection_sha256,
         "transaction_sha256":candidate.transaction_sha256,
         "logical_activation_id":candidate.logical_activation_id,
+        "activation_operation_id":candidate.activation_operation_id,
         "candidate_cfctl_build_sha256":candidate.cfctl_build_sha256,
         "candidate_profile_sha256":candidate.profile_sha256,
         "candidate_account_sha256":candidate.account_sha256,
@@ -209,6 +210,10 @@ pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<V
     ]))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one validation boundary rebinds repository, compiler runtime, private stage, candidate, control plane, and recovery proof"
+)]
 pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<()> {
     let Some(contract) = plan.capability.workspace_d1_reply_admission.as_ref() else {
         return Ok(());
@@ -280,6 +285,10 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
         (
             "logical_activation_id",
             candidate.logical_activation_id.as_str(),
+        ),
+        (
+            "activation_operation_id",
+            candidate.activation_operation_id.as_str(),
         ),
         (
             "candidate_cfctl_build_sha256",
@@ -375,6 +384,7 @@ pub(super) async fn run(
             "activation_record_sha256":candidate.activation_record_sha256,
             "transaction_sha256":candidate.transaction_sha256,
             "logical_activation_id":candidate.logical_activation_id,
+            "activation_operation_id":candidate.activation_operation_id,
             "cfctl_operation_id":plan.operation_id,
             "provider_output_retained":false,
             "record_content_retained":false,
@@ -385,7 +395,7 @@ pub(super) async fn run(
         json!({"adapter":"workspace_d1_reply_admission_v1","success":result.success,"exit_status":result.exit_status,"boundary_crossed":true,
         "source_sha256":candidate.source_sha256,"compiled_candidate_sha256":candidate.compiled_candidate_sha256,
         "activation_record_sha256":candidate.activation_record_sha256,"transaction_sha256":candidate.transaction_sha256,
-        "logical_activation_id":candidate.logical_activation_id,"cfctl_operation_id":plan.operation_id,
+        "logical_activation_id":candidate.logical_activation_id,"activation_operation_id":candidate.activation_operation_id,"cfctl_operation_id":plan.operation_id,
         "wrangler_version":observed_version,"provider_output_retained":false,"record_content_retained":false,
         "body_returned":false,"recovery":target.get("recovery")}),
     )
@@ -403,6 +413,284 @@ pub(super) async fn verify(
         }
     }
 }
+
+pub(super) fn read_receipt_is_complete(receipt: &Value) -> bool {
+    let Some(object) = receipt.as_object() else {
+        return false;
+    };
+    if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != [
+            "activation_operation_id",
+            "activation_record_sha256",
+            "adapter",
+            "account_sha256",
+            "body_returned",
+            "boundary_crossed",
+            "cfctl_build_sha256",
+            "credential_generation_sha256",
+            "expires_at",
+            "match_count",
+            "observed_at",
+            "pre_send_identity_projection",
+            "pre_send_identity_projection_sha256",
+            "provider_output_retained",
+            "profile_sha256",
+            "record_content_retained",
+            "status",
+            "success",
+            "transaction_sha256",
+            "wrangler_version",
+        ]
+        .into_iter()
+        .collect()
+    {
+        return false;
+    }
+    let projection_digest_matches = receipt
+        .get("pre_send_identity_projection")
+        .filter(|projection| projection.is_object())
+        .zip(
+            receipt
+                .get("pre_send_identity_projection_sha256")
+                .and_then(Value::as_str),
+        )
+        .is_some_and(|(projection, expected)| hash_json(projection) == expected);
+    let control_plane_matches = [
+        "account_sha256",
+        "cfctl_build_sha256",
+        "credential_generation_sha256",
+        "profile_sha256",
+    ]
+    .iter()
+    .all(|key| {
+        receipt.get(*key)
+            == receipt.pointer(&format!(
+                "/pre_send_identity_projection/control_plane/{key}"
+            ))
+    }) && receipt.get("activation_operation_id")
+        == receipt.pointer("/pre_send_identity_projection/control_plane/activation_operation_id");
+    receipt.get("adapter").and_then(Value::as_str) == Some("workspace_reply_admission_read_v1")
+        && receipt.get("success").and_then(Value::as_bool) == Some(true)
+        && receipt.get("boundary_crossed").and_then(Value::as_bool) == Some(true)
+        && receipt.get("status").and_then(Value::as_str) == Some("active")
+        && receipt.get("match_count").and_then(Value::as_u64) == Some(1)
+        && receipt
+            .get("provider_output_retained")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt
+            .get("record_content_retained")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
+        && projection_digest_matches
+        && control_plane_matches
+        && receipt
+            .get("activation_operation_id")
+            .and_then(Value::as_str)
+            .is_some_and(safe_ref)
+        && [
+            "transaction_sha256",
+            "activation_record_sha256",
+            "pre_send_identity_projection_sha256",
+        ]
+        .iter()
+        .all(|key| {
+            receipt
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    value
+                        .strip_prefix("sha256:")
+                        .is_some_and(|digest| lower_hex(digest, 64))
+                })
+        })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed read boundary keeps compiler binding, exact selectors, provider projection, and body-free failure translation visibly contiguous"
+)]
+pub(super) async fn read(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+    profile: &ProfileMetadata,
+    account_id: &str,
+    source: &Path,
+) -> Result<Value> {
+    let contract = capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .ok_or_else(|| CliError::Input("reply-admission read contract missing".to_owned()))?;
+    if contract.operation_kind != "read"
+        || contract.read_projection.as_deref() != Some("maildesk_reply_admission_read_v1")
+    {
+        return Err(CliError::Input(
+            "reply-admission read projection is not the closed workspace contract".to_owned(),
+        ));
+    }
+    let current = load(store, &capability.id)?.ok_or_else(|| {
+        CliError::Input("reply-admission read operation is no longer uniquely available".to_owned())
+    })?;
+    if current.workspace_d1_reply_admission.as_ref() != Some(contract) {
+        return Err(CliError::Input(
+            "reply-admission read repository authority drifted".to_owned(),
+        ));
+    }
+    if input.body.is_some() || input.query.as_object().is_none_or(|query| query.len() != 5) {
+        return Err(CliError::Input(
+            "reply-admission read accepts only the exact config and four digest/operation selectors"
+                .to_owned(),
+        ));
+    }
+    let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
+    let runtime = compiler_runtime(store, contract)?;
+    let bytes = compile_private_candidate(store, contract, source, &runtime)?;
+    let candidate = validate_candidate_bytes(&bytes)?;
+    validate_candidate_fresh(&candidate, Utc::now())?;
+    let generation = credential_generation_for_read(profile)?;
+    validate_control_plane_binding(&candidate, profile, account_id, &generation)?;
+    for (key, expected) in [
+        ("transaction_sha256", candidate.transaction_sha256.as_str()),
+        (
+            "activation_record_sha256",
+            candidate.activation_record_sha256.as_str(),
+        ),
+        (
+            "pre_send_identity_projection_sha256",
+            candidate.projection_sha256.as_str(),
+        ),
+        (
+            "activation_operation_id",
+            candidate.activation_operation_id.as_str(),
+        ),
+    ] {
+        if input.query.get(key).and_then(Value::as_str) != Some(expected) {
+            return Err(CliError::Input(format!(
+                "reply-admission read selector `{key}` does not match the compiler-owned candidate"
+            )));
+        }
+    }
+    let version = workspace_d1_migration::run_wrangler(
+        &["--version".to_owned()],
+        Path::new(&contract.repository_root),
+        credential,
+        account_id,
+        &store.paths().cache_dir,
+        TIMEOUT,
+    )
+    .await?;
+    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
+    if !version.success || observed_version != contract.wrangler_version {
+        return Err(CliError::Input(format!(
+            "workspace reply-admission read requires Wrangler {}, observed {observed_version}",
+            contract.wrangler_version
+        )));
+    }
+    let sql = format!(
+        "SELECT {} FROM {} WHERE id = '{}' AND transaction_sha256 = '{}' LIMIT 2",
+        RECORD_COLUMNS.join(","),
+        identifier(&contract.admission_table)?,
+        escape(candidate.record["id"].as_str().unwrap_or_default()),
+        escape(candidate.transaction_sha256.trim_start_matches("sha256:")),
+    );
+    let rows = workspace_d1_migration::execute_json_query(
+        &config.database_name,
+        &config.path,
+        &sql,
+        Path::new(&contract.repository_root),
+        credential,
+        account_id,
+        &store.paths().cache_dir,
+    )
+    .await;
+    let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let Ok(rows) = rows else {
+        return Ok(json!({
+            "adapter":"workspace_reply_admission_read_v1",
+            "success":false,
+            "boundary_crossed":true,
+            "status":"provider_read_failed",
+            "match_count":Value::Null,
+            "transaction_sha256":candidate.transaction_sha256,
+            "activation_record_sha256":candidate.activation_record_sha256,
+            "pre_send_identity_projection_sha256":candidate.projection_sha256,
+            "activation_operation_id":candidate.activation_operation_id,
+            "cfctl_build_sha256":candidate.cfctl_build_sha256,
+            "profile_sha256":candidate.profile_sha256,
+            "account_sha256":candidate.account_sha256,
+            "credential_generation_sha256":candidate.credential_generation_sha256,
+            "observed_at":observed_at,
+            "expires_at":candidate.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "wrangler_version":observed_version,
+            "failure_code":"CFCTL_WORKSPACE_D1_REPLY_ADMISSION_PROVIDER_READ_FAILED",
+            "provider_output_retained":false,
+            "record_content_retained":false,
+            "body_returned":false,
+        }));
+    };
+    Ok(project_read_receipt(
+        &candidate,
+        &rows,
+        &observed_at,
+        &observed_version,
+    ))
+}
+
+fn project_read_receipt(
+    candidate: &Candidate,
+    rows: &[Map<String, Value>],
+    observed_at: &str,
+    observed_version: &str,
+) -> Value {
+    let match_count = rows.len();
+    let exact = match_count == 1
+        && rows[0].get("status").and_then(Value::as_str) == Some("admitted")
+        && hash_json(&Value::Object(rows[0].clone())) == candidate.activation_record_sha256;
+    let status = match match_count {
+        0 => "missing",
+        1 if exact => "active",
+        1 => "invalid",
+        _ => "ambiguous",
+    };
+    let mut receipt = json!({
+        "adapter":"workspace_reply_admission_read_v1",
+        "success":exact,
+        "boundary_crossed":true,
+        "status":status,
+        "match_count":match_count,
+        "transaction_sha256":candidate.transaction_sha256,
+        "activation_record_sha256":candidate.activation_record_sha256,
+        "pre_send_identity_projection_sha256":candidate.projection_sha256,
+        "activation_operation_id":candidate.activation_operation_id,
+        "cfctl_build_sha256":candidate.cfctl_build_sha256,
+        "profile_sha256":candidate.profile_sha256,
+        "account_sha256":candidate.account_sha256,
+        "credential_generation_sha256":candidate.credential_generation_sha256,
+        "observed_at":observed_at,
+        "expires_at":candidate.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "wrangler_version":observed_version,
+        "provider_output_retained":false,
+        "record_content_retained":false,
+        "body_returned":false,
+    });
+    if exact {
+        receipt["pre_send_identity_projection"] = candidate.projection.clone();
+    } else {
+        receipt["failure_code"] = Value::String(
+            match status {
+                "missing" => "CFCTL_WORKSPACE_D1_REPLY_ADMISSION_READ_NO_MATCH",
+                "ambiguous" => "CFCTL_WORKSPACE_D1_REPLY_ADMISSION_READ_AMBIGUOUS",
+                _ => "CFCTL_WORKSPACE_D1_REPLY_ADMISSION_READ_BINDING_MISMATCH",
+            }
+            .to_owned(),
+        );
+    }
+    receipt
+}
+
 async fn verify_inner(
     store: &StateStore,
     plan: &PlanV1,
@@ -449,6 +737,7 @@ struct Candidate {
     projection_sha256: String,
     transaction_sha256: String,
     logical_activation_id: String,
+    activation_operation_id: String,
     cfctl_build_sha256: String,
     profile_sha256: String,
     account_sha256: String,
@@ -456,6 +745,7 @@ struct Candidate {
     admitted_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     record: Map<String, Value>,
+    projection: Value,
 }
 
 struct CompilerRuntime {
@@ -579,11 +869,11 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
     let cfctl_build_sha256 = digest(cp, "cfctl_build_sha256")?;
     let credential_generation_sha256 = digest(cp, "credential_generation_sha256")?;
     let profile_sha256 = digest(cp, "profile_sha256")?;
-    let logical = cp
+    let activation_operation_id = cp
         .get("activation_operation_id")
         .and_then(Value::as_str)
         .filter(|s| safe_ref(s))
-        .ok_or_else(|| CliError::Input("logical activation identity is invalid".to_owned()))?
+        .ok_or_else(|| CliError::Input("activation operation identity is invalid".to_owned()))?
         .to_owned();
     let activation = o
         .get("activation")
@@ -617,6 +907,12 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
         ));
     }
     validate_record(&record)?;
+    let logical_activation_id = record
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| safe_ref(value))
+        .ok_or_else(|| CliError::Input("logical activation identity is invalid".to_owned()))?
+        .to_owned();
     validate_projection_record_bindings(projection, &record, &transaction)?;
     let admitted_at = timestamp(record.get("admitted_at"), "admitted_at")?;
     let expires_at = timestamp(record.get("expires_at"), "expires_at")?;
@@ -636,7 +932,8 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
         activation_record_sha256: activation_hash,
         projection_sha256: projection_hash,
         transaction_sha256: transaction,
-        logical_activation_id: logical,
+        logical_activation_id,
+        activation_operation_id,
         cfctl_build_sha256,
         profile_sha256,
         account_sha256,
@@ -644,6 +941,7 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
         admitted_at,
         expires_at,
         record,
+        projection: Value::Object(projection.clone()),
     })
 }
 
@@ -1721,7 +2019,14 @@ mod tests {
     fn compiled_candidate_binds_distinct_logical_activation_and_hashes() {
         let bytes = serde_json::to_vec(&candidate()).expect("candidate bytes");
         let admitted = validate_candidate_bytes(&bytes).expect("valid candidate");
-        assert_eq!(admitted.logical_activation_id, "controller:activation:one");
+        assert_eq!(
+            admitted.logical_activation_id,
+            format!("reply-admission:{}", "1".repeat(32))
+        );
+        assert_eq!(
+            admitted.activation_operation_id,
+            "controller:activation:one"
+        );
         assert_ne!(
             admitted.logical_activation_id,
             "00000000-0000-4000-8000-000000000000"
@@ -1751,6 +2056,74 @@ mod tests {
         value["source_prerequisites"]["configured_policy"]["private_address"] =
             Value::String("operator@example.net".to_owned());
         assert!(validate_candidate_bytes(&serde_json::to_vec(&value).expect("bytes")).is_err());
+    }
+
+    #[test]
+    fn read_projection_requires_one_exact_active_record_and_retains_no_provider_row() {
+        let bytes = serde_json::to_vec(&candidate()).expect("candidate bytes");
+        let admitted = validate_candidate_bytes(&bytes).expect("valid candidate");
+        let exact_row = admitted.record.clone();
+        let success = project_read_receipt(
+            &admitted,
+            std::slice::from_ref(&exact_row),
+            "2030-01-01T00:02:00.000Z",
+            "4.120.1",
+        );
+        assert!(read_receipt_is_complete(&success));
+        assert_eq!(success["status"], "active");
+        assert_eq!(success["match_count"], 1);
+        assert_eq!(
+            success["activation_operation_id"],
+            "controller:activation:one"
+        );
+        assert_eq!(success["provider_output_retained"], false);
+        assert_eq!(success["record_content_retained"], false);
+        assert_eq!(success["body_returned"], false);
+        let encoded = success.to_string();
+        assert!(!encoded.contains("claimed_attempt_id"));
+        assert!(!encoded.contains("provider_boundary_at"));
+        let mut expanded = success.clone();
+        expanded["provider_payload"] = json!({"forbidden":true});
+        assert!(!read_receipt_is_complete(&expanded));
+
+        let missing = project_read_receipt(&admitted, &[], "2030-01-01T00:02:00.000Z", "4.120.1");
+        assert!(!read_receipt_is_complete(&missing));
+        assert_eq!(missing["status"], "missing");
+        assert_eq!(missing["match_count"], 0);
+        assert!(missing.get("pre_send_identity_projection").is_none());
+
+        let multiple = project_read_receipt(
+            &admitted,
+            &[exact_row.clone(), exact_row],
+            "2030-01-01T00:02:00.000Z",
+            "4.120.1",
+        );
+        assert!(!read_receipt_is_complete(&multiple));
+        assert_eq!(multiple["status"], "ambiguous");
+        assert_eq!(multiple["match_count"], 2);
+        assert!(multiple.get("pre_send_identity_projection").is_none());
+    }
+
+    #[test]
+    fn read_projection_rejects_one_mismatched_or_non_active_record() {
+        let bytes = serde_json::to_vec(&candidate()).expect("candidate bytes");
+        let admitted = validate_candidate_bytes(&bytes).expect("valid candidate");
+        let mut drifted = admitted.record.clone();
+        drifted.insert(
+            "display_name".to_owned(),
+            Value::String("Wrong Identity".to_owned()),
+        );
+        let mismatch =
+            project_read_receipt(&admitted, &[drifted], "2030-01-01T00:02:00.000Z", "4.120.1");
+        assert_eq!(mismatch["status"], "invalid");
+        assert!(!read_receipt_is_complete(&mismatch));
+
+        let mut claimed = admitted.record.clone();
+        claimed.insert("status".to_owned(), Value::String("claimed".to_owned()));
+        let terminal =
+            project_read_receipt(&admitted, &[claimed], "2030-01-01T00:02:00.000Z", "4.120.1");
+        assert_eq!(terminal["status"], "invalid");
+        assert!(!read_receipt_is_complete(&terminal));
     }
 
     #[cfg(unix)]
