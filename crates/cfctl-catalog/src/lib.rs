@@ -8809,7 +8809,7 @@ fn finalize_email_routing_rules_read_projection(capabilities: &mut BTreeMap<Stri
         return;
     }
     capability.description = Some(
-        "Lists routing rules as cfctl's bounded `EmailRoutingRuleSetV1` projection; raw non-Worker action values never enter stdout or evidence."
+        "Lists routing rules as cfctl's bounded `EmailRoutingRuleSetV1` projection; opaque rule identifiers remain available for exact update or delete plans, while raw non-Worker action values never enter stdout or evidence."
             .to_owned(),
     );
     capability.aliases.extend([

@@ -5226,7 +5226,7 @@ async fn r2_bucket_inventory_rejects_malformed_or_repeated_cursors() {
 #[tokio::test]
 async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
     let (address, server) = json_response_sequence_server(vec![
-        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"worker","value":["maildesk-router"]}]},{"enabled":true,"matchers":[{"type":"all"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[],"result_info":{"page":1,"per_page":50,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"tag":"rule-001","enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"worker","value":["maildesk-router"]}]},{"tag":"rule-002","enabled":true,"matchers":[{"type":"all"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[],"result_info":{"page":1,"per_page":50,"total_count":2}}"#,
         r#"{"success":true,"result":[],"errors":[],"result_info":{"page":2,"per_page":50,"total_count":2}}"#,
     ])
     .await;
@@ -5291,6 +5291,7 @@ async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
     assert_eq!(response.result["schema_version"], 1);
     assert_eq!(response.result["complete"], true);
     assert_eq!(response.result["rule_count"], 2);
+    assert_eq!(response.result["rules"][0]["rule_identifier"], "rule-001");
     assert_eq!(response.result["rules"][0]["matchers"][0]["field"], "to");
     assert_eq!(
         response.result["rules"][0]["matchers"][0]["value_sha256"],
@@ -5315,7 +5316,7 @@ async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
 #[tokio::test]
 async fn email_routing_rules_read_rejects_shape_drift_without_echoing_values() {
     let (address, server) = json_response_sequence_server(vec![
-        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[]}"#,
+        r#"{"success":true,"result":[{"tag":"rule-001","enabled":true,"matchers":[{"type":"literal","field":"to"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[]}"#,
         r#"{"success":true,"result":[],"errors":[]}"#,
     ])
     .await;
