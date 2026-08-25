@@ -413,7 +413,7 @@ pub(super) fn validated_config(
     normalize_production_identity(&mut production, &template, &contract.database_binding)?;
     if production != template {
         return Err(CliError::Input(
-            "production Wrangler config differs from the tracked template outside the allowed Worker and D1 identity fields"
+            "production Wrangler config differs from the tracked template outside the allowed Worker, D1 identity, sender restriction, and split relay activation fields"
                 .to_owned(),
         ));
     }
@@ -488,7 +488,104 @@ fn normalize_production_identity(
     production["name"] = template_name;
     let template_database = d1_entry(template, binding)?.clone();
     *d1_entry_mut(production, binding)? = template_database;
+    normalize_sender_identity(production, template)?;
+    normalize_relay_activation(production, template)?;
     Ok(())
+}
+
+fn normalize_relay_activation(production: &mut toml::Value, template: &toml::Value) -> Result<()> {
+    let Some(production_vars) = production
+        .get_mut("vars")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return Ok(());
+    };
+    let template_vars = template.get("vars").and_then(toml::Value::as_table);
+    for key in ["MAILDESK_INBOUND_RELAY_MODE", "MAILDESK_REPLY_RELAY_MODE"] {
+        let Some(production_mode) = production_vars.get(key) else {
+            continue;
+        };
+        let valid_mode =
+            |value: &toml::Value| matches!(value.as_str(), Some("disabled" | "enabled"));
+        if !valid_mode(production_mode) {
+            return Err(CliError::Input(format!(
+                "workspace D1 production {key} must be disabled or enabled"
+            )));
+        }
+        let template_mode = template_vars
+            .and_then(|values| values.get(key))
+            .filter(|value| valid_mode(value))
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "workspace D1 production {key} has no canonical tracked-template authority"
+                ))
+            })?;
+        production_vars.insert(key.to_owned(), template_mode.clone());
+    }
+    Ok(())
+}
+
+fn normalize_sender_identity(production: &mut toml::Value, template: &toml::Value) -> Result<()> {
+    let Some(production_senders) = production
+        .get_mut("send_email")
+        .and_then(toml::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let Some(template_senders) = template.get("send_email").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    if production_senders.len() != template_senders.len() {
+        return Ok(());
+    }
+    for (production_sender, template_sender) in production_senders.iter_mut().zip(template_senders)
+    {
+        let Some(production_table) = production_sender.as_table_mut() else {
+            continue;
+        };
+        let Some(addresses) = production_table.get("allowed_sender_addresses") else {
+            continue;
+        };
+        validate_sender_addresses(addresses)?;
+        if let Some(template_addresses) = template_sender.get("allowed_sender_addresses") {
+            production_table.insert(
+                "allowed_sender_addresses".to_owned(),
+                template_addresses.clone(),
+            );
+        } else {
+            production_table.remove("allowed_sender_addresses");
+        }
+    }
+    Ok(())
+}
+
+fn validate_sender_addresses(value: &toml::Value) -> Result<()> {
+    let valid = value.as_array().is_some_and(|addresses| {
+        (1..=256).contains(&addresses.len())
+            && addresses.iter().all(|address| {
+                address.as_str().is_some_and(|address| {
+                    (3..=320).contains(&address.len())
+                        && !address
+                            .bytes()
+                            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+                        && address.split_once('@').is_some_and(|(local, domain)| {
+                            !local.is_empty()
+                                && !domain.is_empty()
+                                && !domain.contains('@')
+                                && !domain.starts_with('.')
+                                && !domain.ends_with('.')
+                        })
+                })
+            })
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::Input(
+            "workspace D1 production sender identity must be a bounded list of email addresses"
+                .to_owned(),
+        ))
+    }
 }
 
 fn d1_entry<'a>(config: &'a toml::Value, binding: &str) -> Result<&'a toml::Value> {
@@ -629,7 +726,7 @@ pub(super) fn validate_recovery_target(
     Ok(())
 }
 
-fn validate_recovery_target_identity<'a>(
+pub(super) fn validate_recovery_target_identity<'a>(
     store: &StateStore,
     target: &'a Map<String, Value>,
     catalog_hash: &str,
@@ -1265,14 +1362,22 @@ mod tests {
     }
 
     #[test]
-    fn production_config_normalizes_only_worker_and_d1_identity() {
+    fn production_config_normalizes_worker_d1_sender_identity_and_split_relay_activation() {
         let template: toml::Value = toml::from_str(
             r#"
 name = "template"
 main = "build/_worker.js"
 
+send_email = [
+  { name = "EMAIL" }
+]
+
 [observability]
 enabled = true
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
 
 [[d1_databases]]
 binding = "DB"
@@ -1287,8 +1392,16 @@ preview_database_id = "00000000-0000-0000-0000-000000000000"
 name = "production-worker"
 main = "build/_worker.js"
 
+send_email = [
+  { name = "EMAIL", allowed_sender_addresses = ["security@example.com"] }
+]
+
 [observability]
 enabled = true
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "enabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
 
 [[d1_databases]]
 binding = "DB"
@@ -1306,6 +1419,59 @@ preview_database_id = "11111111-1111-4111-8111-111111111111"
         production["main"] = toml::Value::String("other.js".to_owned());
         normalize_production_identity(&mut production, &template, "DB").expect("normalize");
         assert_ne!(production, template);
+    }
+
+    #[test]
+    fn production_relay_activation_rejects_invalid_values_and_legacy_authority() {
+        let template: toml::Value = toml::from_str(
+            r#"
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+"#,
+        )
+        .expect("template");
+
+        for invalid in [
+            toml::Value::String("preview".to_owned()),
+            toml::Value::Boolean(true),
+            toml::Value::Integer(1),
+        ] {
+            let mut production = template.clone();
+            production["vars"]["MAILDESK_INBOUND_RELAY_MODE"] = invalid;
+            assert!(normalize_relay_activation(&mut production, &template).is_err());
+        }
+
+        let mut legacy = template.clone();
+        legacy["vars"].as_table_mut().expect("vars table").insert(
+            "MAILDESK_RELAY_PROCESSING_MODE".to_owned(),
+            toml::Value::String("enabled".to_owned()),
+        );
+        normalize_relay_activation(&mut legacy, &template).expect("normalize allowed fields");
+        assert_ne!(
+            legacy, template,
+            "legacy combined activation must remain forbidden drift"
+        );
+    }
+
+    #[test]
+    fn production_sender_identity_rejects_malformed_or_unbounded_addresses() {
+        for addresses in [
+            toml::Value::Array(Vec::new()),
+            toml::Value::Array(vec![toml::Value::String("not-an-address".to_owned())]),
+            toml::Value::Array(vec![toml::Value::String(
+                "bad address@example.com".to_owned(),
+            )]),
+            toml::Value::String("security@example.com".to_owned()),
+        ] {
+            assert!(validate_sender_addresses(&addresses).is_err());
+        }
+        assert!(
+            validate_sender_addresses(&toml::Value::Array(vec![toml::Value::String(
+                "security@example.com".to_owned()
+            )]))
+            .is_ok()
+        );
     }
 
     #[test]

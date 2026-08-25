@@ -43,6 +43,15 @@ binary directly with `cfctl version --json` if its self-reported identity is
 needed. Unknown source identity, missing or different PATH executables, and
 managed-instruction drift are unhealthy installation states.
 
+Source bootstrap applies that same tracked-and-untracked non-ignored
+cleanliness invariant before verification or installation. Its current `cargo
+install --force` flow still replaces the install-root binary before checking
+the new binary's exact commit. A failed post-install identity check can
+therefore leave that PATH binary unhealthy; recover by rerunning bootstrap from
+an exact clean checkout. Staging the executable without losing Cargo's
+install-root tracking, then promoting it atomically only after identity
+verification, remains a separate installer hardening boundary.
+
 If a command reports `catalog content hash mismatch`, do not edit the stored
 hash. Run `cfctl catalog sync --json` to fetch a fresh official snapshot and
 inspect `previous_catalog`. `discarded_invalid` means the corrupt current file
@@ -451,12 +460,47 @@ are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
 Application repositories may declare ordered migration operations in
 `.cfctl/operations/d1-migrations.toml`, private policy projections in
 `.cfctl/operations/d1-policy-projections.toml`, and fixed body-free readiness
-reads in `.cfctl/operations/d1-evidence.toml`. The repository must already be
+reads in `.cfctl/operations/d1-evidence.toml`. Maildesk may additionally declare
+the closed `star-maildesk-cf.reply-admission-activate` and
+`star-maildesk-cf.reply-admission-read` pair in
+`.cfctl/operations/d1-reply-admission.toml`. Activation accepts one exact
+mode-0600 compiler input through `--source-file`, stages the exact committed
+compiler bytes, executes them with the version-and-digest-pinned Bun runtime,
+stages only the compiled candidate,
+derives its SQL internally, and places only hashes and body-free bindings in
+PlanV2 and evidence. The companion non-mutating read accepts the same private
+compiler input plus the exact transaction, activation-record,
+identity-projection, and controller activation-operation selectors. It executes
+only cfctl's fixed two-row-bounded query, discards provider rows, and proves only
+one exact still-admitted record. The logical D1 admission ID, controller
+activation-operation ID, and cfctl PlanV2 UUID remain distinct; each is bound
+and reported without rewriting one to impersonate another.
+
+Maildesk's separately documented `star-maildesk-cf.reply-subdomain-ingress-read`
+is also workspace-owned and non-mutating. It accepts only `account_id`,
+`reply_domain`, and `worker_script_name`. cfctl resolves the nearest exact active
+parent zone in the selected account and reads
+`/zones/{zone_id}/email/routing/dns` with the exact reply domain in the
+`subdomain` query. It then enumerates the complete account Email Routing rule
+inventory through `GET /accounts/{account_id}/email/routing/rules`. The typed
+projection hashes each rule's domain and parent-zone identities, retains only
+validated Worker action targets, and discards raw rule values. Exactly one
+enabled rule whose domain hash matches the reply subdomain, whose parent hash
+matches the resolved zone, whose sole matcher is `all`, and whose sole action
+targets the selected Worker closes the routing plane. The closed
+`workspace_reply_subdomain_ingress_v1` projection: hashed reply-domain and
+Worker identities, typed `ok`, `drift`, or `missing` DNS and routing states,
+and explicit `provider_output_retained:false` and `body_returned:false`.
+A separate reply-domain zone, the parent-zone catch-all, incomplete account
+pagination, ambiguous exact rules, or a merely similar Worker never satisfy
+the contract.
+
+The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
 the operation pack and tracked Wrangler template at that HEAD. Migration packs
 also close the ordered migration directory with exact per-file SHA-256 values.
 
-Both operations bind an exact Wrangler version, the ignored production-config
+All mutating repository operations bind an exact Wrangler version, the ignored production-config
 path and D1 binding, a fresh pre-change bookmark, and a separately approved
 exact-bookmark recovery capability. The production config must be a regular
 mode-restricted file and may differ from its tracked template only in the
@@ -524,6 +568,19 @@ counts; and Queue/DLQ correlations. Addresses, subjects, recipients, message
 content, arbitrary columns, output paths, parameters, PRAGMAs, and mutating SQL
 are not representable. A dirty repository, wrong HEAD/origin/config/binding,
 query drift, extra column, malformed map, or non-singleton result fails closed.
+
+The result also contains additive `route_health` schema V2 while keeping the
+V1 `evidence` object unchanged. Each record contains only cfctl-computed SHA-256
+references for route and domain identity, the active policy digest, closed
+route/provider/readiness codes, enabled state, four body-free proof timestamps,
+a bounded error code, and `updated_at`. The projection is accepted only when at
+most 1,000 unique route records exactly cover the aggregate active route count.
+Missing health rows, route-kind or policy-revision drift, disabled active rows,
+truncation, duplicates, unknown codes, malformed timestamps, or unexpected
+fields reject the entire read. Raw route IDs,
+addresses, domains, operators, account IDs, and provider payloads never enter a
+route record; `provider_output_retained:false` and `body_returned:false` remain
+explicit.
 
 ```sh
 cfctl call <repository-d1-evidence-operation-id> \

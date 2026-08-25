@@ -17,13 +17,14 @@ use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
     D1ApprovedMlnImportContractV1, D1FullExportContractV1, D1RestoreExactBookmarkContractV1,
-    D1SchemaIntrospectionContractV1, EMAIL_ROUTING_RULES_MAX_PAGES, EMAIL_ROUTING_RULES_PAGE_SIZE,
-    EmailRoutingRuleDiagnosticV1, GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1,
-    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
-    R2PrivateObjectDigestV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1,
-    SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
-    is_email_routing_rules_list_capability, normalize_email_routing_rule_set,
-    request_header_is_reserved,
+    D1SchemaIntrospectionContractV1, EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID,
+    EMAIL_ROUTING_RULES_MAX_PAGES, EMAIL_ROUTING_RULES_PAGE_SIZE, EmailRoutingRuleDiagnosticV1,
+    GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
+    PlanStatus, PlanV1, R2LogRetrievalContractV1, R2PrivateObjectDigestV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1, TimestampFormatV1,
+    TransactionStageV1, hash_value, is_email_routing_rules_list_capability,
+    normalize_email_routing_account_rule_set_with_page_size,
+    normalize_email_routing_rule_set_with_page_size, request_header_is_reserved,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
@@ -150,6 +151,14 @@ pub enum CloudflareError {
     InvalidHeaderSelector(String),
     #[error("Cloudflare reported {0} pages, above the governed pagination limit")]
     PaginationLimit(u64),
+    #[error("Cloudflare page pagination metadata is invalid or internally inconsistent")]
+    PaginationMetadataInvalid,
+    #[error("Cloudflare queue-consumer single-page metadata failed the body-free `{reason}` check")]
+    QueueConsumersSinglePageMetadataInvalid { reason: &'static str },
+    #[error(
+        "Cloudflare page pagination result count {actual} did not match the declared total count {expected}"
+    )]
+    PaginationCountMismatch { expected: u64, actual: usize },
     #[error("Cloudflare cursor pagination repeated a cursor; completion cannot be proven")]
     PaginationCursorLoop,
     #[error("Cloudflare cursor pagination omitted cursor metadata before completion")]
@@ -500,6 +509,13 @@ fn normalize_md5_etag(value: &str) -> Option<&str> {
     let value = value.strip_prefix("W/").unwrap_or(value).trim();
     let value = value.strip_prefix('"')?.strip_suffix('"')?;
     (value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())).then_some(value)
+}
+
+fn normalize_r2_upload_json_etag(value: &str) -> Option<&str> {
+    normalize_md5_etag(value).or_else(|| {
+        (value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit()))
+            .then_some(value)
+    })
 }
 
 fn d1_full_export_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
@@ -1027,6 +1043,7 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
         "trigger_exists" => &["assertion", "trigger"],
         "schema_contains" => &["assertion", "object_type", "name", "fragment"],
         "foreign_key_check_empty" => &["assertion"],
+        "migration_ledger_equals" => &["assertion", "migrations"],
         "mln_0142_trigger_definition" => &[
             "assertion",
             "import_operation_id",
@@ -1065,28 +1082,28 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
                 ))
             })
     };
-    let (sql, params) = match assertion {
+    let (sql, params): (String, Vec<Value>) = match assertion {
         "table_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1) AS present".to_owned(),
             vec![Value::String(bounded("table", 255)?)],
         ),
         "column_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2) AS present",
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2) AS present".to_owned(),
             vec![
                 Value::String(bounded("table", 255)?),
                 Value::String(bounded("column", 255)?),
             ],
         ),
         "index_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1) AS present".to_owned(),
             vec![Value::String(bounded("index", 255)?)],
         ),
         "trigger_exists" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present".to_owned(),
             vec![Value::String(bounded("trigger", 255)?)],
         ),
         "schema_contains" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present".to_owned(),
             vec![
                 Value::String(
                     body.get("object_type")
@@ -1104,16 +1121,76 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
             ],
         ),
         "foreign_key_check_empty" => (
-            "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present",
+            "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present".to_owned(),
             Vec::new(),
         ),
+        "migration_ledger_equals" => migration_ledger_assertion(body)?,
         "mln_0142_trigger_definition" => (
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present".to_owned(),
             vec![Value::String(MLN_0142_TERMINAL_TRIGGER_SQL.to_owned())],
         ),
         _ => unreachable!("assertion variants were closed above"),
     };
     Ok(serde_json::json!({"sql":sql,"params":params}))
+}
+
+fn migration_ledger_assertion(
+    body: &serde_json::Map<String, Value>,
+) -> Result<(String, Vec<Value>)> {
+    let migrations = body
+        .get("migrations")
+        .and_then(Value::as_array)
+        .filter(|migrations| (1..=64).contains(&migrations.len()))
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "D1 migration ledger assertion requires one to 64 filenames".to_owned(),
+            )
+        })?;
+    let mut unique = BTreeSet::new();
+    let names = migrations
+        .iter()
+        .map(|migration| {
+            migration
+                .as_str()
+                .filter(|name| {
+                    (5..=128).contains(&name.len())
+                        && Path::new(name).extension() == Some(std::ffi::OsStr::new("sql"))
+                        && !name.contains("..")
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(
+                        "D1 migration ledger filenames must be bounded SQL basenames".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !names.iter().all(|name| unique.insert(name.clone())) {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "D1 migration ledger filenames must be unique".to_owned(),
+        ));
+    }
+
+    let mut params = Vec::with_capacity(names.len() * 2);
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let position = index + 1;
+            params.push(Value::from(u64::try_from(position).unwrap_or(u64::MAX)));
+            params.push(Value::String(name.clone()));
+            format!("(?{}, ?{})", position * 2 - 1, position * 2)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH expected(position,name) AS (VALUES {values}), observed AS (SELECT ROW_NUMBER() OVER (ORDER BY id) AS position,name FROM d1_migrations) SELECT ((SELECT COUNT(*) FROM observed) = {} AND NOT EXISTS(SELECT 1 FROM expected LEFT JOIN observed USING(position,name) WHERE observed.name IS NULL)) AS present",
+        names.len()
+    );
+    Ok((sql, params))
 }
 
 fn d1_schema_introspection_request_schema() -> Value {
@@ -1128,6 +1205,7 @@ fn d1_schema_introspection_request_schema() -> Value {
             {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
             {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
             {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+            ,{"type":"object","additionalProperties":false,"required":["assertion","migrations"],"properties":{"assertion":{"type":"string","enum":["migration_ledger_equals"]},"migrations":{"type":"array","minItems":1,"maxItems":64,"uniqueItems":true,"items":{"type":"string","minLength":5,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+\\.sql$"}}}}
         ]
     })
 }
@@ -1602,8 +1680,10 @@ pub fn validate_reviewed_schema_migration_sql(sql: &str) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod d1_schema_introspection_tests {
     use super::{d1_schema_introspection_caller_sql, render_d1_schema_introspection_body};
+    use rusqlite::{Connection, params};
     use serde_json::json;
 
     #[test]
@@ -1615,9 +1695,83 @@ mod d1_schema_introspection_tests {
             json!({"assertion":"trigger_exists","trigger":"users_guard","unexpected":true}),
             json!({"assertion":"schema_contains","object_type":"table","name":"users","fragment":"id","unexpected":true}),
             json!({"assertion":"foreign_key_check_empty","unexpected":true}),
+            json!({"assertion":"migration_ledger_equals","migrations":["0001_init.sql"],"sql":"SELECT 1"}),
         ] {
             assert!(render_d1_schema_introspection_body(&body).is_err());
         }
+    }
+
+    #[test]
+    fn migration_ledger_renderer_accepts_only_one_bounded_unique_ordered_filename_set() {
+        let rendered = render_d1_schema_introspection_body(&json!({
+            "assertion":"migration_ledger_equals",
+            "migrations":["0001_init.sql","0002_routes.sql"],
+        }))
+        .expect("closed migration ledger assertion");
+        assert!(rendered["sql"].as_str().is_some_and(|sql| {
+            sql.contains("d1_migrations") && sql.contains("ROW_NUMBER() OVER (ORDER BY id)")
+        }));
+        assert_eq!(
+            rendered["params"],
+            json!([1, "0001_init.sql", 2, "0002_routes.sql"])
+        );
+
+        for migrations in [
+            json!([]),
+            json!(["0001_init.sql", "0001_init.sql"]),
+            json!(["../0001_init.sql"]),
+            json!(["not-sql.txt"]),
+        ] {
+            assert!(
+                render_d1_schema_introspection_body(&json!({
+                    "assertion":"migration_ledger_equals",
+                    "migrations":migrations,
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn migration_ledger_assertion_requires_the_exact_ordered_remote_ledger() {
+        let rendered = render_d1_schema_introspection_body(&json!({
+            "assertion":"migration_ledger_equals",
+            "migrations":["0001_init.sql","0002_routes.sql"],
+        }))
+        .expect("closed migration ledger assertion");
+        let sql = rendered["sql"].as_str().unwrap_or_default();
+        let connection = Connection::open_in_memory().expect("in-memory D1 model");
+        connection
+            .execute_batch(
+                "CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\
+                 INSERT INTO d1_migrations(id,name) VALUES (1,'0001_init.sql'),(2,'0002_routes.sql');",
+            )
+            .expect("exact ledger");
+        let present = connection
+            .query_row(
+                sql,
+                params![1_i64, "0001_init.sql", 2_i64, "0002_routes.sql"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("exact assertion");
+        assert_eq!(present, 1);
+
+        connection
+            .execute("DELETE FROM d1_migrations", [])
+            .expect("clear ledger");
+        connection
+            .execute_batch(
+                "INSERT INTO d1_migrations(id,name) VALUES (1,'0002_routes.sql'),(2,'0001_init.sql');",
+            )
+            .expect("reordered ledger");
+        let present = connection
+            .query_row(
+                sql,
+                params![1_i64, "0001_init.sql", 2_i64, "0002_routes.sql"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reordered assertion");
+        assert_eq!(present, 0);
     }
 
     #[test]
@@ -2508,6 +2662,7 @@ pub struct CloudflareResponseV1 {
 fn email_routing_rules_rejected_response(
     mut response: CloudflareResponseV1,
     diagnostic: EmailRoutingRuleDiagnosticV1,
+    account_scoped: bool,
 ) -> CloudflareResponseV1 {
     response.success = false;
     response.result = serde_json::json!({
@@ -2516,7 +2671,11 @@ fn email_routing_rules_rejected_response(
         "diagnostic": diagnostic,
     });
     response.result_info = Some(serde_json::json!({
-        "cfctl_projection": "email_routing_rule_set_v1",
+        "cfctl_projection": if account_scoped {
+            "email_routing_account_rule_set_v1"
+        } else {
+            "email_routing_rule_set_v1"
+        },
         "cfctl_page_probe_complete": false,
     }));
     response.errors = vec![CloudflareApiErrorV1 {
@@ -2756,10 +2915,78 @@ impl Executor {
         let request = self.builder.build(capability, input)?;
         if is_email_routing_rules_list_capability(capability) {
             return self
-                .execute_email_routing_rules_read(&request, credential)
+                .execute_email_routing_rules_read(
+                    &request,
+                    credential,
+                    capability.id == EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID,
+                )
+                .await;
+        }
+        if is_r2_buckets_list_capability(capability) {
+            return self
+                .execute_r2_buckets_list_read(&request, credential)
                 .await;
         }
         self.send_paginated(&request, credential).await
+    }
+
+    async fn execute_r2_buckets_list_read(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        let mut combined = self.send(request, credential).await?;
+        if !combined.success {
+            return Ok(combined);
+        }
+        let mut next_cursor = direct_cursor_after(combined.result_info.as_ref())?;
+        let status = combined.status;
+        let Some(buckets) = combined
+            .result
+            .as_object_mut()
+            .and_then(|result| result.get_mut("buckets"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(CloudflareError::InvalidResponseEnvelope { status });
+        };
+        let mut observed = BTreeSet::new();
+        let mut pages = 1_u64;
+        while let Some(cursor) = next_cursor {
+            if pages >= 1_000 {
+                return Err(CloudflareError::PaginationLimit(pages + 1));
+            }
+            if !observed.insert(cursor.clone()) {
+                return Err(CloudflareError::PaginationCursorLoop);
+            }
+            let mut page_request = request.clone();
+            set_query_parameter(&mut page_request.url, "cursor", &cursor);
+            let response = self.send(&page_request, credential).await?;
+            if !response.success {
+                return Ok(response);
+            }
+            let Some(page_buckets) = response
+                .result
+                .as_object()
+                .and_then(|result| result.get("buckets"))
+                .and_then(Value::as_array)
+            else {
+                return Err(CloudflareError::InvalidResponseEnvelope {
+                    status: response.status,
+                });
+            };
+            buckets.extend(page_buckets.iter().cloned());
+            pages += 1;
+            next_cursor = direct_cursor_after(response.result_info.as_ref())?;
+            combined.etag = response.etag;
+            combined.cf_ray = response.cf_ray;
+        }
+        combined.result_info = Some(serde_json::json!({
+            "cursor": "",
+            "count": buckets.len(),
+            "cfctl_cursor_complete": true,
+            "cfctl_pages": pages,
+        }));
+        Ok(combined)
     }
 
     /// Streams one exact private R2 object into an in-memory digest state. The
@@ -2938,13 +3165,22 @@ impl Executor {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the bounded pagination state machine keeps every provider response check adjacent to the one read boundary"
+    )]
     async fn execute_email_routing_rules_read(
         &self,
         request: &PreparedRequest,
         credential: &AuthCredential,
+        account_scoped: bool,
     ) -> Result<CloudflareResponseV1> {
         let mut combined = Vec::new();
         let mut base_response = None;
+        let mut metadata_present = None;
+        let mut expected_total_pages = None;
+        let mut expected_total_count = None;
+        let mut expected_page_size = None;
         for page in 1..=EMAIL_ROUTING_RULES_MAX_PAGES {
             let mut page_request = request.clone();
             set_query_parameter(&mut page_request.url, "page", &page.to_string());
@@ -2962,6 +3198,7 @@ impl Executor {
                         None,
                         "provider_response",
                     ),
+                    account_scoped,
                 ));
             }
             if !response.errors.is_empty() {
@@ -2972,12 +3209,14 @@ impl Executor {
                         None,
                         "provider_response",
                     ),
+                    account_scoped,
                 ));
             }
             let Some(page_rules) = response.result.as_array() else {
                 return Ok(email_routing_rules_rejected_response(
                     response,
                     EmailRoutingRuleDiagnosticV1::new("rules_not_array", None, "rules"),
+                    account_scoped,
                 ));
             };
             if page_rules.len()
@@ -2986,32 +3225,154 @@ impl Executor {
                 return Ok(email_routing_rules_rejected_response(
                     response,
                     EmailRoutingRuleDiagnosticV1::new("page_bound_exceeded", None, "pagination"),
+                    account_scoped,
                 ));
             }
+            let pagination = if let Some(info) = response.result_info.as_ref() {
+                if metadata_present == Some(false) {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                let Ok(Some(pagination)) = page_pagination(Some(info)) else {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                };
+                let Some(returned_page_size) = pagination.per_page else {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                };
+                if validate_page_item_count(&response, pagination).is_err()
+                    || pagination.current_page != page
+                    || returned_page_size > EMAIL_ROUTING_RULES_PAGE_SIZE
+                    || pagination.total_pages > EMAIL_ROUTING_RULES_MAX_PAGES
+                    || expected_page_size.is_some_and(|expected| expected != returned_page_size)
+                    || expected_total_pages
+                        .is_some_and(|expected| expected != pagination.total_pages)
+                    || expected_total_count
+                        .is_some_and(|expected| Some(expected) != pagination.total_count)
+                {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                metadata_present = Some(true);
+                expected_page_size = Some(returned_page_size);
+                expected_total_pages = Some(pagination.total_pages);
+                expected_total_count = pagination.total_count;
+                Some(pagination)
+            } else {
+                if metadata_present == Some(true) {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_missing",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                metadata_present = Some(false);
+                None
+            };
             if base_response.is_none() {
                 base_response = Some(response.clone());
             }
-            if page_rules.is_empty() {
-                let projection =
-                    match normalize_email_routing_rule_set(&Value::Array(combined), page) {
-                        Ok(projection) => projection,
-                        Err(diagnostic) => {
-                            return Ok(email_routing_rules_rejected_response(response, diagnostic));
-                        }
-                    };
+            let metadata_complete = pagination
+                .is_some_and(|pagination| pagination.current_page == pagination.total_pages);
+            if pagination.is_some_and(|pagination| {
+                page_rules.is_empty() && pagination.current_page < pagination.total_pages
+            }) {
+                return Ok(email_routing_rules_rejected_response(
+                    response,
+                    EmailRoutingRuleDiagnosticV1::new(
+                        "pagination_page_incomplete",
+                        None,
+                        "pagination",
+                    ),
+                    account_scoped,
+                ));
+            }
+            if !page_rules.is_empty() {
+                combined.extend(page_rules.iter().cloned());
+            }
+            if metadata_complete || (pagination.is_none() && page_rules.is_empty()) {
+                if expected_total_count.is_some_and(|expected| expected != combined.len() as u64) {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_total_count_mismatch",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                let projection = match if account_scoped {
+                    normalize_email_routing_account_rule_set_with_page_size(
+                        &Value::Array(combined),
+                        page,
+                        expected_page_size.unwrap_or(EMAIL_ROUTING_RULES_PAGE_SIZE),
+                    )
+                } else {
+                    normalize_email_routing_rule_set_with_page_size(
+                        &Value::Array(combined),
+                        page,
+                        expected_page_size.unwrap_or(EMAIL_ROUTING_RULES_PAGE_SIZE),
+                    )
+                } {
+                    Ok(projection) => projection,
+                    Err(diagnostic) => {
+                        return Ok(email_routing_rules_rejected_response(
+                            response,
+                            diagnostic,
+                            account_scoped,
+                        ));
+                    }
+                };
                 let mut completed = base_response.unwrap_or(response);
                 completed.result = serde_json::to_value(&projection)?;
                 completed.result_info = Some(serde_json::json!({
                     "page": 1,
-                    "per_page": EMAIL_ROUTING_RULES_PAGE_SIZE,
+                    "per_page": projection.page_size,
                     "total_pages": page,
                     "total_count": projection.rule_count,
                     "cfctl_page_probe_complete": true,
-                    "cfctl_projection": "email_routing_rule_set_v1",
+                    "cfctl_projection": if account_scoped {
+                        "email_routing_account_rule_set_v1"
+                    } else {
+                        "email_routing_rule_set_v1"
+                    },
                 }));
                 return Ok(completed);
             }
-            combined.extend(page_rules.iter().cloned());
         }
         Ok(email_routing_rules_rejected_response(
             base_response.unwrap_or(CloudflareResponseV1 {
@@ -3024,6 +3385,7 @@ impl Executor {
                 cf_ray: None,
             }),
             EmailRoutingRuleDiagnosticV1::new("page_bound_exceeded", None, "pagination"),
+            account_scoped,
         ))
     }
 
@@ -4394,7 +4756,8 @@ impl Executor {
                     "private R2 upload expected MD5 is missing".to_owned(),
                 )
             })?;
-        let returned_etag = apply_response.etag.as_deref().and_then(normalize_md5_etag);
+        let returned_etag = Self::exact_r2_upload_md5_etag(apply_response);
+        let conditional_etag = returned_etag.map(|etag| format!("\"{etag}\""));
         let mut read = CapabilityV1::new(
             &contract.read_capability_id,
             "Conditional private R2 object identity readback",
@@ -4426,7 +4789,7 @@ impl Executor {
                 selectors: Value::Object(selectors),
                 query: serde_json::json!({}),
                 body: None,
-                if_none_match: apply_response.etag.clone(),
+                if_none_match: conditional_etag,
                 ..CallInput::default()
             },
         )?;
@@ -4459,6 +4822,21 @@ impl Executor {
             },
             correlated_resource_id: None,
         })
+    }
+
+    fn exact_r2_upload_md5_etag(response: &CloudflareResponseV1) -> Option<&str> {
+        let header = response.etag.as_deref().and_then(normalize_md5_etag);
+        let result = response.result.get("etag");
+        match (header, result) {
+            (Some(header), None) => Some(header),
+            (Some(header), Some(Value::String(result)))
+                if normalize_r2_upload_json_etag(result) == Some(header) =>
+            {
+                Some(header)
+            }
+            (None, Some(Value::String(result))) => normalize_r2_upload_json_etag(result),
+            _ => None,
+        }
     }
 
     async fn verify_email_sending_dns_repair(
@@ -6983,33 +7361,17 @@ impl Executor {
         if !combined.success || !request.method.eq_ignore_ascii_case("GET") {
             return Ok(combined);
         }
-        if let Some((current_page, total_pages)) = pagination_bounds(combined.result_info.as_ref())
-        {
-            if total_pages > 1_000 {
-                return Err(CloudflareError::PaginationLimit(total_pages));
-            }
-            let Some(results) = combined.result.as_array_mut() else {
-                return Ok(combined);
-            };
-            for page in (current_page + 1)..=total_pages {
-                let mut page_request = request.clone();
-                set_query_parameter(&mut page_request.url, "page", &page.to_string());
-                let response = self.send(&page_request, credential).await?;
-                if !response.success {
-                    return Ok(response);
-                }
-                if let Some(page_results) = response.result.as_array() {
-                    results.extend(page_results.iter().cloned());
-                }
-                combined.etag = response.etag;
-                combined.cf_ray = response.cf_ray;
-            }
-            if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut)
-            {
-                result_info.insert("page".to_owned(), Value::from(total_pages));
-                result_info.insert("count".to_owned(), Value::from(results.len()));
-            }
+        if request_is_queue_consumers_single_page(request) {
+            normalize_queue_consumers_single_page(&mut combined)?;
             return Ok(combined);
+        }
+        if let Some(pagination) = page_pagination(combined.result_info.as_ref())? {
+            return self
+                .complete_page_pagination(request, credential, combined, pagination)
+                .await;
+        }
+        if request_expects_page_pagination(request) {
+            return Err(CloudflareError::PaginationMetadataInvalid);
         }
 
         let mut next_cursor = match cursor_after(combined.result_info.as_ref()) {
@@ -7057,6 +7419,70 @@ impl Executor {
             result_info.insert("count".to_owned(), Value::from(results.len()));
             result_info.insert("cfctl_cursor_complete".to_owned(), Value::Bool(true));
             result_info.insert("cfctl_pages".to_owned(), Value::from(pages));
+        }
+        Ok(combined)
+    }
+
+    async fn complete_page_pagination(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        mut combined: CloudflareResponseV1,
+        pagination: PagePagination,
+    ) -> Result<CloudflareResponseV1> {
+        let PagePagination {
+            current_page,
+            total_pages,
+            total_count,
+            ..
+        } = pagination;
+        if total_pages > 1_000 {
+            return Err(CloudflareError::PaginationLimit(total_pages));
+        }
+        validate_page_item_count(&combined, pagination)?;
+        let status = combined.status;
+        let Some(results) = combined.result.as_array_mut() else {
+            return Err(CloudflareError::InvalidResponseEnvelope { status });
+        };
+        for page in (current_page + 1)..=total_pages {
+            let mut page_request = request.clone();
+            set_query_parameter(&mut page_request.url, "page", &page.to_string());
+            let response = self.send(&page_request, credential).await?;
+            if !response.success {
+                return Ok(response);
+            }
+            let response_pagination = page_pagination(response.result_info.as_ref())?
+                .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+            if response_pagination.current_page != page
+                || response_pagination.total_pages != total_pages
+                || response_pagination.total_count != total_count
+            {
+                return Err(CloudflareError::PaginationMetadataInvalid);
+            }
+            validate_page_item_count(&response, response_pagination)?;
+            let Some(page_results) = response.result.as_array() else {
+                return Err(CloudflareError::InvalidResponseEnvelope {
+                    status: response.status,
+                });
+            };
+            results.extend(page_results.iter().cloned());
+            combined.etag = response.etag;
+            combined.cf_ray = response.cf_ray;
+        }
+        if let Some(expected) = total_count
+            && expected != results.len() as u64
+        {
+            return Err(CloudflareError::PaginationCountMismatch {
+                expected,
+                actual: results.len(),
+            });
+        }
+        if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut) {
+            result_info.insert("page".to_owned(), Value::from(total_pages));
+            result_info.insert("count".to_owned(), Value::from(results.len()));
+            result_info.insert("total_pages".to_owned(), Value::from(total_pages));
+            result_info.insert("cfctl_pages".to_owned(), Value::from(total_pages));
+            result_info.insert("cfctl_page_complete".to_owned(), Value::Bool(true));
         }
         Ok(combined)
     }
@@ -8618,11 +9044,226 @@ fn add_conditional_header(
     Ok(())
 }
 
-fn pagination_bounds(result_info: Option<&Value>) -> Option<(u64, u64)> {
-    let result_info = result_info?;
-    let current = result_info.get("page").and_then(Value::as_u64).unwrap_or(1);
-    let total = result_info.get("total_pages").and_then(Value::as_u64)?;
-    (total > current).then_some((current, total))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PagePagination {
+    current_page: u64,
+    total_pages: u64,
+    per_page: Option<u64>,
+    count: Option<u64>,
+    total_count: Option<u64>,
+}
+
+fn page_pagination(result_info: Option<&Value>) -> Result<Option<PagePagination>> {
+    let Some(result_info) = result_info else {
+        return Ok(None);
+    };
+    let has_page = result_info.get("page").is_some();
+    let has_total_pages = result_info.get("total_pages").is_some();
+    if !has_page && !has_total_pages {
+        return Ok(None);
+    }
+    if !has_page || result_info.get("cursor").is_some() || result_info.get("cursors").is_some() {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    let current = result_info
+        .get("page")
+        .and_then(Value::as_u64)
+        .filter(|page| *page > 0)
+        .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+    let explicit_total_pages = result_info
+        .get("total_pages")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or(CloudflareError::PaginationMetadataInvalid)
+        })
+        .transpose()?;
+    let per_page = optional_pagination_u64(result_info, "per_page")?;
+    let count = optional_pagination_u64(result_info, "count")?;
+    let total_count = optional_pagination_u64(result_info, "total_count")?;
+    if per_page == Some(0) {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    if let (Some(count), Some(per_page)) = (count, per_page)
+        && count > per_page
+    {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    let explicit_total_pages = match explicit_total_pages {
+        Some(0) if current == 1 && count == Some(0) && total_count == Some(0) => Some(1),
+        Some(0) => return Err(CloudflareError::PaginationMetadataInvalid),
+        other => other,
+    };
+    let derived_total_pages = match (per_page, count, total_count) {
+        (Some(per_page), Some(_), Some(total_count)) => Some(total_count.div_ceil(per_page).max(1)),
+        _ => None,
+    };
+    let total_pages = match (explicit_total_pages, derived_total_pages) {
+        (Some(explicit), Some(derived)) if explicit != derived => {
+            return Err(CloudflareError::PaginationMetadataInvalid);
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(derived)) => derived,
+        (None, None) => return Err(CloudflareError::PaginationMetadataInvalid),
+    };
+    if current > total_pages {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    Ok(Some(PagePagination {
+        current_page: current,
+        total_pages,
+        per_page,
+        count,
+        total_count,
+    }))
+}
+
+fn optional_pagination_u64(result_info: &Value, field: &str) -> Result<Option<u64>> {
+    result_info
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or(CloudflareError::PaginationMetadataInvalid)
+        })
+        .transpose()
+}
+
+fn validate_page_item_count(
+    response: &CloudflareResponseV1,
+    pagination: PagePagination,
+) -> Result<()> {
+    let Some(results) = response.result.as_array() else {
+        return Err(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        });
+    };
+    if let Some(expected) = pagination.count
+        && expected != results.len() as u64
+    {
+        return Err(CloudflareError::PaginationCountMismatch {
+            expected,
+            actual: results.len(),
+        });
+    }
+    Ok(())
+}
+
+fn request_expects_page_pagination(request: &PreparedRequest) -> bool {
+    request.url.query_pairs().any(|(name, _)| name == "page")
+}
+
+fn request_is_queue_consumers_single_page(request: &PreparedRequest) -> bool {
+    if !request.method.eq_ignore_ascii_case("GET") || request.url.query().is_some() {
+        return false;
+    }
+    let segments = request
+        .url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    let Some(tail) = segments
+        .len()
+        .checked_sub(5)
+        .map(|start| &segments[start..])
+    else {
+        return false;
+    };
+    tail[0] == "accounts"
+        && !tail[1].is_empty()
+        && tail[2] == "queues"
+        && !tail[3].is_empty()
+        && tail[4] == "consumers"
+}
+
+fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) -> Result<()> {
+    let results = response
+        .result
+        .as_array()
+        .ok_or(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        })?;
+    let count = results.len() as u64;
+    if response.result_info.is_none() {
+        response.result_info = Some(serde_json::json!({}));
+    }
+    let info = response
+        .result_info
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "result_info_object",
+        })?;
+    if info.contains_key("cursor") || info.contains_key("cursors") {
+        return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "cursor_absent",
+        });
+    }
+    let metadata_u64 = |field: &str| {
+        info.get(field)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+                        reason: "metadata_unsigned_integer",
+                    })
+            })
+            .transpose()
+    };
+    for (field, expected, reason) in [
+        ("page", 1, "page_one"),
+        ("count", count, "count_matches_items"),
+        ("total_count", count, "total_count_matches_items"),
+    ] {
+        if let Some(actual) = metadata_u64(field)?
+            && actual != expected
+        {
+            return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid { reason });
+        }
+    }
+    if let Some(total_pages) = metadata_u64("total_pages")?
+        && total_pages != 1
+        && !(total_pages == 0 && count == 0)
+    {
+        return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "total_pages_complete",
+        });
+    }
+    if let Some(per_page) = metadata_u64("per_page")?
+        && (per_page == 0 || count > per_page)
+    {
+        return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
+            reason: "per_page_capacity",
+        });
+    }
+    info.insert("count".to_owned(), Value::from(count));
+    info.insert("cfctl_single_page_complete".to_owned(), Value::Bool(true));
+    Ok(())
+}
+
+fn is_r2_buckets_list_capability(capability: &CapabilityV1) -> bool {
+    capability.id == "r2-list-buckets"
+        && capability.method == "GET"
+        && capability.path == "/accounts/{account_id}/r2/buckets"
+        && !capability.mutating
+}
+
+fn direct_cursor_after(result_info: Option<&Value>) -> Result<Option<String>> {
+    let Some(result_info) = result_info else {
+        return Ok(None);
+    };
+    let Some(info) = result_info.as_object() else {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    };
+    if info.contains_key("cursors") {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    match info.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor)) if cursor.is_empty() => Ok(None),
+        Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
+        Some(_) => Err(CloudflareError::PaginationMetadataInvalid),
+    }
 }
 
 enum CursorState {
@@ -11798,6 +12439,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "subdomain_id" && pointer == "/tag")
         || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()
@@ -11820,6 +12462,12 @@ mod identity_pointer_parity_tests {
             "oauth_client_id",
             "/client_id"
         ));
+        // Email Service returns the sending-subdomain identity as `tag`, while
+        // the detail endpoint consumes it as `subdomain_id`. The core catalog
+        // gate already admits this provider-native mapping, so the executor
+        // must admit the same exact pair before a governed create can cross
+        // the provider boundary.
+        assert!(response_identity_pointer_supported("subdomain_id", "/tag"));
         // Standard identities still hold.
         assert!(response_identity_pointer_supported("id", "/id"));
         assert!(response_identity_pointer_supported("widget_name", "/name"));

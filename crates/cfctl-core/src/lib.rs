@@ -940,12 +940,17 @@ pub struct ResponseContractV1 {
 pub const EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID: &str =
     "email-routing-routing-rules-list-routing-rules";
 pub const EMAIL_ROUTING_RULES_LIST_PATH: &str = "/zones/{zone_id}/email/routing/rules";
+pub const EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID: &str =
+    "email-routing-account-rules-list-routing-rules";
+pub const EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH: &str =
+    "/accounts/{account_id}/email/routing/rules";
 pub const EMAIL_ROUTING_RULES_PAGE_SIZE: u64 = 50;
 pub const EMAIL_ROUTING_RULES_MAX_PAGES: u64 = 100;
 const EMAIL_ROUTING_RULES_MAX_MATCHERS: usize = 32;
 const EMAIL_ROUTING_RULES_MAX_ACTIONS: usize = 32;
 const EMAIL_ROUTING_RULES_MAX_ACTION_VALUES: usize = 100;
 const EMAIL_ROUTING_RULES_MAX_STRING_BYTES: usize = 4_096;
+const EMAIL_ROUTING_RULE_IDENTIFIER_MAX_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailRoutingRuleSetV1 {
@@ -959,7 +964,12 @@ pub struct EmailRoutingRuleSetV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailRoutingRuleV1 {
+    pub rule_identifier: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_name_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_tag_sha256: Option<String>,
     pub matchers: Vec<EmailRoutingMatcherV1>,
     pub actions: Vec<EmailRoutingActionV1>,
 }
@@ -1004,9 +1014,11 @@ impl EmailRoutingRuleDiagnosticV1 {
 
 #[must_use]
 pub fn is_email_routing_rules_list_capability(capability: &CapabilityV1) -> bool {
-    capability.id == EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID
+    ((capability.id == EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID
+        && capability.path == EMAIL_ROUTING_RULES_LIST_PATH)
+        || (capability.id == EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID
+            && capability.path == EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH))
         && capability.method == "GET"
-        && capability.path == EMAIL_ROUTING_RULES_LIST_PATH
         && !capability.mutating
         && capability
             .response_contract
@@ -1020,9 +1032,52 @@ pub fn normalize_email_routing_rule_set(
     value: &Value,
     pages: u64,
 ) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_rule_set_with_page_size(value, pages, EMAIL_ROUTING_RULES_PAGE_SIZE)
+}
+
+pub fn normalize_email_routing_rule_set_with_page_size(
+    value: &Value,
+    pages: u64,
+    page_size: u64,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_rule_set_with_scope(value, pages, page_size, false)
+}
+
+pub fn normalize_email_routing_account_rule_set(
+    value: &Value,
+    pages: u64,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_account_rule_set_with_page_size(
+        value,
+        pages,
+        EMAIL_ROUTING_RULES_PAGE_SIZE,
+    )
+}
+
+pub fn normalize_email_routing_account_rule_set_with_page_size(
+    value: &Value,
+    pages: u64,
+    page_size: u64,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
+    normalize_email_routing_rule_set_with_scope(value, pages, page_size, true)
+}
+
+fn normalize_email_routing_rule_set_with_scope(
+    value: &Value,
+    pages: u64,
+    page_size: u64,
+    account_scoped: bool,
+) -> std::result::Result<EmailRoutingRuleSetV1, EmailRoutingRuleDiagnosticV1> {
     if !(1..=EMAIL_ROUTING_RULES_MAX_PAGES).contains(&pages) {
         return Err(EmailRoutingRuleDiagnosticV1::new(
             "page_bound_invalid",
+            None,
+            "pagination",
+        ));
+    }
+    if !(1..=EMAIL_ROUTING_RULES_PAGE_SIZE).contains(&page_size) {
+        return Err(EmailRoutingRuleDiagnosticV1::new(
+            "page_size_invalid",
             None,
             "pagination",
         ));
@@ -1044,12 +1099,12 @@ pub fn normalize_email_routing_rule_set(
     let normalized = rules
         .iter()
         .enumerate()
-        .map(|(rule_index, rule)| normalize_email_routing_rule(rule, rule_index))
+        .map(|(rule_index, rule)| normalize_email_routing_rule(rule, rule_index, account_scoped))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(EmailRoutingRuleSetV1 {
         schema_version: 1,
         complete: true,
-        page_size: EMAIL_ROUTING_RULES_PAGE_SIZE,
+        page_size,
         pages,
         rule_count: normalized.len(),
         rules: normalized,
@@ -1059,9 +1114,34 @@ pub fn normalize_email_routing_rule_set(
 fn normalize_email_routing_rule(
     value: &Value,
     rule_index: usize,
+    account_scoped: bool,
 ) -> std::result::Result<EmailRoutingRuleV1, EmailRoutingRuleDiagnosticV1> {
     let rule = value.as_object().ok_or_else(|| {
         EmailRoutingRuleDiagnosticV1::new("rule_not_object", Some(rule_index), "rule")
+    })?;
+    let bounded_identifier = |value| {
+        bounded_email_routing_string(value).filter(|identifier| {
+            identifier.len() <= EMAIL_ROUTING_RULE_IDENTIFIER_MAX_BYTES
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    };
+    let rule_identifier = if account_scoped {
+        bounded_identifier(rule.get("id")).or_else(|| bounded_identifier(rule.get("tag")))
+    } else {
+        bounded_identifier(rule.get("tag"))
+    }
+    .ok_or_else(|| {
+        EmailRoutingRuleDiagnosticV1::new(
+            "rule_identifier_invalid",
+            Some(rule_index),
+            if account_scoped {
+                "rule.id_or_tag"
+            } else {
+                "rule.tag"
+            },
+        )
     })?;
     let enabled = rule
         .get("enabled")
@@ -1069,6 +1149,35 @@ fn normalize_email_routing_rule(
         .ok_or_else(|| {
             EmailRoutingRuleDiagnosticV1::new("enabled_not_boolean", Some(rule_index), "enabled")
         })?;
+    let (zone_name_sha256, zone_tag_sha256) = if account_scoped {
+        let zone = rule.get("zone").and_then(Value::as_object).ok_or_else(|| {
+            EmailRoutingRuleDiagnosticV1::new("zone_not_object", Some(rule_index), "zone")
+        })?;
+        let zone_name = bounded_email_routing_string(zone.get("name"))
+            .and_then(|name| normalize_email_routing_domain(&name))
+            .ok_or_else(|| {
+                EmailRoutingRuleDiagnosticV1::new(
+                    "zone_name_invalid",
+                    Some(rule_index),
+                    "zone.name",
+                )
+            })?;
+        let zone_tag = bounded_email_routing_string(zone.get("tag")).ok_or_else(|| {
+            EmailRoutingRuleDiagnosticV1::new("zone_tag_invalid", Some(rule_index), "zone.tag")
+        })?;
+        (
+            Some(format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(zone_name.as_bytes()))
+            )),
+            Some(format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(zone_tag.as_bytes()))
+            )),
+        )
+    } else {
+        (None, None)
+    };
     let matcher_values = bounded_email_routing_array(
         rule.get("matchers"),
         EMAIL_ROUTING_RULES_MAX_MATCHERS,
@@ -1092,10 +1201,34 @@ fn normalize_email_routing_rule(
         .map(|action| normalize_email_routing_action(action, rule_index))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(EmailRoutingRuleV1 {
+        rule_identifier,
         enabled,
+        zone_name_sha256,
+        zone_tag_sha256,
         matchers,
         actions,
     })
+}
+
+fn normalize_email_routing_domain(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.contains('.')
+        || normalized.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn bounded_email_routing_array<'a>(
@@ -1873,6 +2006,54 @@ pub struct WorkspaceD1PolicyProjectionContractV1 {
     pub rollback_capability_id: String,
 }
 
+/// Repository-owned contract for activating one compiler-produced Maildesk
+/// reply admission. Candidate bytes remain in a private staged file; plans
+/// carry only immutable digests and the distinct logical activation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceD1ReplyAdmissionContractV1 {
+    pub operation_kind: String,
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub compiler_path: String,
+    pub compiler_sha256: String,
+    pub compiler_runtime: String,
+    pub compiler_runtime_version: String,
+    pub compiler_runtime_sha256: String,
+    pub config_template_path: String,
+    pub config_template_sha256: String,
+    pub production_config_path: String,
+    pub database_binding: String,
+    pub wrangler_version: String,
+    pub admission_table: String,
+    pub input_contract: String,
+    pub mutation_projection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_projection: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_parameters: Vec<String>,
+    pub recovery_capability_id: String,
+    pub recovery_max_age_seconds: u64,
+    pub rollback_capability_id: String,
+}
+
+/// Repository-owned contract for proving one exact Maildesk reply subdomain
+/// ingress configuration. Provider zone, DNS, and routing-rule values are
+/// reduced inside cfctl and never become part of the public projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReplySubdomainIngressContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub surface_path: String,
+    pub surface_sha256: String,
+    pub consumer_contract_path: String,
+    pub consumer_contract_sha256: String,
+    pub projection: String,
+}
+
 /// Repository-bound, caller-invariant D1 evidence projection. The committed
 /// query is executed only inside cfctl and its rows are reduced to the typed,
 /// body-free `MaildeskD1EvidenceV1` result.
@@ -1911,6 +2092,79 @@ pub struct MaildeskD1EvidenceV1 {
     pub audit_event_counts: BTreeMap<String, u64>,
     pub queue_correlation_count: u64,
     pub dlq_correlation_count: u64,
+    pub body_returned: bool,
+}
+
+/// Closed route classes emitted by the Maildesk D1 route-health projection.
+/// These are operational policy classes, never public or private addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaildeskRouteKindV2 {
+    RoleAlias,
+    PersonalAlias,
+    CatchAll,
+    Sink,
+}
+
+/// Closed provider identifiers understood by the Maildesk route-health
+/// projection. Provider-specific response payloads are never retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaildeskRouteProviderV2 {
+    CloudflareEmailRouting,
+    GoogleWorkspace,
+    External,
+    Excluded,
+}
+
+/// Closed readiness states for one Maildesk route and one evidence plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaildeskRouteReadinessStatusV2 {
+    Declared,
+    LocalPolicyValid,
+    EdgeVerified,
+    ProviderAccepted,
+    InboxVerified,
+    ReplyVerified,
+    PartialDelivery,
+    RecoveryRequired,
+    Failed,
+    IntentionallyExcluded,
+}
+
+/// One body-free route-health record. Route and domain identity are computed
+/// inside cfctl as SHA-256 references; the raw route id, address, domain,
+/// operator identity, and provider row have no public representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaildeskD1RouteHealthRecordV2 {
+    pub route_ref_sha256: String,
+    pub domain_sha256: String,
+    pub policy_digest: String,
+    pub route_kind: MaildeskRouteKindV2,
+    pub enabled: bool,
+    pub desired_provider: MaildeskRouteProviderV2,
+    pub observed_provider: Option<MaildeskRouteProviderV2>,
+    pub inbound_status: MaildeskRouteReadinessStatusV2,
+    pub reply_status: MaildeskRouteReadinessStatusV2,
+    pub provider_accepted_at: Option<String>,
+    pub inbox_received_at: Option<String>,
+    pub reply_provider_accepted_at: Option<String>,
+    pub reply_proven_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub updated_at: String,
+}
+
+/// Additive V2 route-health projection returned beside, not instead of, the
+/// aggregate `MaildeskD1EvidenceV1` contract. `complete` is true only after
+/// cfctl proves the bounded result contains every active projected route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaildeskD1RouteHealthEvidenceV2 {
+    pub schema_version: u8,
+    pub record_count: u64,
+    pub complete: bool,
+    pub records: Vec<MaildeskD1RouteHealthRecordV2>,
+    pub provider_output_retained: bool,
     pub body_returned: bool,
 }
 
@@ -2187,6 +2441,10 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_reply_admission: Option<WorkspaceD1ReplyAdmissionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_reply_subdomain_ingress: Option<WorkspaceReplySubdomainIngressContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_evidence: Option<WorkspaceD1EvidenceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
@@ -2309,6 +2567,8 @@ impl CapabilityV1 {
             d1_restore_exact_bookmark: None,
             workspace_d1_migration: None,
             workspace_d1_policy_projection: None,
+            workspace_d1_reply_admission: None,
+            workspace_reply_subdomain_ingress: None,
             workspace_d1_evidence: None,
             r2_private_file_upload: None,
             r2_private_object_digest: None,
@@ -2543,6 +2803,89 @@ impl CapabilityV1 {
                                 && contract.recovery_max_age_seconds > 0
                                 && contract.recovery_max_age_seconds <= 600
                                 && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                        })
+            }
+            "workspace_d1_reply_admission_exact_readback" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::DataWrite
+                    && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
+                        contract.operation_kind == "activate"
+                            && !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.compiler_sha256.is_empty()
+                            && contract.compiler_runtime == "bun"
+                            && !contract.compiler_runtime_version.is_empty()
+                            && !contract.compiler_runtime_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && !contract.admission_table.is_empty()
+                            && contract.input_contract == "maildesk_reply_admission_compiler_input_v1"
+                            && contract.mutation_projection == "maildesk_reply_admission_insert_v1"
+                            && contract.read_projection.is_none()
+                            && contract.read_parameters.is_empty()
+                            && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+                            && contract.recovery_max_age_seconds > 0
+                            && contract.recovery_max_age_seconds <= 600
+                            && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+                    })
+            }
+            "workspace_d1_reply_admission_body_free_read" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
+                        contract.operation_kind == "read"
+                            && !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.compiler_sha256.is_empty()
+                            && contract.compiler_runtime == "bun"
+                            && !contract.compiler_runtime_version.is_empty()
+                            && !contract.compiler_runtime_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && !contract.admission_table.is_empty()
+                            && contract.input_contract
+                                == "maildesk_reply_admission_compiler_input_v1"
+                            && contract.mutation_projection.is_empty()
+                            && contract.read_projection.as_deref()
+                                == Some("maildesk_reply_admission_read_v1")
+                            && contract.read_parameters
+                                == [
+                                    "transaction_sha256",
+                                    "activation_record_sha256",
+                                    "pre_send_identity_projection_sha256",
+                                    "activation_operation_id",
+                                ]
+                            && contract.recovery_capability_id.is_empty()
+                            && contract.recovery_max_age_seconds == 0
+                            && contract.rollback_capability_id.is_empty()
+                    })
+            }
+            "workspace_reply_subdomain_ingress_body_free_read" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self
+                        .workspace_reply_subdomain_ingress
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.surface_sha256.is_empty()
+                                && !contract.consumer_contract_sha256.is_empty()
+                                && contract.projection
+                                    == "workspace_reply_subdomain_ingress_v1"
                         })
             }
             "workspace_d1_maildesk_body_free_evidence" => {

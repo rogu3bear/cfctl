@@ -441,6 +441,63 @@ async fn r2_private_upload_verifier_proves_etag_without_reading_object_bytes() {
     );
 }
 
+#[tokio::test]
+async fn r2_private_upload_verifier_accepts_raw_json_etag_when_header_is_absent() {
+    let md5 = "0123456789abcdef0123456789abcdef";
+    let quoted_etag = format!("\"{md5}\"");
+    let (address, server) = single_not_modified_server(&quoted_etag).await;
+    let mut capability = r2_private_upload_capability();
+    capability.verification.required = true;
+    capability.verification.strategy =
+        "r2_private_file_upload_etag_and_conditional_read".to_owned();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"account",
+            "bucket_name":"bucket",
+            "object_key":"config/policy/digest.json"
+        }),
+        if_none_match: Some("*".to_owned()),
+        ..CallInput::default()
+    };
+    let mut plan =
+        PlanV1::draft("profile", "account", "catalog", capability, json!({})).expect("plan");
+    plan.input = serde_json::to_value(&input).expect("input");
+    plan.targets = json!({"adapter":{"r2_private_file_upload":{"source_md5":md5}}});
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"etag":md5}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan_with_input(
+        &plan,
+        &apply,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("verification from JSON ETag");
+
+    assert!(verification.passed);
+    let request = server.await.expect("server joins");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"0123456789abcdef0123456789abcdef\"")
+    );
+}
+
 fn path_selector(name: &str) -> SelectorV1 {
     SelectorV1 {
         name: name.to_owned(),
@@ -4755,16 +4812,444 @@ async fn executor_collects_all_cloudflare_result_pages() {
         .expect("paginated response");
     assert_eq!(response.result.as_array().expect("result array").len(), 2);
     assert_eq!(response.etag.as_deref(), Some("page-2"));
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.get("count")),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.get("cfctl_page_complete")),
+        Some(&json!(true))
+    );
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("page=2"));
+}
+
+fn paginated_workers_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "workers-list",
+        "List Workers",
+        "GET",
+        "/accounts/{account_id}/workers/scripts",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "per_page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability
+}
+
+async fn execute_paginated_workers_read(
+    address: &str,
+) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &paginated_workers_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            query: json!({"page":1,"per_page":100}),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+fn queue_consumers_single_page_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "queues-list-consumers",
+        "List Queue Consumers",
+        "GET",
+        "/accounts/{account_id}/queues/{queue_id}/consumers",
+    );
+    capability.selectors = ["account_id", "queue_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    capability
+}
+
+async fn execute_queue_consumers_single_page_read(
+    address: &str,
+) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &queue_consumers_single_page_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1","queue_id":"queue-1"}),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn queue_consumers_accepts_provider_single_page_metadata_without_inventing_pagination() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":1}}"#,
+    ])
+    .await;
+
+    let response = execute_queue_consumers_single_page_read(&address)
+        .await
+        .expect("documented single-page consumer inventory");
+
+    assert_eq!(response.result, json!([{"consumer_id":"consumer-1"}]));
+    let info = response.result_info.expect("normalized completeness proof");
+    assert_eq!(info["count"], json!(1));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn queue_consumers_marks_the_documented_metadata_free_response_complete() {
+    let (address, server) =
+        json_response_sequence_server(vec![r#"{"success":true,"result":[],"errors":[]}"#]).await;
+
+    let response = execute_queue_consumers_single_page_read(&address)
+        .await
+        .expect("metadata-free documented single page");
+
+    assert_eq!(response.result, json!([]));
+    let info = response.result_info.expect("normalized completeness proof");
+    assert_eq!(info["count"], json!(0));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn queue_consumers_accepts_zero_total_pages_only_for_an_empty_single_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":20,"count":0,"total_count":0,"total_pages":0}}"#,
+    ])
+    .await;
+
+    let response = execute_queue_consumers_single_page_read(&address)
+        .await
+        .expect("empty single-page consumer inventory");
+
+    assert_eq!(response.result, json!([]));
+    let info = response.result_info.expect("normalized completeness proof");
+    assert_eq!(info["count"], json!(0));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn queue_consumers_rejects_metadata_that_claims_an_incomplete_single_page() {
+    for body in [
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":2}}"#,
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":1,"total_count":1,"total_pages":0}}"#,
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":20,"count":0,"total_count":0,"total_pages":2}}"#,
+        r#"{"success":true,"result":[{"consumer_id":"consumer-1"}],"errors":[],"result_info":{"cursors":{"after":"next"}}}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = execute_queue_consumers_single_page_read(&address)
+            .await
+            .expect_err("incomplete single-page inventory must fail closed");
+        assert!(matches!(
+            error,
+            CloudflareError::QueueConsumersSinglePageMetadataInvalid { .. }
+        ));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn executor_normalizes_a_provider_capped_terminal_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"},{"id":"worker-2"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":2,"total_count":2}}"#,
+    ])
+    .await;
+    let response = execute_paginated_workers_read(&address)
+        .await
+        .expect("provider-capped terminal page");
+
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["per_page"], json!(50));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["total_pages"], json!(1));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("page=1"));
+    assert!(requests[0].contains("per_page=100"));
+}
+
+#[tokio::test]
+async fn executor_collects_pages_when_total_pages_is_derived() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"id":"worker-2"}],"errors":[],"result_info":{"page":2,"per_page":1,"count":1,"total_count":2}}"#,
+    ])
+    .await;
+    let response = execute_paginated_workers_read(&address)
+        .await
+        .expect("derived multi-page inventory");
+
+    assert_eq!(
+        response.result,
+        json!([{"id":"worker-1"},{"id":"worker-2"}])
+    );
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["page"], json!(2));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["total_pages"], json!(2));
+    assert_eq!(info["cfctl_pages"], json!(2));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
     let requests = server.await.expect("server joins");
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("page=2"));
 }
 
 #[tokio::test]
+async fn executor_normalizes_an_empty_zero_total_pages_response() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":50,"count":0,"total_count":0,"total_pages":0}}"#,
+    ])
+    .await;
+    let response = execute_paginated_workers_read(&address)
+        .await
+        .expect("empty inventory is a complete observed page");
+
+    assert_eq!(response.result, json!([]));
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["page"], json!(1));
+    assert_eq!(info["count"], json!(0));
+    assert_eq!(info["total_pages"], json!(1));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn executor_rejects_missing_or_ambiguous_page_metadata() {
+    for body in [
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[]}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"total_pages":1,"total_count":1,"cursors":{"after":null}}}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":0,"per_page":50,"total_pages":1,"total_count":1}}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":1,"total_pages":0,"total_count":1}}"#,
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":50,"count":0,"total_pages":0,"total_count":1}}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = execute_paginated_workers_read(&address)
+            .await
+            .expect_err("unproven page metadata must fail closed");
+        assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn executor_rejects_terminal_page_item_count_disagreement() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":1,"total_pages":1,"total_count":2}}"#,
+    ])
+    .await;
+
+    let error = execute_paginated_workers_read(&address)
+        .await
+        .expect_err("declared total must match returned inventory");
+    assert!(matches!(
+        error,
+        CloudflareError::PaginationCountMismatch {
+            expected: 2,
+            actual: 1
+        }
+    ));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn executor_rejects_an_incoherent_later_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"id":"worker-2"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+    ])
+    .await;
+
+    let error = execute_paginated_workers_read(&address)
+        .await
+        .expect_err("a mismatched later page cannot establish complete inventory");
+    assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+    assert_eq!(server.await.expect("server joins").len(), 2);
+}
+
+fn r2_buckets_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "r2-list-buckets",
+        "List R2 buckets",
+        "GET",
+        "/accounts/{account_id}/r2/buckets",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "cursor".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "per_page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability
+}
+
+async fn execute_r2_buckets_read(address: &str) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &r2_buckets_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            query: json!({"per_page":1000}),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn r2_bucket_inventory_normalizes_an_omitted_terminal_cursor() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"buckets":[{"name":"bucket-1"}]},"errors":[]}"#,
+    ])
+    .await;
+    let response = execute_r2_buckets_read(&address)
+        .await
+        .expect("terminal bucket inventory");
+
+    assert_eq!(response.result["buckets"], json!([{"name":"bucket-1"}]));
+    let info = response.result_info.expect("normalized cursor proof");
+    assert_eq!(info["cursor"], json!(""));
+    assert_eq!(info["count"], json!(1));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_cursor_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn r2_bucket_inventory_collects_every_direct_cursor_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"buckets":[{"name":"bucket-1"}]},"errors":[],"result_info":{"cursor":"next-1","per_page":1}}"#,
+        r#"{"success":true,"result":{"buckets":[{"name":"bucket-2"}]},"errors":[]}"#,
+    ])
+    .await;
+    let response = execute_r2_buckets_read(&address)
+        .await
+        .expect("complete bucket inventory");
+
+    assert_eq!(
+        response.result["buckets"],
+        json!([{"name":"bucket-1"},{"name":"bucket-2"}])
+    );
+    let info = response.result_info.expect("normalized cursor proof");
+    assert_eq!(info["cursor"], json!(""));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["cfctl_pages"], json!(2));
+    assert_eq!(info["cfctl_cursor_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("cursor=next-1"));
+}
+
+#[tokio::test]
+async fn r2_bucket_inventory_rejects_malformed_or_repeated_cursors() {
+    for bodies in [
+        vec![r#"{"success":true,"result":{"buckets":[]},"errors":[],"result_info":{"cursor":7}}"#],
+        vec![
+            r#"{"success":true,"result":{"buckets":[]},"errors":[],"result_info":{"cursor":"next-1"}}"#,
+            r#"{"success":true,"result":{"buckets":[]},"errors":[],"result_info":{"cursor":"next-1"}}"#,
+        ],
+    ] {
+        let (address, server) = json_response_sequence_server(bodies).await;
+        let error = execute_r2_buckets_read(&address)
+            .await
+            .expect_err("cursor ambiguity cannot prove complete inventory");
+        assert!(matches!(
+            error,
+            CloudflareError::PaginationMetadataInvalid | CloudflareError::PaginationCursorLoop
+        ));
+        server.await.expect("server joins");
+    }
+}
+
+#[tokio::test]
 async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
     let (address, server) = json_response_sequence_server(vec![
-        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"worker","value":["maildesk-router"]}]},{"enabled":true,"matchers":[{"type":"all"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[],"result_info":{"page":1,"per_page":50,"total_count":2}}"#,
-        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":2,"per_page":50,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"tag":"rule-001","enabled":true,"matchers":[{"type":"literal","field":"to","value":"security@example.com"}],"actions":[{"type":"worker","value":["maildesk-router"]}]}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"tag":"rule-002","enabled":true,"matchers":[{"type":"all"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[],"result_info":{"page":2,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
     ])
     .await;
     let mut capability = CapabilityV1::new(
@@ -4827,7 +5312,9 @@ async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
     assert!(response.success);
     assert_eq!(response.result["schema_version"], 1);
     assert_eq!(response.result["complete"], true);
+    assert_eq!(response.result["page_size"], 1);
     assert_eq!(response.result["rule_count"], 2);
+    assert_eq!(response.result["rules"][0]["rule_identifier"], "rule-001");
     assert_eq!(response.result["rules"][0]["matchers"][0]["field"], "to");
     assert_eq!(
         response.result["rules"][0]["matchers"][0]["value_sha256"],
@@ -4850,9 +5337,148 @@ async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
 }
 
 #[tokio::test]
+async fn account_email_routing_rules_read_paginates_and_retains_only_hashed_rule_domain() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"rule-001","enabled":true,"zone":{"name":"reply.example.com","tag":"parent-zone-tag"},"matchers":[{"type":"all"}],"actions":[{"type":"worker","value":["maildesk-router"]}]}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"id":"rule-002","enabled":false,"zone":{"name":"reply.example.net","tag":"other-zone-tag"},"matchers":[{"type":"all"}],"actions":[{"type":"worker","value":["other-router"]}]}],"errors":[],"result_info":{"page":2,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+    ])
+    .await;
+    let mut capability = CapabilityV1::new(
+        cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID,
+        "List account routing rules",
+        "GET",
+        cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH,
+    );
+    capability.selectors = vec![SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let response = executor
+        .execute_read(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"private-account"}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("typed account Email Routing response");
+
+    assert!(response.success);
+    assert_eq!(response.result["complete"], true);
+    assert_eq!(response.result["page_size"], 1);
+    assert_eq!(
+        response.result["rules"][0]["zone_name_sha256"],
+        "sha256:ee551193ff63e4819a1f4333a425488c2980fe91b67f1d6b3d66faaa24f4e708"
+    );
+    let serialized = serde_json::to_string(&response).expect("serialize projection");
+    assert!(!serialized.contains("reply.example.com"));
+    assert!(!serialized.contains("parent-zone-tag"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("/accounts/private-account/email/routing/rules"));
+}
+
+#[tokio::test]
+async fn account_email_routing_rules_read_rejects_incoherent_page_metadata_body_free() {
+    let first_page = (0..50)
+        .map(|index| json!({"id":format!("rule-{index:03}")}))
+        .collect::<Vec<_>>();
+    let unstable_first = serde_json::to_string(&json!({
+        "success":true,
+        "result":first_page,
+        "errors":[],
+        "result_info":{"page":1,"per_page":50,"count":50,"total_pages":2,"total_count":51}
+    }))
+    .expect("unstable first page");
+    let cases = vec![
+        vec![
+            r#"{"success":true,"result":[{"id":"rule-001"}],"errors":[],"result_info":{"cursors":{"after":"private-cursor"}}}"#.to_owned(),
+        ],
+        vec![
+            r#"{"success":true,"result":[{"id":"rule-001"}],"errors":[],"result_info":{"page":2,"per_page":50,"count":1,"total_pages":2,"total_count":51}}"#.to_owned(),
+        ],
+        vec![
+            r#"{"success":true,"result":[{"id":"rule-001"}],"errors":[],"result_info":{"page":1,"per_page":20,"count":1,"total_pages":1,"total_count":1}}"#.to_owned(),
+        ],
+        vec![
+            r#"{"success":true,"result":[{"id":"rule-001"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":2,"total_pages":1,"total_count":1}}"#.to_owned(),
+        ],
+        vec![
+            unstable_first,
+            r#"{"success":true,"result":[{"id":"rule-050"}],"errors":[],"result_info":{"page":2,"per_page":50,"count":1,"total_pages":2,"total_count":100}}"#.to_owned(),
+        ],
+    ];
+    for bodies in cases {
+        let (address, server) = json_response_sequence_server(bodies).await;
+        let mut capability = CapabilityV1::new(
+            cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID,
+            "List account routing rules",
+            "GET",
+            cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH,
+        );
+        capability.selectors = vec![SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
+        let executor = Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor");
+        let response = executor
+            .execute_read(
+                &capability,
+                &CallInput {
+                    selectors: json!({"account_id":"private-account"}),
+                    ..CallInput::default()
+                },
+                &AuthCredential::Bearer {
+                    token: "token".to_owned(),
+                },
+            )
+            .await
+            .expect("typed fail-closed response");
+        assert!(!response.success);
+        assert_eq!(response.result["complete"], false);
+        let serialized = serde_json::to_string(&response).expect("body-free rejection");
+        assert!(!serialized.contains("private-cursor"));
+        assert!(!serialized.contains("rule-001"));
+        assert!(!serialized.contains("rule-002"));
+        server.await.expect("server joins");
+    }
+}
+
+#[tokio::test]
 async fn email_routing_rules_read_rejects_shape_drift_without_echoing_values() {
     let (address, server) = json_response_sequence_server(vec![
-        r#"{"success":true,"result":[{"enabled":true,"matchers":[{"type":"literal","field":"to"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[]}"#,
+        r#"{"success":true,"result":[{"tag":"rule-001","enabled":true,"matchers":[{"type":"literal","field":"to"}],"actions":[{"type":"forward","value":["operator@example.com"]}]}],"errors":[]}"#,
         r#"{"success":true,"result":[],"errors":[]}"#,
     ])
     .await;
@@ -10031,6 +10657,7 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
             {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
             {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
             {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+            ,{"type":"object","additionalProperties":false,"required":["assertion","migrations"],"properties":{"assertion":{"type":"string","enum":["migration_ledger_equals"]},"migrations":{"type":"array","minItems":1,"maxItems":64,"uniqueItems":true,"items":{"type":"string","minLength":5,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+\\.sql$"}}}}
         ]
     }));
     capability.response_contract = Some(ResponseContractV1 {
@@ -10507,13 +11134,16 @@ fn d1_schema_introspection_supports_every_closed_migration_assertion() {
         json!({"assertion":"trigger_exists","trigger":"document_render_jobs_terminal_generation_guard"}),
         json!({"assertion":"schema_contains","object_type":"table","name":"equity_issuance_evidence_links","fragment":"advisor_equity_instrument"}),
         json!({"assertion":"foreign_key_check_empty"}),
+        json!({"assertion":"migration_ledger_equals","migrations":["0001_init.sql","0002_routes.sql"]}),
     ] {
         let prepared = builder
             .build(&capability, &d1_schema_input(body))
             .expect("supported assertion");
         let wire = prepared.body.expect("compiler-owned D1 body");
         assert!(wire["sql"].as_str().is_some_and(|sql| {
-            sql.starts_with("SELECT ") && !sql.contains(';') && !sql.contains("--")
+            (sql.starts_with("SELECT ") || sql.starts_with("WITH expected("))
+                && !sql.contains(';')
+                && !sql.contains("--")
         }));
         assert!(wire["params"].is_array());
     }

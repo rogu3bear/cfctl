@@ -9,6 +9,8 @@ mod worker_deployment;
 mod workspace_d1_evidence;
 mod workspace_d1_migration;
 mod workspace_d1_projection;
+mod workspace_d1_reply_admission;
+mod workspace_reply_subdomain_ingress;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1347,14 +1349,18 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
     let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
+    let is_workspace_d1_reply_admission = capability.workspace_d1_reply_admission.is_some();
     let is_r2_private_file_upload = capability.r2_private_file_upload.is_some();
     let is_d1_approved_mln_import_poll_resume =
         capability.d1_approved_mln_import_poll_resume.is_some();
-    if (is_d1_approved_mln_import || is_workspace_d1_projection || is_r2_private_file_upload)
+    if (is_d1_approved_mln_import
+        || is_workspace_d1_projection
+        || is_workspace_d1_reply_admission
+        || is_r2_private_file_upload)
         != arguments.source_file.is_some()
     {
         return Err(CliError::Input(
-            "governed D1 imports, workspace policy projections, and create-only private R2 uploads require exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports, workspace policy projections, reply-admission activation/read, and create-only private R2 uploads require exactly one private `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -1498,6 +1504,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             arguments.account.as_deref(),
             arguments.out.as_deref(),
             r2_credentials.as_ref(),
+            arguments.source_file.as_deref(),
         )
         .await?;
         let mut envelope = executed.envelope;
@@ -1620,6 +1627,38 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             CliError::Input("workspace D1 policy projection target could not be derived".to_owned())
         })?;
         adapter_targets.insert("workspace_d1_policy_projection".to_owned(), target);
+    }
+    if capability.workspace_d1_reply_admission.is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace reply admission requires an explicit account pin or --account"
+                    .to_owned(),
+            )
+        })?;
+        let source = arguments.source_file.as_deref().ok_or_else(|| {
+            CliError::Input("workspace reply-admission source is missing".to_owned())
+        })?;
+        let target = workspace_d1_reply_admission::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+            source,
+        )?
+        .ok_or_else(|| {
+            CliError::Input("workspace reply-admission target could not be derived".to_owned())
+        })?;
+        adapter_targets.insert("workspace_d1_reply_admission".to_owned(), target);
     }
     if capability.r2_private_file_upload.is_some() {
         let source = arguments
@@ -6067,6 +6106,7 @@ async fn execute_read(
     requested_account: Option<&str>,
     output_path: Option<&Path>,
     r2_credentials: Option<&R2LogRetrievalCredentials>,
+    reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
     if capability.workflow.is_some() {
         return Ok(ExecutedRead::without_credential(execute_native_workflow(
@@ -6082,6 +6122,7 @@ async fn execute_read(
                 input,
                 requested_profile,
                 requested_account,
+                reply_admission_source,
             )
             .await;
         }
@@ -6263,6 +6304,10 @@ async fn execute_read(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "delegated reads keep workspace evidence, reply-admission, and generic CLI receipt handling in one explicit dispatch boundary"
+)]
 async fn execute_delegated_read(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -6270,17 +6315,87 @@ async fn execute_delegated_read(
     input: &CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
+    reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let receipt = if capability.workspace_d1_evidence.is_some() {
+    let receipt = if capability.workspace_reply_subdomain_ingress.is_some() {
+        let account_id = account_id.as_deref().ok_or_else(|| {
+            CliError::Input(
+                "workspace reply-subdomain ingress read requires an exact account".to_owned(),
+            )
+        })?;
+        workspace_reply_subdomain_ingress::read(
+            store,
+            catalog,
+            capability,
+            input,
+            &credential,
+            profile,
+            account_id,
+            &credential_generation_id,
+        )
+        .await?
+    } else if capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "read")
+    {
+        let account_id = account_id.as_deref().ok_or_else(|| {
+            CliError::Input("workspace reply-admission read requires an exact account".to_owned())
+        })?;
+        let source = reply_admission_source.ok_or_else(|| {
+            CliError::Input(
+                "workspace reply-admission read requires one private source file".to_owned(),
+            )
+        })?;
+        workspace_d1_reply_admission::read(
+            store,
+            capability,
+            input,
+            &credential,
+            profile,
+            account_id,
+            source,
+        )
+        .await?
+    } else if capability.workspace_d1_evidence.is_some() {
         let account_id = account_id.as_deref().ok_or_else(|| {
             CliError::Input("workspace D1 evidence requires an exact account".to_owned())
         })?;
-        workspace_d1_evidence::execute(store, capability, input, &credential, account_id).await?
+        match workspace_d1_evidence::execute(store, capability, input, &credential, account_id)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(failure) => {
+                let receipt = failure.receipt();
+                let evidence = if failure.boundary_crossed() {
+                    Some(store.write_evidence(EvidenceClass::LiveRead, &receipt)?)
+                } else {
+                    None
+                };
+                let mut envelope = delegated_read_envelope(
+                    &catalog.schema_hash,
+                    &capability.id,
+                    &profile.id,
+                    Some(account_id.to_owned()),
+                    receipt,
+                    evidence,
+                );
+                envelope.verification.state = VerificationState::Failed;
+                envelope.verification.basis = Some(
+                    "workspace D1 evidence failed closed without retaining provider rows or message bodies"
+                        .to_owned(),
+                );
+                return Ok(ExecutedRead {
+                    envelope,
+                    credential_generation_id: Some(credential_generation_id),
+                });
+            }
+        }
     } else {
         run_delegated_cli(
             capability,
@@ -6294,16 +6409,15 @@ async fn execute_delegated_read(
         .await?
     };
     let workspace_d1_evidence_passed = capability.workspace_d1_evidence.is_some()
-        && receipt.get("success").and_then(Value::as_bool) == Some(true)
-        && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
-        && receipt
-            .pointer("/evidence/schema_version")
-            .and_then(Value::as_u64)
-            == Some(1)
-        && receipt
-            .pointer("/evidence/body_returned")
-            .and_then(Value::as_bool)
-            == Some(false);
+        && workspace_d1_evidence::receipt_is_complete(&receipt);
+    let workspace_reply_admission_read_passed = capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "read")
+        && workspace_d1_reply_admission::read_receipt_is_complete(&receipt);
+    let workspace_reply_subdomain_ingress_passed =
+        capability.workspace_reply_subdomain_ingress.is_some()
+            && workspace_reply_subdomain_ingress::receipt_is_complete(&receipt);
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     let mut envelope = delegated_read_envelope(
         &catalog.schema_hash,
@@ -6311,23 +6425,105 @@ async fn execute_delegated_read(
         &profile.id,
         account_id,
         receipt,
-        evidence,
+        Some(evidence),
     );
     if capability.workspace_d1_evidence.is_some() {
-        envelope.verification.state = if workspace_d1_evidence_passed {
-            VerificationState::Passed
-        } else {
-            VerificationState::Failed
-        };
-        envelope.verification.basis = Some(
-            "clean-repository fixed D1 projection reduced to MaildeskD1EvidenceV1 without provider rows or message bodies"
-                .to_owned(),
+        set_workspace_d1_evidence_verification(&mut envelope, workspace_d1_evidence_passed);
+    }
+    if capability
+        .workspace_d1_reply_admission
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "read")
+    {
+        set_workspace_reply_admission_read_verification(
+            &mut envelope,
+            workspace_reply_admission_read_passed,
+        );
+    }
+    if capability.workspace_reply_subdomain_ingress.is_some() {
+        set_workspace_reply_subdomain_ingress_verification(
+            &mut envelope,
+            workspace_reply_subdomain_ingress_passed,
         );
     }
     Ok(ExecutedRead {
         envelope,
         credential_generation_id: Some(credential_generation_id),
     })
+}
+
+fn set_workspace_reply_subdomain_ingress_verification(
+    envelope: &mut ResultEnvelopeV2,
+    receipt_is_complete: bool,
+) {
+    envelope.verification.state = if receipt_is_complete {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if receipt_is_complete {
+        "the authoritative parent zone, exact subdomain DNS settings, and one exact account-inventory all-matcher Worker rule were reduced to the closed body-free Maildesk ingress result"
+            .to_owned()
+    } else {
+        "reply-subdomain ingress did not produce one complete body-free parent-zone, exact subdomain-DNS, and account-rule projection"
+            .to_owned()
+    });
+    if !receipt_is_complete {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_INGRESS_READ_FAILED".to_owned(),
+            message: "the governed reply-subdomain ingress read did not complete".to_owned(),
+            next_step: Some(
+                "Preserve the body-free failure receipt and reconcile the exact parent-zone, subdomain DNS, or complete account-rule inventory blocker; do not infer subdomain routing from the parent-zone catch-all."
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
+fn set_workspace_reply_admission_read_verification(
+    envelope: &mut ResultEnvelopeV2,
+    receipt_is_complete: bool,
+) {
+    envelope.verification.state = if receipt_is_complete {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if receipt_is_complete {
+        "exactly one active reply admission matched the compiler-owned transaction, activation record, identity projection, and activation operation without retaining provider rows"
+            .to_owned()
+    } else {
+        "reply-admission read did not prove one exact active body-free record; later mail planes remain blocked"
+            .to_owned()
+    });
+    if !receipt_is_complete {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_WORKSPACE_D1_REPLY_ADMISSION_READ_FAILED".to_owned(),
+            message: "the governed reply-admission read returned no exact active match".to_owned(),
+            next_step: Some(
+                "Preserve this body-free receipt and reconcile the exact activation transaction; do not retry through caller SQL or infer readiness from the plan."
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
+fn set_workspace_d1_evidence_verification(
+    envelope: &mut ResultEnvelopeV2,
+    receipt_is_complete: bool,
+) {
+    envelope.verification.state = if receipt_is_complete {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if receipt_is_complete {
+        "clean-repository fixed D1 projection reduced to unchanged MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows"
+            .to_owned()
+    } else {
+        "workspace D1 evidence receipt did not prove a coherent V1 aggregate plus complete bounded body-free V2 route-health projection"
+            .to_owned()
+    });
 }
 
 fn credential_generation_for_read(profile: &ProfileMetadata) -> Result<String> {
@@ -6352,28 +6548,99 @@ fn delegated_read_envelope(
     profile_id: &str,
     account_id: Option<String>,
     receipt: Value,
-    evidence: EvidenceV1,
+    evidence: Option<EvidenceV1>,
 ) -> ResultEnvelopeV2 {
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut envelope = ResultEnvelopeV2::success("call", receipt).with_evidence(evidence);
+    let workspace_failure = workspace_d1_evidence_failure(&receipt);
+    let mut envelope = ResultEnvelopeV2::success("call", receipt);
+    if let Some(evidence) = evidence {
+        envelope = envelope.with_evidence(evidence);
+    }
     envelope.ok = success;
-    envelope.performed = true;
+    envelope.performed = workspace_failure
+        .as_ref()
+        .is_none_or(|failure| failure.boundary_crossed);
     envelope.capability_id = Some(capability_id.to_owned());
     envelope.profile_id = Some(profile_id.to_owned());
     envelope.account_id = account_id;
-    envelope.verification.state = VerificationState::NotApplicable;
-    envelope.verification.basis = Some(format!(
-        "governed CLI read pinned to catalog {catalog_hash}"
-    ));
+    if let Some(failure) = workspace_failure {
+        envelope.verification.state = VerificationState::Failed;
+        envelope.verification.basis = Some(format!(
+            "workspace D1 evidence failed closed at `{}` without retaining provider output",
+            failure.stage
+        ));
+        let next_step = if failure.boundary_crossed {
+            "Do not replay or infer D1 readiness from lower planes; preserve this receipt, repair the exact provider-read or projection blocker, then run one fresh coherent transaction."
+        } else {
+            "Repair the exact workspace D1 evidence preflight blocker, re-admit the bound cfctl build, then run one fresh coherent transaction; do not bypass cfctl with Wrangler."
+        };
+        envelope.error = Some(ErrorV1 {
+            code: failure.code.clone(),
+            message: format!(
+                "workspace D1 evidence failed at governed stage `{}`; provider output was not retained",
+                failure.stage
+            ),
+            next_step: Some(next_step.to_owned()),
+        });
+    } else {
+        envelope.verification.state = VerificationState::NotApplicable;
+        envelope.verification.basis = Some(format!(
+            "governed CLI read pinned to catalog {catalog_hash}"
+        ));
+    }
     envelope
+}
+
+struct WorkspaceD1EvidenceFailureReceipt {
+    code: String,
+    stage: String,
+    boundary_crossed: bool,
+}
+
+fn workspace_d1_evidence_failure(receipt: &Value) -> Option<WorkspaceD1EvidenceFailureReceipt> {
+    if receipt.get("adapter").and_then(Value::as_str) != Some("workspace_d1_evidence_v1")
+        || receipt.get("success").and_then(Value::as_bool) != Some(false)
+        || receipt
+            .get("provider_output_retained")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || receipt.get("body_returned").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let code = receipt.get("failure_code").and_then(Value::as_str)?;
+    if !matches!(
+        code,
+        "CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED"
+            | "CFCTL_WORKSPACE_D1_EVIDENCE_WRANGLER_VERSION_FAILED"
+            | "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED"
+            | "CFCTL_WORKSPACE_D1_EVIDENCE_PROJECTION_FAILED"
+    ) {
+        return None;
+    }
+    let stage = receipt.get("failure_stage").and_then(Value::as_str)?;
+    let boundary_crossed = receipt.get("boundary_crossed").and_then(Value::as_bool)?;
+    Some(WorkspaceD1EvidenceFailureReceipt {
+        code: code.to_owned(),
+        stage: stage.to_owned(),
+        boundary_crossed,
+    })
 }
 
 fn apply_operational_proof_index_result(envelope: &mut ResultEnvelopeV2, proof_result: Result<()>) {
     if let Err(error) = proof_result {
         envelope.ok = false;
+        if envelope.error.is_some() {
+            if envelope.result.is_null() {
+                envelope.result = json!({ "operational_proof_indexed": false });
+            } else if let Some(result) = envelope.result.as_object_mut() {
+                result.insert("operational_proof_indexed".to_owned(), Value::Bool(false));
+            }
+            return;
+        }
         envelope.error = Some(ErrorV1 {
             code: "CFCTL_OPERATIONAL_PROOF_INDEX_FAILED".to_owned(),
             message: format!(
@@ -6451,24 +6718,12 @@ async fn execute_delegated_plan(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let evidence = store.write_evidence(EvidenceClass::Apply, &receipt)?;
-    persist_transaction_stage_with_artifact(
-        store,
-        plan,
-        TransactionStageV1::BoundaryResponsePersisted,
-        json!({
-            "adapter": "delegated_cli",
-            "apply_evidence_hash": evidence.content_hash,
-            "success": success,
-        }),
-    )?;
-    persist_secret_lifecycle(store, plan, success, Some(&receipt), secrets)?;
+    persist_delegated_boundary_result(store, plan, success, &receipt, &evidence, secrets)?;
     if !success {
         // A delegated CLI can fail after applying part of a mutation (Wrangler
         // may upload and promote a Worker before a trigger update fails). Keep
         // the transaction open for rectification and report that the boundary
         // was performed; a non-zero exit is not proof of zero side effects.
-        plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
         return Ok(delegated_cli_failure_envelope(plan, receipt, evidence));
     }
 
@@ -6542,6 +6797,34 @@ async fn execute_delegated_plan(
     Ok(envelope)
 }
 
+fn persist_delegated_boundary_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    success: bool,
+    receipt: &Value,
+    evidence: &EvidenceV1,
+    secrets: &dyn SecretStore,
+) -> Result<()> {
+    // The status recorded by each checkpoint is part of the journal hash. A
+    // failing delegated command can have crossed a mutation boundary, so bind
+    // rectification_required before persisting either post-boundary receipt.
+    // Changing status afterward makes the otherwise valid journal unreadable.
+    if !success {
+        plan.status = PlanStatus::RectificationRequired;
+    }
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        json!({
+            "adapter": "delegated_cli",
+            "apply_evidence_hash": evidence.content_hash,
+            "success": success,
+        }),
+    )?;
+    persist_secret_lifecycle(store, plan, success, Some(receipt), secrets).map(|_| ())
+}
+
 async fn run_delegated_plan_boundary(
     store: &StateStore,
     plan: &PlanV1,
@@ -6553,6 +6836,9 @@ async fn run_delegated_plan_boundary(
     }
     if plan.capability.workspace_d1_policy_projection.is_some() {
         return workspace_d1_projection::run(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_reply_admission.is_some() {
+        return Box::pin(workspace_d1_reply_admission::run(store, plan, credential)).await;
     }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let mut delegated_input =
@@ -6645,6 +6931,12 @@ async fn verify_delegated_cli_plan(
     }
     if plan.capability.workspace_d1_policy_projection.is_some() {
         return workspace_d1_projection::verify(store, plan, credential).await;
+    }
+    if plan.capability.workspace_d1_reply_admission.is_some() {
+        return Box::pin(workspace_d1_reply_admission::verify(
+            store, plan, credential,
+        ))
+        .await;
     }
     if plan.capability.verification.strategy == "trycloudflare_https_url_reaches_reviewed_origin" {
         return verify_quick_tunnel_plan(input, receipt).await;
@@ -15650,6 +15942,9 @@ fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Re
     if let Some(paths) = workspace_d1_projection::local_artifact_paths(capability)? {
         return Ok(paths);
     }
+    if let Some(paths) = workspace_d1_reply_admission::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
     if worker_deployment::binds_artifact(capability) {
         return worker_deployment::artifact_paths(capability, input);
     }
@@ -19251,14 +19546,14 @@ async fn execute_api_plan(
         .await;
     }
     if plan.capability.d1_approved_mln_import.is_some() && !is_reviewed_schema_migration {
-        return execute_approved_mln_import_plan(
+        return Box::pin(execute_approved_mln_import_plan(
             store,
             &executor,
             plan,
             execution_input,
             credential,
             secrets,
-        )
+        ))
         .await;
     }
     let response_result = if plan.capability.r2_private_file_upload.is_some() {
@@ -22424,17 +22719,16 @@ async fn execute_approved_mln_import_plan(
         })?;
     validate_managed_mln_stage_authority(plan)?;
     let checkpoint_operation_id = plan.operation_id.clone();
-    let response = match executor
-        .execute_d1_approved_mln_import(
-            plan,
-            execution_input,
-            credential,
-            &stage_path,
-            |checkpoint: &D1ImportCheckpointV1| {
-                persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint)
-            },
-        )
-        .await
+    let response = match Box::pin(executor.execute_d1_approved_mln_import(
+        plan,
+        execution_input,
+        credential,
+        &stage_path,
+        |checkpoint: &D1ImportCheckpointV1| {
+            persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint)
+        },
+    ))
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -24204,11 +24498,17 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, &mut plan);
     }
+    if r2_private_upload_rectification_eligible(&plan) {
+        return rectify_r2_private_upload(store, &mut plan).await;
+    }
     if worker_version_rollback_rectification_eligible(&plan) {
         return rectify_worker_version_rollback(store, &mut plan).await;
     }
     if workspace_d1_migration_rectification_eligible(&plan) {
         return rectify_workspace_d1_migration(store, &mut plan).await;
+    }
+    if workspace_d1_projection_rectification_eligible(&plan) {
+        return rectify_workspace_d1_projection(store, &mut plan).await;
     }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
     if let Some(mut request) = compensation_request(&plan)? {
@@ -24490,6 +24790,359 @@ fn persist_worker_version_rollback_rectification(
         });
     }
     Ok(envelope)
+}
+
+fn r2_private_upload_rectification_eligible(plan: &PlanV1) -> bool {
+    let boundary = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted);
+    plan.capability.r2_private_file_upload.is_some()
+        && plan.status == PlanStatus::RectificationRequired
+        && plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted
+        && boundary.is_some_and(|receipt| {
+            receipt.get("http_status").and_then(Value::as_u64) == Some(200)
+                && receipt.get("success").and_then(Value::as_bool) == Some(true)
+                && receipt.get("etag").is_none_or(Value::is_null)
+        })
+}
+
+fn r2_private_upload_digest_matches(
+    plan: &PlanV1,
+    response: &CloudflareResponseV1,
+) -> Result<bool> {
+    let target = plan
+        .targets
+        .pointer("/adapter/r2_private_file_upload")
+        .ok_or_else(|| CliError::Input("private R2 upload target is missing".to_owned()))?;
+    let source_sha256 = target
+        .get("source_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| CliError::Input("private R2 upload source digest is invalid".to_owned()))?;
+    let source_bytes = target
+        .get("source_bytes")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CliError::Input("private R2 upload source size is invalid".to_owned()))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let selector = |name: &str| {
+        input
+            .selectors
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "private R2 upload rectification selector `{name}` is missing"
+                ))
+            })
+    };
+    let result = response
+        .result
+        .as_object()
+        .ok_or_else(|| CliError::Input("private R2 digest readback is not an object".to_owned()))?;
+    Ok(response.status == 200
+        && response.success
+        && response.errors.is_empty()
+        && result.len() == 8
+        && result.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && result.get("account_id").and_then(Value::as_str) == Some(selector("account_id")?)
+        && result.get("bucket_name").and_then(Value::as_str) == Some(selector("bucket_name")?)
+        && result.get("object_key").and_then(Value::as_str) == Some(selector("object_key")?)
+        && result.get("byte_count").and_then(Value::as_u64) == Some(source_bytes)
+        && result.get("sha256").and_then(Value::as_str)
+            == Some(format!("sha256:{source_sha256}").as_str())
+        && result
+            .get("etag")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && result.get("body_returned").and_then(Value::as_bool) == Some(false))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "private R2 rectification keeps exact staged authority, digest-only provider readback, no-replay evidence, and closure in one auditable state machine"
+)]
+async fn rectify_r2_private_upload(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    let secrets = platform_secrets(store);
+    let target = r2_private_upload::rectification_target(store, plan, &secrets)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "private R2 upload rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let credential = fresh_credential(profile, &secrets).await?;
+    let catalog = ensure_catalog(store).await?;
+    let read = catalog
+        .get(target.rectification_read_capability_id)
+        .filter(|capability| capability.r2_private_object_digest.is_some())
+        .ok_or_else(|| {
+            CliError::Input(
+                "private R2 upload rectification digest capability is unavailable or drifted"
+                    .to_owned(),
+            )
+        })?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let digest = executor
+        .execute_r2_private_object_digest(read, &target.input, &credential)
+        .await?;
+    let passed = r2_private_upload_digest_matches(plan, &digest)?;
+    let observed_sha256 = digest.result.get("sha256").cloned().unwrap_or(Value::Null);
+    let observed_bytes = digest
+        .result
+        .get("byte_count")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let target_hash = hash_value(&target.input.selectors)?;
+    let basis = if passed {
+        "the native digest-only R2 read matched the exact staged source SHA-256, byte count, account, bucket, and object key"
+    } else {
+        "the native digest-only R2 read did not match the exact staged source or object target"
+    };
+    let verification = json!({
+        "strategy":"r2_private_upload_digest_rectification",
+        "passed":passed,
+        "basis":basis,
+        "expected_sha256":target.source_sha256,
+        "expected_bytes":target.source_bytes,
+        "observed_sha256":observed_sha256,
+        "observed_bytes":observed_bytes,
+        "target_hash":target_hash,
+        "body_returned":false,
+        "verification_only":true,
+        "boundary_replayed":false,
+    });
+    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let receipt = json!({
+        "state":if passed { "passed" } else { "failed" },
+        "evidence_hash":evidence.content_hash,
+        "reconciliation":true,
+        "verification_only":true,
+        "boundary_replayed":false,
+    });
+    if passed {
+        r2_private_upload::discard(store, plan, &secrets)?;
+    }
+    persist_r2_private_upload_rectification_result(store, plan, receipt, passed)?;
+
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id":plan.operation_id,
+            "status":plan.status,
+            "verification_only":true,
+            "boundary_replayed":false,
+            "message":if passed {
+                "The already-crossed create-only R2 upload was verified by an exact native digest read without replaying PUT."
+            } else {
+                "The native digest read did not match the staged source and exact target; the upload remains rectification_required and PUT was not replayed."
+            },
+        }),
+    )
+    .with_evidence(evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.to_owned());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis.to_owned(),
+            next_step: Some(
+                "Inspect the body-free digest evidence and repair target drift; do not replay the create-only upload plan."
+                    .to_owned(),
+            ),
+        });
+    }
+    Ok(envelope)
+}
+
+fn persist_r2_private_upload_rectification_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    verification_receipt: Value,
+    passed: bool,
+) -> Result<()> {
+    if !passed {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(());
+    }
+    plan.status = PlanStatus::Verified;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::Closed,
+        json!({
+            "rectification_verification":verification_receipt,
+            "retry":true,
+        }),
+    )
+}
+
+fn workspace_d1_projection_rectification_eligible(plan: &PlanV1) -> bool {
+    plan.capability.workspace_d1_policy_projection.is_some()
+        && plan.status == PlanStatus::RectificationRequired
+        && matches!(
+            plan.transaction_stage,
+            TransactionStageV1::BoundaryResponsePersisted
+                | TransactionStageV1::SecretSinkPersisted
+                | TransactionStageV1::VerificationAttemptPersisted
+                | TransactionStageV1::VerificationResponsePersisted
+        )
+        && plan.transaction_journal.iter().any(|checkpoint| {
+            checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted
+                && checkpoint.artifact_hash.is_some()
+        })
+}
+
+async fn rectify_workspace_d1_projection(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    workspace_d1_projection::validate_bound_plan_for_rectification(store, plan)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "workspace D1 policy projection rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
+    let retrying_after_verification_response =
+        plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted;
+    if matches!(
+        plan.transaction_stage,
+        TransactionStageV1::BoundaryResponsePersisted | TransactionStageV1::SecretSinkPersisted
+    ) {
+        persist_transaction_stage(
+            store,
+            plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )?;
+    }
+    let verification =
+        workspace_d1_projection::verify_rectification(store, plan, &credential).await;
+    let verification_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let passed = verification
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let basis = verification
+        .get("basis")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace D1 policy projection reconciliation did not return a basis")
+        .to_owned();
+    let verification_receipt = json!({
+        "state": if passed { "passed" } else { "failed" },
+        "basis_hash": hash_value(&json!(basis))?,
+        "evidence_hash": verification_evidence.content_hash,
+        "reconciliation": true,
+        "boundary_replayed": false,
+    });
+
+    persist_workspace_d1_projection_rectification_result(
+        store,
+        plan,
+        verification_receipt,
+        passed,
+        retrying_after_verification_response,
+    )?;
+
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id": plan.operation_id,
+            "status": plan.status,
+            "verification_only": true,
+            "boundary_replayed": false,
+            "message": if passed {
+                "The already-crossed workspace D1 policy projection boundary was reconciled from fresh route-count and digest readback without replaying the projection apply."
+            } else {
+                "Fresh workspace D1 route-count and digest readback did not verify; the plan remains rectification_required and the projection was not replayed."
+            },
+        }),
+    )
+    .with_evidence(verification_evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.clone());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis,
+            next_step: Some(
+                "Inspect the fresh route-count/digest evidence and repair the observed state; do not replay the projection plan."
+                    .to_owned(),
+            ),
+        });
+    }
+    Ok(envelope)
+}
+
+fn persist_workspace_d1_projection_rectification_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    verification_receipt: Value,
+    passed: bool,
+    retrying_after_verification_response: bool,
+) -> Result<()> {
+    if plan.transaction_stage == TransactionStageV1::VerificationAttemptPersisted {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            verification_receipt.clone(),
+        )?;
+    }
+    if !passed {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(());
+    }
+
+    plan.status = PlanStatus::Verified;
+    if retrying_after_verification_response {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::Closed,
+            json!({
+                "rectification_verification": verification_receipt,
+                "retry": true,
+            }),
+        )
+    } else {
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+    }
 }
 
 async fn rectify_workspace_d1_migration(
@@ -27601,7 +28254,7 @@ fn health_envelope(
             code: code.to_owned(),
             message: message.to_owned(),
             next_step: Some(
-                "Run ./bootstrap.sh from a tracked-clean checkout, then synchronize managed agents."
+                "Run ./bootstrap.sh from a checkout clean of tracked and untracked non-ignored files, then synchronize managed agents."
                     .to_owned(),
             ),
         });
@@ -28081,6 +28734,7 @@ fn current_pages_source_remote_precondition(
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;
+    workspace_d1_reply_admission::validate_bound_plan(store, plan)?;
     r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let graph = discover_registered(store)?;
@@ -30271,6 +30925,12 @@ fn load_workspace_capability(
     if let Some(capability) = workspace_d1_projection::load(store, capability_id)? {
         return Ok(Some(capability));
     }
+    if let Some(capability) = workspace_d1_reply_admission::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
+    if let Some(capability) = workspace_reply_subdomain_ingress::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
     workspace_d1_evidence::load(store, capability_id)
 }
 
@@ -30358,13 +31018,17 @@ mod tests {
         normalize_reviewed_mln_repository_id, operational_proof_coverage, pages_deployment,
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        persist_worker_version_rollback_rectification, persist_workspace_d1_rectification_result,
-        plan_impact, plan_local_artifact_paths, plan_requires_live_credential,
-        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
-        preflight_standing_authority, prepare_r2_temporary_credentials_input,
-        prepare_security_action_input, prepare_wrangler_deployment_status_command,
-        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
+        persist_r2_private_upload_rectification_result, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage,
+        persist_worker_version_rollback_rectification,
+        persist_workspace_d1_projection_rectification_result,
+        persist_workspace_d1_rectification_result, plan_impact, plan_local_artifact_paths,
+        plan_requires_live_credential, plan_state_next_step, plan_status_label,
+        preflight_call_input, preflight_secret_sink, preflight_standing_authority,
+        prepare_r2_temporary_credentials_input, prepare_security_action_input,
+        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
+        query_object_from_pairs, r2_private_upload_digest_matches,
+        r2_private_upload_rectification_eligible, read_import_secret,
         read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
         rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
         redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
@@ -30380,13 +31044,13 @@ mod tests {
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         resolve_actionable, resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
         resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_artifact,
-        secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
-        should_bind_d1_read_replication_state, should_bind_dns_record_state,
-        should_bind_global_warp_override_state, should_bind_kv_empty_namespace_state,
-        should_bind_oauth_client_secret_state, should_bind_oauth_client_update_state,
-        should_bind_pages_project_absence, should_bind_warp_connector_configuration_state,
-        should_bind_web_analytics_rum_state, should_bind_zone_account,
-        should_redact_secret_response, should_resolve_entitlement_probe,
+        secret_sink_format, set_workspace_d1_evidence_verification,
+        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
+        should_bind_dns_record_state, should_bind_global_warp_override_state,
+        should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
+        should_bind_oauth_client_update_state, should_bind_pages_project_absence,
+        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
+        should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
@@ -30401,8 +31065,9 @@ mod tests {
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
         validate_zone_account_receipt_precondition, validate_zone_id,
-        validated_standing_lineage_token_id, verification_outcome,
-        workspace_d1_migration_rectification_eligible, workspace_operational_proof_posture,
+        validated_standing_lineage_token_id, verification_outcome, workspace_d1_evidence,
+        workspace_d1_migration_rectification_eligible,
+        workspace_d1_projection_rectification_eligible, workspace_operational_proof_posture,
         workspace_precondition_hashes_for_scope, workspace_resource_keys,
         wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_status_has_promoted_version, wrangler_version_readback_matches,
@@ -30432,11 +31097,13 @@ mod tests {
         EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
         Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
         OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1,
-        PlanV2, QuerySerializationV1, ResponseBodyModeV1, ResponseContractV1, ResultEnvelopeV2,
-        RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
-        SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
-        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-        WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1, hash_value,
+        PlanV2, QuerySerializationV1, R2PrivateFileUploadContractV1, ResponseBodyModeV1,
+        ResponseContractV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
+        SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
+        WorkflowStepV1, WorkspaceD1MigrationContractV1, WorkspaceD1PolicyProjectionContractV1,
+        hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -43136,6 +43803,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("live read must not use ambient global-key current profile");
@@ -43152,6 +43820,7 @@ mod tests {
             &capability,
             &input,
             Some("emergency"),
+            None,
             None,
             None,
             None,
@@ -44983,6 +45652,324 @@ mod tests {
             durable.transaction_artifact(TransactionStageV1::Closed),
             plan.transaction_artifact(TransactionStageV1::Closed)
         );
+    }
+
+    #[test]
+    fn workspace_d1_projection_rectification_requires_crossed_boundary_and_never_replays() {
+        let mut capability = CapabilityV1::new(
+            "example.d1-policy-project",
+            "Project workspace policy into D1",
+            "POST",
+            "/workspace/d1/policy-projection",
+        );
+        capability.workspace_d1_policy_projection = Some(WorkspaceD1PolicyProjectionContractV1 {
+            repository_root: "/repo".to_owned(),
+            repository_head: "a".repeat(40),
+            repository_origin: "https://example.com/repo.git".to_owned(),
+            operation_pack_path: ".cfctl/operations/d1-projection.toml".to_owned(),
+            operation_pack_sha256: format!("sha256:{}", "a".repeat(64)),
+            config_template_path: "wrangler.toml".to_owned(),
+            config_template_sha256: format!("sha256:{}", "b".repeat(64)),
+            production_config_path: "wrangler.production.toml".to_owned(),
+            database_binding: "DB".to_owned(),
+            wrangler_version: "4.120.1".to_owned(),
+            route_table: "alias_routes".to_owned(),
+            route_policy_sha_column: "policy_sha256".to_owned(),
+            runtime_state_table: "runtime_state".to_owned(),
+            runtime_state_key_column: "state_key".to_owned(),
+            runtime_state_value_column: "state_value".to_owned(),
+            active_policy_key: "active_policy_sha256".to_owned(),
+            desired_state_digest_key: "desired_state_sha256".to_owned(),
+            projection_digest_key: "projection_sha256".to_owned(),
+            recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
+            recovery_max_age_seconds: 600,
+            rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("projection plan");
+        assert!(!workspace_d1_projection_rectification_eligible(&plan));
+
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"boundary_crossed":true,"success":true}),
+        )
+        .expect("boundary response");
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("verification attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"failed","boundary_replayed":false}),
+        )
+        .expect("failed verification response");
+        assert!(workspace_d1_projection_rectification_eligible(&plan));
+
+        let root = tempfile::tempdir().expect("rectification store");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let journal_len_before_retry = plan.transaction_journal.len();
+        persist_workspace_d1_projection_rectification_result(
+            &store,
+            &mut plan,
+            json!({
+                "state":"failed",
+                "evidence_hash":format!("sha256:{}", "c".repeat(64)),
+                "reconciliation":true,
+                "boundary_replayed":false,
+            }),
+            false,
+            true,
+        )
+        .expect("failed verification-only retry remains open");
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            plan.transaction_stage,
+            TransactionStageV1::VerificationResponsePersisted
+        );
+        assert_eq!(plan.transaction_journal.len(), journal_len_before_retry);
+
+        let retry = json!({
+            "state":"passed",
+            "evidence_hash":format!("sha256:{}", "d".repeat(64)),
+            "reconciliation":true,
+            "boundary_replayed":false,
+        });
+        persist_workspace_d1_projection_rectification_result(
+            &store,
+            &mut plan,
+            retry.clone(),
+            true,
+            true,
+        )
+        .expect("passing verification-only retry");
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::Closed)
+                .expect("closed checkpoint")["rectification_verification"],
+            retry
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression proves eligibility, exact digest and target matching, fail-closed drift, no replay, and durable closure in one fixture"
+    )]
+    fn private_r2_upload_rectification_requires_exact_digest_and_never_replays_put() {
+        let mut capability = CapabilityV1::new(
+            "r2-put-object",
+            "Upload private object",
+            "PUT",
+            "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}",
+        );
+        capability.r2_private_file_upload = Some(R2PrivateFileUploadContractV1 {
+            max_source_bytes: 300_000_000,
+            allowed_content_types: vec!["application/json".to_owned()],
+            require_if_none_match_star: true,
+            read_capability_id: "r2-get-object".to_owned(),
+            delete_capability_id: "r2-delete-object".to_owned(),
+            etag_algorithm: "md5".to_owned(),
+        });
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "bucket_name":"bucket-a",
+                "object_key":"config/policy.json",
+                "Content-Type":"application/json"
+            }),
+            if_none_match: Some("*".to_owned()),
+            ..CallInput::default()
+        };
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("private R2 plan");
+        plan.input = serde_json::to_value(&input).expect("input");
+        plan.targets = json!({"adapter":{"r2_private_file_upload":{
+            "source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_bytes":36234,
+            "create_only":true
+        }}});
+        plan.refresh_hash().expect("refresh private R2 plan hash");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"http_status":200,"success":true,"etag":null}),
+        )
+        .expect("headerless successful boundary");
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage(TransactionStageV1::SecretSinkPersisted)
+            .expect("sink checkpoint");
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("verification attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"failed"}),
+        )
+        .expect("verification response");
+        assert!(r2_private_upload_rectification_eligible(&plan));
+
+        let digest = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "schema_version":1,
+                "account_id":"account-a",
+                "bucket_name":"bucket-a",
+                "object_key":"config/policy.json",
+                "byte_count":36234,
+                "etag":"\"provider-etag\"",
+                "sha256":format!("sha256:{}", "a".repeat(64)),
+                "body_returned":false
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: Some("\"provider-etag\"".to_owned()),
+            cf_ray: None,
+        };
+        assert!(r2_private_upload_digest_matches(&plan, &digest).expect("exact digest"));
+        let mut drifted = digest.clone();
+        drifted.result["byte_count"] = json!(36233);
+        assert!(!r2_private_upload_digest_matches(&plan, &drifted).expect("drift decision"));
+        let mut digest_drifted = digest.clone();
+        digest_drifted.result["sha256"] = json!(format!("sha256:{}", "c".repeat(64)));
+        assert!(
+            !r2_private_upload_digest_matches(&plan, &digest_drifted)
+                .expect("digest drift decision")
+        );
+        let mut target_drifted = digest.clone();
+        target_drifted.result["object_key"] = json!("config/other.json");
+        assert!(
+            !r2_private_upload_digest_matches(&plan, &target_drifted)
+                .expect("target drift decision")
+        );
+
+        let root = tempfile::tempdir().expect("rectification store");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let journal_len = plan.transaction_journal.len();
+        persist_r2_private_upload_rectification_result(
+            &store,
+            &mut plan,
+            json!({
+                "state":"failed",
+                "reconciliation":true,
+                "verification_only":true,
+                "boundary_replayed":false,
+                "evidence_hash":format!("sha256:{}", "c".repeat(64))
+            }),
+            false,
+        )
+        .expect("failed verification remains rectifiable");
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            plan.transaction_stage,
+            TransactionStageV1::VerificationResponsePersisted
+        );
+        assert_eq!(plan.transaction_journal.len(), journal_len);
+
+        let receipt = json!({
+            "state":"passed",
+            "reconciliation":true,
+            "verification_only":true,
+            "boundary_replayed":false,
+            "evidence_hash":format!("sha256:{}", "b".repeat(64))
+        });
+        persist_r2_private_upload_rectification_result(&store, &mut plan, receipt.clone(), true)
+            .expect("close verified rectification");
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::Closed)
+                .expect("closed checkpoint")["rectification_verification"],
+            receipt
+        );
+    }
+
+    #[test]
+    fn delegated_failure_status_precedes_durable_boundary_receipts() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut capability = CapabilityV1::new(
+            "example.delegated-write",
+            "Run delegated write",
+            "CLI",
+            "example delegated write",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("delegated plan");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        store.save_plan(&plan).expect("persist boundary attempt");
+        let receipt = json!({"success":false,"boundary_crossed":true});
+        let evidence_hash = format!("sha256:{}", "a".repeat(64));
+        let evidence = EvidenceV1::new(
+            EvidenceClass::Apply,
+            &evidence_hash,
+            "/managed/evidence/apply.json",
+        );
+
+        super::persist_delegated_boundary_result(
+            &store,
+            &mut plan,
+            false,
+            &receipt,
+            &evidence,
+            &MemorySecretStore::default(),
+        )
+        .expect("a failed delegated boundary remains durably rectifiable");
+
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("failed delegated plan reloads");
+        assert_eq!(durable.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        assert!(
+            durable
+                .transaction_journal
+                .iter()
+                .filter(|checkpoint| {
+                    matches!(
+                        checkpoint.stage,
+                        TransactionStageV1::BoundaryResponsePersisted
+                            | TransactionStageV1::SecretSinkPersisted
+                    )
+                })
+                .all(|checkpoint| checkpoint.plan_status == PlanStatus::RectificationRequired),
+            "every post-boundary failure checkpoint must bind the terminal recovery status"
+        );
+        durable
+            .validate_transaction_journal()
+            .expect("the durable failure journal is coherent");
     }
 
     #[tokio::test]
@@ -47253,17 +48240,204 @@ mod tests {
             "profile-a",
             Some("account-a".to_owned()),
             json!({"success": true, "bounded": true}),
-            EvidenceV1::new(
+            Some(EvidenceV1::new(
                 EvidenceClass::LiveRead,
                 "sha256:evidence",
                 "/tmp/evidence.json",
-            ),
+            )),
         );
 
         assert!(envelope.ok);
         assert!(envelope.performed);
         assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn delegated_d1_verification_requires_coherent_v1_and_complete_bounded_v2() {
+        let coherent = json!({
+            "adapter":"workspace_d1_evidence_v1",
+            "success":true,
+            "provider_output_retained":false,
+            "body_returned":false,
+            "evidence":{
+                "schema_version":1,
+                "body_returned":false
+            },
+            "route_health":{
+                "schema_version":2,
+                "record_count":1,
+                "complete":true,
+                "records":[{"route_ref_sha256":format!("sha256:{}", "a".repeat(64))}],
+                "provider_output_retained":false,
+                "body_returned":false
+            }
+        });
+        let mut coherent_envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "star-maildesk-cf.d1-evidence-read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            coherent.clone(),
+            Some(EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:evidence",
+                "/tmp/evidence.json",
+            )),
+        );
+        set_workspace_d1_evidence_verification(
+            &mut coherent_envelope,
+            workspace_d1_evidence::receipt_is_complete(&coherent),
+        );
+        assert_eq!(
+            coherent_envelope.verification.state,
+            VerificationState::Passed
+        );
+        assert!(
+            coherent_envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("complete bounded body-free"))
+        );
+
+        let mut incomplete = coherent.clone();
+        incomplete["route_health"]["complete"] = json!(false);
+        let mut count_mismatch = coherent.clone();
+        count_mismatch["route_health"]["record_count"] = json!(2);
+        let mut retained = coherent.clone();
+        retained["route_health"]["provider_output_retained"] = json!(true);
+        let mut malformed = coherent.clone();
+        malformed["route_health"]["records"] = json!({"not":"an array"});
+        let mut oversized = coherent.clone();
+        oversized["route_health"]["records"] = Value::Array(vec![Value::Null; 1_001]);
+        oversized["route_health"]["record_count"] = json!(1_001);
+        let missing_v2 = json!({
+            "success":true,
+            "provider_output_retained":false,
+            "body_returned":false,
+            "evidence":{"schema_version":1,"body_returned":false}
+        });
+
+        for receipt in [
+            incomplete,
+            count_mismatch,
+            retained,
+            malformed,
+            oversized,
+            missing_v2,
+        ] {
+            let mut envelope = delegated_read_envelope(
+                "sha256:catalog",
+                "star-maildesk-cf.d1-evidence-read",
+                "profile-a",
+                Some("account-a".to_owned()),
+                receipt.clone(),
+                Some(EvidenceV1::new(
+                    EvidenceClass::LiveRead,
+                    "sha256:evidence",
+                    "/tmp/evidence.json",
+                )),
+            );
+            set_workspace_d1_evidence_verification(
+                &mut envelope,
+                workspace_d1_evidence::receipt_is_complete(&receipt),
+            );
+            assert_eq!(envelope.verification.state, VerificationState::Failed);
+            assert!(
+                envelope
+                    .verification
+                    .basis
+                    .as_deref()
+                    .is_some_and(|basis| basis.contains("did not prove"))
+            );
+        }
+    }
+
+    #[test]
+    fn delegated_d1_preflight_failure_retains_identity_without_claiming_a_boundary() {
+        let envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "star-maildesk-cf.d1-evidence-read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            json!({
+                "adapter":"workspace_d1_evidence_v1",
+                "success":false,
+                "boundary_crossed":false,
+                "failure_code":"CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED",
+                "failure_stage":"preflight",
+                "provider_output_retained":false,
+                "body_returned":false
+            }),
+            None,
+        );
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(
+            envelope.capability_id.as_deref(),
+            Some("star-maildesk-cf.d1-evidence-read")
+        );
+        assert_eq!(envelope.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(envelope.account_id.as_deref(), Some("account-a"));
+        assert_eq!(envelope.verification.state, VerificationState::Failed);
+        assert!(envelope.evidence.is_empty());
+        assert_eq!(
+            envelope.error.as_ref().map(|error| error.code.as_str()),
+            Some("CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED")
+        );
+    }
+
+    #[test]
+    fn delegated_d1_post_boundary_failure_is_bound_body_free_and_not_retryable_by_inference() {
+        let envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "star-maildesk-cf.d1-evidence-read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            json!({
+                "adapter":"workspace_d1_evidence_v1",
+                "success":false,
+                "boundary_crossed":true,
+                "failure_code":"CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED",
+                "failure_stage":"provider_query",
+                "provider_output_retained":false,
+                "body_returned":false
+            }),
+            Some(EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:evidence",
+                "/tmp/evidence.json",
+            )),
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.verification.state, VerificationState::Failed);
+        let error = envelope.error.as_ref().expect("typed failure");
+        assert_eq!(
+            error.code,
+            "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED"
+        );
+        assert!(
+            error
+                .next_step
+                .as_deref()
+                .is_some_and(|step| step.contains("Do not replay"))
+        );
+        let encoded = serde_json::to_string(&envelope).expect("failure envelope JSON");
+        for prohibited in [
+            "subject",
+            "recipient",
+            "message_content",
+            "provider_payload",
+        ] {
+            assert!(
+                !encoded.contains(prohibited),
+                "prohibited field `{prohibited}`"
+            );
+        }
     }
 
     #[test]
@@ -47453,6 +48627,35 @@ mod tests {
             Some("CFCTL_OPERATIONAL_PROOF_INDEX_FAILED")
         );
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn operational_proof_persistence_failure_does_not_replace_the_first_read_blocker() {
+        let mut envelope = ResultEnvelopeV2::failure(
+            "call",
+            "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED",
+            "workspace D1 evidence failed",
+            Some("Do not replay the read."),
+        )
+        .with_evidence(EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:evidence",
+            "/tmp/evidence.json",
+        ));
+        envelope.performed = true;
+
+        apply_operational_proof_index_result(
+            &mut envelope,
+            Err(CliError::Input("fixture persistence failure".to_owned())),
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(
+            envelope.error.as_ref().map(|error| error.code.as_str()),
+            Some("CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED")
+        );
+        assert_eq!(envelope.result["operational_proof_indexed"], false);
     }
 
     #[test]

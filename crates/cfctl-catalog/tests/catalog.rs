@@ -139,9 +139,33 @@ fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
     );
     assert!(
         capability
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("exact update or delete plans"))
+    );
+    assert!(
+        capability
             .aliases
             .iter()
             .any(|alias| alias == "privacy-safe Email Routing inventory")
+    );
+    let account_capability = snapshot
+        .capabilities
+        .get(cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID)
+        .expect("typed account Email Routing capability");
+    assert!(is_email_routing_rules_list_capability(account_capability));
+    assert_eq!(
+        account_capability.path,
+        cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH
+    );
+    assert!(account_capability.selectors.iter().any(|selector| {
+        selector.name == "account_id" && selector.location == "path" && selector.required
+    }));
+    assert!(
+        account_capability
+            .permissions
+            .iter()
+            .any(|permission| permission == "Email Routing Rules Read")
     );
 
     let mut drifted_documents = Vec::new();
@@ -14219,7 +14243,7 @@ fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
         .as_ref()
         .expect("closed assertion schema");
     let variants = schema["oneOf"].as_array().expect("assertion variants");
-    assert_eq!(variants.len(), 6);
+    assert_eq!(variants.len(), 7);
     assert!(
         variants
             .iter()
@@ -14228,6 +14252,7 @@ fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
     let encoded = serde_json::to_string(schema).expect("schema JSON");
     assert!(!encoded.contains("\"sql\""));
     assert!(!encoded.contains("\"params\""));
+    assert!(encoded.contains("migration_ledger_equals"));
     let contract = capability
         .d1_schema_introspection
         .as_ref()
