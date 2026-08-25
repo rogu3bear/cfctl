@@ -1923,6 +1923,21 @@ pub struct WorkspaceD1ReplyAdmissionContractV1 {
     pub rollback_capability_id: String,
 }
 
+/// Repository-owned contract for proving one exact Maildesk reply subdomain
+/// ingress configuration. Provider zone, DNS, and routing-rule values are
+/// reduced inside cfctl and never become part of the public projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReplySubdomainIngressContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub surface_path: String,
+    pub surface_sha256: String,
+    pub consumer_contract_path: String,
+    pub consumer_contract_sha256: String,
+    pub projection: String,
+}
+
 /// Repository-bound, caller-invariant D1 evidence projection. The committed
 /// query is executed only inside cfctl and its rows are reduced to the typed,
 /// body-free `MaildeskD1EvidenceV1` result.
@@ -2312,6 +2327,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_reply_admission: Option<WorkspaceD1ReplyAdmissionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_reply_subdomain_ingress: Option<WorkspaceReplySubdomainIngressContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_evidence: Option<WorkspaceD1EvidenceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
@@ -2435,6 +2452,7 @@ impl CapabilityV1 {
             workspace_d1_migration: None,
             workspace_d1_policy_projection: None,
             workspace_d1_reply_admission: None,
+            workspace_reply_subdomain_ingress: None,
             workspace_d1_evidence: None,
             r2_private_file_upload: None,
             r2_private_object_digest: None,
@@ -2734,6 +2752,25 @@ impl CapabilityV1 {
                             && contract.recovery_max_age_seconds == 0
                             && contract.rollback_capability_id.is_empty()
                     })
+            }
+            "workspace_reply_subdomain_ingress_body_free_read" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self
+                        .workspace_reply_subdomain_ingress
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.surface_sha256.is_empty()
+                                && !contract.consumer_contract_sha256.is_empty()
+                                && contract.projection
+                                    == "workspace_reply_subdomain_ingress_v1"
+                        })
             }
             "workspace_d1_maildesk_body_free_evidence" => {
                 self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)

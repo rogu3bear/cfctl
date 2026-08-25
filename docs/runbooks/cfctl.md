@@ -475,6 +475,20 @@ only cfctl's fixed two-row-bounded query, discards provider rows, and proves onl
 one exact still-admitted record. The logical D1 admission ID, controller
 activation-operation ID, and cfctl PlanV2 UUID remain distinct; each is bound
 and reported without rewriting one to impersonate another.
+
+Maildesk's separately documented `star-maildesk-cf.reply-subdomain-ingress-read`
+is also workspace-owned and non-mutating. It accepts only `account_id`,
+`reply_domain`, and `worker_script_name`. cfctl resolves exactly one active zone
+whose name and account match the reply domain, requests only MX records for
+that exact name with explicit match-all filtering and complete page metadata,
+and reads the dedicated catch-all
+rule for that exact zone. The result is the closed
+`workspace_reply_subdomain_ingress_v1` projection: hashed reply-domain and
+Worker identities, typed `ok`, `drift`, or `missing` DNS and routing states,
+and explicit `provider_output_retained:false` and `body_returned:false`.
+Parent-zone evidence, the generic routing-rule list, incomplete pagination,
+ambiguous zones, or a merely similar Worker never satisfy the contract.
+
 The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
 the operation pack and tracked Wrangler template at that HEAD. Migration packs

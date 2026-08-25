@@ -248,6 +248,18 @@ two-row-bounded D1 projection. Zero, multiple, claimed, terminal, expired, or
 digest-mismatched rows fail closed. Only one exact admitted row returns the
 local pre-send identity projection; raw provider rows are always discarded.
 
+The Maildesk reply-subdomain ingress adapter composes three provider-generic
+reads behind one repository-owned projection without creating another provider
+surface. An exact account-and-name-filtered zone read must return one active
+reply-domain zone; an exact-name, MX-only, match-all DNS read must finish
+pagination and equal Cloudflare's canonical three-host MX set; and the dedicated catch-all GET
+must contain one enabled `all` matcher and one `worker` action targeting the
+selected script. The adapter discards all zone IDs, DNS records, rule fields,
+and provider errors before evidence persistence. Profile and account remain in
+the outer call envelope, while credential generation remains bound by the
+operational-proof record; the closed Maildesk result exposes only the two
+public identity hashes and typed configuration states.
+
 ## Executable guidance projection
 
 The public explanation layer is a projection of the executable contracts, not

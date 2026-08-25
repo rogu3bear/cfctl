@@ -10,6 +10,7 @@ mod workspace_d1_evidence;
 mod workspace_d1_migration;
 mod workspace_d1_projection;
 mod workspace_d1_reply_admission;
+mod workspace_reply_subdomain_ingress;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -6321,7 +6322,24 @@ async fn execute_delegated_read(
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let receipt = if capability
+    let receipt = if capability.workspace_reply_subdomain_ingress.is_some() {
+        let account_id = account_id.as_deref().ok_or_else(|| {
+            CliError::Input(
+                "workspace reply-subdomain ingress read requires an exact account".to_owned(),
+            )
+        })?;
+        workspace_reply_subdomain_ingress::read(
+            store,
+            catalog,
+            capability,
+            input,
+            &credential,
+            profile,
+            account_id,
+            &credential_generation_id,
+        )
+        .await?
+    } else if capability
         .workspace_d1_reply_admission
         .as_ref()
         .is_some_and(|contract| contract.operation_kind == "read")
@@ -6397,6 +6415,9 @@ async fn execute_delegated_read(
         .as_ref()
         .is_some_and(|contract| contract.operation_kind == "read")
         && workspace_d1_reply_admission::read_receipt_is_complete(&receipt);
+    let workspace_reply_subdomain_ingress_passed =
+        capability.workspace_reply_subdomain_ingress.is_some()
+            && workspace_reply_subdomain_ingress::receipt_is_complete(&receipt);
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     let mut envelope = delegated_read_envelope(
         &catalog.schema_hash,
@@ -6419,10 +6440,44 @@ async fn execute_delegated_read(
             workspace_reply_admission_read_passed,
         );
     }
+    if capability.workspace_reply_subdomain_ingress.is_some() {
+        set_workspace_reply_subdomain_ingress_verification(
+            &mut envelope,
+            workspace_reply_subdomain_ingress_passed,
+        );
+    }
     Ok(ExecutedRead {
         envelope,
         credential_generation_id: Some(credential_generation_id),
     })
+}
+
+fn set_workspace_reply_subdomain_ingress_verification(
+    envelope: &mut ResultEnvelopeV2,
+    receipt_is_complete: bool,
+) {
+    envelope.verification.state = if receipt_is_complete {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if receipt_is_complete {
+        "exact active reply-domain zone, complete exact-name MX projection, and dedicated catch-all Worker read were reduced to the closed body-free Maildesk ingress result"
+            .to_owned()
+    } else {
+        "reply-subdomain ingress did not produce one complete body-free zone, exact MX, and dedicated catch-all projection"
+            .to_owned()
+    });
+    if !receipt_is_complete {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_INGRESS_READ_FAILED".to_owned(),
+            message: "the governed reply-subdomain ingress read did not complete".to_owned(),
+            next_step: Some(
+                "Preserve the body-free failure receipt and reconcile the exact zone, DNS, or catch-all blocker; do not use parent-zone evidence or a generic routing-rule list."
+                    .to_owned(),
+            ),
+        });
+    }
 }
 
 fn set_workspace_reply_admission_read_verification(
@@ -30869,6 +30924,9 @@ fn load_workspace_capability(
         return Ok(Some(capability));
     }
     if let Some(capability) = workspace_d1_reply_admission::load(store, capability_id)? {
+        return Ok(Some(capability));
+    }
+    if let Some(capability) = workspace_reply_subdomain_ingress::load(store, capability_id)? {
         return Ok(Some(capability));
     }
     workspace_d1_evidence::load(store, capability_id)
