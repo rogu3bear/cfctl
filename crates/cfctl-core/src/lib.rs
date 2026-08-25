@@ -1914,6 +1914,79 @@ pub struct MaildeskD1EvidenceV1 {
     pub body_returned: bool,
 }
 
+/// Closed route classes emitted by the Maildesk D1 route-health projection.
+/// These are operational policy classes, never public or private addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaildeskRouteKindV2 {
+    RoleAlias,
+    PersonalAlias,
+    CatchAll,
+    Sink,
+}
+
+/// Closed provider identifiers understood by the Maildesk route-health
+/// projection. Provider-specific response payloads are never retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaildeskRouteProviderV2 {
+    CloudflareEmailRouting,
+    GoogleWorkspace,
+    External,
+    Excluded,
+}
+
+/// Closed readiness states for one Maildesk route and one evidence plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaildeskRouteReadinessStatusV2 {
+    Declared,
+    LocalPolicyValid,
+    EdgeVerified,
+    ProviderAccepted,
+    InboxVerified,
+    ReplyVerified,
+    PartialDelivery,
+    RecoveryRequired,
+    Failed,
+    IntentionallyExcluded,
+}
+
+/// One body-free route-health record. Route and domain identity are computed
+/// inside cfctl as SHA-256 references; the raw route id, address, domain,
+/// operator identity, and provider row have no public representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaildeskD1RouteHealthRecordV2 {
+    pub route_ref_sha256: String,
+    pub domain_sha256: String,
+    pub policy_digest: String,
+    pub route_kind: MaildeskRouteKindV2,
+    pub enabled: bool,
+    pub desired_provider: MaildeskRouteProviderV2,
+    pub observed_provider: Option<MaildeskRouteProviderV2>,
+    pub inbound_status: MaildeskRouteReadinessStatusV2,
+    pub reply_status: MaildeskRouteReadinessStatusV2,
+    pub provider_accepted_at: Option<String>,
+    pub inbox_received_at: Option<String>,
+    pub reply_provider_accepted_at: Option<String>,
+    pub reply_proven_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub updated_at: String,
+}
+
+/// Additive V2 route-health projection returned beside, not instead of, the
+/// aggregate `MaildeskD1EvidenceV1` contract. `complete` is true only after
+/// cfctl proves the bounded result contains every active projected route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaildeskD1RouteHealthEvidenceV2 {
+    pub schema_version: u8,
+    pub record_count: u64,
+    pub complete: bool,
+    pub records: Vec<MaildeskD1RouteHealthRecordV2>,
+    pub provider_output_retained: bool,
+    pub body_returned: bool,
+}
+
 /// A create-only private local file upload to one exact R2 object key. The
 /// bytes remain in a mode-0600 managed stage; plans and receipts carry only
 /// content identity and bounded metadata.

@@ -6323,16 +6323,7 @@ async fn execute_delegated_read(
         .await?
     };
     let workspace_d1_evidence_passed = capability.workspace_d1_evidence.is_some()
-        && receipt.get("success").and_then(Value::as_bool) == Some(true)
-        && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
-        && receipt
-            .pointer("/evidence/schema_version")
-            .and_then(Value::as_u64)
-            == Some(1)
-        && receipt
-            .pointer("/evidence/body_returned")
-            .and_then(Value::as_bool)
-            == Some(false);
+        && workspace_d1_evidence::receipt_is_complete(&receipt);
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     let mut envelope = delegated_read_envelope(
         &catalog.schema_hash,
@@ -6343,20 +6334,30 @@ async fn execute_delegated_read(
         Some(evidence),
     );
     if capability.workspace_d1_evidence.is_some() {
-        envelope.verification.state = if workspace_d1_evidence_passed {
-            VerificationState::Passed
-        } else {
-            VerificationState::Failed
-        };
-        envelope.verification.basis = Some(
-            "clean-repository fixed D1 projection reduced to MaildeskD1EvidenceV1 without provider rows or message bodies"
-                .to_owned(),
-        );
+        set_workspace_d1_evidence_verification(&mut envelope, workspace_d1_evidence_passed);
     }
     Ok(ExecutedRead {
         envelope,
         credential_generation_id: Some(credential_generation_id),
     })
+}
+
+fn set_workspace_d1_evidence_verification(
+    envelope: &mut ResultEnvelopeV2,
+    receipt_is_complete: bool,
+) {
+    envelope.verification.state = if receipt_is_complete {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if receipt_is_complete {
+        "clean-repository fixed D1 projection reduced to unchanged MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows"
+            .to_owned()
+    } else {
+        "workspace D1 evidence receipt did not prove a coherent V1 aggregate plus complete bounded body-free V2 route-health projection"
+            .to_owned()
+    });
 }
 
 fn credential_generation_for_read(profile: &ProfileMetadata) -> Result<String> {
@@ -30480,13 +30481,13 @@ mod tests {
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         resolve_actionable, resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
         resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_artifact,
-        secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
-        should_bind_d1_read_replication_state, should_bind_dns_record_state,
-        should_bind_global_warp_override_state, should_bind_kv_empty_namespace_state,
-        should_bind_oauth_client_secret_state, should_bind_oauth_client_update_state,
-        should_bind_pages_project_absence, should_bind_warp_connector_configuration_state,
-        should_bind_web_analytics_rum_state, should_bind_zone_account,
-        should_redact_secret_response, should_resolve_entitlement_probe,
+        secret_sink_format, set_workspace_d1_evidence_verification,
+        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
+        should_bind_dns_record_state, should_bind_global_warp_override_state,
+        should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
+        should_bind_oauth_client_update_state, should_bind_pages_project_absence,
+        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
+        should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
@@ -30501,7 +30502,7 @@ mod tests {
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
         validate_zone_account_receipt_precondition, validate_zone_id,
-        validated_standing_lineage_token_id, verification_outcome,
+        validated_standing_lineage_token_id, verification_outcome, workspace_d1_evidence,
         workspace_d1_migration_rectification_eligible, workspace_operational_proof_posture,
         workspace_precondition_hashes_for_scope, workspace_resource_keys,
         wrangler_config_directory, wrangler_deploy_version_id,
@@ -47364,6 +47365,107 @@ mod tests {
         assert!(envelope.performed);
         assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn delegated_d1_verification_requires_coherent_v1_and_complete_bounded_v2() {
+        let coherent = json!({
+            "adapter":"workspace_d1_evidence_v1",
+            "success":true,
+            "provider_output_retained":false,
+            "body_returned":false,
+            "evidence":{
+                "schema_version":1,
+                "body_returned":false
+            },
+            "route_health":{
+                "schema_version":2,
+                "record_count":1,
+                "complete":true,
+                "records":[{"route_ref_sha256":format!("sha256:{}", "a".repeat(64))}],
+                "provider_output_retained":false,
+                "body_returned":false
+            }
+        });
+        let mut coherent_envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "star-maildesk-cf.d1-evidence-read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            coherent.clone(),
+            Some(EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:evidence",
+                "/tmp/evidence.json",
+            )),
+        );
+        set_workspace_d1_evidence_verification(
+            &mut coherent_envelope,
+            workspace_d1_evidence::receipt_is_complete(&coherent),
+        );
+        assert_eq!(
+            coherent_envelope.verification.state,
+            VerificationState::Passed
+        );
+        assert!(
+            coherent_envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("complete bounded body-free"))
+        );
+
+        let mut incomplete = coherent.clone();
+        incomplete["route_health"]["complete"] = json!(false);
+        let mut count_mismatch = coherent.clone();
+        count_mismatch["route_health"]["record_count"] = json!(2);
+        let mut retained = coherent.clone();
+        retained["route_health"]["provider_output_retained"] = json!(true);
+        let mut malformed = coherent.clone();
+        malformed["route_health"]["records"] = json!({"not":"an array"});
+        let mut oversized = coherent.clone();
+        oversized["route_health"]["records"] = Value::Array(vec![Value::Null; 1_001]);
+        oversized["route_health"]["record_count"] = json!(1_001);
+        let missing_v2 = json!({
+            "success":true,
+            "provider_output_retained":false,
+            "body_returned":false,
+            "evidence":{"schema_version":1,"body_returned":false}
+        });
+
+        for receipt in [
+            incomplete,
+            count_mismatch,
+            retained,
+            malformed,
+            oversized,
+            missing_v2,
+        ] {
+            let mut envelope = delegated_read_envelope(
+                "sha256:catalog",
+                "star-maildesk-cf.d1-evidence-read",
+                "profile-a",
+                Some("account-a".to_owned()),
+                receipt.clone(),
+                Some(EvidenceV1::new(
+                    EvidenceClass::LiveRead,
+                    "sha256:evidence",
+                    "/tmp/evidence.json",
+                )),
+            );
+            set_workspace_d1_evidence_verification(
+                &mut envelope,
+                workspace_d1_evidence::receipt_is_complete(&receipt),
+            );
+            assert_eq!(envelope.verification.state, VerificationState::Failed);
+            assert!(
+                envelope
+                    .verification
+                    .basis
+                    .as_deref()
+                    .is_some_and(|basis| basis.contains("did not prove"))
+            );
+        }
     }
 
     #[test]

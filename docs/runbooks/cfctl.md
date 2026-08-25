@@ -525,6 +525,19 @@ content, arbitrary columns, output paths, parameters, PRAGMAs, and mutating SQL
 are not representable. A dirty repository, wrong HEAD/origin/config/binding,
 query drift, extra column, malformed map, or non-singleton result fails closed.
 
+The result also contains additive `route_health` schema V2 while keeping the
+V1 `evidence` object unchanged. Each record contains only cfctl-computed SHA-256
+references for route and domain identity, the active policy digest, closed
+route/provider/readiness codes, enabled state, four body-free proof timestamps,
+a bounded error code, and `updated_at`. The projection is accepted only when at
+most 1,000 unique route records exactly cover the aggregate active route count.
+Missing health rows, route-kind or policy-revision drift, disabled active rows,
+truncation, duplicates, unknown codes, malformed timestamps, or unexpected
+fields reject the entire read. Raw route IDs,
+addresses, domains, operators, account IDs, and provider payloads never enter a
+route record; `provider_output_retained:false` and `body_returned:false` remain
+explicit.
+
 ```sh
 cfctl call <repository-d1-evidence-operation-id> \
   --selector account_id=<account-id> \

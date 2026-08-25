@@ -19,7 +19,7 @@ mod d1_policy_projection;
 
 pub use d1_evidence::{
     MAILDESK_D1_EVIDENCE_COLUMNS_V1, MAILDESK_D1_EVIDENCE_SQL_V1,
-    load_workspace_d1_evidence_capability,
+    MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2, load_workspace_d1_evidence_capability,
 };
 pub use d1_operation::load_workspace_d1_migration_capability;
 pub use d1_policy_projection::load_workspace_d1_policy_projection_capability;
