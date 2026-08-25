@@ -508,6 +508,13 @@ fn normalize_md5_etag(value: &str) -> Option<&str> {
     (value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())).then_some(value)
 }
 
+fn normalize_r2_upload_json_etag(value: &str) -> Option<&str> {
+    normalize_md5_etag(value).or_else(|| {
+        (value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit()))
+            .then_some(value)
+    })
+}
+
 fn d1_full_export_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
     let contract = capability.d1_full_export.as_ref()?;
     Some(serde_json::json!({
@@ -4602,7 +4609,8 @@ impl Executor {
                     "private R2 upload expected MD5 is missing".to_owned(),
                 )
             })?;
-        let returned_etag = apply_response.etag.as_deref().and_then(normalize_md5_etag);
+        let returned_etag = Self::exact_r2_upload_md5_etag(apply_response);
+        let conditional_etag = returned_etag.map(|etag| format!("\"{etag}\""));
         let mut read = CapabilityV1::new(
             &contract.read_capability_id,
             "Conditional private R2 object identity readback",
@@ -4634,7 +4642,7 @@ impl Executor {
                 selectors: Value::Object(selectors),
                 query: serde_json::json!({}),
                 body: None,
-                if_none_match: apply_response.etag.clone(),
+                if_none_match: conditional_etag,
                 ..CallInput::default()
             },
         )?;
@@ -4667,6 +4675,21 @@ impl Executor {
             },
             correlated_resource_id: None,
         })
+    }
+
+    fn exact_r2_upload_md5_etag(response: &CloudflareResponseV1) -> Option<&str> {
+        let header = response.etag.as_deref().and_then(normalize_md5_etag);
+        let result = response.result.get("etag");
+        match (header, result) {
+            (Some(header), None) => Some(header),
+            (Some(header), Some(Value::String(result)))
+                if normalize_r2_upload_json_etag(result) == Some(header) =>
+            {
+                Some(header)
+            }
+            (None, Some(Value::String(result))) => normalize_r2_upload_json_etag(result),
+            _ => None,
+        }
     }
 
     async fn verify_email_sending_dns_repair(

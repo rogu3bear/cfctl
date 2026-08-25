@@ -441,6 +441,63 @@ async fn r2_private_upload_verifier_proves_etag_without_reading_object_bytes() {
     );
 }
 
+#[tokio::test]
+async fn r2_private_upload_verifier_accepts_raw_json_etag_when_header_is_absent() {
+    let md5 = "0123456789abcdef0123456789abcdef";
+    let quoted_etag = format!("\"{md5}\"");
+    let (address, server) = single_not_modified_server(&quoted_etag).await;
+    let mut capability = r2_private_upload_capability();
+    capability.verification.required = true;
+    capability.verification.strategy =
+        "r2_private_file_upload_etag_and_conditional_read".to_owned();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"account",
+            "bucket_name":"bucket",
+            "object_key":"config/policy/digest.json"
+        }),
+        if_none_match: Some("*".to_owned()),
+        ..CallInput::default()
+    };
+    let mut plan =
+        PlanV1::draft("profile", "account", "catalog", capability, json!({})).expect("plan");
+    plan.input = serde_json::to_value(&input).expect("input");
+    plan.targets = json!({"adapter":{"r2_private_file_upload":{"source_md5":md5}}});
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"etag":md5}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan_with_input(
+        &plan,
+        &apply,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("verification from JSON ETag");
+
+    assert!(verification.passed);
+    let request = server.await.expect("server joins");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"0123456789abcdef0123456789abcdef\"")
+    );
+}
+
 fn path_selector(name: &str) -> SelectorV1 {
     SelectorV1 {
         name: name.to_owned(),

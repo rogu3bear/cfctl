@@ -34,6 +34,16 @@ pub(super) struct LoadedPrivateUpload {
     pub(super) content_type: String,
 }
 
+pub(super) struct PrivateUploadRectificationTarget {
+    pub(super) input: CallInput,
+    pub(super) source_sha256: String,
+    pub(super) source_bytes: u64,
+    pub(super) rectification_read_capability_id: &'static str,
+}
+
+const NORMAL_READ_CAPABILITY_ID: &str = "r2-get-object";
+pub(super) const RECTIFICATION_READ_CAPABILITY_ID: &str = "r2-get-private-object-digest";
+
 pub(super) fn prepare_plan_target(
     store: &StateStore,
     secrets: &dyn SecretStore,
@@ -135,6 +145,74 @@ pub(super) fn load(
         bytes,
         md5: binding.md5,
         content_type: required_string(target, "content_type")?.to_owned(),
+    })
+}
+
+pub(super) fn rectification_target(
+    store: &StateStore,
+    plan: &PlanV1,
+    secrets: &dyn SecretStore,
+) -> Result<PrivateUploadRectificationTarget> {
+    validate_bound_plan(store, plan, secrets)?;
+    let contract = plan
+        .capability
+        .r2_private_file_upload
+        .as_ref()
+        .ok_or_else(|| CliError::Input("private R2 upload contract is missing".to_owned()))?;
+    if contract.read_capability_id != NORMAL_READ_CAPABILITY_ID {
+        return Err(CliError::Input(
+            "private R2 upload verification contract drifted; create a new plan".to_owned(),
+        ));
+    }
+    let target = target(plan)?;
+    let source_sha256 = required_string(target, "source_sha256")?;
+    if source_sha256.len() != 64
+        || !source_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CliError::Input(
+            "private R2 upload source SHA-256 is invalid".to_owned(),
+        ));
+    }
+    let source_bytes = target
+        .get("source_bytes")
+        .and_then(Value::as_u64)
+        .filter(|bytes| *bytes > 0 && *bytes <= contract.max_source_bytes)
+        .ok_or_else(|| {
+            CliError::Input("private R2 upload source byte count is invalid".to_owned())
+        })?;
+    let original: CallInput = serde_json::from_value(plan.input.clone())?;
+    let selectors = ["account_id", "bucket_name", "object_key"]
+        .into_iter()
+        .map(|name| {
+            original
+                .selectors
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.to_owned(), Value::String(value.to_owned())))
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "private R2 upload rectification selector `{name}` is missing"
+                    ))
+                })
+        })
+        .collect::<Result<serde_json::Map<_, _>>>()?;
+    if selectors.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "private R2 upload rectification account drifted".to_owned(),
+        ));
+    }
+    Ok(PrivateUploadRectificationTarget {
+        input: CallInput {
+            selectors: Value::Object(selectors),
+            query: json!({}),
+            ..CallInput::default()
+        },
+        source_sha256: format!("sha256:{source_sha256}"),
+        source_bytes,
+        rectification_read_capability_id: RECTIFICATION_READ_CAPABILITY_ID,
     })
 }
 
@@ -488,6 +566,21 @@ mod tests {
         validate_bound_plan(&store, &plan, &secrets).expect("bound plan");
         let loaded = load(&store, &plan, &secrets).expect("managed bytes");
         assert_eq!(loaded.bytes, br#"{"operator":"operator@example.com"}"#);
+        let rectification =
+            rectification_target(&store, &plan, &secrets).expect("rectification target");
+        assert_eq!(
+            rectification.rectification_read_capability_id,
+            "r2-get-private-object-digest"
+        );
+        assert_eq!(
+            rectification.input.selectors,
+            json!({
+                "account_id":"account",
+                "bucket_name":"policy-bucket",
+                "object_key":"config/policy/digest.json"
+            })
+        );
+        assert_eq!(rectification.source_bytes, loaded.bytes.len() as u64);
         let stage_dir = load_binding(&secrets, &target)
             .expect("binding before discard")
             .path

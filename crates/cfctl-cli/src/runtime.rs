@@ -24324,6 +24324,9 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if worker_version_rollback_rectification_eligible(&plan) {
         return rectify_worker_version_rollback(store, &mut plan).await;
     }
+    if r2_private_upload_rectification_eligible(&plan) {
+        return rectify_r2_private_upload(store, &mut plan).await;
+    }
     if workspace_d1_migration_rectification_eligible(&plan) {
         return rectify_workspace_d1_migration(store, &mut plan).await;
     }
@@ -24610,6 +24613,211 @@ fn persist_worker_version_rollback_rectification(
         });
     }
     Ok(envelope)
+fn r2_private_upload_rectification_eligible(plan: &PlanV1) -> bool {
+    let boundary = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted);
+    plan.capability.r2_private_file_upload.is_some()
+        && plan.status == PlanStatus::RectificationRequired
+        && plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted
+        && boundary.is_some_and(|receipt| {
+            receipt.get("http_status").and_then(Value::as_u64) == Some(200)
+                && receipt.get("success").and_then(Value::as_bool) == Some(true)
+                && receipt.get("etag").is_none_or(Value::is_null)
+        })
+}
+
+fn r2_private_upload_digest_matches(
+    plan: &PlanV1,
+    response: &CloudflareResponseV1,
+) -> Result<bool> {
+    let target = plan
+        .targets
+        .pointer("/adapter/r2_private_file_upload")
+        .ok_or_else(|| CliError::Input("private R2 upload target is missing".to_owned()))?;
+    let source_sha256 = target
+        .get("source_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| CliError::Input("private R2 upload source digest is invalid".to_owned()))?;
+    let source_bytes = target
+        .get("source_bytes")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CliError::Input("private R2 upload source size is invalid".to_owned()))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let selector = |name: &str| {
+        input
+            .selectors
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "private R2 upload rectification selector `{name}` is missing"
+                ))
+            })
+    };
+    let result = response
+        .result
+        .as_object()
+        .ok_or_else(|| CliError::Input("private R2 digest readback is not an object".to_owned()))?;
+    Ok(response.status == 200
+        && response.success
+        && response.errors.is_empty()
+        && result.len() == 8
+        && result.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && result.get("account_id").and_then(Value::as_str) == Some(selector("account_id")?)
+        && result.get("bucket_name").and_then(Value::as_str) == Some(selector("bucket_name")?)
+        && result.get("object_key").and_then(Value::as_str) == Some(selector("object_key")?)
+        && result.get("byte_count").and_then(Value::as_u64) == Some(source_bytes)
+        && result.get("sha256").and_then(Value::as_str)
+            == Some(format!("sha256:{source_sha256}").as_str())
+        && result
+            .get("etag")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && result.get("body_returned").and_then(Value::as_bool) == Some(false))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "private R2 rectification keeps exact staged authority, digest-only provider readback, no-replay evidence, and closure in one auditable state machine"
+)]
+async fn rectify_r2_private_upload(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    let secrets = platform_secrets(store);
+    let target = r2_private_upload::rectification_target(store, plan, &secrets)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "private R2 upload rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let credential = fresh_credential(profile, &secrets).await?;
+    let catalog = ensure_catalog(store).await?;
+    let read = catalog
+        .get(target.rectification_read_capability_id)
+        .filter(|capability| capability.r2_private_object_digest.is_some())
+        .ok_or_else(|| {
+            CliError::Input(
+                "private R2 upload rectification digest capability is unavailable or drifted"
+                    .to_owned(),
+            )
+        })?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let digest = executor
+        .execute_r2_private_object_digest(read, &target.input, &credential)
+        .await?;
+    let passed = r2_private_upload_digest_matches(plan, &digest)?;
+    let observed_sha256 = digest.result.get("sha256").cloned().unwrap_or(Value::Null);
+    let observed_bytes = digest
+        .result
+        .get("byte_count")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let target_hash = hash_value(&target.input.selectors)?;
+    let basis = if passed {
+        "the native digest-only R2 read matched the exact staged source SHA-256, byte count, account, bucket, and object key"
+    } else {
+        "the native digest-only R2 read did not match the exact staged source or object target"
+    };
+    let verification = json!({
+        "strategy":"r2_private_upload_digest_rectification",
+        "passed":passed,
+        "basis":basis,
+        "expected_sha256":target.source_sha256,
+        "expected_bytes":target.source_bytes,
+        "observed_sha256":observed_sha256,
+        "observed_bytes":observed_bytes,
+        "target_hash":target_hash,
+        "body_returned":false,
+        "verification_only":true,
+        "boundary_replayed":false,
+    });
+    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let receipt = json!({
+        "state":if passed { "passed" } else { "failed" },
+        "evidence_hash":evidence.content_hash,
+        "reconciliation":true,
+        "verification_only":true,
+        "boundary_replayed":false,
+    });
+    if passed {
+        r2_private_upload::discard(store, plan, &secrets)?;
+    }
+    persist_r2_private_upload_rectification_result(store, plan, receipt, passed)?;
+
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id":plan.operation_id,
+            "status":plan.status,
+            "verification_only":true,
+            "boundary_replayed":false,
+            "message":if passed {
+                "The already-crossed create-only R2 upload was verified by an exact native digest read without replaying PUT."
+            } else {
+                "The native digest read did not match the staged source and exact target; the upload remains rectification_required and PUT was not replayed."
+            },
+        }),
+    )
+    .with_evidence(evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.to_owned());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis.to_owned(),
+            next_step: Some(
+                "Inspect the body-free digest evidence and repair target drift; do not replay the create-only upload plan."
+                    .to_owned(),
+            ),
+        });
+    }
+    Ok(envelope)
+}
+
+fn persist_r2_private_upload_rectification_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    verification_receipt: Value,
+    passed: bool,
+) -> Result<()> {
+    if !passed {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(());
+    }
+    plan.status = PlanStatus::Verified;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::Closed,
+        json!({
+            "rectification_verification":verification_receipt,
+            "retry":true,
+        }),
+    )
+}
+
 fn workspace_d1_projection_rectification_eligible(plan: &PlanV1) -> bool {
     plan.capability.workspace_d1_policy_projection.is_some()
         && plan.status == PlanStatus::RectificationRequired
@@ -30624,7 +30832,8 @@ mod tests {
         normalize_reviewed_mln_repository_id, operational_proof_coverage, pages_deployment,
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        persist_r2_private_upload_rectification_result, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage,
         persist_worker_version_rollback_rectification,
         persist_workspace_d1_projection_rectification_result,
         persist_workspace_d1_rectification_result, plan_impact, plan_local_artifact_paths,
@@ -30632,11 +30841,12 @@ mod tests {
         preflight_call_input, preflight_secret_sink, preflight_standing_authority,
         prepare_r2_temporary_credentials_input, prepare_security_action_input,
         prepare_wrangler_deployment_status_command, preserve_previous_catalog,
-        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
-        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
-        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
-        repair_keychain_access_with_warning, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        query_object_from_pairs, r2_private_upload_digest_matches,
+        r2_private_upload_rectification_eligible, read_import_secret,
+        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
+        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -30701,12 +30911,13 @@ mod tests {
         EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
         Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
         OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1,
-        PlanV2, QuerySerializationV1, ResponseBodyModeV1, ResponseContractV1, ResultEnvelopeV2,
-        RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
-        SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
-        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-        WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1,
-        WorkspaceD1PolicyProjectionContractV1, hash_value,
+        PlanV2, QuerySerializationV1, R2PrivateFileUploadContractV1, ResponseBodyModeV1,
+        ResponseContractV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
+        SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
+        WorkflowStepV1, WorkspaceD1MigrationContractV1, WorkspaceD1PolicyProjectionContractV1,
+        hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -45358,6 +45569,148 @@ mod tests {
             plan.transaction_artifact(TransactionStageV1::Closed)
                 .expect("closed checkpoint")["rectification_verification"],
             retry
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression proves eligibility, exact digest and target matching, fail-closed drift, no replay, and durable closure in one fixture"
+    )]
+    fn private_r2_upload_rectification_requires_exact_digest_and_never_replays_put() {
+        let mut capability = CapabilityV1::new(
+            "r2-put-object",
+            "Upload private object",
+            "PUT",
+            "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}",
+        );
+        capability.r2_private_file_upload = Some(R2PrivateFileUploadContractV1 {
+            max_source_bytes: 300_000_000,
+            allowed_content_types: vec!["application/json".to_owned()],
+            require_if_none_match_star: true,
+            read_capability_id: "r2-get-object".to_owned(),
+            delete_capability_id: "r2-delete-object".to_owned(),
+            etag_algorithm: "md5".to_owned(),
+        });
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "bucket_name":"bucket-a",
+                "object_key":"config/policy.json",
+                "Content-Type":"application/json"
+            }),
+            if_none_match: Some("*".to_owned()),
+            ..CallInput::default()
+        };
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("private R2 plan");
+        plan.input = serde_json::to_value(&input).expect("input");
+        plan.targets = json!({"adapter":{"r2_private_file_upload":{
+            "source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_bytes":36234,
+            "create_only":true
+        }}});
+        plan.refresh_hash().expect("refresh private R2 plan hash");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"http_status":200,"success":true,"etag":null}),
+        )
+        .expect("headerless successful boundary");
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage(TransactionStageV1::SecretSinkPersisted)
+            .expect("sink checkpoint");
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("verification attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"failed"}),
+        )
+        .expect("verification response");
+        assert!(r2_private_upload_rectification_eligible(&plan));
+
+        let digest = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "schema_version":1,
+                "account_id":"account-a",
+                "bucket_name":"bucket-a",
+                "object_key":"config/policy.json",
+                "byte_count":36234,
+                "etag":"\"provider-etag\"",
+                "sha256":format!("sha256:{}", "a".repeat(64)),
+                "body_returned":false
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: Some("\"provider-etag\"".to_owned()),
+            cf_ray: None,
+        };
+        assert!(r2_private_upload_digest_matches(&plan, &digest).expect("exact digest"));
+        let mut drifted = digest.clone();
+        drifted.result["byte_count"] = json!(36233);
+        assert!(!r2_private_upload_digest_matches(&plan, &drifted).expect("drift decision"));
+        let mut digest_drifted = digest.clone();
+        digest_drifted.result["sha256"] = json!(format!("sha256:{}", "c".repeat(64)));
+        assert!(
+            !r2_private_upload_digest_matches(&plan, &digest_drifted)
+                .expect("digest drift decision")
+        );
+        let mut target_drifted = digest.clone();
+        target_drifted.result["object_key"] = json!("config/other.json");
+        assert!(
+            !r2_private_upload_digest_matches(&plan, &target_drifted)
+                .expect("target drift decision")
+        );
+
+        let root = tempfile::tempdir().expect("rectification store");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let journal_len = plan.transaction_journal.len();
+        persist_r2_private_upload_rectification_result(
+            &store,
+            &mut plan,
+            json!({
+                "state":"failed",
+                "reconciliation":true,
+                "verification_only":true,
+                "boundary_replayed":false,
+                "evidence_hash":format!("sha256:{}", "c".repeat(64))
+            }),
+            false,
+        )
+        .expect("failed verification remains rectifiable");
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            plan.transaction_stage,
+            TransactionStageV1::VerificationResponsePersisted
+        );
+        assert_eq!(plan.transaction_journal.len(), journal_len);
+
+        let receipt = json!({
+            "state":"passed",
+            "reconciliation":true,
+            "verification_only":true,
+            "boundary_replayed":false,
+            "evidence_hash":format!("sha256:{}", "b".repeat(64))
+        });
+        persist_r2_private_upload_rectification_result(&store, &mut plan, receipt.clone(), true)
+            .expect("close verified rectification");
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::Closed)
+                .expect("closed checkpoint")["rectification_verification"],
+            receipt
         );
     }
 
