@@ -24498,11 +24498,11 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, &mut plan);
     }
-    if worker_version_rollback_rectification_eligible(&plan) {
-        return rectify_worker_version_rollback(store, &mut plan).await;
-    }
     if r2_private_upload_rectification_eligible(&plan) {
         return rectify_r2_private_upload(store, &mut plan).await;
+    }
+    if worker_version_rollback_rectification_eligible(&plan) {
+        return rectify_worker_version_rollback(store, &mut plan).await;
     }
     if workspace_d1_migration_rectification_eligible(&plan) {
         return rectify_workspace_d1_migration(store, &mut plan).await;
@@ -24790,6 +24790,8 @@ fn persist_worker_version_rollback_rectification(
         });
     }
     Ok(envelope)
+}
+
 fn r2_private_upload_rectification_eligible(plan: &PlanV1) -> bool {
     let boundary = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted);
     plan.capability.r2_private_file_upload.is_some()
