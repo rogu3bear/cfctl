@@ -640,9 +640,10 @@ fn optional_error_code(row: &Map<String, Value>, field: &str) -> Result<Option<S
     let Some(value) = optional_string(row, field, 128)? else {
         return Ok(None);
     };
-    if !value.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
-    }) {
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
         return Err(CliError::Input(
             "workspace D1 route-health error code is outside the closed contract".to_owned(),
         ));
@@ -917,6 +918,30 @@ mod tests {
     }
 
     #[test]
+    fn provider_typed_error_codes_remain_body_free_evidence() {
+        let mut evidence_row = row();
+        let mut records = serde_json::from_str::<Vec<Value>>(
+            evidence_row["route_health_rows_json"]
+                .as_str()
+                .expect("route-health JSON"),
+        )
+        .expect("route rows");
+        records[0]["last_error_code"] = json!("E_HEADER_NOT_ALLOWED");
+        evidence_row.insert(
+            "route_health_rows_json".to_owned(),
+            json!(serde_json::to_string(&records).expect("route rows")),
+        );
+
+        let (_, route_health) =
+            project_evidence(&contract(), vec![evidence_row]).expect("typed provider error");
+
+        assert_eq!(
+            route_health.records[0].last_error_code.as_deref(),
+            Some("E_HEADER_NOT_ALLOWED")
+        );
+    }
+
+    #[test]
     fn column_order_is_irrelevant_but_extra_private_columns_fail_closed() {
         let mut private = row();
         private.insert("recipient".to_owned(), json!("operator@example.com"));
@@ -969,6 +994,20 @@ mod tests {
             json!("operator@example.com"),
         );
         assert!(project_evidence(&contract(), vec![value_smuggling]).is_err());
+
+        let mut malformed_error = row();
+        let mut records = serde_json::from_str::<Vec<Value>>(
+            malformed_error["route_health_rows_json"]
+                .as_str()
+                .expect("route-health JSON"),
+        )
+        .expect("route rows");
+        records[0]["last_error_code"] = json!("E_HEADER_NOT_ALLOWED: private detail");
+        malformed_error.insert(
+            "route_health_rows_json".to_owned(),
+            json!(serde_json::to_string(&records).expect("route rows")),
+        );
+        assert!(project_evidence(&contract(), vec![malformed_error]).is_err());
     }
 
     #[test]
