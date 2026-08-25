@@ -230,6 +230,17 @@ change after the boundary without invalidating the transaction chain, and a
 supported rollback uses them only to create a new compensation plan with
 independent authority.
 
+The workspace-owned Maildesk reply-admission adapter is a closed D1 write
+contract, not a generic query surface. It loads only the dedicated committed
+operation pack from an exact clean registered checkout, accepts one private
+mode-0600 compiler input, executes a private copy of the exact committed
+compiler with a version-and-digest-pinned Bun runtime, validates the resulting Git identity and canonical
+candidate/projection/activation-record hashes, and generates a private SQL file
+inside cfctl. Plan creation never performs the write. Execution crosses the
+provider boundary once, retains no provider or record content, and verifies
+exact cardinality plus the activation-record digest. Ambiguous execution or
+verification requires rectification and is never replayed automatically.
+
 ## Executable guidance projection
 
 The public explanation layer is a projection of the executable contracts, not
