@@ -8797,18 +8797,27 @@ fn apply_post_normalization_contracts(
 }
 
 fn finalize_email_routing_rules_read_projection(capabilities: &mut BTreeMap<String, CapabilityV1>) {
-    let Some(capability) = capabilities.get_mut(cfctl_core::EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
+    let Some(capability) = capabilities.get(cfctl_core::EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
     else {
         return;
     };
     if !cfctl_core::is_email_routing_rules_list_capability(capability) {
-        capability.adapter_status = AdapterStatus::Blocked;
-        capability.blocked_reason = Some(
-            "Email Routing rules no longer match the pinned typed read-projection contract"
-                .to_owned(),
-        );
+        if let Some(capability) =
+            capabilities.get_mut(cfctl_core::EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
+        {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "Email Routing rules no longer match the pinned typed read-projection contract"
+                    .to_owned(),
+            );
+        }
         return;
     }
+    let mut account_capability = capability.clone();
+    let Some(capability) = capabilities.get_mut(cfctl_core::EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID)
+    else {
+        return;
+    };
     capability.description = Some(
         "Lists routing rules as cfctl's bounded `EmailRoutingRuleSetV1` projection; opaque rule identifiers remain available for exact update or delete plans, while raw non-Worker action values never enter stdout or evidence."
             .to_owned(),
@@ -8819,6 +8828,33 @@ fn finalize_email_routing_rules_read_projection(capabilities: &mut BTreeMap<Stri
     ]);
     capability.aliases.sort();
     capability.aliases.dedup();
+
+    cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID
+        .clone_into(&mut account_capability.id);
+    "List account Email Routing rules".clone_into(&mut account_capability.title);
+    cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH.clone_into(&mut account_capability.path);
+    "account".clone_into(&mut account_capability.account_scope);
+    account_capability.description = Some(
+        "Lists account Email Routing rules as cfctl's bounded body-free `EmailRoutingRuleSetV1` projection, retaining only hashed rule-domain identity and validated Worker targets."
+            .to_owned(),
+    );
+    account_capability.selectors.retain(|selector| {
+        selector.location == "query" && matches!(selector.name.as_str(), "page" | "per_page")
+    });
+    account_capability.selectors.push(SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: Some("Exact account containing the Email Routing rule inventory".to_owned()),
+        contract: None,
+    });
+    account_capability.permissions = vec!["Email Routing Rules Read".to_owned()];
+    account_capability.aliases = vec![
+        "body-free account Email Routing inventory".to_owned(),
+        "subdomain-bound Email Routing rules".to_owned(),
+    ];
+    capabilities.insert(account_capability.id.clone(), account_capability);
 }
 
 const PAGES_DEPLOYMENT_CREATE_CAPABILITY_ID: &str = "pages-deployment-create-deployment";

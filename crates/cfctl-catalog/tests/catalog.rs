@@ -149,6 +149,24 @@ fn email_routing_rules_catalog_exposes_the_typed_privacy_safe_projection() {
             .iter()
             .any(|alias| alias == "privacy-safe Email Routing inventory")
     );
+    let account_capability = snapshot
+        .capabilities
+        .get(cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID)
+        .expect("typed account Email Routing capability");
+    assert!(is_email_routing_rules_list_capability(account_capability));
+    assert_eq!(
+        account_capability.path,
+        cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH
+    );
+    assert!(account_capability.selectors.iter().any(|selector| {
+        selector.name == "account_id" && selector.location == "path" && selector.required
+    }));
+    assert!(
+        account_capability
+            .permissions
+            .iter()
+            .any(|permission| permission == "Email Routing Rules Read")
+    );
 
     let mut drifted_documents = Vec::new();
     let mut wrong_path = document.clone();

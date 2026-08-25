@@ -251,12 +251,14 @@ local pre-send identity projection; raw provider rows are always discarded.
 The Maildesk reply-subdomain ingress adapter resolves the nearest exact active
 parent zone, then reads the Email Routing DNS settings endpoint with the exact
 reply domain as its `subdomain` query. The returned MX projection must equal
-Cloudflare's canonical three-host set. Cloudflare's current catch-all GET has
-only a parent-zone selector, so the adapter does not call it or infer its result
-as subdomain proof; it returns a typed body-free Worker-rule capability gap.
-Only a future provider contract with a conclusive subdomain selector may close
-that plane. The adapter discards all zone IDs, DNS records, and provider errors
-before evidence persistence. Profile and account remain in
+Cloudflare's canonical three-host set. The adapter then consumes cfctl's fully
+paginated account Email Routing rule projection. Each provider rule's domain
+and parent-zone identities are hashed before they leave the provider adapter;
+raw matcher values and non-Worker action values never cross the boundary. One
+enabled rule must bind the exact reply-domain hash and parent-zone hash to one
+`all` matcher and one exact Worker action. The zone-only catch-all GET is never
+used as subdomain evidence. The adapter discards all zone IDs, DNS records, and
+provider errors before evidence persistence. Profile and account remain in
 the outer call envelope, while credential generation remains bound by the
 operational-proof record; the closed Maildesk result exposes only the two
 public identity hashes and typed configuration states.

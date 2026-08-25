@@ -481,18 +481,19 @@ is also workspace-owned and non-mutating. It accepts only `account_id`,
 `reply_domain`, and `worker_script_name`. cfctl resolves the nearest exact active
 parent zone in the selected account and reads
 `/zones/{zone_id}/email/routing/dns` with the exact reply domain in the
-`subdomain` query. Cloudflare's current catch-all read is scoped only by parent
-zone: it has no subdomain selector. cfctl therefore never treats the parent
-zone's catch-all as proof of the reply-subdomain Worker target and returns a
-typed `subdomain_worker_rule_read_unsupported` blocker after reducing the DNS
-read. A closed success becomes possible only if a provider contract exposes a
-conclusive subdomain-scoped Worker-rule read. The eventual closed
+`subdomain` query. It then enumerates the complete account Email Routing rule
+inventory through `GET /accounts/{account_id}/email/routing/rules`. The typed
+projection hashes each rule's domain and parent-zone identities, retains only
+validated Worker action targets, and discards raw rule values. Exactly one
+enabled rule whose domain hash matches the reply subdomain, whose parent hash
+matches the resolved zone, whose sole matcher is `all`, and whose sole action
+targets the selected Worker closes the routing plane. The closed
 `workspace_reply_subdomain_ingress_v1` projection: hashed reply-domain and
 Worker identities, typed `ok`, `drift`, or `missing` DNS and routing states,
 and explicit `provider_output_retained:false` and `body_returned:false`.
-A separate reply-domain zone, the parent-zone catch-all, a generic routing-rule
-list, incomplete pagination, ambiguous zones, or a merely similar Worker never
-satisfy the contract.
+A separate reply-domain zone, the parent-zone catch-all, incomplete account
+pagination, ambiguous exact rules, or a merely similar Worker never satisfy
+the contract.
 
 The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry

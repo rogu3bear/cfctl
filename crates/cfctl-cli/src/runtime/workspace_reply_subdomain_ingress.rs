@@ -14,8 +14,8 @@ const ZONE_LIST_PATH: &str = "/zones";
 const ZONE_LIST_ID: &str = "zones-get";
 const SUBDOMAIN_DNS_ID: &str = "email-routing-settings-email-routing-dns-settings";
 const SUBDOMAIN_DNS_PATH: &str = "/zones/{zone_id}/email/routing/dns";
-const CATCH_ALL_ID: &str = "email-routing-routing-rules-get-catch-all-rule";
-const CATCH_ALL_PATH: &str = "/zones/{zone_id}/email/routing/rules/catch_all";
+const ACCOUNT_RULES_ID: &str = cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID;
+const ACCOUNT_RULES_PATH: &str = cfctl_core::EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH;
 const CANONICAL_MX: [&str; 3] = [
     "route1.mx.cloudflare.net",
     "route2.mx.cloudflare.net",
@@ -82,6 +82,7 @@ pub(super) fn receipt_is_complete(receipt: &Value) -> bool {
 
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "profile, account, credential generation, catalog, credential, and workspace contract stay explicit at the composed provider-read boundary"
 )]
 pub(super) async fn read(
@@ -119,8 +120,8 @@ pub(super) async fn read(
     let target = target(input, account_id)?;
     let zone_capability = exact_zone_list_capability(catalog)?;
     let dns_capability = exact_capability(catalog, SUBDOMAIN_DNS_ID, SUBDOMAIN_DNS_PATH)?;
-    let catch_all_capability = exact_capability(catalog, CATCH_ALL_ID, CATCH_ALL_PATH)?;
-    validate_provider_contracts(zone_capability, dns_capability, catch_all_capability)?;
+    let account_rules_capability = exact_capability(catalog, ACCOUNT_RULES_ID, ACCOUNT_RULES_PATH)?;
+    validate_provider_contracts(zone_capability, dns_capability, account_rules_capability)?;
 
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
     let mut zone_id = None;
@@ -187,8 +188,29 @@ pub(super) async fn read(
         Ok(state) => state,
         Err(receipt) => return Ok(receipt),
     };
-    debug_assert!(!subdomain_rule_read_supported(catch_all_capability));
-    Ok(unsupported_rule(&target, dns_state))
+    let Ok(account_rules) = executor
+        .execute_read(
+            account_rules_capability,
+            &CallInput {
+                selectors: json!({"account_id":target.account_id}),
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await
+    else {
+        return Ok(failure(
+            "account_rules_read_failed",
+            "routing_rule",
+            true,
+            None,
+        ));
+    };
+    let routing_state = match project_account_rules(&account_rules, &target, &zone_id) {
+        Ok(state) => state,
+        Err(receipt) => return Ok(receipt),
+    };
+    Ok(success(&target, dns_state, routing_state))
 }
 
 #[derive(Debug)]
@@ -387,31 +409,122 @@ fn parent_zone_candidates(reply_domain: &str) -> Vec<String> {
         .collect()
 }
 
-fn subdomain_rule_read_supported(capability: &CapabilityV1) -> bool {
-    capability.method == "GET"
-        && capability.path == CATCH_ALL_PATH
-        && capability.selectors.iter().any(|selector| {
-            selector.name == "subdomain" && selector.location == "query" && selector.required
-        })
-}
-
-fn unsupported_rule(target: &Target, dns: &str) -> Value {
+fn success(target: &Target, dns: &str, routing_rule: &str) -> Value {
     json!({
         "adapter":cfctl_workspace::MAILDESK_REPLY_SUBDOMAIN_INGRESS_PROJECTION,
-        "success":false,
+        "success":true,
         "boundary_crossed":true,
         "schema_version":1,
-        "status":"subdomain_worker_rule_read_unsupported",
-        "stage":"routing_rule",
         "reply_domain_sha256":sha256(target.reply_domain.as_bytes()),
         "worker_target_sha256":sha256(target.worker_script_name.as_bytes()),
-        "dns_scope":"exact_reply_subdomain_dns_settings",
-        "routing_scope":"subdomain_scoped_worker_rule_unavailable",
+        "dns_scope":"exact_reply_subdomain",
+        "routing_scope":"exact_reply_subdomain_catch_all_to_worker",
         "dns":dns,
-        "routing_rule":"unproved",
+        "routing_rule":routing_rule,
         "provider_output_retained":false,
         "body_returned":false,
     })
+}
+
+fn project_account_rules(
+    response: &CloudflareResponseV1,
+    target: &Target,
+    parent_zone_id: &str,
+) -> std::result::Result<&'static str, Value> {
+    if !response.success || response.status != 200 || !response.errors.is_empty() {
+        return Err(failure(
+            "account_rules_read_incomplete",
+            "routing_rule",
+            true,
+            None,
+        ));
+    }
+    let projection: cfctl_core::EmailRoutingRuleSetV1 =
+        serde_json::from_value(response.result.clone()).map_err(|_| {
+            failure(
+                "account_rules_projection_malformed",
+                "routing_rule",
+                true,
+                None,
+            )
+        })?;
+    let info_complete = response.result_info.as_ref().is_some_and(|info| {
+        info.get("page").and_then(Value::as_u64) == Some(1)
+            && info.get("per_page").and_then(Value::as_u64) == Some(projection.page_size)
+            && info.get("total_pages").and_then(Value::as_u64) == Some(projection.pages)
+            && info.get("total_count").and_then(Value::as_u64) == Some(projection.rule_count as u64)
+            && info
+                .get("cfctl_page_probe_complete")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && info.get("cfctl_projection").and_then(Value::as_str)
+                == Some("email_routing_account_rule_set_v1")
+    });
+    if projection.schema_version != 1
+        || !projection.complete
+        || !(1..=cfctl_core::EMAIL_ROUTING_RULES_PAGE_SIZE).contains(&projection.page_size)
+        || projection.pages == 0
+        || projection.rule_count != projection.rules.len()
+        || !info_complete
+        || projection.rules.iter().any(|rule| {
+            rule.zone_name_sha256
+                .as_deref()
+                .is_none_or(|hash| !is_sha256(hash))
+                || rule
+                    .zone_tag_sha256
+                    .as_deref()
+                    .is_none_or(|hash| !is_sha256(hash))
+        })
+    {
+        return Err(failure(
+            "account_rules_projection_malformed",
+            "routing_rule",
+            true,
+            None,
+        ));
+    }
+    let domain_hash = sha256(target.reply_domain.as_bytes());
+    let parent_zone_hash = sha256(parent_zone_id.as_bytes());
+    let domain_rules = projection
+        .rules
+        .iter()
+        .filter(|rule| rule.zone_name_sha256.as_deref() == Some(domain_hash.as_str()))
+        .collect::<Vec<_>>();
+    if domain_rules.is_empty() {
+        return Ok("missing");
+    }
+    let all_matcher_candidates = domain_rules
+        .iter()
+        .filter(|rule| {
+            rule.enabled
+                && rule.zone_tag_sha256.as_deref() == Some(parent_zone_hash.as_str())
+                && rule.matchers.len() == 1
+                && rule.matchers[0].matcher_type == "all"
+                && rule.matchers[0].field.is_none()
+                && rule.matchers[0].value_sha256.is_none()
+        })
+        .collect::<Vec<_>>();
+    match all_matcher_candidates.len() {
+        0 => Ok("drift"),
+        1 => {
+            let candidate = all_matcher_candidates[0];
+            if candidate.actions.len() == 1
+                && candidate.actions[0].action_type == "worker"
+                && candidate.actions[0].value_count == 1
+                && candidate.actions[0].worker_targets == [target.worker_script_name.as_str()]
+            {
+                Ok("ok")
+            } else {
+                Ok("drift")
+            }
+        }
+        count => Err(failure(
+            "account_rules_cardinality_ambiguous",
+            "routing_rule",
+            true,
+            Some(count),
+        )),
+    }
 }
 
 fn failure(status: &str, stage: &str, boundary_crossed: bool, match_count: Option<usize>) -> Value {
@@ -472,7 +585,7 @@ fn exact_capability<'a>(
 fn validate_provider_contracts(
     zone: &CapabilityV1,
     dns: &CapabilityV1,
-    catch_all: &CapabilityV1,
+    account_rules: &CapabilityV1,
 ) -> Result<()> {
     let common = |capability: &CapabilityV1| {
         !capability.mutating
@@ -511,20 +624,20 @@ fn validate_provider_contracts(
             .any(|permission| permission == "Zone Settings Read")
         && selector(dns, "zone_id", "path")
         && selector(dns, "subdomain", "query");
-    let catch_all_ok = common(catch_all)
-        && catch_all.id == CATCH_ALL_ID
-        && catch_all
+    let account_rules_ok = common(account_rules)
+        && account_rules.id == ACCOUNT_RULES_ID
+        && account_rules.path == ACCOUNT_RULES_PATH
+        && account_rules
             .permissions
             .iter()
             .any(|permission| permission == "Email Routing Rules Read")
-        && selector(catch_all, "zone_id", "path")
-        && !catch_all
-            .selectors
+        && selector(account_rules, "account_id", "path")
+        && ["page", "per_page"]
             .iter()
-            .any(|selector| selector.name == "subdomain");
-    if !zone_ok || !dns_ok || !catch_all_ok {
+            .all(|name| selector(account_rules, name, "query"));
+    if !zone_ok || !dns_ok || !account_rules_ok {
         return Err(CliError::Input(
-            "reply-subdomain ingress parent-zone, subdomain DNS, or zone-only catch-all source contract drifted"
+            "reply-subdomain ingress parent-zone, subdomain DNS, or account-rule inventory source contract drifted"
                 .to_owned(),
         ));
     }
@@ -632,10 +745,8 @@ mod tests {
             project_subdomain_dns(&dns, &target.reply_domain).expect("dns"),
             "ok"
         );
-        let receipt = unsupported_rule(&target, "ok");
-        assert!(!receipt_is_complete(&receipt));
-        assert_eq!(receipt["status"], "subdomain_worker_rule_read_unsupported");
-        assert_eq!(receipt["routing_rule"], "unproved");
+        let receipt = success(&target, "ok", "ok");
+        assert!(receipt_is_complete(&receipt));
         let serialized = serde_json::to_string(&receipt).expect("receipt");
         assert!(!serialized.contains("reply.example.com"));
         assert!(!serialized.contains("maildesk-relay-router"));
@@ -690,8 +801,8 @@ mod tests {
             project_subdomain_dns(&dns, &target.reply_domain).expect("dns"),
             "drift"
         );
-        let receipt = unsupported_rule(&target, "drift");
-        assert!(!receipt_is_complete(&receipt));
+        let receipt = success(&target, "drift", "ok");
+        assert!(receipt_is_complete(&receipt));
         assert!(
             !serde_json::to_string(&receipt)
                 .expect("receipt")
@@ -801,45 +912,148 @@ mod tests {
             &["Zone Settings Read"],
             &[("zone_id", "path"), ("subdomain", "query")],
         );
-        let catch_all = provider_capability(
-            CATCH_ALL_ID,
-            CATCH_ALL_PATH,
+        let account_rules = provider_capability(
+            ACCOUNT_RULES_ID,
+            ACCOUNT_RULES_PATH,
             &["Email Routing Rules Read"],
-            &[("zone_id", "path")],
+            &[
+                ("account_id", "path"),
+                ("page", "query"),
+                ("per_page", "query"),
+            ],
         );
-        assert!(validate_provider_contracts(&zone, &dns, &catch_all).is_ok());
+        assert!(validate_provider_contracts(&zone, &dns, &account_rules).is_ok());
         dns.permissions.clear();
-        assert!(validate_provider_contracts(&zone, &dns, &catch_all).is_err());
+        assert!(validate_provider_contracts(&zone, &dns, &account_rules).is_err());
         zone.permissions.clear();
         dns.permissions.push("Zone Settings Read".to_owned());
-        assert!(validate_provider_contracts(&zone, &dns, &catch_all).is_err());
+        assert!(validate_provider_contracts(&zone, &dns, &account_rules).is_err());
     }
 
     #[test]
-    fn parent_candidates_exclude_reply_domain_and_zone_only_catch_all_is_unsupported() {
+    fn parent_candidates_exclude_reply_domain() {
         assert_eq!(
             parent_zone_candidates("reply.mail.example.com"),
             ["mail.example.com", "example.com"]
         );
-        let mut catch_all = CapabilityV1::new(CATCH_ALL_ID, "catch all", "GET", CATCH_ALL_PATH);
-        catch_all.selectors.push(cfctl_core::SelectorV1 {
-            name: "zone_id".to_owned(),
-            location: "path".to_owned(),
-            required: true,
-            value_type: "string".to_owned(),
-            description: None,
-            contract: None,
+    }
+
+    #[test]
+    fn account_rule_projection_exactly_binds_subdomain_parent_zone_and_worker() {
+        let target = target();
+        let account_rules = CloudflareResponseV1 {
+            result: json!({
+                "schema_version":1,
+                "complete":true,
+                "page_size":50,
+                "pages":2,
+                "rule_count":1,
+                "rules":[{
+                    "rule_identifier":"rule-001",
+                    "enabled":true,
+                    "zone_name_sha256":sha256(target.reply_domain.as_bytes()),
+                    "zone_tag_sha256":sha256(b"private-zone"),
+                    "matchers":[{"matcher_type":"all"}],
+                    "actions":[{
+                        "action_type":"worker",
+                        "worker_targets":["maildesk-relay-router"],
+                        "value_count":1
+                    }]
+                }]
+            }),
+            result_info: Some(json!({
+                "page":1,
+                "per_page":50,
+                "total_pages":2,
+                "total_count":1,
+                "cfctl_page_probe_complete":true,
+                "cfctl_projection":"email_routing_account_rule_set_v1"
+            })),
+            ..response(Value::Null, 0)
+        };
+        assert_eq!(
+            project_account_rules(&account_rules, &target, "private-zone").expect("rules"),
+            "ok"
+        );
+        let serialized =
+            serde_json::to_string(&success(&target, "ok", "ok")).expect("body-free receipt");
+        assert!(!serialized.contains("reply.example.com"));
+        assert!(!serialized.contains("private-zone"));
+    }
+
+    #[test]
+    fn account_rule_projection_distinguishes_missing_drift_and_ambiguous_cardinality() {
+        let target = target();
+        let rule = json!({
+            "rule_identifier":"rule-001",
+            "enabled":true,
+            "zone_name_sha256":sha256(target.reply_domain.as_bytes()),
+            "zone_tag_sha256":sha256(b"private-zone"),
+            "matchers":[{"matcher_type":"all"}],
+            "actions":[{
+                "action_type":"worker",
+                "worker_targets":["maildesk-relay-router"],
+                "value_count":1
+            }]
         });
-        assert!(!subdomain_rule_read_supported(&catch_all));
-        catch_all.selectors.push(cfctl_core::SelectorV1 {
-            name: "subdomain".to_owned(),
-            location: "query".to_owned(),
-            required: true,
-            value_type: "string".to_owned(),
-            description: None,
-            contract: None,
-        });
-        assert!(subdomain_rule_read_supported(&catch_all));
+        let projected = |rules: Vec<Value>| {
+            let count = rules.len();
+            CloudflareResponseV1 {
+                result: json!({
+                    "schema_version":1,
+                    "complete":true,
+                    "page_size":50,
+                    "pages":2,
+                    "rule_count":count,
+                    "rules":rules
+                }),
+                result_info: Some(json!({
+                    "page":1,
+                    "per_page":50,
+                    "total_pages":2,
+                    "total_count":count,
+                    "cfctl_page_probe_complete":true,
+                    "cfctl_projection":"email_routing_account_rule_set_v1"
+                })),
+                ..response(Value::Null, 0)
+            }
+        };
+        assert_eq!(
+            project_account_rules(&projected(Vec::new()), &target, "private-zone")
+                .expect("complete absence"),
+            "missing"
+        );
+        let mut wrong_worker = rule.clone();
+        wrong_worker["actions"][0]["worker_targets"] = json!(["another-worker"]);
+        assert_eq!(
+            project_account_rules(&projected(vec![wrong_worker]), &target, "private-zone")
+                .expect("typed drift"),
+            "drift"
+        );
+        let ambiguous = project_account_rules(
+            &projected(vec![rule.clone(), rule.clone()]),
+            &target,
+            "private-zone",
+        )
+        .expect_err("duplicate exact rule is ambiguous");
+        assert_eq!(ambiguous["status"], "account_rules_cardinality_ambiguous");
+        assert_eq!(ambiguous["match_count"], 2);
+        let mut wrong_worker = rule.clone();
+        wrong_worker["actions"][0]["worker_targets"] = json!(["another-worker"]);
+        let mixed_target = project_account_rules(
+            &projected(vec![rule, wrong_worker]),
+            &target,
+            "private-zone",
+        )
+        .expect_err("two enabled all-matcher rules are ambiguous before target selection");
+        assert_eq!(
+            mixed_target["status"],
+            "account_rules_cardinality_ambiguous"
+        );
+        assert_eq!(mixed_target["match_count"], 2);
+        let serialized = serde_json::to_string(&ambiguous).expect("body-free ambiguity");
+        assert!(!serialized.contains("reply.example.com"));
+        assert!(!serialized.contains("maildesk-relay-router"));
     }
 
     fn provider_capability(

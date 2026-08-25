@@ -17,13 +17,14 @@ use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
     D1ApprovedMlnImportContractV1, D1FullExportContractV1, D1RestoreExactBookmarkContractV1,
-    D1SchemaIntrospectionContractV1, EMAIL_ROUTING_RULES_MAX_PAGES, EMAIL_ROUTING_RULES_PAGE_SIZE,
-    EmailRoutingRuleDiagnosticV1, GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1,
-    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
-    R2PrivateObjectDigestV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1,
-    SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
-    is_email_routing_rules_list_capability, normalize_email_routing_rule_set,
-    request_header_is_reserved,
+    D1SchemaIntrospectionContractV1, EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID,
+    EMAIL_ROUTING_RULES_MAX_PAGES, EMAIL_ROUTING_RULES_PAGE_SIZE, EmailRoutingRuleDiagnosticV1,
+    GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
+    PlanStatus, PlanV1, R2LogRetrievalContractV1, R2PrivateObjectDigestV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1, TimestampFormatV1,
+    TransactionStageV1, hash_value, is_email_routing_rules_list_capability,
+    normalize_email_routing_account_rule_set_with_page_size,
+    normalize_email_routing_rule_set_with_page_size, request_header_is_reserved,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
@@ -2661,6 +2662,7 @@ pub struct CloudflareResponseV1 {
 fn email_routing_rules_rejected_response(
     mut response: CloudflareResponseV1,
     diagnostic: EmailRoutingRuleDiagnosticV1,
+    account_scoped: bool,
 ) -> CloudflareResponseV1 {
     response.success = false;
     response.result = serde_json::json!({
@@ -2669,7 +2671,11 @@ fn email_routing_rules_rejected_response(
         "diagnostic": diagnostic,
     });
     response.result_info = Some(serde_json::json!({
-        "cfctl_projection": "email_routing_rule_set_v1",
+        "cfctl_projection": if account_scoped {
+            "email_routing_account_rule_set_v1"
+        } else {
+            "email_routing_rule_set_v1"
+        },
         "cfctl_page_probe_complete": false,
     }));
     response.errors = vec![CloudflareApiErrorV1 {
@@ -2909,7 +2915,11 @@ impl Executor {
         let request = self.builder.build(capability, input)?;
         if is_email_routing_rules_list_capability(capability) {
             return self
-                .execute_email_routing_rules_read(&request, credential)
+                .execute_email_routing_rules_read(
+                    &request,
+                    credential,
+                    capability.id == EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID,
+                )
                 .await;
         }
         if is_r2_buckets_list_capability(capability) {
@@ -3155,13 +3165,22 @@ impl Executor {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the bounded pagination state machine keeps every provider response check adjacent to the one read boundary"
+    )]
     async fn execute_email_routing_rules_read(
         &self,
         request: &PreparedRequest,
         credential: &AuthCredential,
+        account_scoped: bool,
     ) -> Result<CloudflareResponseV1> {
         let mut combined = Vec::new();
         let mut base_response = None;
+        let mut metadata_present = None;
+        let mut expected_total_pages = None;
+        let mut expected_total_count = None;
+        let mut expected_page_size = None;
         for page in 1..=EMAIL_ROUTING_RULES_MAX_PAGES {
             let mut page_request = request.clone();
             set_query_parameter(&mut page_request.url, "page", &page.to_string());
@@ -3179,6 +3198,7 @@ impl Executor {
                         None,
                         "provider_response",
                     ),
+                    account_scoped,
                 ));
             }
             if !response.errors.is_empty() {
@@ -3189,12 +3209,14 @@ impl Executor {
                         None,
                         "provider_response",
                     ),
+                    account_scoped,
                 ));
             }
             let Some(page_rules) = response.result.as_array() else {
                 return Ok(email_routing_rules_rejected_response(
                     response,
                     EmailRoutingRuleDiagnosticV1::new("rules_not_array", None, "rules"),
+                    account_scoped,
                 ));
             };
             if page_rules.len()
@@ -3203,32 +3225,154 @@ impl Executor {
                 return Ok(email_routing_rules_rejected_response(
                     response,
                     EmailRoutingRuleDiagnosticV1::new("page_bound_exceeded", None, "pagination"),
+                    account_scoped,
                 ));
             }
+            let pagination = if let Some(info) = response.result_info.as_ref() {
+                if metadata_present == Some(false) {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                let Ok(Some(pagination)) = page_pagination(Some(info)) else {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                };
+                let Some(returned_page_size) = pagination.per_page else {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                };
+                if validate_page_item_count(&response, pagination).is_err()
+                    || pagination.current_page != page
+                    || returned_page_size > EMAIL_ROUTING_RULES_PAGE_SIZE
+                    || pagination.total_pages > EMAIL_ROUTING_RULES_MAX_PAGES
+                    || expected_page_size.is_some_and(|expected| expected != returned_page_size)
+                    || expected_total_pages
+                        .is_some_and(|expected| expected != pagination.total_pages)
+                    || expected_total_count
+                        .is_some_and(|expected| Some(expected) != pagination.total_count)
+                {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_invalid",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                metadata_present = Some(true);
+                expected_page_size = Some(returned_page_size);
+                expected_total_pages = Some(pagination.total_pages);
+                expected_total_count = pagination.total_count;
+                Some(pagination)
+            } else {
+                if metadata_present == Some(true) {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_metadata_missing",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                metadata_present = Some(false);
+                None
+            };
             if base_response.is_none() {
                 base_response = Some(response.clone());
             }
-            if page_rules.is_empty() {
-                let projection =
-                    match normalize_email_routing_rule_set(&Value::Array(combined), page) {
-                        Ok(projection) => projection,
-                        Err(diagnostic) => {
-                            return Ok(email_routing_rules_rejected_response(response, diagnostic));
-                        }
-                    };
+            let metadata_complete = pagination
+                .is_some_and(|pagination| pagination.current_page == pagination.total_pages);
+            if pagination.is_some_and(|pagination| {
+                page_rules.is_empty() && pagination.current_page < pagination.total_pages
+            }) {
+                return Ok(email_routing_rules_rejected_response(
+                    response,
+                    EmailRoutingRuleDiagnosticV1::new(
+                        "pagination_page_incomplete",
+                        None,
+                        "pagination",
+                    ),
+                    account_scoped,
+                ));
+            }
+            if !page_rules.is_empty() {
+                combined.extend(page_rules.iter().cloned());
+            }
+            if metadata_complete || (pagination.is_none() && page_rules.is_empty()) {
+                if expected_total_count.is_some_and(|expected| expected != combined.len() as u64) {
+                    return Ok(email_routing_rules_rejected_response(
+                        response,
+                        EmailRoutingRuleDiagnosticV1::new(
+                            "pagination_total_count_mismatch",
+                            None,
+                            "pagination",
+                        ),
+                        account_scoped,
+                    ));
+                }
+                let projection = match if account_scoped {
+                    normalize_email_routing_account_rule_set_with_page_size(
+                        &Value::Array(combined),
+                        page,
+                        expected_page_size.unwrap_or(EMAIL_ROUTING_RULES_PAGE_SIZE),
+                    )
+                } else {
+                    normalize_email_routing_rule_set_with_page_size(
+                        &Value::Array(combined),
+                        page,
+                        expected_page_size.unwrap_or(EMAIL_ROUTING_RULES_PAGE_SIZE),
+                    )
+                } {
+                    Ok(projection) => projection,
+                    Err(diagnostic) => {
+                        return Ok(email_routing_rules_rejected_response(
+                            response,
+                            diagnostic,
+                            account_scoped,
+                        ));
+                    }
+                };
                 let mut completed = base_response.unwrap_or(response);
                 completed.result = serde_json::to_value(&projection)?;
                 completed.result_info = Some(serde_json::json!({
                     "page": 1,
-                    "per_page": EMAIL_ROUTING_RULES_PAGE_SIZE,
+                    "per_page": projection.page_size,
                     "total_pages": page,
                     "total_count": projection.rule_count,
                     "cfctl_page_probe_complete": true,
-                    "cfctl_projection": "email_routing_rule_set_v1",
+                    "cfctl_projection": if account_scoped {
+                        "email_routing_account_rule_set_v1"
+                    } else {
+                        "email_routing_rule_set_v1"
+                    },
                 }));
                 return Ok(completed);
             }
-            combined.extend(page_rules.iter().cloned());
         }
         Ok(email_routing_rules_rejected_response(
             base_response.unwrap_or(CloudflareResponseV1 {
@@ -3241,6 +3385,7 @@ impl Executor {
                 cf_ray: None,
             }),
             EmailRoutingRuleDiagnosticV1::new("page_bound_exceeded", None, "pagination"),
+            account_scoped,
         ))
     }
 
@@ -8903,6 +9048,7 @@ fn add_conditional_header(
 struct PagePagination {
     current_page: u64,
     total_pages: u64,
+    per_page: Option<u64>,
     count: Option<u64>,
     total_count: Option<u64>,
 }
@@ -8966,6 +9112,7 @@ fn page_pagination(result_info: Option<&Value>) -> Result<Option<PagePagination>
     Ok(Some(PagePagination {
         current_page: current,
         total_pages,
+        per_page,
         count,
         total_count,
     }))

@@ -80,7 +80,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
         "workspace maildesk reply-subdomain ingress",
     );
     capability.description = Some(
-        "Proves exact reply-subdomain DNS under its authoritative parent zone and fails closed until Cloudflare exposes a conclusive subdomain-scoped Worker-rule read."
+        "Proves exact reply-subdomain DNS and one exact all-matcher Worker rule through Cloudflare's complete body-free account rule inventory."
             .to_owned(),
     );
     capability.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
@@ -98,7 +98,11 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
             contract: None,
         })
         .collect();
-    capability.permissions = vec!["Zone Zone Read".to_owned(), "Zone Settings Read".to_owned()];
+    capability.permissions = vec![
+        "Zone Zone Read".to_owned(),
+        "Zone Settings Read".to_owned(),
+        "Email Routing Rules Read".to_owned(),
+    ];
     capability.mutating = false;
     capability.risk = RiskClass::Read;
     capability.effect = EffectClass::ReadOnly;
@@ -106,7 +110,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
     capability.entitlement = EntitlementV1 {
         available: Some(true),
         source: Some(
-            "workspace source requires exact parent-zone and Email Routing subdomain-DNS reads; Worker routing remains unavailable until a subdomain-scoped read exists"
+            "workspace source requires exact parent-zone and subdomain-DNS reads plus complete account Email Routing rule inventory"
                 .to_owned(),
         ),
         ..EntitlementV1::default()
@@ -115,7 +119,10 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
         incremental: false,
         currency: None,
         maximum: None,
-        basis: Some("bounded parent-zone resolution and one exact subdomain-DNS read".to_owned()),
+        basis: Some(
+            "bounded parent-zone resolution, one exact subdomain-DNS read, and complete account rule pagination"
+                .to_owned(),
+        ),
         known: true,
         billing_model: BillingModelV1::None,
         exposure: CostExposureV1::None,
@@ -267,7 +274,11 @@ mod tests {
         .expect("capability");
         assert_eq!(
             capability.permissions,
-            ["Zone Zone Read", "Zone Settings Read"]
+            [
+                "Zone Zone Read",
+                "Zone Settings Read",
+                "Email Routing Rules Read"
+            ]
         );
         assert!(!capability.mutating);
         assert_eq!(capability.effect, EffectClass::ReadOnly);
