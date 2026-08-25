@@ -2765,7 +2765,71 @@ impl Executor {
                 .execute_email_routing_rules_read(&request, credential)
                 .await;
         }
+        if is_r2_buckets_list_capability(capability) {
+            return self
+                .execute_r2_buckets_list_read(&request, credential)
+                .await;
+        }
         self.send_paginated(&request, credential).await
+    }
+
+    async fn execute_r2_buckets_list_read(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        let mut combined = self.send(request, credential).await?;
+        if !combined.success {
+            return Ok(combined);
+        }
+        let mut next_cursor = direct_cursor_after(combined.result_info.as_ref())?;
+        let status = combined.status;
+        let Some(buckets) = combined
+            .result
+            .as_object_mut()
+            .and_then(|result| result.get_mut("buckets"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(CloudflareError::InvalidResponseEnvelope { status });
+        };
+        let mut observed = BTreeSet::new();
+        let mut pages = 1_u64;
+        while let Some(cursor) = next_cursor {
+            if pages >= 1_000 {
+                return Err(CloudflareError::PaginationLimit(pages + 1));
+            }
+            if !observed.insert(cursor.clone()) {
+                return Err(CloudflareError::PaginationCursorLoop);
+            }
+            let mut page_request = request.clone();
+            set_query_parameter(&mut page_request.url, "cursor", &cursor);
+            let response = self.send(&page_request, credential).await?;
+            if !response.success {
+                return Ok(response);
+            }
+            let Some(page_buckets) = response
+                .result
+                .as_object()
+                .and_then(|result| result.get("buckets"))
+                .and_then(Value::as_array)
+            else {
+                return Err(CloudflareError::InvalidResponseEnvelope {
+                    status: response.status,
+                });
+            };
+            buckets.extend(page_buckets.iter().cloned());
+            pages += 1;
+            next_cursor = direct_cursor_after(response.result_info.as_ref())?;
+            combined.etag = response.etag;
+            combined.cf_ray = response.cf_ray;
+        }
+        combined.result_info = Some(serde_json::json!({
+            "cursor": "",
+            "count": buckets.len(),
+            "cfctl_cursor_complete": true,
+            "cfctl_pages": pages,
+        }));
+        Ok(combined)
     }
 
     /// Streams one exact private R2 object into an in-memory digest state. The
@@ -8769,6 +8833,31 @@ fn validate_page_item_count(
 
 fn request_expects_page_pagination(request: &PreparedRequest) -> bool {
     request.url.query_pairs().any(|(name, _)| name == "page")
+}
+
+fn is_r2_buckets_list_capability(capability: &CapabilityV1) -> bool {
+    capability.id == "r2-list-buckets"
+        && capability.method == "GET"
+        && capability.path == "/accounts/{account_id}/r2/buckets"
+        && !capability.mutating
+}
+
+fn direct_cursor_after(result_info: Option<&Value>) -> Result<Option<String>> {
+    let Some(result_info) = result_info else {
+        return Ok(None);
+    };
+    let Some(info) = result_info.as_object() else {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    };
+    if info.contains_key("cursors") {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    match info.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor)) if cursor.is_empty() => Ok(None),
+        Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
+        Some(_) => Err(CloudflareError::PaginationMetadataInvalid),
+    }
 }
 
 enum CursorState {

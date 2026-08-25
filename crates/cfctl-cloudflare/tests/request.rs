@@ -4931,6 +4931,127 @@ async fn executor_rejects_an_incoherent_later_page() {
     assert_eq!(server.await.expect("server joins").len(), 2);
 }
 
+fn r2_buckets_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "r2-list-buckets",
+        "List R2 buckets",
+        "GET",
+        "/accounts/{account_id}/r2/buckets",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "cursor".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "per_page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability
+}
+
+async fn execute_r2_buckets_read(address: &str) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &r2_buckets_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            query: json!({"per_page":1000}),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn r2_bucket_inventory_normalizes_an_omitted_terminal_cursor() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"buckets":[{"name":"bucket-1"}]},"errors":[]}"#,
+    ])
+    .await;
+    let response = execute_r2_buckets_read(&address)
+        .await
+        .expect("terminal bucket inventory");
+
+    assert_eq!(response.result["buckets"], json!([{"name":"bucket-1"}]));
+    let info = response.result_info.expect("normalized cursor proof");
+    assert_eq!(info["cursor"], json!(""));
+    assert_eq!(info["count"], json!(1));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_cursor_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn r2_bucket_inventory_collects_every_direct_cursor_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"buckets":[{"name":"bucket-1"}]},"errors":[],"result_info":{"cursor":"next-1","per_page":1}}"#,
+        r#"{"success":true,"result":{"buckets":[{"name":"bucket-2"}]},"errors":[]}"#,
+    ])
+    .await;
+    let response = execute_r2_buckets_read(&address)
+        .await
+        .expect("complete bucket inventory");
+
+    assert_eq!(
+        response.result["buckets"],
+        json!([{"name":"bucket-1"},{"name":"bucket-2"}])
+    );
+    let info = response.result_info.expect("normalized cursor proof");
+    assert_eq!(info["cursor"], json!(""));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["cfctl_pages"], json!(2));
+    assert_eq!(info["cfctl_cursor_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("cursor=next-1"));
+}
+
+#[tokio::test]
+async fn r2_bucket_inventory_rejects_malformed_or_repeated_cursors() {
+    for bodies in [
+        vec![r#"{"success":true,"result":{"buckets":[]},"errors":[],"result_info":{"cursor":7}}"#],
+        vec![
+            r#"{"success":true,"result":{"buckets":[]},"errors":[],"result_info":{"cursor":"next-1"}}"#,
+            r#"{"success":true,"result":{"buckets":[]},"errors":[],"result_info":{"cursor":"next-1"}}"#,
+        ],
+    ] {
+        let (address, server) = json_response_sequence_server(bodies).await;
+        let error = execute_r2_buckets_read(&address)
+            .await
+            .expect_err("cursor ambiguity cannot prove complete inventory");
+        assert!(matches!(
+            error,
+            CloudflareError::PaginationMetadataInvalid | CloudflareError::PaginationCursorLoop
+        ));
+        server.await.expect("server joins");
+    }
+}
+
 #[tokio::test]
 async fn email_routing_rules_read_returns_one_bounded_typed_projection() {
     let (address, server) = json_response_sequence_server(vec![
