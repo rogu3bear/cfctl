@@ -376,7 +376,7 @@ fn private_d1_identity_overlay(
     normalize_private_d1_identity(&mut normalized, &template_snapshot.document)?;
     if normalized != template_snapshot.document {
         return Err(CliError::Input(
-            "private Worker production config differs from its tracked role template outside canonical D1 database IDs"
+            "private Worker production config differs from its tracked role template outside canonical D1 identity, sender restriction, and split relay activation fields"
                 .to_owned(),
         ));
     }
@@ -461,6 +461,40 @@ fn normalize_private_d1_identity(production: &mut Value, template: &Value) -> Re
         database["database_id"] = template_id;
     }
     normalize_private_sender_identity(production, template)?;
+    normalize_private_relay_activation(production, template)?;
+    Ok(())
+}
+
+fn normalize_private_relay_activation(
+    production: &mut Value,
+    template: &Value,
+) -> Result<(), CliError> {
+    let Some(production_vars) = production.get_mut("vars").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let Some(template_vars) = template.get("vars").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for key in ["MAILDESK_INBOUND_RELAY_MODE", "MAILDESK_REPLY_RELAY_MODE"] {
+        let Some(production_mode) = production_vars.get(key) else {
+            continue;
+        };
+        let valid_mode = |value: &Value| matches!(value.as_str(), Some("disabled" | "enabled"));
+        if !valid_mode(production_mode) {
+            return Err(CliError::Input(format!(
+                "private Worker {key} must be disabled or enabled"
+            )));
+        }
+        let template_mode = template_vars
+            .get(key)
+            .filter(|value| valid_mode(value))
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "private Worker {key} has no canonical tracked-template authority"
+                ))
+            })?;
+        production_vars.insert(key.to_owned(), template_mode.clone());
+    }
     Ok(())
 }
 
@@ -1530,7 +1564,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one Git fixture proves private overlay admission, target binding, and execution-time drift rejection"
     )]
-    fn target_accepts_mode_0600_private_config_with_only_d1_identity_overlaid() {
+    fn target_accepts_mode_0600_private_config_with_bounded_runtime_overlays() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().expect("repository root");
@@ -1542,15 +1576,24 @@ mod tests {
         let template_text = r#"name = "relay-router"
 main = "build/worker.js"
 
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+
 [[d1_databases]]
 binding = "MAILDESK_DB"
 database_name = "relay-db"
 database_id = "00000000-0000-4000-8000-000000000000"
 "#;
-        let private_text = template_text.replace(
-            "00000000-0000-4000-8000-000000000000",
-            "11111111-1111-4111-8111-111111111111",
-        );
+        let private_text = template_text
+            .replace(
+                "00000000-0000-4000-8000-000000000000",
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .replace(
+                "MAILDESK_INBOUND_RELAY_MODE = \"disabled\"",
+                "MAILDESK_INBOUND_RELAY_MODE = \"enabled\"",
+            );
         fs::write(&template, template_text).expect("tracked template");
         fs::write(&private, &private_text).expect("private config");
         fs::set_permissions(&private, fs::Permissions::from_mode(0o600))
@@ -1663,7 +1706,7 @@ database_id = "00000000-0000-4000-8000-000000000000"
 
         fs::write(
             &private,
-            format!("{private_text}\n[vars]\nEXTRA = \"forbidden\"\n"),
+            private_text.replace("[vars]\n", "[vars]\nEXTRA = \"forbidden\"\n"),
         )
         .expect("add forbidden private field");
         let forbidden_graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
@@ -1671,7 +1714,9 @@ database_id = "00000000-0000-4000-8000-000000000000"
         let error = prepare_target(&forbidden_graph, &capability, &input)
             .expect_err("private config with extra field must fail")
             .to_string();
-        assert!(error.contains("outside canonical D1 database IDs"));
+        assert!(error.contains(
+            "outside canonical D1 identity, sender restriction, and split relay activation fields"
+        ));
 
         for mode in [0o644, 0o400] {
             fs::write(&private, &private_text).expect("restore private config");
@@ -1687,7 +1732,7 @@ database_id = "00000000-0000-4000-8000-000000000000"
     }
 
     #[test]
-    fn private_config_normalizes_only_canonical_d1_database_ids() {
+    fn private_config_normalizes_only_canonical_d1_ids_and_split_relay_activation() {
         let parse = |text: &str| {
             let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
             serde_json::to_value(document).expect("Wrangler JSON")
@@ -1698,6 +1743,10 @@ main = "build/worker.js"
 
 [observability]
 enabled = true
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
 
 [[d1_databases]]
 binding = "MAILDESK_DB"
@@ -1710,6 +1759,10 @@ main = "build/worker.js"
 
 [observability]
 enabled = true
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "enabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
 
 [[d1_databases]]
 binding = "MAILDESK_DB"
@@ -1745,6 +1798,20 @@ database_id = "11111111-1111-4111-8111-111111111111"
             rejected["d1_databases"][0]["database_id"] = json!(invalid);
             assert!(normalize_private_d1_identity(&mut rejected, &template).is_err());
         }
+
+        for invalid in [json!("preview"), json!(true), Value::Null] {
+            let mut rejected = parse(production_text);
+            rejected["vars"]["MAILDESK_INBOUND_RELAY_MODE"] = invalid;
+            assert!(normalize_private_d1_identity(&mut rejected, &template).is_err());
+        }
+
+        let mut legacy = parse(production_text);
+        legacy["vars"]["MAILDESK_RELAY_PROCESSING_MODE"] = json!("enabled");
+        normalize_private_d1_identity(&mut legacy, &template).expect("normalize allowed fields");
+        assert_ne!(
+            legacy, template,
+            "legacy combined activation must remain forbidden drift"
+        );
     }
 
     #[test]
