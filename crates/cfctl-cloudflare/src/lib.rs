@@ -9059,18 +9059,16 @@ fn normalize_queue_consumers_single_page(response: &mut CloudflareResponseV1) ->
             })
             .transpose()
     };
-    for (field, expected) in [
-        ("page", 1),
-        ("total_pages", 1),
-        ("count", count),
-        ("total_count", count),
+    for (field, expected, reason) in [
+        ("page", 1, "page_one"),
+        ("total_pages", 1, "total_pages_one"),
+        ("count", count, "count_matches_items"),
+        ("total_count", count, "total_count_matches_items"),
     ] {
         if let Some(actual) = metadata_u64(field)?
             && actual != expected
         {
-            return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid {
-                reason: "metadata_value_consistent",
-            });
+            return Err(CloudflareError::QueueConsumersSinglePageMetadataInvalid { reason });
         }
     }
     if let Some(per_page) = metadata_u64("per_page")?
