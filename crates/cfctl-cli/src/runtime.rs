@@ -6462,10 +6462,10 @@ fn set_workspace_reply_subdomain_ingress_verification(
         VerificationState::Failed
     };
     envelope.verification.basis = Some(if receipt_is_complete {
-        "exact active reply-domain zone, complete exact-name MX projection, and dedicated catch-all Worker read were reduced to the closed body-free Maildesk ingress result"
+        "the authoritative parent zone, exact subdomain DNS settings, and a conclusive subdomain-scoped Worker-rule read were reduced to the closed body-free Maildesk ingress result"
             .to_owned()
     } else {
-        "reply-subdomain ingress did not produce one complete body-free zone, exact MX, and dedicated catch-all projection"
+        "reply-subdomain ingress did not produce one complete body-free parent-zone, exact subdomain-DNS, and subdomain-scoped Worker-rule projection"
             .to_owned()
     });
     if !receipt_is_complete {
@@ -6473,7 +6473,7 @@ fn set_workspace_reply_subdomain_ingress_verification(
             code: "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_INGRESS_READ_FAILED".to_owned(),
             message: "the governed reply-subdomain ingress read did not complete".to_owned(),
             next_step: Some(
-                "Preserve the body-free failure receipt and reconcile the exact zone, DNS, or catch-all blocker; do not use parent-zone evidence or a generic routing-rule list."
+                "Preserve the body-free failure receipt. Cloudflare's zone-only catch-all read cannot prove a reply-subdomain Worker target; do not infer it from the parent-zone catch-all or a generic rule list."
                     .to_owned(),
             ),
         });

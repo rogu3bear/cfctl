@@ -478,16 +478,21 @@ and reported without rewriting one to impersonate another.
 
 Maildesk's separately documented `star-maildesk-cf.reply-subdomain-ingress-read`
 is also workspace-owned and non-mutating. It accepts only `account_id`,
-`reply_domain`, and `worker_script_name`. cfctl resolves exactly one active zone
-whose name and account match the reply domain, requests only MX records for
-that exact name with explicit match-all filtering and complete page metadata,
-and reads the dedicated catch-all
-rule for that exact zone. The result is the closed
+`reply_domain`, and `worker_script_name`. cfctl resolves the nearest exact active
+parent zone in the selected account and reads
+`/zones/{zone_id}/email/routing/dns` with the exact reply domain in the
+`subdomain` query. Cloudflare's current catch-all read is scoped only by parent
+zone: it has no subdomain selector. cfctl therefore never treats the parent
+zone's catch-all as proof of the reply-subdomain Worker target and returns a
+typed `subdomain_worker_rule_read_unsupported` blocker after reducing the DNS
+read. A closed success becomes possible only if a provider contract exposes a
+conclusive subdomain-scoped Worker-rule read. The eventual closed
 `workspace_reply_subdomain_ingress_v1` projection: hashed reply-domain and
 Worker identities, typed `ok`, `drift`, or `missing` DNS and routing states,
 and explicit `provider_output_retained:false` and `body_returned:false`.
-Parent-zone evidence, the generic routing-rule list, incomplete pagination,
-ambiguous zones, or a merely similar Worker never satisfy the contract.
+A separate reply-domain zone, the parent-zone catch-all, a generic routing-rule
+list, incomplete pagination, ambiguous zones, or a merely similar Worker never
+satisfy the contract.
 
 The repository must already be
 an explicit cfctl workspace registration, clean at a canonical HEAD, and carry
