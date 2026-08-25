@@ -460,6 +460,93 @@ fn normalize_private_d1_identity(production: &mut Value, template: &Value) -> Re
         })?;
         database["database_id"] = template_id;
     }
+    normalize_private_sender_identity(production, template)?;
+    Ok(())
+}
+
+fn normalize_private_sender_identity(
+    production: &mut Value,
+    template: &Value,
+) -> Result<(), CliError> {
+    let Some(production_senders) = production
+        .get_mut("send_email")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let Some(template_senders) = template.get("send_email").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if production_senders.len() != template_senders.len() {
+        return Ok(());
+    }
+    for (production_sender, template_sender) in production_senders.iter_mut().zip(template_senders)
+    {
+        let Some(production_table) = production_sender.as_object_mut() else {
+            continue;
+        };
+        let Some(addresses) = production_table.get("allowed_sender_addresses") else {
+            continue;
+        };
+        validate_private_sender_addresses(addresses)?;
+        if let Some(template_addresses) = template_sender.get("allowed_sender_addresses") {
+            production_table.insert(
+                "allowed_sender_addresses".to_owned(),
+                template_addresses.clone(),
+            );
+        } else {
+            production_table.remove("allowed_sender_addresses");
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_sender_addresses(value: &Value) -> Result<(), CliError> {
+    let Some(addresses) = value.as_array() else {
+        return Err(CliError::Input(
+            "private Worker allowed sender addresses must be a bounded array".to_owned(),
+        ));
+    };
+    if !(1..=256).contains(&addresses.len()) {
+        return Err(CliError::Input(
+            "private Worker allowed sender addresses must be a bounded array".to_owned(),
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for address in addresses {
+        let Some(address) = address.as_str() else {
+            return Err(CliError::Input(
+                "private Worker allowed sender addresses must be canonical email addresses"
+                    .to_owned(),
+            ));
+        };
+        let Some((local, domain)) = address.split_once('@') else {
+            return Err(CliError::Input(
+                "private Worker allowed sender addresses must be canonical email addresses"
+                    .to_owned(),
+            ));
+        };
+        if !(3..=320).contains(&address.len())
+            || local.is_empty()
+            || domain.is_empty()
+            || domain.contains('@')
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+            || address
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(CliError::Input(
+                "private Worker allowed sender addresses must be canonical email addresses"
+                    .to_owned(),
+            ));
+        }
+        if !unique.insert(address) {
+            return Err(CliError::Input(
+                "private Worker allowed sender addresses must not contain duplicates".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1658,6 +1745,65 @@ database_id = "11111111-1111-4111-8111-111111111111"
             rejected["d1_databases"][0]["database_id"] = json!(invalid);
             assert!(normalize_private_d1_identity(&mut rejected, &template).is_err());
         }
+    }
+
+    #[test]
+    fn private_config_normalizes_bounded_sender_identity_without_exposing_it() {
+        let parse = |text: &str| {
+            let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
+            serde_json::to_value(document).expect("Wrangler JSON")
+        };
+        let template = parse(
+            r#"name = "relay-router"
+main = "build/worker.js"
+
+send_email = [
+  { name = "EMAIL" }
+]
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "00000000-0000-4000-8000-000000000000"
+"#,
+        );
+        let production = parse(
+            r#"name = "relay-router"
+main = "build/worker.js"
+
+send_email = [
+  { name = "EMAIL", allowed_sender_addresses = ["security@example.com"] }
+]
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "11111111-1111-4111-8111-111111111111"
+"#,
+        );
+
+        let mut allowed = production.clone();
+        normalize_private_d1_identity(&mut allowed, &template).expect("normalize private identity");
+        assert_eq!(allowed, template);
+
+        for invalid in [
+            json!([]),
+            json!(["not-an-address"]),
+            json!(["security@example.com", "security@example.com"]),
+        ] {
+            let mut rejected = production.clone();
+            rejected["send_email"][0]["allowed_sender_addresses"] = invalid;
+            assert!(normalize_private_d1_identity(&mut rejected, &template).is_err());
+        }
+
+        let mut forbidden = production;
+        forbidden["send_email"][0]["remote"] = json!(true);
+        normalize_private_d1_identity(&mut forbidden, &template)
+            .expect("normalize otherwise valid private identity");
+        assert_ne!(
+            forbidden, template,
+            "unrelated binding drift must remain visible"
+        );
     }
 
     #[test]
