@@ -4835,7 +4835,7 @@ async fn execute_paginated_workers_read(
 #[tokio::test]
 async fn executor_normalizes_a_provider_capped_terminal_page() {
     let (address, server) = json_response_sequence_server(vec![
-        r#"{"success":true,"result":[{"id":"worker-1"},{"id":"worker-2"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":2,"total_pages":1,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"},{"id":"worker-2"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":2,"total_count":2}}"#,
     ])
     .await;
     let response = execute_paginated_workers_read(&address)
@@ -4851,6 +4851,31 @@ async fn executor_normalizes_a_provider_capped_terminal_page() {
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("page=1"));
     assert!(requests[0].contains("per_page=100"));
+}
+
+#[tokio::test]
+async fn executor_collects_pages_when_total_pages_is_derived() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"id":"worker-2"}],"errors":[],"result_info":{"page":2,"per_page":1,"count":1,"total_count":2}}"#,
+    ])
+    .await;
+    let response = execute_paginated_workers_read(&address)
+        .await
+        .expect("derived multi-page inventory");
+
+    assert_eq!(
+        response.result,
+        json!([{"id":"worker-1"},{"id":"worker-2"}])
+    );
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["page"], json!(2));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["cfctl_pages"], json!(2));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("page=2"));
 }
 
 #[tokio::test]

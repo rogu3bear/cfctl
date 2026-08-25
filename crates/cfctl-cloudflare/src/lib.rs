@@ -6989,11 +6989,9 @@ impl Executor {
         if !combined.success || !request.method.eq_ignore_ascii_case("GET") {
             return Ok(combined);
         }
-        if let Some((current_page, total_pages)) =
-            page_pagination_bounds(combined.result_info.as_ref())?
-        {
+        if let Some(pagination) = page_pagination(combined.result_info.as_ref())? {
             return self
-                .complete_page_pagination(request, credential, combined, current_page, total_pages)
+                .complete_page_pagination(request, credential, combined, pagination)
                 .await;
         }
         if request_expects_page_pagination(request) {
@@ -7054,22 +7052,18 @@ impl Executor {
         request: &PreparedRequest,
         credential: &AuthCredential,
         mut combined: CloudflareResponseV1,
-        current_page: u64,
-        total_pages: u64,
+        pagination: PagePagination,
     ) -> Result<CloudflareResponseV1> {
+        let PagePagination {
+            current_page,
+            total_pages,
+            total_count,
+            ..
+        } = pagination;
         if total_pages > 1_000 {
             return Err(CloudflareError::PaginationLimit(total_pages));
         }
-        let total_count = combined
-            .result_info
-            .as_ref()
-            .and_then(|info| info.get("total_count"))
-            .map(|value| {
-                value
-                    .as_u64()
-                    .ok_or(CloudflareError::PaginationMetadataInvalid)
-            })
-            .transpose()?;
+        validate_page_item_count(&combined, pagination)?;
         let status = combined.status;
         let Some(results) = combined.result.as_array_mut() else {
             return Err(CloudflareError::InvalidResponseEnvelope { status });
@@ -7081,9 +7075,15 @@ impl Executor {
             if !response.success {
                 return Ok(response);
             }
-            if page_pagination_bounds(response.result_info.as_ref())? != Some((page, total_pages)) {
+            let response_pagination = page_pagination(response.result_info.as_ref())?
+                .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+            if response_pagination.current_page != page
+                || response_pagination.total_pages != total_pages
+                || response_pagination.total_count != total_count
+            {
                 return Err(CloudflareError::PaginationMetadataInvalid);
             }
+            validate_page_item_count(&response, response_pagination)?;
             let Some(page_results) = response.result.as_array() else {
                 return Err(CloudflareError::InvalidResponseEnvelope {
                     status: response.status,
@@ -8667,7 +8667,15 @@ fn add_conditional_header(
     Ok(())
 }
 
-fn page_pagination_bounds(result_info: Option<&Value>) -> Result<Option<(u64, u64)>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PagePagination {
+    current_page: u64,
+    total_pages: u64,
+    count: Option<u64>,
+    total_count: Option<u64>,
+}
+
+fn page_pagination(result_info: Option<&Value>) -> Result<Option<PagePagination>> {
     let Some(result_info) = result_info else {
         return Ok(None);
     };
@@ -8676,14 +8684,7 @@ fn page_pagination_bounds(result_info: Option<&Value>) -> Result<Option<(u64, u6
     if !has_page && !has_total_pages {
         return Ok(None);
     }
-    if !has_page
-        || !has_total_pages
-        || result_info.get("cursor").is_some()
-        || result_info.get("cursors").is_some()
-        || result_info
-            .get("per_page")
-            .is_some_and(|value| value.as_u64().is_none_or(|per_page| per_page == 0))
-    {
+    if !has_page || result_info.get("cursor").is_some() || result_info.get("cursors").is_some() {
         return Err(CloudflareError::PaginationMetadataInvalid);
     }
     let current = result_info
@@ -8691,12 +8692,78 @@ fn page_pagination_bounds(result_info: Option<&Value>) -> Result<Option<(u64, u6
         .and_then(Value::as_u64)
         .filter(|page| *page > 0)
         .ok_or(CloudflareError::PaginationMetadataInvalid)?;
-    let total = result_info
+    let explicit_total_pages = result_info
         .get("total_pages")
-        .and_then(Value::as_u64)
-        .filter(|total_pages| *total_pages >= current)
-        .ok_or(CloudflareError::PaginationMetadataInvalid)?;
-    Ok(Some((current, total)))
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|total_pages| *total_pages > 0)
+                .ok_or(CloudflareError::PaginationMetadataInvalid)
+        })
+        .transpose()?;
+    let per_page = optional_pagination_u64(result_info, "per_page")?;
+    let count = optional_pagination_u64(result_info, "count")?;
+    let total_count = optional_pagination_u64(result_info, "total_count")?;
+    if per_page == Some(0) {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    if let (Some(count), Some(per_page)) = (count, per_page)
+        && count > per_page
+    {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    let derived_total_pages = match (per_page, count, total_count) {
+        (Some(per_page), Some(_), Some(total_count)) => Some(total_count.div_ceil(per_page).max(1)),
+        _ => None,
+    };
+    let total_pages = match (explicit_total_pages, derived_total_pages) {
+        (Some(explicit), Some(derived)) if explicit != derived => {
+            return Err(CloudflareError::PaginationMetadataInvalid);
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(derived)) => derived,
+        (None, None) => return Err(CloudflareError::PaginationMetadataInvalid),
+    };
+    if current > total_pages {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    Ok(Some(PagePagination {
+        current_page: current,
+        total_pages,
+        count,
+        total_count,
+    }))
+}
+
+fn optional_pagination_u64(result_info: &Value, field: &str) -> Result<Option<u64>> {
+    result_info
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or(CloudflareError::PaginationMetadataInvalid)
+        })
+        .transpose()
+}
+
+fn validate_page_item_count(
+    response: &CloudflareResponseV1,
+    pagination: PagePagination,
+) -> Result<()> {
+    let Some(results) = response.result.as_array() else {
+        return Err(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        });
+    };
+    if let Some(expected) = pagination.count
+        && expected != results.len() as u64
+    {
+        return Err(CloudflareError::PaginationCountMismatch {
+            expected,
+            actual: results.len(),
+        });
+    }
+    Ok(())
 }
 
 fn request_expects_page_pagination(request: &PreparedRequest) -> bool {
