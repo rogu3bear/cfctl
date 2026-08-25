@@ -6552,24 +6552,12 @@ async fn execute_delegated_plan(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let evidence = store.write_evidence(EvidenceClass::Apply, &receipt)?;
-    persist_transaction_stage_with_artifact(
-        store,
-        plan,
-        TransactionStageV1::BoundaryResponsePersisted,
-        json!({
-            "adapter": "delegated_cli",
-            "apply_evidence_hash": evidence.content_hash,
-            "success": success,
-        }),
-    )?;
-    persist_secret_lifecycle(store, plan, success, Some(&receipt), secrets)?;
+    persist_delegated_boundary_result(store, plan, success, &receipt, &evidence, secrets)?;
     if !success {
         // A delegated CLI can fail after applying part of a mutation (Wrangler
         // may upload and promote a Worker before a trigger update fails). Keep
         // the transaction open for rectification and report that the boundary
         // was performed; a non-zero exit is not proof of zero side effects.
-        plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
         return Ok(delegated_cli_failure_envelope(plan, receipt, evidence));
     }
 
@@ -6641,6 +6629,34 @@ async fn execute_delegated_plan(
         });
     }
     Ok(envelope)
+}
+
+fn persist_delegated_boundary_result(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    success: bool,
+    receipt: &Value,
+    evidence: &EvidenceV1,
+    secrets: &dyn SecretStore,
+) -> Result<()> {
+    // The status recorded by each checkpoint is part of the journal hash. A
+    // failing delegated command can have crossed a mutation boundary, so bind
+    // rectification_required before persisting either post-boundary receipt.
+    // Changing status afterward makes the otherwise valid journal unreadable.
+    if !success {
+        plan.status = PlanStatus::RectificationRequired;
+    }
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        json!({
+            "adapter": "delegated_cli",
+            "apply_evidence_hash": evidence.content_hash,
+            "success": success,
+        }),
+    )?;
+    persist_secret_lifecycle(store, plan, success, Some(receipt), secrets).map(|_| ())
 }
 
 async fn run_delegated_plan_boundary(
@@ -45084,6 +45100,76 @@ mod tests {
             durable.transaction_artifact(TransactionStageV1::Closed),
             plan.transaction_artifact(TransactionStageV1::Closed)
         );
+    }
+
+    #[test]
+    fn delegated_failure_status_precedes_durable_boundary_receipts() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut capability = CapabilityV1::new(
+            "example.delegated-write",
+            "Run delegated write",
+            "CLI",
+            "example delegated write",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("delegated plan");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        store.save_plan(&plan).expect("persist boundary attempt");
+        let receipt = json!({"success":false,"boundary_crossed":true});
+        let evidence_hash = format!("sha256:{}", "a".repeat(64));
+        let evidence = EvidenceV1::new(
+            EvidenceClass::Apply,
+            &evidence_hash,
+            "/managed/evidence/apply.json",
+        );
+
+        super::persist_delegated_boundary_result(
+            &store,
+            &mut plan,
+            false,
+            &receipt,
+            &evidence,
+            &MemorySecretStore::default(),
+        )
+        .expect("a failed delegated boundary remains durably rectifiable");
+
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("failed delegated plan reloads");
+        assert_eq!(durable.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        assert!(
+            durable
+                .transaction_journal
+                .iter()
+                .filter(|checkpoint| {
+                    matches!(
+                        checkpoint.stage,
+                        TransactionStageV1::BoundaryResponsePersisted
+                            | TransactionStageV1::SecretSinkPersisted
+                    )
+                })
+                .all(|checkpoint| checkpoint.plan_status == PlanStatus::RectificationRequired),
+            "every post-boundary failure checkpoint must bind the terminal recovery status"
+        );
+        durable
+            .validate_transaction_journal()
+            .expect("the durable failure journal is coherent");
     }
 
     #[tokio::test]
