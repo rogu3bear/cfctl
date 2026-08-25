@@ -4755,9 +4755,153 @@ async fn executor_collects_all_cloudflare_result_pages() {
         .expect("paginated response");
     assert_eq!(response.result.as_array().expect("result array").len(), 2);
     assert_eq!(response.etag.as_deref(), Some("page-2"));
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.get("count")),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.get("cfctl_page_complete")),
+        Some(&json!(true))
+    );
     let requests = server.await.expect("server joins");
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("page=2"));
+}
+
+fn paginated_workers_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "workers-list",
+        "List Workers",
+        "GET",
+        "/accounts/{account_id}/workers/scripts",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "per_page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability
+}
+
+async fn execute_paginated_workers_read(
+    address: &str,
+) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &paginated_workers_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            query: json!({"page":1,"per_page":100}),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn executor_normalizes_a_provider_capped_terminal_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"},{"id":"worker-2"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":2,"total_pages":1,"total_count":2}}"#,
+    ])
+    .await;
+    let response = execute_paginated_workers_read(&address)
+        .await
+        .expect("provider-capped terminal page");
+
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["per_page"], json!(50));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("page=1"));
+    assert!(requests[0].contains("per_page=100"));
+}
+
+#[tokio::test]
+async fn executor_rejects_missing_or_ambiguous_page_metadata() {
+    for body in [
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[]}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"total_pages":1,"total_count":1,"cursors":{"after":null}}}"#,
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":0,"per_page":50,"total_pages":1,"total_count":1}}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = execute_paginated_workers_read(&address)
+            .await
+            .expect_err("unproven page metadata must fail closed");
+        assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn executor_rejects_terminal_page_item_count_disagreement() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":50,"count":1,"total_pages":1,"total_count":2}}"#,
+    ])
+    .await;
+
+    let error = execute_paginated_workers_read(&address)
+        .await
+        .expect_err("declared total must match returned inventory");
+    assert!(matches!(
+        error,
+        CloudflareError::PaginationCountMismatch {
+            expected: 2,
+            actual: 1
+        }
+    ));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn executor_rejects_an_incoherent_later_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":[{"id":"worker-1"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+        r#"{"success":true,"result":[{"id":"worker-2"}],"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_pages":2,"total_count":2}}"#,
+    ])
+    .await;
+
+    let error = execute_paginated_workers_read(&address)
+        .await
+        .expect_err("a mismatched later page cannot establish complete inventory");
+    assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+    assert_eq!(server.await.expect("server joins").len(), 2);
 }
 
 #[tokio::test]
