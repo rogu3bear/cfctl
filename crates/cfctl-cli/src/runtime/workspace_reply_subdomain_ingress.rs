@@ -423,24 +423,25 @@ fn coherent_optional_result_info(result_info: Option<&Value>, record_count: usiz
     {
         return false;
     }
-    let optional_u64_is = |key: &str, expected: u64| {
-        info.get(key)
-            .is_none_or(|value| value.as_u64() == Some(expected))
-    };
     let count = record_count as u64;
-    optional_u64_is("page", 1)
-        && optional_u64_is("total_pages", 1)
-        && optional_u64_is("cfctl_pages", 1)
-        && optional_u64_is("count", count)
-        && optional_u64_is("total_count", count)
+    let provider_complete = info.get("page").and_then(Value::as_u64) == Some(1)
+        && info.get("total_pages").and_then(Value::as_u64) == Some(1)
+        && info.get("count").and_then(Value::as_u64) == Some(count)
+        && info.get("total_count").and_then(Value::as_u64) == Some(count);
+    let cfctl_complete = match (info.get("cfctl_pages"), info.get("cfctl_page_complete")) {
+        (None, None) => true,
+        (Some(pages), Some(complete)) => {
+            pages.as_u64() == Some(1) && complete.as_bool() == Some(true)
+        }
+        _ => false,
+    };
+    provider_complete
+        && cfctl_complete
         && info.get("per_page").is_none_or(|value| {
             value
                 .as_u64()
                 .is_some_and(|per_page| per_page > 0 && count <= per_page)
         })
-        && info
-            .get("cfctl_page_complete")
-            .is_none_or(|value| value.as_bool() == Some(true))
 }
 
 fn parent_zone_candidates(reply_domain: &str) -> Vec<String> {
@@ -844,6 +845,11 @@ mod tests {
             })
         });
         for result_info in [
+            json!({}),
+            json!({
+                "page":1,
+                "count":3,
+            }),
             json!({
                 "page":1,
                 "per_page":20,
@@ -865,6 +871,14 @@ mod tests {
                 "total_count":3,
                 "count":3,
                 "cursor":"private-provider-cursor",
+            }),
+            json!({
+                "page":1,
+                "per_page":20,
+                "total_pages":1,
+                "total_count":3,
+                "count":3,
+                "cfctl_pages":1,
             }),
         ] {
             let response = CloudflareResponseV1 {
