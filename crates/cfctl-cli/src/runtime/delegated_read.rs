@@ -331,14 +331,20 @@ pub(super) fn set_workspace_d1_evidence_verification(
     envelope: &mut ResultEnvelopeV2,
     receipt_is_complete: bool,
 ) {
+    let inbound_acceptance = envelope.result.get("adapter").and_then(Value::as_str)
+        == Some("workspace_inbound_acceptance_v1");
     envelope.verification.state = if receipt_is_complete {
         VerificationState::Passed
     } else {
         VerificationState::Failed
     };
-    envelope.verification.basis = Some(if receipt_is_complete {
-        "clean-repository fixed D1 projection reduced to unchanged MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows"
+    envelope.verification.basis = Some(if receipt_is_complete && inbound_acceptance {
+        "clean-repository fixed D1 projection reduced one deterministic delivery fingerprint to exactly one accepted body-free inbound, relay, and thread binding without retaining provider rows"
             .to_owned()
+    } else if receipt_is_complete {
+        "clean-repository fixed D1 projection reduced to unchanged MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows".to_owned()
+    } else if inbound_acceptance {
+        "workspace D1 inbound-acceptance receipt did not prove exactly one fully provider-accepted binding for the selected delivery fingerprint, route, and policy".to_owned()
     } else {
         "workspace D1 evidence receipt did not prove a coherent V1 aggregate plus complete bounded body-free V2 route-health projection"
             .to_owned()

@@ -19,6 +19,42 @@ fn contract() -> WorkspaceD1EvidenceContractV1 {
     }
 }
 
+fn inbound_contract() -> WorkspaceD1EvidenceContractV1 {
+    WorkspaceD1EvidenceContractV1 {
+        projection: MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1.to_owned(),
+        query_sha256: sha256(MAILDESK_INBOUND_ACCEPTANCE_SQL_V1.as_bytes()),
+        ..contract()
+    }
+}
+
+fn inbound_input() -> CallInput {
+    CallInput {
+        query: json!({
+            "config":"wrangler.production.toml",
+            "binding":"DB",
+            "delivery_fingerprint_sha256":format!("sha256:{}", "a".repeat(64)),
+            "route_id":"route:example.com:security",
+            "policy_sha256":format!("sha256:{}", "b".repeat(64)),
+        }),
+        ..CallInput::default()
+    }
+}
+
+fn inbound_row() -> Map<String, Value> {
+    serde_json::from_value::<Map<String, Value>>(json!({
+        "inbound_delivery_id":format!("inbound:{}", "a".repeat(64)),
+        "relay_id":format!("relay:{}", "a".repeat(64)),
+        "thread_id":format!("thread:{}", "c".repeat(64)),
+        "route_id":"route:example.com:security",
+        "policy_sha256":"b".repeat(64),
+        "provider_accepted_at":"2026-08-26 22:06:57",
+        "status":"provider_accepted",
+        "recipient_count":2,
+        "provider_accepted_count":2,
+    }))
+    .expect("inbound row")
+}
+
 fn row() -> Map<String, Value> {
     let route_health_rows = json!([
         {
@@ -290,7 +326,11 @@ fn partial_oversized_duplicate_and_malformed_route_inventory_fail_closed() {
 
 #[test]
 fn execution_argv_is_exact_and_contains_only_the_compiler_query() {
-    let arguments = compiler_query_arguments("maildesk-production", "/private/config.toml");
+    let arguments = compiler_query_arguments(
+        "maildesk-production",
+        "/private/config.toml",
+        MAILDESK_D1_EVIDENCE_SQL_V1,
+    );
     assert_eq!(
         arguments,
         [
@@ -312,6 +352,101 @@ fn execution_argv_is_exact_and_contains_only_the_compiler_query() {
             .filter(|argument| argument.as_str() == MAILDESK_D1_EVIDENCE_SQL_V1)
             .count(),
         1
+    );
+}
+
+#[test]
+fn inbound_acceptance_query_is_compiler_owned_and_projects_one_exact_binding() {
+    let input = inbound_input();
+    let query = compiler_query(&inbound_contract(), &input).expect("compiler query");
+    assert_eq!(query.template, MAILDESK_INBOUND_ACCEPTANCE_SQL_V1);
+    assert!(query.sql.contains(&"a".repeat(64)));
+    assert!(query.sql.contains("route:example.com:security"));
+    assert!(!query.sql.contains("__MAILDESK_"));
+
+    let row = inbound_row();
+    let config = workspace_d1_migration::ValidatedConfig {
+        path: "wrangler.production.toml".to_owned(),
+        sha256: format!("sha256:{}", "d".repeat(64)),
+        database_name: "maildesk-production".to_owned(),
+        database_id: "database-private".to_owned(),
+    };
+    let receipt =
+        project_inbound_acceptance(&inbound_contract(), &input, vec![row], "4.120.1", &config)
+            .expect("receipt");
+    assert!(inbound_acceptance_receipt_is_complete(&receipt));
+    assert_eq!(receipt["status"], "accepted");
+    let encoded = serde_json::to_string(&receipt).expect("receipt JSON");
+    for forbidden in [
+        "database-private",
+        "operator@example.com",
+        "subject",
+        "body_content",
+    ] {
+        assert!(!encoded.contains(forbidden));
+    }
+}
+
+#[test]
+fn inbound_acceptance_zero_multiple_and_mismatched_rows_fail_closed() {
+    let input = inbound_input();
+    let config = workspace_d1_migration::ValidatedConfig {
+        path: "wrangler.production.toml".to_owned(),
+        sha256: format!("sha256:{}", "d".repeat(64)),
+        database_name: "maildesk-production".to_owned(),
+        database_id: "database-private".to_owned(),
+    };
+    for rows in [Vec::new(), vec![inbound_row(), inbound_row()]] {
+        let receipt =
+            project_inbound_acceptance(&inbound_contract(), &input, rows, "4.120.1", &config)
+                .expect("typed failure receipt");
+        assert!(!inbound_acceptance_receipt_is_complete(&receipt));
+        assert_eq!(receipt["success"], false);
+    }
+
+    let drift_cases = [
+        (
+            "inbound_delivery_id",
+            json!(format!("inbound:{}", "f".repeat(64))),
+        ),
+        ("relay_id", json!(format!("relay:{}", "f".repeat(64)))),
+        ("thread_id", json!("thread:not-a-digest")),
+        ("route_id", json!("route:example.net:security")),
+        ("policy_sha256", json!("f".repeat(64))),
+        ("status", json!("received")),
+        ("recipient_count", json!(0)),
+        ("provider_accepted_count", json!(1)),
+        ("provider_accepted_at", json!("not-a-timestamp")),
+    ];
+    for (field, value) in drift_cases {
+        let mut drifted_row = inbound_row();
+        drifted_row.insert(field.to_owned(), value);
+        if let Ok(receipt) = project_inbound_acceptance(
+            &inbound_contract(),
+            &input,
+            vec![drifted_row],
+            "4.120.1",
+            &config,
+        ) {
+            assert!(
+                !inbound_acceptance_receipt_is_complete(&receipt),
+                "{field} drift must not produce a complete receipt",
+            );
+            assert_eq!(receipt["success"], false);
+        }
+    }
+
+    let mut expanded = inbound_row();
+    expanded.insert("subject".to_owned(), json!("must not be projected"));
+    assert!(
+        project_inbound_acceptance(
+            &inbound_contract(),
+            &input,
+            vec![expanded],
+            "4.120.1",
+            &config,
+        )
+        .is_err()
     );
 }
 
