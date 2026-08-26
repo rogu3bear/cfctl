@@ -135,6 +135,25 @@ const SOURCE_BINDING_KEYS: &[&str] = &[
     "admitted_operator_sha256",
     "identity_profile_sha256",
 ];
+const APPLE_MAIL_INBOX_SOURCE_KEYS: &[&str] = &[
+    "schema_version",
+    "kind",
+    "performed",
+    "body_free",
+    "route_ref_sha256",
+    "domain_sha256",
+    "public_role_identity_sha256",
+    "policy_sha256",
+    "provider_accepted_at",
+    "observed_at",
+    "correlation_sha256",
+    "match_count",
+    "opaque_relay_recipient_sha256",
+    "selection_basis",
+    "subject_used",
+    "body_used",
+    "private_identity_retained",
+];
 
 pub(super) fn load(store: &StateStore, id: &str) -> Result<Option<CapabilityV1>> {
     Ok(
@@ -923,6 +942,7 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
         .ok_or_else(|| CliError::Input("logical activation identity is invalid".to_owned()))?
         .to_owned();
     validate_projection_record_bindings(projection, &record, &transaction)?;
+    validate_apple_source_projection_binding(source_prerequisites, projection)?;
     let admitted_at = timestamp(record.get("admitted_at"), "admitted_at")?;
     let expires_at = timestamp(record.get("expires_at"), "expires_at")?;
     let evidence_observed_at =
@@ -973,6 +993,10 @@ fn validate_source_prerequisites(prerequisites: &Map<String, Value>) -> Result<(
                     "reply-admission `{plane}` source receipt is missing"
                 ))
             })?;
+        if *plane == "apple_mail_inbox" {
+            validate_apple_mail_inbox_source(receipt)?;
+            continue;
+        }
         exact_keys(receipt, SOURCE_RECEIPT_KEYS)?;
         if receipt.get("schema_version").and_then(Value::as_u64) != Some(1)
             || receipt.get("performed").and_then(Value::as_bool) != Some(true)
@@ -1011,7 +1035,6 @@ fn validate_source_prerequisites(prerequisites: &Map<String, Value>) -> Result<(
             "edge_activation" => &["edge_state_sha256", "status"],
             "sender_domain" => &["sender_domain_sha256", "status"],
             "inbound_acceptance" => &["inbound_delivery_id", "provider_accepted_at", "status"],
-            "apple_mail_inbox" => &["inbox_message_id_sha256", "status"],
             "operator_authorization" => {
                 &["admitted_operator_sha256", "operator_set_sha256", "status"]
             }
@@ -1019,6 +1042,78 @@ fn validate_source_prerequisites(prerequisites: &Map<String, Value>) -> Result<(
             _ => unreachable!("closed prerequisite plane"),
         };
         exact_keys(result, result_keys)?;
+    }
+    Ok(())
+}
+
+fn validate_apple_mail_inbox_source(receipt: &Map<String, Value>) -> Result<()> {
+    exact_keys(receipt, APPLE_MAIL_INBOX_SOURCE_KEYS)?;
+    if receipt.get("schema_version").and_then(Value::as_u64) != Some(2)
+        || receipt.get("kind").and_then(Value::as_str) != Some("maildesk_apple_mail_inbox_receipt")
+        || receipt.get("performed").and_then(Value::as_bool) != Some(true)
+        || receipt.get("body_free").and_then(Value::as_bool) != Some(true)
+        || receipt.get("match_count").and_then(Value::as_u64) != Some(1)
+        || receipt.get("selection_basis").and_then(Value::as_str)
+            != Some("provider_acceptance_interval_and_public_role_identity")
+        || receipt.get("subject_used").and_then(Value::as_bool) != Some(false)
+        || receipt.get("body_used").and_then(Value::as_bool) != Some(false)
+        || receipt
+            .get("private_identity_retained")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(CliError::Input(
+            "reply-admission Apple Mail source receipt is not one body-free observation".to_owned(),
+        ));
+    }
+    for key in [
+        "route_ref_sha256",
+        "domain_sha256",
+        "public_role_identity_sha256",
+        "policy_sha256",
+        "correlation_sha256",
+        "opaque_relay_recipient_sha256",
+    ] {
+        digest(receipt, key)?;
+    }
+    let provider_accepted_at =
+        timestamp(receipt.get("provider_accepted_at"), "provider_accepted_at")?;
+    let observed_at = timestamp(receipt.get("observed_at"), "observed_at")?;
+    if observed_at < provider_accepted_at {
+        return Err(CliError::Input(
+            "reply-admission Apple Mail source receipt chronology is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_apple_source_projection_binding(
+    source_prerequisites: &Map<String, Value>,
+    projection: &Map<String, Value>,
+) -> Result<()> {
+    let projected = projection
+        .get("prerequisites")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("reply-admission prerequisites are missing".to_owned()))?;
+    let source = source_prerequisites
+        .get("apple_mail_inbox")
+        .ok_or_else(|| {
+            CliError::Input("reply-admission Apple Mail source receipt is missing".to_owned())
+        })?;
+    let projected_receipt = projected
+        .get("apple_mail_inbox")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("reply-admission `apple_mail_inbox` receipt missing".to_owned())
+        })?;
+    if projected_receipt
+        .get("receipt_sha256")
+        .and_then(Value::as_str)
+        != Some(hash_json(source).as_str())
+    {
+        return Err(CliError::Input(
+            "reply-admission Apple Mail source receipt digest binding mismatch".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2001,6 +2096,26 @@ mod tests {
         let transaction = prefixed('1');
         let candidate = json!({"dirty":false,"head":"a".repeat(40),"tree":"b".repeat(40)});
         let candidate_sha = bare_hex_sha(&canonical_json_bytes(&candidate));
+        let apple_mail_inbox_source = json!({
+            "schema_version":2,
+            "kind":"maildesk_apple_mail_inbox_receipt",
+            "performed":true,
+            "body_free":true,
+            "route_ref_sha256":prefixed('1'),
+            "domain_sha256":prefixed('2'),
+            "public_role_identity_sha256":prefixed('3'),
+            "policy_sha256":prefixed('8'),
+            "provider_accepted_at":"2030-01-01T00:00:00.000Z",
+            "observed_at":"2030-01-01T00:00:30.000Z",
+            "correlation_sha256":prefixed('6'),
+            "match_count":1,
+            "opaque_relay_recipient_sha256":prefixed('0'),
+            "selection_basis":"provider_acceptance_interval_and_public_role_identity",
+            "subject_used":false,
+            "body_used":false,
+            "private_identity_retained":false,
+        });
+        let apple_mail_inbox_source_sha = hash_json(&apple_mail_inbox_source);
         let receipt = |byte: char| {
             json!({
                 "receipt_kind":"body_free_test_receipt",
@@ -2010,7 +2125,7 @@ mod tests {
                 "binding":{},
             })
         };
-        let prerequisites = json!({
+        let mut prerequisites = json!({
             "configured_policy":receipt('a'),
             "edge_activation":receipt('b'),
             "sender_domain":receipt('c'),
@@ -2019,6 +2134,8 @@ mod tests {
             "operator_authorization":receipt('f'),
             "opaque_relay":receipt('0'),
         });
+        prerequisites["apple_mail_inbox"]["receipt_sha256"] =
+            Value::String(apple_mail_inbox_source_sha.clone());
         let projection = json!({
             "schema_version":1,
             "transaction_sha256":transaction,
@@ -2082,7 +2199,7 @@ mod tests {
             "edge_activation_receipt_sha256":"b".repeat(64),
             "sender_domain_receipt_sha256":"c".repeat(64),
             "inbound_acceptance_receipt_sha256":"d".repeat(64),
-            "apple_mail_inbox_receipt_sha256":"e".repeat(64),
+            "apple_mail_inbox_receipt_sha256":apple_mail_inbox_source_sha.trim_start_matches("sha256:"),
             "operator_authorization_receipt_sha256":"f".repeat(64),
             "opaque_relay_receipt_sha256":"0".repeat(64),
             "evidence_bundle_sha256":"e".repeat(64),
@@ -2115,7 +2232,7 @@ mod tests {
             "edge_activation":source_receipt("edge_activation",json!({"edge_state_sha256":prefixed('3'),"status":"active"})),
             "sender_domain":source_receipt("sender_domain",json!({"sender_domain_sha256":prefixed('4'),"status":"verified"})),
             "inbound_acceptance":source_receipt("inbound_acceptance",json!({"inbound_delivery_id":"inbound:one","provider_accepted_at":"2030-01-01T00:00:00.000Z","status":"accepted"})),
-            "apple_mail_inbox":source_receipt("apple_mail_inbox",json!({"inbox_message_id_sha256":prefixed('5'),"status":"received"})),
+            "apple_mail_inbox":apple_mail_inbox_source,
             "operator_authorization":source_receipt("operator_authorization",json!({"admitted_operator_sha256":prefixed('b'),"operator_set_sha256":prefixed('a'),"status":"authorized"})),
             "opaque_relay":source_receipt("opaque_relay",json!({"opaque_relay_recipient_sha256":prefixed('0'),"relay_id":"relay:one","status":"authorized"})),
         });
@@ -2204,6 +2321,25 @@ mod tests {
         let mut value = candidate();
         value["source_prerequisites"]["configured_policy"]["private_address"] =
             Value::String("operator@example.net".to_owned());
+        assert!(validate_candidate_bytes(&serde_json::to_vec(&value).expect("bytes")).is_err());
+
+        for (field, invalid) in [
+            ("match_count", json!(0)),
+            ("subject_used", json!(true)),
+            ("body_used", json!(true)),
+            ("private_identity_retained", json!(true)),
+        ] {
+            let mut value = candidate();
+            value["source_prerequisites"]["apple_mail_inbox"][field] = invalid;
+            assert!(
+                validate_candidate_bytes(&serde_json::to_vec(&value).expect("bytes")).is_err(),
+                "invalid Apple Mail source field must fail closed: {field}",
+            );
+        }
+
+        let mut value = candidate();
+        value["source_prerequisites"]["apple_mail_inbox"]["observed_at"] =
+            Value::String("2030-01-01T00:01:00.000Z".to_owned());
         assert!(validate_candidate_bytes(&serde_json::to_vec(&value).expect("bytes")).is_err());
     }
 
