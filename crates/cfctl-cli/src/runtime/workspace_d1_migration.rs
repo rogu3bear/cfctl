@@ -1116,6 +1116,12 @@ mod tests {
     use cfctl_storage::RuntimePaths;
 
     #[test]
+    fn workspace_d1_preserves_query_and_apply_timeout_bounds() {
+        assert_eq!(QUERY_TIMEOUT, Duration::from_mins(2));
+        assert_eq!(APPLY_TIMEOUT, Duration::from_mins(5));
+    }
+
+    #[test]
     fn ledger_must_be_an_exact_prefix() {
         let declared = vec!["0001.sql".to_owned(), "0002.sql".to_owned()];
         assert!(is_prefix(&[], &declared));

@@ -42,9 +42,14 @@ fn failure_envelope(
     context: &FailureEnvelopeContext,
     error: &runtime::CliError,
 ) -> ResultEnvelopeV2 {
-    let next_step = error
-        .next_step()
-        .unwrap_or_else(|| "Run `cfctl doctor --json` and inspect the exact blocker.".to_owned());
+    let next_step = match (error, context.command, context.operation_id.as_deref()) {
+        (runtime::CliError::SubprocessTimeout { .. }, "plans run", Some(operation_id)) => format!(
+            "The plan is consumed and its provider outcome is uncertain. Run `cfctl plans status {operation_id} --json`, then `cfctl plans rectify {operation_id} --json`; do not replay `plans run`."
+        ),
+        _ => error.next_step().unwrap_or_else(|| {
+            "Run `cfctl doctor --json` and inspect the exact blocker.".to_owned()
+        }),
+    };
     let mut envelope = ResultEnvelopeV2::failure(
         context.command,
         error.code(),
@@ -165,5 +170,40 @@ mod tests {
                 "The plan is already approved; run it: `cfctl plans run ab2c8ee6-8d88-4d3a-a015-2329b65bf6d3`."
             )
         );
+    }
+
+    #[test]
+    fn plan_run_timeout_names_the_consumed_operation_and_rectification_path() {
+        let operation_id = "ab2c8ee6-8d88-4d3a-a015-2329b65bf6d3";
+        let cli = match Cli::try_parse_from(["cfctl", "plans", "run", operation_id, "--json"]) {
+            Ok(cli) => cli,
+            Err(error) => panic!("valid plan run command: {error}"),
+        };
+        let context = FailureEnvelopeContext::deterministic(&cli);
+        let error = CliError::SubprocessTimeout {
+            label: "wrangler deploy".to_owned(),
+            timeout_seconds: 600,
+        };
+
+        let envelope = failure_envelope(&context, &error);
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(envelope.command, "plans run");
+        assert_eq!(envelope.operation_id.as_deref(), Some(operation_id));
+        let Some(error) = envelope.error else {
+            panic!("failure envelope must include timeout details");
+        };
+        assert_eq!(error.code, "CFCTL_SUBPROCESS_TIMEOUT");
+        assert!(error.message.contains("600-second governed timeout"));
+        let Some(next_step) = error.next_step else {
+            panic!("timeout envelope must carry operation-bound recovery");
+        };
+        assert!(next_step.contains(&format!("cfctl plans status {operation_id} --json")));
+        assert!(next_step.contains(&format!("cfctl plans rectify {operation_id} --json")));
+        assert!(next_step.contains("consumed"));
+        assert!(next_step.contains("uncertain"));
+        assert!(next_step.contains("do not replay"));
+        assert!(!next_step.contains("doctor"));
     }
 }
