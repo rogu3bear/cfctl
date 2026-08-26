@@ -1,5 +1,6 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
+mod delegated_read;
 mod event_batch;
 mod pages_deployment;
 mod plan_set;
@@ -6151,7 +6152,7 @@ async fn execute_read(
     }
     match capability.adapter_status {
         AdapterStatus::DelegatedCli => {
-            return execute_delegated_read(
+            return delegated_read::execute(delegated_read::Request {
                 store,
                 catalog,
                 capability,
@@ -6159,7 +6160,7 @@ async fn execute_read(
                 requested_profile,
                 requested_account,
                 reply_admission_source,
-            )
+            })
             .await;
         }
         AdapterStatus::GovernedUi => {
@@ -6340,229 +6341,6 @@ async fn execute_read(
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "delegated reads keep workspace evidence, reply-admission, and generic CLI receipt handling in one explicit dispatch boundary"
-)]
-async fn execute_delegated_read(
-    store: &StateStore,
-    catalog: &CatalogSnapshot,
-    capability: &CapabilityV1,
-    input: &CallInput,
-    requested_profile: Option<&str>,
-    requested_account: Option<&str>,
-    reply_admission_source: Option<&Path>,
-) -> Result<ExecutedRead> {
-    let profiles = ProfilesConfig::load(store)?;
-    let profile = profiles.selected(requested_profile)?;
-    let credential_generation_id = credential_generation_for_read(profile)?;
-    let account_id = resolve_account_id(store, profile, requested_account, input)?;
-    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let receipt = if capability.workspace_reply_subdomain_ingress.is_some() {
-        let account_id = account_id.as_deref().ok_or_else(|| {
-            CliError::Input(
-                "workspace reply-subdomain ingress read requires an exact account".to_owned(),
-            )
-        })?;
-        workspace_reply_subdomain_ingress::read(
-            store,
-            catalog,
-            capability,
-            input,
-            &credential,
-            profile,
-            account_id,
-            requested_account,
-            &credential_generation_id,
-        )
-        .await?
-    } else if capability
-        .workspace_d1_reply_admission
-        .as_ref()
-        .is_some_and(|contract| contract.operation_kind == "read")
-    {
-        let account_id = account_id.as_deref().ok_or_else(|| {
-            CliError::Input("workspace reply-admission read requires an exact account".to_owned())
-        })?;
-        let source = reply_admission_source.ok_or_else(|| {
-            CliError::Input(
-                "workspace reply-admission read requires one private source file".to_owned(),
-            )
-        })?;
-        workspace_d1_reply_admission::read(
-            store,
-            capability,
-            input,
-            &credential,
-            profile,
-            account_id,
-            source,
-        )
-        .await?
-    } else if capability.workspace_d1_evidence.is_some() {
-        let account_id = account_id.as_deref().ok_or_else(|| {
-            CliError::Input("workspace D1 evidence requires an exact account".to_owned())
-        })?;
-        match workspace_d1_evidence::execute(store, capability, input, &credential, account_id)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(failure) => {
-                let receipt = failure.receipt();
-                let evidence = if failure.boundary_crossed() {
-                    Some(store.write_evidence(EvidenceClass::LiveRead, &receipt)?)
-                } else {
-                    None
-                };
-                let mut envelope = delegated_read_envelope(
-                    &catalog.schema_hash,
-                    &capability.id,
-                    &profile.id,
-                    Some(account_id.to_owned()),
-                    receipt,
-                    evidence,
-                );
-                envelope.verification.state = VerificationState::Failed;
-                envelope.verification.basis = Some(
-                    "workspace D1 evidence failed closed without retaining provider rows or message bodies"
-                        .to_owned(),
-                );
-                return Ok(ExecutedRead {
-                    envelope,
-                    credential_generation_id: Some(credential_generation_id),
-                });
-            }
-        }
-    } else {
-        run_delegated_cli(
-            capability,
-            input,
-            &credential,
-            account_id.as_deref(),
-            &store.paths().cache_dir,
-            None,
-            None,
-        )
-        .await?
-    };
-    let workspace_d1_evidence_passed = capability.workspace_d1_evidence.is_some()
-        && workspace_d1_evidence::receipt_is_complete(&receipt);
-    let workspace_reply_admission_read_passed = capability
-        .workspace_d1_reply_admission
-        .as_ref()
-        .is_some_and(|contract| contract.operation_kind == "read")
-        && workspace_d1_reply_admission::read_receipt_is_complete(&receipt);
-    let workspace_reply_subdomain_ingress_passed =
-        capability.workspace_reply_subdomain_ingress.is_some()
-            && workspace_reply_subdomain_ingress::receipt_is_complete(&receipt);
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
-    let mut envelope = delegated_read_envelope(
-        &catalog.schema_hash,
-        &capability.id,
-        &profile.id,
-        account_id,
-        receipt,
-        Some(evidence),
-    );
-    if capability.workspace_d1_evidence.is_some() {
-        set_workspace_d1_evidence_verification(&mut envelope, workspace_d1_evidence_passed);
-    }
-    if capability
-        .workspace_d1_reply_admission
-        .as_ref()
-        .is_some_and(|contract| contract.operation_kind == "read")
-    {
-        set_workspace_reply_admission_read_verification(
-            &mut envelope,
-            workspace_reply_admission_read_passed,
-        );
-    }
-    if capability.workspace_reply_subdomain_ingress.is_some() {
-        set_workspace_reply_subdomain_ingress_verification(
-            &mut envelope,
-            workspace_reply_subdomain_ingress_passed,
-        );
-    }
-    Ok(ExecutedRead {
-        envelope,
-        credential_generation_id: Some(credential_generation_id),
-    })
-}
-
-fn set_workspace_reply_subdomain_ingress_verification(
-    envelope: &mut ResultEnvelopeV2,
-    receipt_is_complete: bool,
-) {
-    envelope.verification.state = if receipt_is_complete {
-        VerificationState::Passed
-    } else {
-        VerificationState::Failed
-    };
-    envelope.verification.basis = Some(if receipt_is_complete {
-        "the authoritative parent zone, exact subdomain DNS settings, and one exact account-inventory all-matcher Worker rule were reduced to the closed body-free Maildesk ingress result"
-            .to_owned()
-    } else {
-        "reply-subdomain ingress did not produce one complete body-free parent-zone, exact subdomain-DNS, and account-rule projection"
-            .to_owned()
-    });
-    if !receipt_is_complete {
-        envelope.error = Some(ErrorV1 {
-            code: "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_INGRESS_READ_FAILED".to_owned(),
-            message: "the governed reply-subdomain ingress read did not complete".to_owned(),
-            next_step: Some(
-                "Preserve the body-free failure receipt and reconcile the exact parent-zone, subdomain DNS, or complete account-rule inventory blocker; do not infer subdomain routing from the parent-zone catch-all."
-                    .to_owned(),
-            ),
-        });
-    }
-}
-
-fn set_workspace_reply_admission_read_verification(
-    envelope: &mut ResultEnvelopeV2,
-    receipt_is_complete: bool,
-) {
-    envelope.verification.state = if receipt_is_complete {
-        VerificationState::Passed
-    } else {
-        VerificationState::Failed
-    };
-    envelope.verification.basis = Some(if receipt_is_complete {
-        "exactly one active reply admission matched the compiler-owned transaction, activation record, identity projection, and activation operation without retaining provider rows"
-            .to_owned()
-    } else {
-        "reply-admission read did not prove one exact active body-free record; later mail planes remain blocked"
-            .to_owned()
-    });
-    if !receipt_is_complete {
-        envelope.error = Some(ErrorV1 {
-            code: "CFCTL_WORKSPACE_D1_REPLY_ADMISSION_READ_FAILED".to_owned(),
-            message: "the governed reply-admission read returned no exact active match".to_owned(),
-            next_step: Some(
-                "Preserve this body-free receipt and reconcile the exact activation transaction; do not retry through caller SQL or infer readiness from the plan."
-                    .to_owned(),
-            ),
-        });
-    }
-}
-
-fn set_workspace_d1_evidence_verification(
-    envelope: &mut ResultEnvelopeV2,
-    receipt_is_complete: bool,
-) {
-    envelope.verification.state = if receipt_is_complete {
-        VerificationState::Passed
-    } else {
-        VerificationState::Failed
-    };
-    envelope.verification.basis = Some(if receipt_is_complete {
-        "clean-repository fixed D1 projection reduced to unchanged MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows"
-            .to_owned()
-    } else {
-        "workspace D1 evidence receipt did not prove a coherent V1 aggregate plus complete bounded body-free V2 route-health projection"
-            .to_owned()
-    });
-}
-
 fn credential_generation_for_read(profile: &ProfileMetadata) -> Result<String> {
     let generation = profile.credential_generation_id.as_deref().ok_or_else(|| {
         CliError::Input(format!(
@@ -6577,94 +6355,6 @@ fn credential_generation_for_read(profile: &ProfileMetadata) -> Result<String> {
         ))
     })?;
     Ok(generation.to_owned())
-}
-
-fn delegated_read_envelope(
-    catalog_hash: &str,
-    capability_id: &str,
-    profile_id: &str,
-    account_id: Option<String>,
-    receipt: Value,
-    evidence: Option<EvidenceV1>,
-) -> ResultEnvelopeV2 {
-    let success = receipt
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let workspace_failure = workspace_d1_evidence_failure(&receipt);
-    let mut envelope = ResultEnvelopeV2::success("call", receipt);
-    if let Some(evidence) = evidence {
-        envelope = envelope.with_evidence(evidence);
-    }
-    envelope.ok = success;
-    envelope.performed = workspace_failure
-        .as_ref()
-        .is_none_or(|failure| failure.boundary_crossed);
-    envelope.capability_id = Some(capability_id.to_owned());
-    envelope.profile_id = Some(profile_id.to_owned());
-    envelope.account_id = account_id;
-    if let Some(failure) = workspace_failure {
-        envelope.verification.state = VerificationState::Failed;
-        envelope.verification.basis = Some(format!(
-            "workspace D1 evidence failed closed at `{}` without retaining provider output",
-            failure.stage
-        ));
-        let next_step = if failure.boundary_crossed {
-            "Do not replay or infer D1 readiness from lower planes; preserve this receipt, repair the exact provider-read or projection blocker, then run one fresh coherent transaction."
-        } else {
-            "Repair the exact workspace D1 evidence preflight blocker, re-admit the bound cfctl build, then run one fresh coherent transaction; do not bypass cfctl with Wrangler."
-        };
-        envelope.error = Some(ErrorV1 {
-            code: failure.code.clone(),
-            message: format!(
-                "workspace D1 evidence failed at governed stage `{}`; provider output was not retained",
-                failure.stage
-            ),
-            next_step: Some(next_step.to_owned()),
-        });
-    } else {
-        envelope.verification.state = VerificationState::NotApplicable;
-        envelope.verification.basis = Some(format!(
-            "governed CLI read pinned to catalog {catalog_hash}"
-        ));
-    }
-    envelope
-}
-
-struct WorkspaceD1EvidenceFailureReceipt {
-    code: String,
-    stage: String,
-    boundary_crossed: bool,
-}
-
-fn workspace_d1_evidence_failure(receipt: &Value) -> Option<WorkspaceD1EvidenceFailureReceipt> {
-    if receipt.get("adapter").and_then(Value::as_str) != Some("workspace_d1_evidence_v1")
-        || receipt.get("success").and_then(Value::as_bool) != Some(false)
-        || receipt
-            .get("provider_output_retained")
-            .and_then(Value::as_bool)
-            != Some(false)
-        || receipt.get("body_returned").and_then(Value::as_bool) != Some(false)
-    {
-        return None;
-    }
-    let code = receipt.get("failure_code").and_then(Value::as_str)?;
-    if !matches!(
-        code,
-        "CFCTL_WORKSPACE_D1_EVIDENCE_PREFLIGHT_FAILED"
-            | "CFCTL_WORKSPACE_D1_EVIDENCE_WRANGLER_VERSION_FAILED"
-            | "CFCTL_WORKSPACE_D1_EVIDENCE_PROVIDER_READ_FAILED"
-            | "CFCTL_WORKSPACE_D1_EVIDENCE_PROJECTION_FAILED"
-    ) {
-        return None;
-    }
-    let stage = receipt.get("failure_stage").and_then(Value::as_str)?;
-    let boundary_crossed = receipt.get("boundary_crossed").and_then(Value::as_bool)?;
-    Some(WorkspaceD1EvidenceFailureReceipt {
-        code: code.to_owned(),
-        stage: stage.to_owned(),
-        boundary_crossed,
-    })
 }
 
 fn apply_operational_proof_index_result(envelope: &mut ResultEnvelopeV2, proof_result: Result<()>) {
@@ -31128,6 +30818,9 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use super::delegated_read::{
+        envelope as delegated_read_envelope, set_workspace_d1_evidence_verification,
+    };
     use super::{
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
@@ -31153,16 +30846,16 @@ mod tests {
         approved_mln_import_execution_error_envelope, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request, configured_origin,
-        credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
-        entitlement_probe_selectors, exact_accepted_ingest_bookmarks,
-        exact_durable_poll_exhaustion, exact_durable_provider_complete_boundary,
-        exact_durable_provider_failure_boundary, exact_in_progress_poll_receipt,
-        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
-        fresh_credential, github_remote_identity, governed_cli_environment_contract,
-        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
-        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
-        matching_git_url_rewrite, mln_0142_terminal_import_state, mln_0143_parent_manifests,
+        credential_generation_for_read, d1_recovery_anchor_matches, entitlement_probe_selectors,
+        exact_accepted_ingest_bookmarks, exact_durable_poll_exhaustion,
+        exact_durable_provider_complete_boundary, exact_durable_provider_failure_boundary,
+        exact_in_progress_poll_receipt, execute_native_workflow, execute_read, find_secret_value,
+        force_ipv4_from, fresh_credential, github_remote_identity,
+        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        list_security_action_state_receipt, matching_git_url_rewrite,
+        mln_0142_terminal_import_state, mln_0143_parent_manifests,
         mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
         mln_0143_restore_anchor_matches, non_readback_verification_basis,
         normalize_reviewed_mln_repository_id, operational_proof_coverage, pages_deployment,
@@ -31194,13 +30887,13 @@ mod tests {
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         resolve_actionable, resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
         resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_artifact,
-        secret_sink_format, set_workspace_d1_evidence_verification,
-        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
-        should_bind_dns_record_state, should_bind_global_warp_override_state,
-        should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
-        should_bind_oauth_client_update_state, should_bind_pages_project_absence,
-        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
-        should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
+        secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
+        should_bind_d1_read_replication_state, should_bind_dns_record_state,
+        should_bind_global_warp_override_state, should_bind_kv_empty_namespace_state,
+        should_bind_oauth_client_secret_state, should_bind_oauth_client_update_state,
+        should_bind_pages_project_absence, should_bind_warp_connector_configuration_state,
+        should_bind_web_analytics_rum_state, should_bind_zone_account,
+        should_redact_secret_response, should_resolve_entitlement_probe,
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
