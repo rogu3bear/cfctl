@@ -1404,11 +1404,18 @@ fn compile_private_candidate(
         .to_path_buf();
     let output_path = directory.join("d1-reply-admission-compiled.json");
     let staged_compiler_path = directory.join("reply-admission-compiler.ts");
+    let compiler_path = Path::new(&contract.repository_root).join(&contract.compiler_path);
+    let compiler_relative_path = Path::new(&contract.compiler_path);
+    let support_relative_path = compiler_support_relative_path(compiler_relative_path)?;
+    let support_path = directory.join(support_relative_path.file_name().ok_or_else(|| {
+        CliError::Input("reply-admission compiler support path is invalid".to_owned())
+    })?);
     let staged_runtime_path = directory.join("bun");
     let compiled = (|| {
-        let compiler_path = Path::new(&contract.repository_root).join(&contract.compiler_path);
         let compiler_bytes = read_compiler_bytes(&compiler_path, &contract.compiler_sha256)?;
+        let support_bytes = read_committed_compiler_support(contract, &support_relative_path)?;
         write_private_file(&staged_compiler_path, &compiler_bytes)?;
+        write_private_file(&support_path, &support_bytes)?;
         write_private_executable(&staged_runtime_path, &runtime.executable_bytes)?;
         let result = bounded_output(
             Command::new(&staged_runtime_path)
@@ -1433,11 +1440,49 @@ fn compile_private_candidate(
         }
     })();
     let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&support_path);
     let _ = fs::remove_file(&staged_compiler_path);
     let _ = fs::remove_file(&staged_runtime_path);
     let _ = fs::remove_file(&input_path);
     let _ = fs::remove_dir(&directory);
     compiled
+}
+
+fn compiler_support_relative_path(compiler_path: &Path) -> Result<PathBuf> {
+    if compiler_path != Path::new("scripts/reply-admission-receipt.ts") {
+        return Err(CliError::Input(
+            "reply-admission compiler path has no admitted support module".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from("scripts/apple-mail-inbox-receipt.ts"))
+}
+
+fn read_committed_compiler_support(
+    contract: &WorkspaceD1ReplyAdmissionContractV1,
+    relative_path: &Path,
+) -> Result<Vec<u8>> {
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(CliError::Input(
+            "reply-admission compiler support path is unsafe".to_owned(),
+        ));
+    }
+    let relative = relative_path.to_str().ok_or_else(|| {
+        CliError::Input("reply-admission compiler support path is not UTF-8".to_owned())
+    })?;
+    let repository_root = Path::new(&contract.repository_root);
+    let blob_spec = format!("{}:{relative}", contract.repository_head);
+    let bytes = super::git_authority_bytes(repository_root, &["show", &blob_spec])?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CANDIDATE_BYTES {
+        return Err(CliError::Input(
+            "reply-admission compiler support must be a non-empty committed file of at most 1 MiB"
+                .to_owned(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn read_compiler_bytes(path: &Path, expected_sha256: &str) -> Result<Vec<u8>> {
@@ -2247,5 +2292,163 @@ mod tests {
             0o600
         );
         validate_private_stage_object(&store, object).expect("valid stage");
+    }
+
+    #[test]
+    fn reply_admission_compiler_support_is_exact_and_relative() {
+        assert_eq!(
+            compiler_support_relative_path(Path::new("scripts/reply-admission-receipt.ts"))
+                .expect("known compiler support path"),
+            PathBuf::from("scripts/apple-mail-inbox-receipt.ts"),
+        );
+
+        for unsupported in [
+            "reply-admission-receipt.ts",
+            "scripts/other-compiler.ts",
+            "../scripts/reply-admission-receipt.ts",
+        ] {
+            assert!(
+                compiler_support_relative_path(Path::new(unsupported)).is_err(),
+                "unsupported compiler path must fail closed: {unsupported}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test builds a complete committed compiler fixture and verifies private staging cleanup"
+    )]
+    fn staged_reply_admission_compiler_executes_with_committed_support_module() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let fixture_root = fixture
+            .path()
+            .canonicalize()
+            .expect("canonical fixture root");
+        let repository_root = fixture_root
+            .join("maildesk")
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                fs::create_dir(fixture_root.join("maildesk")).expect("repository directory");
+                fixture_root
+                    .join("maildesk")
+                    .canonicalize()
+                    .expect("canonical repository")
+            });
+        fs::create_dir_all(repository_root.join("scripts")).expect("scripts directory");
+        let compiler = br#"import { seal } from "./apple-mail-inbox-receipt";
+import { readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const input = args[args.indexOf("--input") + 1];
+const output = args[args.indexOf("--out") + 1];
+writeFileSync(output, JSON.stringify({ sealed: seal(JSON.parse(readFileSync(input, "utf8")).value) }), { mode: 0o600 });
+"#;
+        let support =
+            br"export function seal(value: string): string { return `committed:${value}`; }
+";
+        fs::write(
+            repository_root.join("scripts/reply-admission-receipt.ts"),
+            compiler,
+        )
+        .expect("compiler fixture");
+        fs::write(
+            repository_root.join("scripts/apple-mail-inbox-receipt.ts"),
+            support,
+        )
+        .expect("support fixture");
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "scripts"],
+            vec![
+                "-c",
+                "user.name=cfctl test",
+                "-c",
+                "user.email=cfctl-test@example.com",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(&repository_root)
+                    .args(args)
+                    .status()
+                    .expect("git fixture command")
+                    .success()
+            );
+        }
+        let head = Command::new("git")
+            .current_dir(&repository_root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("fixture HEAD");
+        let head = String::from_utf8(head.stdout)
+            .expect("UTF-8 HEAD")
+            .trim()
+            .to_owned();
+
+        fs::write(
+            repository_root.join("scripts/apple-mail-inbox-receipt.ts"),
+            "throw new Error('dirty worktree support must not execute');\n",
+        )
+        .expect("dirty support fixture");
+
+        let bun = which::which("bun").expect("bun");
+        let bun = fs::canonicalize(bun).expect("canonical bun");
+        let bun_bytes = fs::read(&bun).expect("bun bytes");
+        let bun_version = Command::new(&bun)
+            .arg("--version")
+            .output()
+            .expect("bun version");
+        let contract = WorkspaceD1ReplyAdmissionContractV1 {
+            operation_kind: "activate".to_owned(),
+            repository_root: repository_root.display().to_string(),
+            repository_head: head,
+            repository_origin: "fixture".to_owned(),
+            operation_pack_path: ".cfctl/operations/d1-reply-admission.toml".to_owned(),
+            operation_pack_sha256: prefixed('1'),
+            compiler_path: "scripts/reply-admission-receipt.ts".to_owned(),
+            compiler_sha256: hex_sha(compiler),
+            compiler_runtime: "bun".to_owned(),
+            compiler_runtime_version: String::from_utf8(bun_version.stdout)
+                .expect("UTF-8 bun version")
+                .trim()
+                .to_owned(),
+            compiler_runtime_sha256: hex_sha(&bun_bytes),
+            config_template_path: "wrangler.toml".to_owned(),
+            config_template_sha256: prefixed('2'),
+            production_config_path: "wrangler.production.toml".to_owned(),
+            database_binding: "DB".to_owned(),
+            wrangler_version: "4.120.1".to_owned(),
+            admission_table: "reply_admissions".to_owned(),
+            input_contract: "maildesk_reply_admission_compiler_input_v1".to_owned(),
+            mutation_projection: "maildesk_reply_admission_insert_v1".to_owned(),
+            read_projection: None,
+            read_parameters: Vec::new(),
+            recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
+            recovery_max_age_seconds: 600,
+            rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        };
+        let state_root = fixture_root.join("state");
+        let store = StateStore::open(RuntimePaths::from_root(&state_root)).expect("state store");
+        let source = fixture_root.join("source.json");
+        write_private_file(&source, br#"{"value":"candidate"}"#).expect("private source");
+        let source = fs::canonicalize(source).expect("canonical private source");
+        let runtime = compiler_runtime(&store, &contract).expect("compiler runtime");
+        let compiled_output = compile_private_candidate(&store, &contract, &source, &runtime)
+            .expect("staged compiler with committed support");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&compiled_output).expect("compiled JSON"),
+            json!({"sealed":"committed:candidate"}),
+        );
+        assert!(
+            fs::read_dir(store.paths().data_dir.join("private-operation-stages"))
+                .expect("private stages")
+                .next()
+                .is_none(),
+            "private compiler stages must be removed",
+        );
     }
 }
