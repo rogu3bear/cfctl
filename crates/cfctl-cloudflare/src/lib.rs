@@ -7361,6 +7361,10 @@ impl Executor {
         if !combined.success || !request.method.eq_ignore_ascii_case("GET") {
             return Ok(combined);
         }
+        if request_is_worker_versions_list(request) {
+            return Box::pin(self.complete_worker_versions_list(request, credential, combined))
+                .await;
+        }
         if request_is_queue_consumers_single_page(request) {
             normalize_queue_consumers_single_page(&mut combined)?;
             return Ok(combined);
@@ -7480,6 +7484,96 @@ impl Executor {
         if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut) {
             result_info.insert("page".to_owned(), Value::from(total_pages));
             result_info.insert("count".to_owned(), Value::from(results.len()));
+            result_info.insert("total_pages".to_owned(), Value::from(total_pages));
+            result_info.insert("cfctl_pages".to_owned(), Value::from(total_pages));
+            result_info.insert("cfctl_page_complete".to_owned(), Value::Bool(true));
+        }
+        Ok(combined)
+    }
+
+    async fn complete_worker_versions_list(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        mut combined: CloudflareResponseV1,
+    ) -> Result<CloudflareResponseV1> {
+        if request_is_worker_versions_deployable(request) {
+            normalize_deployable_worker_versions(&mut combined)?;
+            return Ok(combined);
+        }
+        let pagination = page_pagination(combined.result_info.as_ref())?
+            .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+        self.complete_worker_versions_page_pagination(request, credential, combined, pagination)
+            .await
+    }
+
+    async fn complete_worker_versions_page_pagination(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        mut combined: CloudflareResponseV1,
+        pagination: PagePagination,
+    ) -> Result<CloudflareResponseV1> {
+        let PagePagination {
+            current_page,
+            total_pages,
+            total_count,
+            ..
+        } = pagination;
+        if total_pages > 1_000 {
+            return Err(CloudflareError::PaginationLimit(total_pages));
+        }
+        validate_worker_versions_item_count(&combined, pagination)?;
+        let status = combined.status;
+        let Some(items) = combined
+            .result
+            .as_object_mut()
+            .and_then(|result| result.get_mut("items"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(CloudflareError::InvalidResponseEnvelope { status });
+        };
+        for page in (current_page + 1)..=total_pages {
+            let mut page_request = request.clone();
+            set_query_parameter(&mut page_request.url, "page", &page.to_string());
+            let response = self.send(&page_request, credential).await?;
+            if !response.success {
+                return Ok(response);
+            }
+            let response_pagination = page_pagination(response.result_info.as_ref())?
+                .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+            if response_pagination.current_page != page
+                || response_pagination.total_pages != total_pages
+                || response_pagination.total_count != total_count
+            {
+                return Err(CloudflareError::PaginationMetadataInvalid);
+            }
+            validate_worker_versions_item_count(&response, response_pagination)?;
+            let Some(page_items) = response
+                .result
+                .as_object()
+                .and_then(|result| result.get("items"))
+                .and_then(Value::as_array)
+            else {
+                return Err(CloudflareError::InvalidResponseEnvelope {
+                    status: response.status,
+                });
+            };
+            items.extend(page_items.iter().cloned());
+            combined.etag = response.etag;
+            combined.cf_ray = response.cf_ray;
+        }
+        if let Some(expected) = total_count
+            && expected != items.len() as u64
+        {
+            return Err(CloudflareError::PaginationCountMismatch {
+                expected,
+                actual: items.len(),
+            });
+        }
+        if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut) {
+            result_info.insert("page".to_owned(), Value::from(total_pages));
+            result_info.insert("count".to_owned(), Value::from(items.len()));
             result_info.insert("total_pages".to_owned(), Value::from(total_pages));
             result_info.insert("cfctl_pages".to_owned(), Value::from(total_pages));
             result_info.insert("cfctl_page_complete".to_owned(), Value::Bool(true));
@@ -9151,6 +9245,116 @@ fn validate_page_item_count(
 
 fn request_expects_page_pagination(request: &PreparedRequest) -> bool {
     request.url.query_pairs().any(|(name, _)| name == "page")
+}
+
+fn request_is_worker_versions_list(request: &PreparedRequest) -> bool {
+    if !request.method.eq_ignore_ascii_case("GET") {
+        return false;
+    }
+    let segments = request
+        .url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    let Some(tail) = segments
+        .len()
+        .checked_sub(6)
+        .map(|start| &segments[start..])
+    else {
+        return false;
+    };
+    tail[0] == "accounts"
+        && !tail[1].is_empty()
+        && tail[2] == "workers"
+        && tail[3] == "scripts"
+        && !tail[4].is_empty()
+        && tail[5] == "versions"
+}
+
+fn request_is_worker_versions_deployable(request: &PreparedRequest) -> bool {
+    request_is_worker_versions_list(request)
+        && request
+            .url
+            .query_pairs()
+            .any(|(name, value)| name == "deployable" && value == "true")
+}
+
+fn validate_worker_versions_item_count(
+    response: &CloudflareResponseV1,
+    pagination: PagePagination,
+) -> Result<()> {
+    let Some(items) = response
+        .result
+        .as_object()
+        .and_then(|result| result.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return Err(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        });
+    };
+    if let Some(expected) = pagination.count
+        && expected != items.len() as u64
+    {
+        return Err(CloudflareError::PaginationCountMismatch {
+            expected,
+            actual: items.len(),
+        });
+    }
+    Ok(())
+}
+
+fn normalize_deployable_worker_versions(response: &mut CloudflareResponseV1) -> Result<()> {
+    let Some(items) = response
+        .result
+        .as_object()
+        .and_then(|result| result.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return Err(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        });
+    };
+    let count = items.len();
+    if response.result_info.is_none() {
+        response.result_info = Some(serde_json::json!({}));
+    }
+    let info = response
+        .result_info
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or(CloudflareError::PaginationMetadataInvalid)?;
+    if info.contains_key("cursor") || info.contains_key("cursors") {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    let metadata_u64 = |field: &str| {
+        info.get(field)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or(CloudflareError::PaginationMetadataInvalid)
+            })
+            .transpose()
+    };
+    if metadata_u64("page")?.is_some_and(|page| page == 0)
+        || metadata_u64("per_page")?.is_some_and(|per_page| per_page == 0)
+    {
+        return Err(CloudflareError::PaginationMetadataInvalid);
+    }
+    if let Some(expected) = metadata_u64("count")?
+        && expected != count as u64
+    {
+        return Err(CloudflareError::PaginationCountMismatch {
+            expected,
+            actual: count,
+        });
+    }
+    metadata_u64("total_count")?;
+    metadata_u64("total_pages")?;
+    info.insert("count".to_owned(), Value::from(count));
+    info.insert("cfctl_pages".to_owned(), Value::from(1));
+    info.insert("cfctl_single_page_complete".to_owned(), Value::Bool(true));
+    Ok(())
 }
 
 fn request_is_queue_consumers_single_page(request: &PreparedRequest) -> bool {
