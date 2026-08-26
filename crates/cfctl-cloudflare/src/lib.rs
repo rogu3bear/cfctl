@@ -9324,17 +9324,26 @@ fn normalize_deployable_worker_versions(response: &mut CloudflareResponseV1) -> 
         .as_mut()
         .and_then(Value::as_object_mut)
         .ok_or(CloudflareError::PaginationMetadataInvalid)?;
-    if info.contains_key("cursor") || info.contains_key("cursors") {
+    let cursor_is_active = info.get("cursor").is_some_and(|cursor| !cursor.is_null());
+    let cursors_are_active = info.get("cursors").is_some_and(|cursors| match cursors {
+        Value::Null => false,
+        Value::Object(entries) => entries.values().any(|cursor| !cursor.is_null()),
+        _ => true,
+    });
+    if cursor_is_active || cursors_are_active {
         return Err(CloudflareError::PaginationMetadataInvalid);
     }
     let metadata_u64 = |field: &str| {
-        info.get(field)
-            .map(|value| {
-                value
-                    .as_u64()
-                    .ok_or(CloudflareError::PaginationMetadataInvalid)
-            })
-            .transpose()
+        let Some(value) = info.get(field) else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        value
+            .as_u64()
+            .map(Some)
+            .ok_or(CloudflareError::PaginationMetadataInvalid)
     };
     if metadata_u64("page")?.is_some_and(|page| page == 0)
         || metadata_u64("per_page")?.is_some_and(|per_page| per_page == 0)

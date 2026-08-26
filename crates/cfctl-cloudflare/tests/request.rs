@@ -5045,6 +5045,41 @@ async fn worker_versions_deployable_is_one_bounded_response() {
 }
 
 #[tokio::test]
+async fn worker_versions_deployable_accepts_nullable_pagination_metadata() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"items":[{"id":"version-1"}]},"errors":[],"result_info":{"page":null,"per_page":null,"count":1,"total_count":287,"total_pages":null,"cursor":null,"cursors":null}}"#,
+    ])
+    .await;
+
+    let response = execute_worker_versions_read(&address, json!({"deployable":true}))
+        .await
+        .expect("nullable metadata does not imply another deployable page");
+
+    assert_eq!(response.result["items"].as_array().map(Vec::len), Some(1));
+    let info = response.result_info.expect("bounded result info");
+    assert_eq!(info["count"], json!(1));
+    assert_eq!(info["total_count"], json!(287));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn worker_versions_deployable_rejects_an_active_cursor() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"items":[{"id":"version-1"}]},"errors":[],"result_info":{"count":1,"cursor":"next-page"}}"#,
+    ])
+    .await;
+
+    let error = execute_worker_versions_read(&address, json!({"deployable":true}))
+        .await
+        .expect_err("an active cursor contradicts bounded deployable completeness");
+
+    assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
 async fn worker_versions_rejects_a_missing_or_malformed_items_array() {
     for body in [
         r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":10,"count":0,"total_count":0}}"#,
