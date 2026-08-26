@@ -1050,8 +1050,9 @@ Worker's `node_modules`. Other delegated CLI capabilities keep their existing
 working directory. `wrangler.deploy` has a bounded ten-minute subprocess
 timeout because a reviewed Worker deployment may include a UI or WASM build;
 other capabilities using the generic delegated-CLI runner retain its two-minute
-bound. The specialized workspace D1 adapter retains a two-minute query/readback
-bound and a five-minute migration-apply bound. A timeout after the
+bound. Specialized workspace D1 adapters retain a two-minute query/readback
+bound and a five-minute mutation-apply bound for migrations, policy projection,
+and reply admission. A timeout after the
 mutation-capable deployment subprocess starts is an uncertain boundary crossing:
 inspect the consumed plan with `plans status` and `plans rectify`, and never
 replay the mutation. `cfctl doctor --json` projects this boundary under
