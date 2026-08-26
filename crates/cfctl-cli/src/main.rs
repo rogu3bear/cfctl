@@ -166,4 +166,39 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn plan_run_timeout_does_not_infer_consumption_from_command_syntax() {
+        let operation_id = "ab2c8ee6-8d88-4d3a-a015-2329b65bf6d3";
+        let cli = match Cli::try_parse_from(["cfctl", "plans", "run", operation_id, "--json"]) {
+            Ok(cli) => cli,
+            Err(error) => panic!("valid plan run command: {error}"),
+        };
+        let context = FailureEnvelopeContext::deterministic(&cli);
+        let error = CliError::SubprocessTimeout {
+            label: "wrangler deploy".to_owned(),
+            timeout_seconds: 600,
+        };
+
+        let envelope = failure_envelope(&context, &error);
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(envelope.command, "plans run");
+        assert_eq!(envelope.operation_id.as_deref(), Some(operation_id));
+        let Some(error) = envelope.error else {
+            panic!("failure envelope must include timeout details");
+        };
+        assert_eq!(error.code, "CFCTL_SUBPROCESS_TIMEOUT");
+        assert!(error.message.contains("600-second governed timeout"));
+        let Some(next_step) = error.next_step else {
+            panic!("timeout envelope must carry operation-bound recovery");
+        };
+        assert!(next_step.contains("governed subprocess"));
+        assert!(next_step.contains("plans status <operation-id>"));
+        assert!(next_step.contains("do not assume the plan was consumed"));
+        assert!(!next_step.contains("provider outcome is uncertain"));
+        assert!(!next_step.contains(&format!("plans rectify {operation_id}")));
+        assert!(!next_step.contains("doctor"));
+    }
 }

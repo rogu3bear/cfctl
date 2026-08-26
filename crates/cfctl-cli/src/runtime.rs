@@ -104,6 +104,8 @@ const PAGES_SOURCE_REMOTE_PRECONDITION: &str = "pages_source_remote";
 const PAGES_PROJECT_NOT_FOUND_ERROR_CODE: i64 = 8_000_007;
 const PAGES_GIT_CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGES_GIT_REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
+const DELEGATED_CLI_TIMEOUT: Duration = Duration::from_mins(2);
+const WRANGLER_DEPLOY_TIMEOUT: Duration = Duration::from_mins(10);
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -134,8 +136,16 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("HTTP client construction failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("subprocess `{0}` exceeded the 120-second governed timeout")]
-    SubprocessTimeout(String),
+    #[error("subprocess `{label}` exceeded the {timeout_seconds}-second governed timeout")]
+    SubprocessTimeout { label: String, timeout_seconds: u64 },
+    #[error("delegated mutation subprocess `{label}` was not started")]
+    SubprocessNotStarted { label: String },
+    #[error(
+        "delegated mutation subprocess `{label}` started, but no complete receipt is available"
+    )]
+    SubprocessReceiptUnavailable { label: String },
+    #[error("delegated mutation was not attempted: {message}")]
+    DelegatedMutationNotAttempted { message: String },
     /// A CLI-level blocker that carries its own stable code and a specific,
     /// copy-pasteable next command for the agent. Prefer this over
     /// `Input(String)` whenever the failure has a knowable recovery step.
@@ -196,7 +206,33 @@ impl CliError {
                 "Run `cfctl registry status --json` and `cfctl registry coverage --json` to inspect projection health and blockers."
                     .to_owned(),
             )),
+            Self::SubprocessTimeout { .. } => Some((
+                "CFCTL_SUBPROCESS_TIMEOUT",
+                "The governed subprocess did not return a complete receipt. If this occurred during `plans run`, inspect `cfctl plans status <operation-id> --json`; do not assume the plan was consumed or replay the mutation until durable status proves the correct recovery path."
+                    .to_owned(),
+            )),
+            Self::SubprocessReceiptUnavailable { .. } => Some((
+                "CFCTL_SUBPROCESS_RECEIPT_UNAVAILABLE",
+                "The mutation-capable subprocess started but did not return a complete receipt. Inspect `cfctl plans status <operation-id> --json`, then use its exact disposition; do not replay the mutation."
+                    .to_owned(),
+            )),
+            Self::SubprocessNotStarted { .. } | Self::DelegatedMutationNotAttempted { .. } => {
+                Some((
+                    "CFCTL_DELEGATED_MUTATION_NOT_ATTEMPTED",
+                    "The mutation-capable subprocess was not started. Inspect `cfctl plans status <operation-id> --json` and the local blocker; do not infer a provider write from plan consumption alone."
+                        .to_owned(),
+                ))
+            }
             _ => None,
+        }
+    }
+
+    fn delegated_mutation_not_attempted(error: Self) -> Self {
+        match error {
+            Self::SubprocessNotStarted { .. } | Self::DelegatedMutationNotAttempted { .. } => error,
+            other => Self::DelegatedMutationNotAttempted {
+                message: other.to_string(),
+            },
         }
     }
 }
@@ -7756,10 +7792,6 @@ fn execute_governed_ui_plan(
     Ok(envelope)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the subprocess boundary keeps governed environment, structured output, timeout, and redaction in one receipt-producing transaction"
-)]
 async fn run_delegated_cli(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -7768,6 +7800,37 @@ async fn run_delegated_cli(
     cache_dir: &Path,
     program_override: Option<&Path>,
     interpreter_override: Option<&Path>,
+) -> Result<Value> {
+    run_delegated_cli_with_timeout(
+        capability,
+        input,
+        credential,
+        account_id,
+        cache_dir,
+        program_override,
+        interpreter_override,
+        governed_delegated_cli_timeout(&capability.id),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test-only timeout seam retains every production boundary input without adding a caller-controlled capability selector"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the subprocess boundary keeps governed environment, structured output, timeout, process-tree containment, and redaction in one receipt-producing transaction"
+)]
+async fn run_delegated_cli_with_timeout(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+    account_id: Option<&str>,
+    cache_dir: &Path,
+    program_override: Option<&Path>,
+    interpreter_override: Option<&Path>,
+    timeout: Duration,
 ) -> Result<Value> {
     let mut path_parts = capability.path.split_whitespace();
     let program = path_parts
@@ -7780,13 +7843,11 @@ async fn run_delegated_cli(
     }
     let selected_program = program_override.unwrap_or_else(|| Path::new(program));
     let mut command = if let Some(interpreter) = interpreter_override {
-        let mut command = ProcessCommand::new(interpreter);
-        command.arg(selected_program);
-        command
+        processkit::Command::new(interpreter).arg(selected_program)
     } else {
-        ProcessCommand::new(selected_program)
+        processkit::Command::new(selected_program)
     };
-    command.args(path_parts);
+    command = command.args(path_parts);
     let isolated_wrangler_directory =
         if worker_deployment::requires_configless_working_directory(capability, input)
             || pages_deployment::binds_artifact(capability)
@@ -7806,9 +7867,9 @@ async fn run_delegated_cli(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
     {
-        command.current_dir(wrangler_config_directory(config)?);
+        command = command.current_dir(wrangler_config_directory(config)?);
     } else if let Some(directory) = &isolated_wrangler_directory {
-        command.current_dir(directory.path());
+        command = command.current_dir(directory.path());
     }
     let wrangler_output_path = if pages_deployment::binds_artifact(capability) {
         isolated_wrangler_directory
@@ -7817,50 +7878,60 @@ async fn run_delegated_cli(
     } else {
         None
     };
-    append_cli_input(&mut command, &input.selectors)?;
-    append_cli_input(&mut command, &input.query)?;
+    command = command
+        .args(cli_input_arguments(&input.selectors)?)
+        .args(cli_input_arguments(&input.query)?);
     if pages_deployment::binds_artifact(capability) {
         // cfctl already produced and hash-bound the closed worker bundle. A
         // second Wrangler bundle would reopen ambient project resolution.
-        command.arg("--no-bundle");
+        command = command.arg("--no-bundle");
     }
     if input.body.is_some() {
         return Err(CliError::Input(
             "delegated CLI request bodies need a capability-specific native adapter".to_owned(),
         ));
     }
-    command
+    command = command
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
         .env("HOME", env::var_os("HOME").unwrap_or_default())
         .env("NO_COLOR", "1")
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(processkit::Stdin::empty())
+        .timeout(timeout);
     for (name, value) in governed_cli_workspace_env(program, account_id, cache_dir) {
-        command.env(name, value);
+        command = command.env(name, value);
     }
     if let Some(path) = &wrangler_output_path {
-        command.env("WRANGLER_OUTPUT_FILE_PATH", path);
+        command = command.env("WRANGLER_OUTPUT_FILE_PATH", path);
     }
-    match credential {
-        AuthCredential::Bearer { token } => {
-            command.env("CLOUDFLARE_API_TOKEN", token);
-        }
-        AuthCredential::GlobalKey { email, key } => {
-            command
-                .env("CLOUDFLARE_EMAIL", email)
-                .env("CLOUDFLARE_API_KEY", key);
-        }
-    }
+    command = match credential {
+        AuthCredential::Bearer { token } => command.env("CLOUDFLARE_API_TOKEN", token),
+        AuthCredential::GlobalKey { email, key } => command
+            .env("CLOUDFLARE_EMAIL", email)
+            .env("CLOUDFLARE_API_KEY", key),
+    };
     let label = capability.path.clone();
-    let output = tokio::time::timeout(Duration::from_mins(2), command.output())
+    let running = command
+        .start()
         .await
-        .map_err(|_| CliError::SubprocessTimeout(label.clone()))?
-        .map_err(|source| cli_io(Path::new(program), source))?;
-    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
-    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+        .map_err(|_| CliError::SubprocessNotStarted {
+            label: label.clone(),
+        })?;
+    let output =
+        running
+            .output_bytes()
+            .await
+            .map_err(|_| CliError::SubprocessReceiptUnavailable {
+                label: label.clone(),
+            })?;
+    if output.timed_out() {
+        return Err(CliError::SubprocessTimeout {
+            label: label.clone(),
+            timeout_seconds: timeout.as_secs(),
+        });
+    }
+    let stdout = redact_subprocess_text(&String::from_utf8_lossy(output.stdout()), credential);
+    let stderr = redact_subprocess_text(output.stderr(), credential);
     let structured_output = if let Some(path) = &wrangler_output_path {
         fs::read_to_string(path)
             .map_err(|source| cli_io(path, source))
@@ -7868,12 +7939,12 @@ async fn run_delegated_cli(
     } else {
         Ok(Value::Null)
     };
-    let success = output.status.success() && structured_output.is_ok();
+    let success = output.is_success() && structured_output.is_ok();
     let structured_output_error = structured_output.as_ref().err().map(ToString::to_string);
     Ok(json!({
         "adapter": "delegated_cli",
         "command": capability.path,
-        "exit_status": output.status.code(),
+        "exit_status": output.code(),
         "success": success,
         "stdout": stdout,
         "stderr": stderr,
@@ -7884,6 +7955,14 @@ async fn run_delegated_cli(
             AuthCredential::GlobalKey { .. } => ["CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"].as_slice(),
         },
     }))
+}
+
+fn governed_delegated_cli_timeout(capability_id: &str) -> Duration {
+    if capability_id == "wrangler.deploy" {
+        WRANGLER_DEPLOY_TIMEOUT
+    } else {
+        DELEGATED_CLI_TIMEOUT
+    }
 }
 
 async fn run_quick_tunnel(store: &StateStore, plan: &PlanV1, input: &CallInput) -> Result<Value> {
@@ -8285,23 +8364,23 @@ fn governed_cli_environment_contract(cache_dir: &Path) -> Value {
     })
 }
 
-fn append_cli_input(command: &mut ProcessCommand, input: &Value) -> Result<()> {
+fn cli_input_arguments(input: &Value) -> Result<Vec<OsString>> {
     let fields = input
         .as_object()
         .ok_or_else(|| CliError::Input("CLI selectors and query must be objects".to_owned()))?;
+    let mut arguments = Vec::with_capacity(fields.len().saturating_mul(2));
     for (key, value) in fields {
         let rendered = value
             .as_str()
             .map_or_else(|| value.to_string(), str::to_owned);
         if matches!(key.as_str(), "argument" | "arg" | "path") {
-            command.arg(rendered);
+            arguments.push(OsString::from(rendered));
         } else {
-            command
-                .arg(format!("--{}", key.replace('_', "-")))
-                .arg(rendered);
+            arguments.push(OsString::from(format!("--{}", key.replace('_', "-"))));
+            arguments.push(OsString::from(rendered));
         }
     }
-    Ok(())
+    Ok(arguments)
 }
 
 fn redact_subprocess_text(text: &str, credential: &AuthCredential) -> String {
@@ -15607,9 +15686,10 @@ fn run_bounded_pages_git_program(
                 CliError::Input("Pages source Git proof could not start or complete".to_owned())
             })?;
             if output.timed_out() {
-                return Err(CliError::SubprocessTimeout(
-                    "Pages source Git proof".to_owned(),
-                ));
+                return Err(CliError::SubprocessTimeout {
+                    label: "Pages source Git proof".to_owned(),
+                    timeout_seconds: timeout.as_secs(),
+                });
             }
             if output.truncated() || output.stdout().len() > 8_192 {
                 return Err(CliError::Input(
@@ -16910,6 +16990,7 @@ fn recover_standing_lineage(store: &StateStore, authority_id: &str) -> Result<Ve
     Ok(evidence)
 }
 
+#[derive(Default)]
 struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
@@ -17054,24 +17135,24 @@ async fn execute_consumed_plan(
         return result;
     }
     if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
-        let mut result =
+        let result =
             execute_delegated_plan(store, catalog, plan, execution_input, credential, secrets)
                 .await;
-        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
-        {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_transaction_stage_with_artifact(
-                store,
-                plan,
-                TransactionStageV1::BoundaryResponsePersisted,
-                boundary_failure_artifact("delegated_cli", "no_receipt"),
-            )?;
-            persist_secret_lifecycle(store, plan, false, None, secrets)?;
-        }
-        if let Ok(envelope) = &mut result {
-            prepend_live_precondition_evidence(envelope, evidence);
-        }
-        return result;
+        return match result {
+            Ok(mut envelope) => {
+                prepend_live_precondition_evidence(&mut envelope, evidence);
+                Ok(envelope)
+            }
+            Err(error)
+                if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted =>
+            {
+                persist_delegated_pre_response_failure(store, plan, &error, secrets)?;
+                let mut envelope = delegated_pre_response_failure_envelope(plan, &error);
+                prepend_live_precondition_evidence(&mut envelope, evidence);
+                Ok(envelope)
+            }
+            Err(error) => Err(error),
+        };
     }
     if plan.capability.adapter_status == AdapterStatus::GovernedUi {
         let mut result = execute_governed_ui_plan(store, plan, execution_input, secrets);
@@ -17102,6 +17183,74 @@ async fn execute_consumed_plan(
     .await?;
     prepend_live_precondition_evidence(&mut envelope, evidence);
     Ok(envelope)
+}
+
+fn persist_delegated_pre_response_failure(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    error: &CliError,
+    secrets: &dyn SecretStore,
+) -> Result<()> {
+    plan.status = PlanStatus::RectificationRequired;
+    let outcome = if delegated_mutation_was_attempted(error) {
+        "no_receipt"
+    } else {
+        "not_attempted"
+    };
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        boundary_failure_artifact("delegated_cli", outcome),
+    )?;
+    persist_secret_lifecycle(store, plan, false, None, secrets)?;
+    Ok(())
+}
+
+fn delegated_pre_response_failure_envelope(plan: &PlanV1, error: &CliError) -> ResultEnvelopeV2 {
+    let next_step = format!(
+        "Do not replay the mutation; run `cfctl plans status {} --json`, then `cfctl plans rectify {} --json`.",
+        plan.operation_id, plan.operation_id
+    );
+    let mut envelope = ResultEnvelopeV2::failure(
+        "plans run",
+        error.code(),
+        &error.to_string(),
+        Some(&next_step),
+    );
+    let performed = delegated_mutation_was_attempted(error);
+    envelope.result = json!({
+        "success": false,
+        "outcome": if performed { "unknown" } else { "not_attempted" },
+        "receipt_available": false,
+        "boundary_replayed": false,
+    });
+    envelope.performed = performed;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = if performed {
+        VerificationState::Pending
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if performed {
+        "the mutation-capable delegated subprocess started, but no complete boundary receipt exists; provider acceptance is unknown and the consumed plan requires rectification without replay"
+            .to_owned()
+    } else {
+        "no mutation-capable delegated subprocess was started; plan consumption is preserved for rectification, but no provider write is claimed"
+            .to_owned()
+    });
+    envelope
+}
+
+fn delegated_mutation_was_attempted(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::SubprocessTimeout { .. } | CliError::SubprocessReceiptUnavailable { .. }
+    )
 }
 
 fn prepend_live_precondition_evidence(
@@ -30983,7 +31132,7 @@ mod tests {
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
         ImportPrerequisiteContext, KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions,
-        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
+        LivePreconditionEvidence, Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
         OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, OAUTH_CLIENT_UPDATE_STATE_PRECONDITION,
         PAGES_PROJECT_ABSENCE_PRECONDITION, PAGES_PROJECT_CREATE_CAPABILITY_ID,
         PAGES_PROJECT_DETAIL_PATH, PAGES_PROJECT_READ_CAPABILITY_ID, PlanAuthority,
@@ -31082,8 +31231,8 @@ mod tests {
         SearchArgs,
     };
     use cfctl_auth::{
-        AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind, ProfileMetadata,
-        SecretStore,
+        AuthCredential, AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind,
+        ProfileMetadata, SecretStore,
     };
     use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
     use cfctl_cloudflare::{
@@ -31521,6 +31670,225 @@ mod tests {
         assert!(validate_pages_source_remote_receipt(&plan, &drifted_identity).is_err());
     }
 
+    #[test]
+    fn wrangler_deploy_has_a_bounded_extended_timeout_without_broadening_other_cli_calls() {
+        assert_eq!(
+            super::governed_delegated_cli_timeout("wrangler.deploy"),
+            Duration::from_mins(10)
+        );
+        for capability_id in [
+            "wrangler.versions-upload",
+            "wrangler.versions-deploy",
+            "wrangler.pages-deploy",
+            "arbitrary.delegated-cli",
+        ] {
+            assert_eq!(
+                super::governed_delegated_cli_timeout(capability_id),
+                Duration::from_mins(2),
+                "{capability_id} must retain the generic bound"
+            );
+        }
+    }
+
+    #[test]
+    fn subprocess_timeout_reports_each_actual_governed_bound() {
+        for seconds in [120, 300, 600] {
+            let error = CliError::SubprocessTimeout {
+                label: "bounded tool".to_owned(),
+                timeout_seconds: seconds,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{seconds}-second governed timeout"))
+            );
+            assert_eq!(error.code(), "CFCTL_SUBPROCESS_TIMEOUT");
+            let next_step = error.next_step().expect("typed timeout guidance");
+            assert!(next_step.contains("plans status"));
+            assert!(next_step.contains("do not assume the plan was consumed"));
+            assert!(next_step.contains("replay the mutation"));
+            assert!(!next_step.contains("plans rectify"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn governed_delegated_timeout_terminates_the_full_build_process_tree() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("delegated process-tree root");
+        let program = root.path().join("wrangler-timeout-probe.sh");
+        let pid_file = root.path().join("pids");
+        fs::write(
+            &program,
+            "#!/bin/sh\nsleep 30 &\nprintf '%s %s\\n' \"$$\" \"$!\" > \"$2\"\nwait\n",
+        )
+        .expect("timeout probe source");
+        let mut permissions = fs::metadata(&program)
+            .expect("timeout probe metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&program, permissions).expect("timeout probe permissions");
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).expect("cache root");
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "deploy Worker", "CLI", "wrangler deploy");
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+
+        let error = super::run_delegated_cli_with_timeout(
+            &capability,
+            &CallInput {
+                selectors: json!({}),
+                query: json!({"argument":pid_file}),
+                ..CallInput::default()
+            },
+            &cfctl_auth::AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            Some("fixture-account"),
+            &cache,
+            Some(&program),
+            Some(Path::new("/bin/sh")),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("delegated process tree must time out");
+        assert!(matches!(
+            error,
+            CliError::SubprocessTimeout {
+                timeout_seconds: 1,
+                ..
+            }
+        ));
+
+        let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
+        for pid in pids.split_whitespace() {
+            let mut alive = true;
+            for _ in 0..100 {
+                alive = StdCommand::new("kill")
+                    .args(["-0", pid])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("process probe")
+                    .success();
+                if !alive {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive, "timed-out delegated process {pid} survived");
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_launch_failure_is_typed_as_not_started() {
+        let root = tempfile::tempdir().expect("delegated launch-failure root");
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).expect("cache root");
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "deploy Worker", "CLI", "wrangler deploy");
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let missing_program = root.path().join("missing-wrangler");
+
+        let error = super::run_delegated_cli_with_timeout(
+            &capability,
+            &CallInput {
+                selectors: json!({}),
+                query: json!({}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            Some("fixture-account"),
+            &cache,
+            Some(&missing_program),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("missing delegated executable must fail before launch");
+
+        assert!(
+            matches!(&error, CliError::SubprocessNotStarted { .. }),
+            "unexpected launch classification: {error}"
+        );
+        assert_eq!(error.code(), "CFCTL_DELEGATED_MUTATION_NOT_ATTEMPTED");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn governed_delegated_timeout_windows_job_contains_the_full_build_tree() {
+        let root = tempfile::tempdir().expect("Windows delegated process-tree root");
+        let program = root.path().join("wrangler-timeout-probe.ps1");
+        let pid_file = root.path().join("pids");
+        fs::write(
+            &program,
+            "$child = Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -NoNewline -LiteralPath $args[1] -Value \"$PID $($child.Id)\"; $child.WaitForExit()",
+        )
+        .expect("Windows timeout probe source");
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).expect("cache root");
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "deploy Worker", "CLI", "wrangler deploy");
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+
+        let error = super::run_delegated_cli_with_timeout(
+            &capability,
+            &CallInput {
+                selectors: json!({}),
+                query: json!({"argument":pid_file}),
+                ..CallInput::default()
+            },
+            &cfctl_auth::AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            Some("fixture-account"),
+            &cache,
+            Some(&program),
+            Some(Path::new("powershell.exe")),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("delegated Windows process tree must time out");
+        assert!(matches!(
+            error,
+            CliError::SubprocessTimeout {
+                timeout_seconds: 1,
+                ..
+            }
+        ));
+
+        let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
+        for pid in pids.split_whitespace() {
+            let mut alive = true;
+            for _ in 0..100 {
+                alive = StdCommand::new("powershell.exe")
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!(
+                            "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                        ),
+                    ])
+                    .status()
+                    .expect("descendant process probe")
+                    .success();
+                if !alive {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive, "timed-out delegated process {pid} survived");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn pages_git_proof_is_prompt_free_bounded_and_terminates_its_process_group() {
@@ -31609,7 +31977,7 @@ mod tests {
             super::PAGES_GIT_CONFIG_TIMEOUT,
         )
         .expect_err("timeout must fail closed");
-        assert!(matches!(error, CliError::SubprocessTimeout(_)));
+        assert!(matches!(error, CliError::SubprocessTimeout { .. }));
 
         let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
         for pid in pids.split_whitespace() {
@@ -31651,7 +32019,13 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect_err("descendant-held pipe must time out");
-        assert!(matches!(error, CliError::SubprocessTimeout(_)));
+        assert!(matches!(
+            error,
+            CliError::SubprocessTimeout {
+                timeout_seconds: 1,
+                ..
+            }
+        ));
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "Windows Pages Git timeout exceeded its fixed teardown bound"
@@ -45971,6 +46345,148 @@ mod tests {
         durable
             .validate_transaction_journal()
             .expect("the durable failure journal is coherent");
+    }
+
+    #[test]
+    fn delegated_timeout_persists_unknown_outcome_and_returns_no_replay_guidance() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("delegated plan");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        store.save_plan(&plan).expect("persist boundary attempt");
+        let timeout = CliError::SubprocessTimeout {
+            label: "wrangler deploy".to_owned(),
+            timeout_seconds: 600,
+        };
+
+        super::persist_delegated_pre_response_failure(
+            &store,
+            &mut plan,
+            &timeout,
+            &MemorySecretStore::default(),
+        )
+        .expect("persist timeout recovery state");
+        let envelope = super::delegated_pre_response_failure_envelope(&plan, &timeout);
+
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("timed-out delegated plan reloads");
+        assert_eq!(durable.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        assert_eq!(
+            durable
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("body-free missing-receipt checkpoint")["outcome"],
+            "no_receipt"
+        );
+        durable
+            .validate_transaction_journal()
+            .expect("timeout recovery journal is coherent");
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.command, "plans run");
+        assert_eq!(envelope.operation_id, Some(plan.operation_id.clone()));
+        assert_eq!(envelope.result["outcome"], "unknown");
+        assert_eq!(envelope.result["receipt_available"], false);
+        assert_eq!(envelope.result["boundary_replayed"], false);
+        assert_eq!(envelope.verification.state, VerificationState::Pending);
+        let error = envelope.error.expect("typed timeout recovery error");
+        assert_eq!(error.code, "CFCTL_SUBPROCESS_TIMEOUT");
+        let next_step = error.next_step.expect("operation-bound recovery");
+        assert!(next_step.contains(&format!("cfctl plans status {} --json", plan.operation_id)));
+        assert!(next_step.contains(&format!("cfctl plans rectify {} --json", plan.operation_id)));
+        assert!(next_step.contains("Do not replay"));
+    }
+
+    #[tokio::test]
+    async fn delegated_local_failure_after_consumption_does_not_claim_a_provider_attempt() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut capability = CapabilityV1::new(
+            "invalid.delegate",
+            "Invalid delegate",
+            "CLI",
+            "unreviewed-tool",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            &catalog.schema_hash,
+            capability,
+            json!({}),
+        )
+        .expect("delegated plan");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary checkpoint");
+        store.save_plan(&plan).expect("persist consumed plan");
+
+        let envelope = super::execute_consumed_plan(
+            &store,
+            &catalog,
+            &mut plan,
+            &CallInput::default(),
+            &AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            &MemorySecretStore::default(),
+            LivePreconditionEvidence::default(),
+        )
+        .await
+        .expect("local delegated failure becomes a typed recovery envelope");
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(envelope.result["outcome"], "not_attempted");
+        assert_eq!(envelope.result["receipt_available"], false);
+        assert_eq!(envelope.result["boundary_replayed"], false);
+        assert_eq!(envelope.verification.state, VerificationState::Failed);
+        assert!(envelope.verification.basis.as_deref().is_some_and(|basis| {
+            basis.contains("no mutation-capable delegated subprocess was started")
+        }));
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("not-attempted plan reloads");
+        assert_eq!(durable.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("body-free not-attempted checkpoint")["outcome"],
+            "not_attempted"
+        );
+        durable
+            .validate_transaction_journal()
+            .expect("not-attempted recovery journal is coherent");
     }
 
     #[tokio::test]

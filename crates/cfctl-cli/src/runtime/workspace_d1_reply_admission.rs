@@ -24,7 +24,8 @@ use super::{
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const TARGET_KEY: &str = "workspace_d1_reply_admission";
-const TIMEOUT: Duration = Duration::from_mins(2);
+const READ_TIMEOUT: Duration = Duration::from_mins(2);
+const APPLY_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CANDIDATE_BYTES: u64 = 1024 * 1024;
 const RECORD_COLUMNS: &[&str] = &[
     "id",
@@ -342,9 +343,10 @@ pub(super) async fn run(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
-        TIMEOUT,
+        READ_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(CliError::delegated_mutation_not_attempted)?;
     let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(
@@ -369,12 +371,18 @@ pub(super) async fn run(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
-        TIMEOUT,
+        APPLY_TIMEOUT,
     )
     .await;
     let _ = fs::remove_file(&sql_path);
-    let Ok(result) = result else {
-        return Ok(json!({
+    let result = match result {
+        Ok(result) => result,
+        Err(
+            error @ (CliError::SubprocessNotStarted { .. }
+            | CliError::DelegatedMutationNotAttempted { .. }),
+        ) => return Err(error),
+        Err(_) => {
+            return Ok(json!({
             "adapter":"workspace_d1_reply_admission_v1",
             "success":false,
             "boundary_crossed":true,
@@ -389,7 +397,8 @@ pub(super) async fn run(
             "provider_output_retained":false,
             "record_content_retained":false,
             "body_returned":false,
-        }));
+            }));
+        }
     };
     Ok(
         json!({"adapter":"workspace_d1_reply_admission_v1","success":result.success,"exit_status":result.exit_status,"boundary_crossed":true,
@@ -579,7 +588,7 @@ pub(super) async fn read(
         credential,
         account_id,
         &store.paths().cache_dir,
-        TIMEOUT,
+        READ_TIMEOUT,
     )
     .await?;
     let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
@@ -1873,6 +1882,12 @@ mod tests {
     use super::super::RuntimePaths;
 
     use super::*;
+
+    #[test]
+    fn reply_admission_separates_d1_read_and_apply_timeouts() {
+        assert_eq!(READ_TIMEOUT, Duration::from_mins(2));
+        assert_eq!(APPLY_TIMEOUT, Duration::from_mins(5));
+    }
 
     fn prefixed(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))

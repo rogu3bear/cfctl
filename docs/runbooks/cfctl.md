@@ -1047,7 +1047,15 @@ from wherever cfctl happened to be invoked. Both processes receive the
 plan-selected account ID and use cfctl's platform cache directory for Wrangler
 state; governed deploys never write account-selection cache files into a
 Worker's `node_modules`. Other delegated CLI capabilities keep their existing
-working directory. `cfctl doctor --json` projects this boundary under
+working directory. `wrangler.deploy` has a bounded ten-minute subprocess
+timeout because a reviewed Worker deployment may include a UI or WASM build;
+other capabilities using the generic delegated-CLI runner retain its two-minute
+bound. Specialized workspace D1 adapters retain a two-minute query/readback
+bound and a five-minute mutation-apply bound for migrations, policy projection,
+and reply admission. A timeout after the
+mutation-capable deployment subprocess starts is an uncertain boundary crossing:
+inspect the consumed plan with `plans status` and `plans rectify`, and never
+replay the mutation. `cfctl doctor --json` projects this boundary under
 `result.delegated_cli_environment` so deploy wrappers can fail closed when an
 older cfctl build does not preserve it.
 
