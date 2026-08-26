@@ -8,13 +8,14 @@ use cfctl_core::{
     MaildeskRouteKindV2, MaildeskRouteProviderV2, MaildeskRouteReadinessStatusV2,
     WorkspaceD1EvidenceContractV1, WorkspaceD1MigrationContractV1,
 };
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use tokio::time::Duration;
 
 use cfctl_workspace::{
     MAILDESK_D1_EVIDENCE_COLUMNS_V1, MAILDESK_D1_EVIDENCE_SQL_V1,
-    MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2,
+    MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2, MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1,
+    MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1, MAILDESK_INBOUND_ACCEPTANCE_SQL_V1,
 };
 
 use super::{
@@ -148,6 +149,9 @@ pub(super) fn load(store: &StateStore, capability_id: &str) -> Result<Option<Cap
 /// Accept a delegated receipt as verified only when the unchanged aggregate
 /// V1 and the additive bounded-complete route-health V2 are both coherent.
 pub(super) fn receipt_is_complete(receipt: &Value) -> bool {
+    if receipt.get("adapter").and_then(Value::as_str) == Some("workspace_inbound_acceptance_v1") {
+        return inbound_acceptance_receipt_is_complete(receipt);
+    }
     let Some(records) = receipt
         .pointer("/route_health/records")
         .and_then(Value::as_array)
@@ -221,9 +225,19 @@ pub(super) async fn execute(
         )
         .into());
     }
-    if input.body.is_some() || input.query.as_object().is_none_or(|query| query.len() != 2) {
+    let expected_query_len = if contract.projection == MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 {
+        5
+    } else {
+        2
+    };
+    if input.body.is_some()
+        || input
+            .query
+            .as_object()
+            .is_none_or(|query| query.len() != expected_query_len)
+    {
         return Err(CliError::Input(
-            "workspace D1 evidence accepts only exact config and binding selectors; SQL, parameters, PRAGMAs, bodies, and arbitrary projections are impossible"
+            "workspace D1 evidence accepts only the exact selectors declared by its fixed projection; caller SQL, PRAGMAs, bodies, and arbitrary projections are impossible"
                 .to_owned(),
         )
         .into());
@@ -237,9 +251,8 @@ pub(super) async fn execute(
         .into());
     }
     let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
-    if contract.projection != "maildesk_v1"
-        || sha256(MAILDESK_D1_EVIDENCE_SQL_V1.as_bytes()) != contract.query_sha256
-    {
+    let compiler_query = compiler_query(contract, input)?;
+    if sha256(compiler_query.template.as_bytes()) != contract.query_sha256 {
         return Err(CliError::Input(
             "workspace D1 evidence compiler projection drifted from its catalog contract"
                 .to_owned(),
@@ -272,7 +285,7 @@ pub(super) async fn execute(
         ));
     }
     let query = workspace_d1_migration::run_wrangler(
-        &compiler_query_arguments(&config.database_name, &config.path),
+        &compiler_query_arguments(&config.database_name, &config.path, &compiler_query.sql),
         Path::new(&contract.repository_root),
         credential,
         account_id,
@@ -297,6 +310,12 @@ pub(super) async fn execute(
     let rows = workspace_d1_migration::parse_query_rows(&query.stdout).map_err(|error| {
         WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderProjection, error)
     })?;
+    if contract.projection == MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 {
+        return project_inbound_acceptance(contract, input, rows, &observed_version, &config)
+            .map_err(|error| {
+                WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderProjection, error)
+            });
+    }
     let (evidence, route_health) = project_evidence(contract, rows).map_err(|error| {
         WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderProjection, error)
     })?;
@@ -317,7 +336,45 @@ pub(super) async fn execute(
     }))
 }
 
-fn compiler_query_arguments(database_name: &str, config_path: &str) -> Vec<String> {
+struct CompilerQuery {
+    template: &'static str,
+    sql: String,
+}
+
+fn compiler_query(
+    contract: &WorkspaceD1EvidenceContractV1,
+    input: &CallInput,
+) -> Result<CompilerQuery> {
+    if contract.projection == "maildesk_v1" {
+        return Ok(CompilerQuery {
+            template: MAILDESK_D1_EVIDENCE_SQL_V1,
+            sql: MAILDESK_D1_EVIDENCE_SQL_V1.to_owned(),
+        });
+    }
+    if contract.projection != MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 {
+        return Err(CliError::Input(
+            "workspace D1 evidence projection is unsupported".to_owned(),
+        ));
+    }
+    let fingerprint = bare_digest_selector(input, "delivery_fingerprint_sha256")?;
+    let policy = bare_digest_selector(input, "policy_sha256")?;
+    let route_id = input
+        .query
+        .get("route_id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_route_id(value))
+        .ok_or_else(|| CliError::Input("inbound acceptance route_id is invalid".to_owned()))?;
+    let sql = MAILDESK_INBOUND_ACCEPTANCE_SQL_V1
+        .replace("__MAILDESK_FINGERPRINT_SHA256__", &escape_sql(fingerprint))
+        .replace("__MAILDESK_ROUTE_ID__", &escape_sql(route_id))
+        .replace("__MAILDESK_POLICY_SHA256__", &escape_sql(policy));
+    Ok(CompilerQuery {
+        template: MAILDESK_INBOUND_ACCEPTANCE_SQL_V1,
+        sql,
+    })
+}
+
+fn compiler_query_arguments(database_name: &str, config_path: &str, sql: &str) -> Vec<String> {
     vec![
         "d1".to_owned(),
         "execute".to_owned(),
@@ -326,9 +383,194 @@ fn compiler_query_arguments(database_name: &str, config_path: &str) -> Vec<Strin
         "--config".to_owned(),
         config_path.to_owned(),
         "--command".to_owned(),
-        MAILDESK_D1_EVIDENCE_SQL_V1.to_owned(),
+        sql.to_owned(),
         "--json".to_owned(),
     ]
+}
+
+fn project_inbound_acceptance(
+    contract: &WorkspaceD1EvidenceContractV1,
+    input: &CallInput,
+    rows: Vec<Map<String, Value>>,
+    observed_version: &str,
+    config: &workspace_d1_migration::ValidatedConfig,
+) -> Result<Value> {
+    let match_count = rows.len();
+    let fingerprint = bare_digest_selector(input, "delivery_fingerprint_sha256")?;
+    let policy = bare_digest_selector(input, "policy_sha256")?;
+    let route_id = input
+        .query
+        .get("route_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let base = json!({
+        "adapter":"workspace_inbound_acceptance_v1",
+        "boundary_crossed":true,
+        "match_count":match_count,
+        "delivery_fingerprint_sha256":format!("sha256:{fingerprint}"),
+        "route_ref_sha256":sha256(route_id.as_bytes()),
+        "policy_sha256":format!("sha256:{policy}"),
+        "repository_head":contract.repository_head,
+        "operation_pack_sha256":contract.operation_pack_sha256,
+        "query_sha256":contract.query_sha256,
+        "production_config_sha256":config.sha256,
+        "production_database_sha256":sha256(config.database_id.as_bytes()),
+        "observed_at":Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "wrangler_version":observed_version,
+        "provider_output_retained":false,
+        "record_content_retained":false,
+        "body_returned":false,
+    });
+    if match_count != 1 {
+        let mut receipt = base;
+        receipt["success"] = json!(false);
+        receipt["status"] = json!(if match_count == 0 {
+            "no_match"
+        } else {
+            "ambiguous"
+        });
+        receipt["failure_code"] = json!(if match_count == 0 {
+            "CFCTL_WORKSPACE_D1_INBOUND_ACCEPTANCE_NO_MATCH"
+        } else {
+            "CFCTL_WORKSPACE_D1_INBOUND_ACCEPTANCE_AMBIGUOUS"
+        });
+        return Ok(receipt);
+    }
+    let row = &rows[0];
+    let observed = row.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if observed != expected || observed.len() != MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1.len() {
+        return Err(CliError::Input(
+            "inbound acceptance projection returned a private, missing, or arbitrary column set"
+                .to_owned(),
+        ));
+    }
+    let inbound_delivery_id = bounded_string(row, "inbound_delivery_id", 80)?;
+    let relay_id = bounded_string(row, "relay_id", 80)?;
+    let thread_id = bounded_string(row, "thread_id", 240)?;
+    let row_route_id = bounded_string(row, "route_id", 240)?;
+    let row_policy = bounded_string(row, "policy_sha256", 64)?;
+    let status = bounded_string(row, "status", 32)?;
+    let recipient_count = count(row, "recipient_count")?;
+    let accepted_count = count(row, "provider_accepted_count")?;
+    let provider_accepted_at = required_timestamp(row, "provider_accepted_at")?;
+    let exact = inbound_delivery_id == format!("inbound:{fingerprint}")
+        && relay_id == format!("relay:{fingerprint}")
+        && row_route_id == route_id
+        && row_policy == policy
+        && status == "provider_accepted"
+        && recipient_count > 0
+        && recipient_count == accepted_count
+        && valid_thread_id(&thread_id);
+    let mut receipt = base;
+    receipt["success"] = json!(exact);
+    receipt["status"] = json!(if exact {
+        "accepted"
+    } else {
+        "binding_mismatch"
+    });
+    if exact {
+        receipt["inbound_delivery_id"] = json!(inbound_delivery_id);
+        receipt["relay_id"] = json!(relay_id);
+        receipt["thread_id"] = json!(thread_id);
+        receipt["provider_accepted_at"] = json!(provider_accepted_at);
+        receipt["recipient_count"] = json!(recipient_count);
+    } else {
+        receipt["failure_code"] = json!("CFCTL_WORKSPACE_D1_INBOUND_ACCEPTANCE_BINDING_MISMATCH");
+    }
+    Ok(receipt)
+}
+
+fn inbound_acceptance_receipt_is_complete(receipt: &Value) -> bool {
+    receipt.get("success").and_then(Value::as_bool) == Some(true)
+        && receipt.get("status").and_then(Value::as_str) == Some("accepted")
+        && receipt.get("match_count").and_then(Value::as_u64) == Some(1)
+        && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
+        && receipt
+            .get("provider_output_retained")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt
+            .get("record_content_retained")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && [
+            "delivery_fingerprint_sha256",
+            "route_ref_sha256",
+            "policy_sha256",
+            "production_database_sha256",
+        ]
+        .iter()
+        .all(|key| {
+            receipt
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(valid_prefixed_digest)
+        })
+        && receipt
+            .get("inbound_delivery_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("inbound:"))
+        && receipt
+            .get("relay_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("relay:"))
+        && receipt
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .is_some_and(valid_thread_id)
+        && receipt
+            .get("provider_accepted_at")
+            .and_then(Value::as_str)
+            .is_some()
+}
+
+fn bare_digest_selector<'a>(input: &'a CallInput, key: &str) -> Result<&'a str> {
+    input
+        .query
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("sha256:").or(Some(value)))
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| CliError::Input(format!("inbound acceptance selector `{key}` is invalid")))
+}
+
+fn valid_prefixed_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_route_id(value: &str) -> bool {
+    value.starts_with("route:")
+        && value.len() <= 240
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-'))
+}
+
+fn valid_thread_id(value: &str) -> bool {
+    value.strip_prefix("thread:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn escape_sql(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn project_evidence(

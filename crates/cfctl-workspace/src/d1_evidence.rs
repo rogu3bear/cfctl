@@ -36,6 +36,36 @@ pub const MAILDESK_D1_EVIDENCE_COLUMNS_V1: &[&str] = &[
 pub const MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2: &[&str] =
     &["active_route_health_count", "route_health_rows_json"];
 
+pub const MAILDESK_INBOUND_ACCEPTANCE_CAPABILITY_ID: &str =
+    "star-maildesk-cf.inbound-acceptance-read";
+pub const MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1: &str = "maildesk_inbound_acceptance_v1";
+pub const MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1: &[&str] = &[
+    "inbound_delivery_id",
+    "relay_id",
+    "thread_id",
+    "route_id",
+    "policy_sha256",
+    "provider_accepted_at",
+    "status",
+    "recipient_count",
+    "provider_accepted_count",
+];
+pub const MAILDESK_INBOUND_ACCEPTANCE_SQL_V1: &str = r"SELECT
+  id AS inbound_delivery_id,
+  relay_id,
+  thread_id,
+  route_id,
+  policy_sha256,
+  updated_at AS provider_accepted_at,
+  status,
+  (SELECT COUNT(*) FROM inbound_recipient_deliveries rd WHERE rd.delivery_id = inbound_deliveries.id) AS recipient_count,
+  (SELECT COUNT(*) FROM inbound_recipient_deliveries rd WHERE rd.delivery_id = inbound_deliveries.id AND rd.status = 'provider_accepted') AS provider_accepted_count
+FROM inbound_deliveries
+WHERE fingerprint_sha256 = '__MAILDESK_FINGERPRINT_SHA256__'
+  AND route_id = '__MAILDESK_ROUTE_ID__'
+  AND policy_sha256 = '__MAILDESK_POLICY_SHA256__'
+LIMIT 2;";
+
 /// Compiler-owned Maildesk readiness projection. Every source table, column,
 /// expression, predicate, action key, and output alias is fixed here; a
 /// workspace declaration cannot supply or modify SQL.
@@ -229,18 +259,25 @@ fn load_from_repository(
         database_binding: operation.database_binding.clone(),
         wrangler_version: operation.wrangler_version.clone(),
         projection: operation.projection.clone(),
-        query_sha256: sha256(MAILDESK_D1_EVIDENCE_SQL_V1.as_bytes()),
+        query_sha256: sha256(query_for_projection(&operation.projection)?.as_bytes()),
     };
     Ok(Some(capability(operation, contract)))
 }
 
 fn validate_operation(operation: &OperationDeclaration) -> Result<()> {
-    if operation.id != "star-maildesk-cf.d1-evidence-read"
+    let identity_matches = matches!(
+        (operation.id.as_str(), operation.projection.as_str()),
+        ("star-maildesk-cf.d1-evidence-read", "maildesk_v1")
+            | (
+                MAILDESK_INBOUND_ACCEPTANCE_CAPABILITY_ID,
+                MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1
+            )
+    );
+    if !identity_matches
         || operation.title.trim().is_empty()
         || operation.description.trim().is_empty()
         || !safe_identifier(&operation.database_binding)
         || !valid_wrangler_version(&operation.wrangler_version)
-        || operation.projection != "maildesk_v1"
     {
         return Err(invariant(
             "workspace D1 evidence declaration is not the fixed Maildesk projection contract",
@@ -270,6 +307,13 @@ fn capability(
         selector("config", "query"),
         selector("binding", "query"),
     ];
+    if operation.projection == MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 {
+        capability.selectors.extend([
+            selector("delivery_fingerprint_sha256", "query"),
+            selector("route_id", "query"),
+            selector("policy_sha256", "query"),
+        ]);
+    }
     capability.permissions = vec!["D1 Read".to_owned()];
     capability.mutating = false;
     capability.risk = RiskClass::Read;
@@ -294,7 +338,11 @@ fn capability(
     };
     capability.verification = VerificationSpecV1 {
         required: true,
-        strategy: "workspace_d1_maildesk_body_free_evidence".to_owned(),
+        strategy: if operation.projection == MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 {
+            "workspace_d1_maildesk_inbound_acceptance_body_free_read".to_owned()
+        } else {
+            "workspace_d1_maildesk_body_free_evidence".to_owned()
+        },
     };
     capability.rollback = RollbackSpecV1 {
         supported: false,
@@ -304,6 +352,14 @@ fn capability(
     capability.adapter_status = AdapterStatus::DelegatedCli;
     capability.workspace_d1_evidence = Some(contract);
     capability
+}
+
+fn query_for_projection(projection: &str) -> Result<&'static str> {
+    match projection {
+        "maildesk_v1" => Ok(MAILDESK_D1_EVIDENCE_SQL_V1),
+        MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 => Ok(MAILDESK_INBOUND_ACCEPTANCE_SQL_V1),
+        _ => Err(invariant("workspace D1 evidence projection is unsupported")),
+    }
 }
 
 fn selector(name: &str, location: &str) -> SelectorV1 {
@@ -436,7 +492,7 @@ mod tests {
         fs::write(root.path().join("wrangler.toml"), "name = \"template\"\n[[d1_databases]]\nbinding = \"DB\"\ndatabase_name = \"template-db\"\ndatabase_id = \"00000000-0000-0000-0000-000000000000\"\n").expect("config");
         fs::write(
             root.path().join(PACK_RELATIVE_PATH),
-            "schema_version = 1\n\n[[operation]]\nid = \"star-maildesk-cf.d1-evidence-read\"\ntitle = \"Read Maildesk D1 evidence\"\ndescription = \"Read one compiler-owned body-free evidence projection.\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nprojection = \"maildesk_v1\"\n",
+            "schema_version = 1\n\n[[operation]]\nid = \"star-maildesk-cf.d1-evidence-read\"\ntitle = \"Read Maildesk D1 evidence\"\ndescription = \"Read one compiler-owned body-free evidence projection.\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nprojection = \"maildesk_v1\"\n\n[[operation]]\nid = \"star-maildesk-cf.inbound-acceptance-read\"\ntitle = \"Read one Maildesk inbound acceptance\"\ndescription = \"Read one compiler-owned body-free inbound binding.\"\nconfig_template = \"wrangler.toml\"\nproduction_config = \"wrangler.production.toml\"\ndatabase_binding = \"DB\"\nwrangler_version = \"4.120.1\"\nprojection = \"maildesk_inbound_acceptance_v1\"\n",
         )
         .expect("pack");
         git(root.path(), &["add", "."]);
@@ -483,6 +539,49 @@ mod tests {
         for private in ["email", "subject", "recipient", "message_content"] {
             assert!(!rendered.contains(private));
         }
+    }
+
+    #[test]
+    fn loads_the_fixed_inbound_acceptance_projection_with_exact_selectors() {
+        let root = fixture();
+        let capability = load_workspace_d1_evidence_capability(
+            &[root.path().to_path_buf()],
+            MAILDESK_INBOUND_ACCEPTANCE_CAPABILITY_ID,
+        )
+        .expect("load")
+        .expect("capability");
+        assert_eq!(capability.effect, EffectClass::ReadOnly);
+        assert!(!capability.mutating);
+        assert!(capability.verification_contract_supported());
+        assert_eq!(
+            capability
+                .selectors
+                .iter()
+                .map(|selector| selector.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "account_id",
+                "database_id",
+                "config",
+                "binding",
+                "delivery_fingerprint_sha256",
+                "route_id",
+                "policy_sha256",
+            ]
+        );
+        let contract = capability
+            .workspace_d1_evidence
+            .as_ref()
+            .expect("evidence contract");
+        assert_eq!(
+            contract.projection,
+            MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1
+        );
+        assert_eq!(
+            contract.query_sha256,
+            sha256(MAILDESK_INBOUND_ACCEPTANCE_SQL_V1.as_bytes())
+        );
+        assert_eq!(MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1.len(), 9);
     }
 
     #[test]

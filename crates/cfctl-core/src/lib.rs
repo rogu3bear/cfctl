@@ -2929,6 +2929,25 @@ impl CapabilityV1 {
                             && contract.query_sha256.starts_with("sha256:")
                     })
             }
+            "workspace_d1_maildesk_inbound_acceptance_body_free_read" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "GET"
+                    && !self.mutating
+                    && self.risk == RiskClass::Read
+                    && self.effect == EffectClass::ReadOnly
+                    && self.workspace_d1_evidence.as_ref().is_some_and(|contract| {
+                        !contract.repository_root.is_empty()
+                            && !contract.repository_head.is_empty()
+                            && !contract.operation_pack_sha256.is_empty()
+                            && !contract.config_template_sha256.is_empty()
+                            && !contract.production_config_path.is_empty()
+                            && !contract.database_binding.is_empty()
+                            && !contract.wrangler_version.is_empty()
+                            && contract.projection == "maildesk_inbound_acceptance_v1"
+                            && contract.query_sha256.starts_with("sha256:")
+                    })
+            }
             "r2_private_file_upload_etag_and_conditional_read" => {
                 self.id == "r2-put-object"
                     && self.method == "PUT"
