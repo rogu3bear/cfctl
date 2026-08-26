@@ -4889,6 +4889,214 @@ async fn execute_paginated_workers_read(
     .await
 }
 
+fn worker_versions_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "worker-versions-list-versions",
+        "List Worker Versions",
+        "GET",
+        "/accounts/{account_id}/workers/scripts/{script_name}/versions",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "script_name".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "deployable".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "boolean".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "per_page".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability
+}
+
+async fn execute_worker_versions_read(
+    address: &str,
+    query: Value,
+) -> Result<CloudflareResponseV1, CloudflareError> {
+    Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &worker_versions_capability(),
+        &CallInput {
+            selectors: json!({"account_id":"account-1","script_name":"worker-1"}),
+            query,
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "token".to_owned(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn worker_versions_normalizes_a_wrapped_terminal_page() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"items":[{"id":"version-1"},{"id":"version-2"}]},"errors":[],"result_info":{"page":1,"per_page":10,"count":2,"total_count":2}}"#,
+    ])
+    .await;
+
+    let response = execute_worker_versions_read(&address, json!({"page":1,"per_page":10}))
+        .await
+        .expect("wrapped terminal page");
+
+    assert_eq!(
+        response.result,
+        json!({"items":[{"id":"version-1"},{"id":"version-2"}]})
+    );
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["total_pages"], json!(1));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn worker_versions_collects_wrapped_items_across_pages() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"items":[{"id":"version-1"}]},"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+        r#"{"success":true,"result":{"items":[{"id":"version-2"}]},"errors":[],"result_info":{"page":2,"per_page":1,"count":1,"total_count":2}}"#,
+    ])
+    .await;
+
+    let response = execute_worker_versions_read(&address, json!({"page":1,"per_page":1}))
+        .await
+        .expect("wrapped multi-page inventory");
+
+    assert_eq!(
+        response.result,
+        json!({"items":[{"id":"version-1"},{"id":"version-2"}]})
+    );
+    let info = response.result_info.expect("normalized result info");
+    assert_eq!(info["page"], json!(2));
+    assert_eq!(info["count"], json!(2));
+    assert_eq!(info["total_pages"], json!(2));
+    assert_eq!(info["cfctl_pages"], json!(2));
+    assert_eq!(info["cfctl_page_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("page=2"));
+}
+
+#[tokio::test]
+async fn worker_versions_deployable_is_one_bounded_response() {
+    let versions = (1..=5)
+        .map(|number| json!({"id":format!("version-{number}")}))
+        .collect::<Vec<_>>();
+    let body = json!({
+        "success": true,
+        "result": {"items": versions},
+        "errors": [],
+        "result_info": {"page":1,"per_page":5,"count":5,"total_count":287}
+    })
+    .to_string();
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+
+    let response =
+        execute_worker_versions_read(&address, json!({"deployable":true,"page":1,"per_page":5}))
+            .await
+            .expect("deployable inventory ignores pagination");
+
+    assert_eq!(response.result["items"].as_array().map(Vec::len), Some(5));
+    let info = response.result_info.expect("bounded result info");
+    assert_eq!(info["count"], json!(5));
+    assert_eq!(info["total_count"], json!(287));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("deployable=true"));
+}
+
+#[tokio::test]
+async fn worker_versions_rejects_a_missing_or_malformed_items_array() {
+    for body in [
+        r#"{"success":true,"result":[],"errors":[],"result_info":{"page":1,"per_page":10,"count":0,"total_count":0}}"#,
+        r#"{"success":true,"result":{"items":{}},"errors":[],"result_info":{"page":1,"per_page":10,"count":0,"total_count":0}}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = execute_worker_versions_read(&address, json!({"page":1,"per_page":10}))
+            .await
+            .expect_err("wrapped items are required");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidResponseEnvelope { status: 200 }
+        ));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn worker_versions_rejects_a_wrapped_item_count_disagreement() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"items":[{"id":"version-1"}]},"errors":[],"result_info":{"page":1,"per_page":10,"count":2,"total_count":2}}"#,
+    ])
+    .await;
+
+    let error = execute_worker_versions_read(&address, json!({"page":1,"per_page":10}))
+        .await
+        .expect_err("declared count must match wrapped items");
+    assert!(matches!(
+        error,
+        CloudflareError::PaginationCountMismatch {
+            expected: 2,
+            actual: 1
+        }
+    ));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn worker_versions_rejects_later_page_metadata_drift() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"items":[{"id":"version-1"}]},"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+        r#"{"success":true,"result":{"items":[{"id":"version-2"}]},"errors":[],"result_info":{"page":1,"per_page":1,"count":1,"total_count":2}}"#,
+    ])
+    .await;
+
+    let error = execute_worker_versions_read(&address, json!({"page":1,"per_page":1}))
+        .await
+        .expect_err("later page identity must remain coherent");
+    assert!(matches!(error, CloudflareError::PaginationMetadataInvalid));
+    assert_eq!(server.await.expect("server joins").len(), 2);
+}
+
 fn queue_consumers_single_page_capability() -> CapabilityV1 {
     let mut capability = CapabilityV1::new(
         "queues-list-consumers",
