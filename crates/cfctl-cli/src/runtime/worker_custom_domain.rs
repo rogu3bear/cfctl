@@ -8,7 +8,12 @@ use cfctl_core::{
 use cfctl_storage::StateStore;
 use serde_json::{Value, json};
 
-use super::{API_BASE_URL, CliError, Result, capability_missing, http_client, validate_zone_id};
+use super::{
+    cloudflare_api::BASE_URL as API_BASE_URL,
+    plan_prepare::validate_zone_id,
+    prelude::{CliError, Result},
+    support::{capability_missing, http_client},
+};
 
 const ATTACH_CAPABILITY_ID: &str = "workers.domains.update";
 const ATTACH_PATH: &str = "/accounts/{account_id}/workers/domains";
@@ -575,9 +580,9 @@ mod tests {
     use cfctl_storage::{RuntimePaths, StateStore};
     use serde_json::json;
 
-    use super::super::{
-        plan_requires_live_credential, resolve_actionable, validate_plan_preconditions,
-    };
+    use super::super::entitlement_state::plan_requires_live_credential;
+    use super::super::guide_generation::resolve_actionable;
+    use super::super::workspace_state::validate_plan_preconditions;
 
     fn attach_capability() -> CapabilityV1 {
         let mut capability = CapabilityV1::new(

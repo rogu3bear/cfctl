@@ -493,7 +493,7 @@ fn verify_public_domain_contract() -> Result<(), TaskError> {
             "`cfctl.com` site publication, publisher-domain verification",
         ),
         (
-            "crates/cfctl-cli/src/runtime.rs",
+            "crates/cfctl-cli/src/runtime/health_commands.rs",
             "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth",
         ),
     ] {
@@ -1009,7 +1009,7 @@ fn is_forbidden_quarantine_consumer(path: &str, content: &str) -> bool {
     }
 
     match path {
-        "crates/cfctl-cli/src/runtime.rs" => consumes_catalog,
+        "crates/cfctl-cli/src/runtime/v1_migration.rs" => consumes_catalog,
         "crates/cfctl-cli/tests/cli.rs" | "xtask/src/main.rs" => false,
         _ => true,
     }
@@ -3509,8 +3509,16 @@ mod tests {
             "The compat/v1/catalog tree is inert migration evidence."
         ));
         assert!(!is_forbidden_quarantine_consumer(
-            "crates/cfctl-cli/src/runtime.rs",
+            "crates/cfctl-cli/src/runtime/v1_migration.rs",
             "let retained_repo_state = \"compat/v1/state\";"
+        ));
+        assert!(is_forbidden_quarantine_consumer(
+            "crates/cfctl-cli/src/runtime/health_commands.rs",
+            "let retained_repo_state = \"compat/v1/state\";"
+        ));
+        assert!(is_forbidden_quarantine_consumer(
+            "crates/cfctl-cli/src/runtime/v1_migration.rs",
+            "let retired_catalog = \"compat/v1/catalog\";"
         ));
     }
 
