@@ -160,7 +160,13 @@ pub(super) fn prepare_plan_target(
     let candidate = validate_candidate_bytes(&bytes)?;
     validate_candidate_fresh(&candidate, Utc::now())?;
     let generation = credential_generation_for_read(profile)?;
-    validate_control_plane_binding(&candidate, profile, account_id, &generation)?;
+    let authority = (
+        profile,
+        account_id,
+        generation.as_str(),
+        config.database_id.as_str(),
+    );
+    control_plane_binding::validate(&candidate, authority)?;
     let stage = stage_private_candidate(store, &bytes)?;
     let recovery = workspace_d1_migration::fresh_recovery_proof(
         store,
@@ -191,6 +197,7 @@ pub(super) fn prepare_plan_target(
         "candidate_profile_sha256":candidate.profile_sha256,
         "candidate_account_sha256":candidate.account_sha256,
         "candidate_credential_generation_sha256":candidate.credential_generation_sha256,
+        "candidate_production_database_sha256":candidate.production_database_sha256,
         "recovery":recovery,
     })))
 }
@@ -303,6 +310,10 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
         (
             "candidate_credential_generation_sha256",
             candidate.credential_generation_sha256.as_str(),
+        ),
+        (
+            "candidate_production_database_sha256",
+            candidate.production_database_sha256.as_str(),
         ),
     ] {
         require(target, k, v)?;
@@ -439,6 +450,7 @@ pub(super) fn read_receipt_is_complete(receipt: &Value) -> bool {
             "observed_at",
             "pre_send_identity_projection",
             "pre_send_identity_projection_sha256",
+            "production_database_sha256",
             "provider_output_retained",
             "profile_sha256",
             "record_content_retained",
@@ -466,6 +478,7 @@ pub(super) fn read_receipt_is_complete(receipt: &Value) -> bool {
         "cfctl_build_sha256",
         "credential_generation_sha256",
         "profile_sha256",
+        "production_database_sha256",
     ]
     .iter()
     .all(|key| {
@@ -557,7 +570,13 @@ pub(super) async fn read(
     let candidate = validate_candidate_bytes(&bytes)?;
     validate_candidate_fresh(&candidate, Utc::now())?;
     let generation = credential_generation_for_read(profile)?;
-    validate_control_plane_binding(&candidate, profile, account_id, &generation)?;
+    let authority = (
+        profile,
+        account_id,
+        generation.as_str(),
+        config.database_id.as_str(),
+    );
+    control_plane_binding::validate(&candidate, authority)?;
     for (key, expected) in [
         ("transaction_sha256", candidate.transaction_sha256.as_str()),
         (
@@ -628,6 +647,7 @@ pub(super) async fn read(
             "profile_sha256":candidate.profile_sha256,
             "account_sha256":candidate.account_sha256,
             "credential_generation_sha256":candidate.credential_generation_sha256,
+            "production_database_sha256":candidate.production_database_sha256,
             "observed_at":observed_at,
             "expires_at":candidate.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             "wrangler_version":observed_version,
@@ -675,6 +695,7 @@ fn project_read_receipt(
         "profile_sha256":candidate.profile_sha256,
         "account_sha256":candidate.account_sha256,
         "credential_generation_sha256":candidate.credential_generation_sha256,
+        "production_database_sha256":candidate.production_database_sha256,
         "observed_at":observed_at,
         "expires_at":candidate.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "wrangler_version":observed_version,
@@ -748,6 +769,7 @@ struct Candidate {
     profile_sha256: String,
     account_sha256: String,
     credential_generation_sha256: String,
+    production_database_sha256: String,
     admitted_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     record: Map<String, Value>,
@@ -869,12 +891,14 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
             "cfctl_build_sha256",
             "credential_generation_sha256",
             "profile_sha256",
+            "production_database_sha256",
         ],
     )?;
     let account_sha256 = digest(cp, "account_sha256")?;
     let cfctl_build_sha256 = digest(cp, "cfctl_build_sha256")?;
     let credential_generation_sha256 = digest(cp, "credential_generation_sha256")?;
     let profile_sha256 = digest(cp, "profile_sha256")?;
+    let production_database_sha256 = digest(cp, "production_database_sha256")?;
     let activation_operation_id = cp
         .get("activation_operation_id")
         .and_then(Value::as_str)
@@ -945,6 +969,7 @@ fn validate_candidate_bytes(bytes: &[u8]) -> Result<Candidate> {
         profile_sha256,
         account_sha256,
         credential_generation_sha256,
+        production_database_sha256,
         admitted_at,
         expires_at,
         record,
@@ -1253,47 +1278,6 @@ fn timestamp(value: Option<&Value>, label: &str) -> Result<DateTime<Utc>> {
     Ok(parsed)
 }
 
-fn validate_control_plane_binding(
-    candidate: &Candidate,
-    profile: &ProfileMetadata,
-    account_id: &str,
-    generation: &str,
-) -> Result<()> {
-    let executable = std::env::current_exe().map_err(|error| {
-        CliError::Input(format!("cfctl executable identity is unavailable: {error}"))
-    })?;
-    let executable_bytes =
-        fs::read(&executable).map_err(|error| super::cli_io(&executable, error))?;
-    for (label, actual, expected) in [
-        (
-            "cfctl build",
-            hex_sha(&executable_bytes),
-            candidate.cfctl_build_sha256.as_str(),
-        ),
-        (
-            "profile",
-            hex_sha(profile.id.as_bytes()),
-            candidate.profile_sha256.as_str(),
-        ),
-        (
-            "account",
-            hex_sha(account_id.as_bytes()),
-            candidate.account_sha256.as_str(),
-        ),
-        (
-            "credential generation",
-            hex_sha(generation.as_bytes()),
-            candidate.credential_generation_sha256.as_str(),
-        ),
-    ] {
-        if actual != expected {
-            return Err(CliError::Input(format!(
-                "reply-admission candidate {label} binding does not match the selected control plane"
-            )));
-        }
-    }
-    Ok(())
-}
 fn insert_sql(table: &str, record: &Map<String, Value>) -> Result<String> {
     let values = RECORD_COLUMNS
         .iter()
@@ -1979,6 +1963,7 @@ fn config_contract(
 }
 
 mod apple_mail_inbox_source;
+mod control_plane_binding;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

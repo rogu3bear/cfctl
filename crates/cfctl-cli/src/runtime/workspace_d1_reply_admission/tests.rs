@@ -73,6 +73,7 @@ fn candidate() -> Value {
             "cfctl_build_sha256":prefixed('3'),
             "credential_generation_sha256":prefixed('4'),
             "profile_sha256":prefixed('5'),
+            "production_database_sha256":prefixed('f'),
         },
         "correlation_sha256":prefixed('6'),
         "scope_manifest_sha256":prefixed('7'),
@@ -285,6 +286,7 @@ fn read_projection_requires_one_exact_active_record_and_retains_no_provider_row(
         success["activation_operation_id"],
         "controller:activation:one"
     );
+    assert_eq!(success["production_database_sha256"], prefixed('f'));
     assert_eq!(success["provider_output_retained"], false);
     assert_eq!(success["record_content_retained"], false);
     assert_eq!(success["body_returned"], false);
@@ -299,6 +301,7 @@ fn read_projection_requires_one_exact_active_record_and_retains_no_provider_row(
     assert!(!read_receipt_is_complete(&missing));
     assert_eq!(missing["status"], "missing");
     assert_eq!(missing["match_count"], 0);
+    assert_eq!(missing["production_database_sha256"], prefixed('f'));
     assert!(missing.get("pre_send_identity_projection").is_none());
 
     let multiple = project_read_receipt(
@@ -310,6 +313,7 @@ fn read_projection_requires_one_exact_active_record_and_retains_no_provider_row(
     assert!(!read_receipt_is_complete(&multiple));
     assert_eq!(multiple["status"], "ambiguous");
     assert_eq!(multiple["match_count"], 2);
+    assert_eq!(multiple["production_database_sha256"], prefixed('f'));
     assert!(multiple.get("pre_send_identity_projection").is_none());
 }
 
