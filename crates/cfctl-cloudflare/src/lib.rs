@@ -7362,8 +7362,7 @@ impl Executor {
             return Ok(combined);
         }
         if request_is_worker_versions_list(request) {
-            return self
-                .complete_worker_versions_list(request, credential, combined)
+            return Box::pin(self.complete_worker_versions_list(request, credential, combined))
                 .await;
         }
         if request_is_queue_consumers_single_page(request) {
