@@ -344,7 +344,8 @@ pub(super) async fn run(
         &store.paths().cache_dir,
         TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(CliError::delegated_mutation_not_attempted)?;
     let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(
@@ -373,8 +374,14 @@ pub(super) async fn run(
     )
     .await;
     let _ = fs::remove_file(&sql_path);
-    let Ok(result) = result else {
-        return Ok(json!({
+    let result = match result {
+        Ok(result) => result,
+        Err(
+            error @ (CliError::SubprocessNotStarted { .. }
+            | CliError::DelegatedMutationNotAttempted { .. }),
+        ) => return Err(error),
+        Err(_) => {
+            return Ok(json!({
             "adapter":"workspace_d1_reply_admission_v1",
             "success":false,
             "boundary_crossed":true,
@@ -389,7 +396,8 @@ pub(super) async fn run(
             "provider_output_retained":false,
             "record_content_retained":false,
             "body_returned":false,
-        }));
+            }));
+        }
     };
     Ok(
         json!({"adapter":"workspace_d1_reply_admission_v1","success":result.success,"exit_status":result.exit_status,"boundary_crossed":true,

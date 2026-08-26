@@ -202,7 +202,8 @@ pub(super) async fn run(
         &store.paths().cache_dir,
         QUERY_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(CliError::delegated_mutation_not_attempted)?;
     let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(

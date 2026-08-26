@@ -2,13 +2,12 @@ use std::{
     collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{process::Command as ProcessCommand, time::Duration};
+use tokio::time::Duration;
 
 use super::{
     AuthCredential, CallInput, CapabilityV1, CatalogSnapshot, CliError, OperationalProofOutcomeV1,
@@ -163,7 +162,8 @@ pub(super) async fn run(
         &store.paths().cache_dir,
         QUERY_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(CliError::delegated_mutation_not_attempted)?;
     let observed_version = parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(
@@ -180,7 +180,8 @@ pub(super) async fn run(
         &plan.account_id,
         &store.paths().cache_dir,
     )
-    .await?;
+    .await
+    .map_err(CliError::delegated_mutation_not_attempted)?;
     let declared = declared_migration_names(contract)?;
     if !is_prefix(&before, &declared) {
         return Err(CliError::Input(
@@ -925,14 +926,34 @@ pub(super) async fn run_wrangler(
     cache_dir: &Path,
     timeout: Duration,
 ) -> Result<WranglerOutput> {
+    run_wrangler_program(
+        Path::new("wrangler"),
+        arguments,
+        root,
+        credential,
+        account_id,
+        cache_dir,
+        timeout,
+    )
+    .await
+}
+
+async fn run_wrangler_program(
+    program: &Path,
+    arguments: &[String],
+    root: &Path,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+    timeout: Duration,
+) -> Result<WranglerOutput> {
     let token = credential.bearer_token().ok_or_else(|| {
         CliError::Input(
             "workspace D1 migrations require a scoped API-token profile; global-key execution is forbidden"
                 .to_owned(),
         )
     })?;
-    let mut command = ProcessCommand::new("wrangler");
-    command
+    let mut command = processkit::Command::new(program)
         .args(arguments)
         .current_dir(root)
         .env_clear()
@@ -940,25 +961,35 @@ pub(super) async fn run_wrangler(
         .env("HOME", env::var_os("HOME").unwrap_or_default())
         .env("NO_COLOR", "1")
         .env("CLOUDFLARE_API_TOKEN", token)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(processkit::Stdin::empty())
+        .timeout(timeout);
     for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
-        command.env(name, value);
+        command = command.env(name, value);
     }
-    let output = tokio::time::timeout(timeout, command.output())
+    let running = command
+        .start()
         .await
-        .map_err(|_| CliError::SubprocessTimeout {
+        .map_err(|_| CliError::SubprocessNotStarted {
+            label: "workspace D1 migration Wrangler".to_owned(),
+        })?;
+    let output =
+        running
+            .output_bytes()
+            .await
+            .map_err(|_| CliError::SubprocessReceiptUnavailable {
+                label: "workspace D1 migration Wrangler".to_owned(),
+            })?;
+    if output.timed_out() {
+        return Err(CliError::SubprocessTimeout {
             label: "workspace D1 migration Wrangler".to_owned(),
             timeout_seconds: timeout.as_secs(),
-        })?
-        .map_err(|source| cli_io(Path::new("wrangler"), source))?;
+        });
+    }
     Ok(WranglerOutput {
-        success: output.status.success(),
-        exit_status: output.status.code(),
-        stdout: redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential),
-        stderr: redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential),
+        success: output.is_success(),
+        exit_status: output.code(),
+        stdout: redact_subprocess_text(&String::from_utf8_lossy(output.stdout()), credential),
+        stderr: redact_subprocess_text(output.stderr(), credential),
     })
 }
 
@@ -1119,6 +1150,136 @@ mod tests {
     fn workspace_d1_preserves_query_and_apply_timeout_bounds() {
         assert_eq!(QUERY_TIMEOUT, Duration::from_mins(2));
         assert_eq!(APPLY_TIMEOUT, Duration::from_mins(5));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_d1_timeout_terminates_and_reaps_the_full_wrangler_process_tree() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("D1 process-tree root");
+        let program = root.path().join("wrangler-timeout-probe.sh");
+        let pid_file = root.path().join("pids");
+        fs::write(
+            &program,
+            "#!/bin/sh\nsleep 30 &\nprintf '%s %s\\n' \"$$\" \"$!\" > \"$1\"\nwait\n",
+        )
+        .expect("timeout probe source");
+        let mut permissions = fs::metadata(&program)
+            .expect("timeout probe metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&program, permissions).expect("timeout probe permissions");
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).expect("cache root");
+
+        let error = run_wrangler_program(
+            &program,
+            &[pid_file.to_string_lossy().into_owned()],
+            root.path(),
+            &AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            "fixture-account",
+            &cache,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("D1 Wrangler process tree must time out");
+        assert!(matches!(
+            error,
+            CliError::SubprocessTimeout {
+                timeout_seconds: 1,
+                ..
+            }
+        ));
+
+        let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
+        for pid in pids.split_whitespace() {
+            let mut alive = true;
+            for _ in 0..100 {
+                alive = std::process::Command::new("kill")
+                    .args(["-0", pid])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("process probe")
+                    .success();
+                if !alive {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive, "timed-out D1 Wrangler process {pid} survived");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn workspace_d1_timeout_windows_job_contains_the_full_wrangler_tree() {
+        let root = tempfile::tempdir().expect("Windows D1 process-tree root");
+        let program = root.path().join("wrangler-timeout-probe.ps1");
+        let pid_file = root.path().join("pids");
+        fs::write(
+            &program,
+            "$child = Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -NoNewline -LiteralPath $args[0] -Value \"$PID $($child.Id)\"; $child.WaitForExit()",
+        )
+        .expect("Windows timeout probe source");
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).expect("cache root");
+
+        let error = run_wrangler_program(
+            Path::new("powershell.exe"),
+            &[
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-File".to_owned(),
+                program.to_string_lossy().into_owned(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            root.path(),
+            &AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            "fixture-account",
+            &cache,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("D1 Windows process tree must time out");
+        assert!(matches!(
+            error,
+            CliError::SubprocessTimeout {
+                timeout_seconds: 1,
+                ..
+            }
+        ));
+
+        let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
+        for pid in pids.split_whitespace() {
+            let mut alive = true;
+            for _ in 0..100 {
+                alive = std::process::Command::new("powershell.exe")
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!(
+                            "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                        ),
+                    ])
+                    .status()
+                    .expect("descendant process probe")
+                    .success();
+                if !alive {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive, "timed-out D1 Wrangler process {pid} survived");
+        }
     }
 
     #[test]

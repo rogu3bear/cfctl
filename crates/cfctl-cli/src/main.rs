@@ -42,14 +42,9 @@ fn failure_envelope(
     context: &FailureEnvelopeContext,
     error: &runtime::CliError,
 ) -> ResultEnvelopeV2 {
-    let next_step = match (error, context.command, context.operation_id.as_deref()) {
-        (runtime::CliError::SubprocessTimeout { .. }, "plans run", Some(operation_id)) => format!(
-            "The plan is consumed and its provider outcome is uncertain. Run `cfctl plans status {operation_id} --json`, then `cfctl plans rectify {operation_id} --json`; do not replay `plans run`."
-        ),
-        _ => error.next_step().unwrap_or_else(|| {
-            "Run `cfctl doctor --json` and inspect the exact blocker.".to_owned()
-        }),
-    };
+    let next_step = error
+        .next_step()
+        .unwrap_or_else(|| "Run `cfctl doctor --json` and inspect the exact blocker.".to_owned());
     let mut envelope = ResultEnvelopeV2::failure(
         context.command,
         error.code(),
@@ -173,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_run_timeout_names_the_consumed_operation_and_rectification_path() {
+    fn plan_run_timeout_does_not_infer_consumption_from_command_syntax() {
         let operation_id = "ab2c8ee6-8d88-4d3a-a015-2329b65bf6d3";
         let cli = match Cli::try_parse_from(["cfctl", "plans", "run", operation_id, "--json"]) {
             Ok(cli) => cli,
@@ -199,11 +194,11 @@ mod tests {
         let Some(next_step) = error.next_step else {
             panic!("timeout envelope must carry operation-bound recovery");
         };
-        assert!(next_step.contains(&format!("cfctl plans status {operation_id} --json")));
-        assert!(next_step.contains(&format!("cfctl plans rectify {operation_id} --json")));
-        assert!(next_step.contains("consumed"));
-        assert!(next_step.contains("uncertain"));
-        assert!(next_step.contains("do not replay"));
+        assert!(next_step.contains("governed subprocess"));
+        assert!(next_step.contains("plans status <operation-id>"));
+        assert!(next_step.contains("do not assume the plan was consumed"));
+        assert!(!next_step.contains("provider outcome is uncertain"));
+        assert!(!next_step.contains(&format!("plans rectify {operation_id}")));
         assert!(!next_step.contains("doctor"));
     }
 }

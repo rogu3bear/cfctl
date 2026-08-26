@@ -138,6 +138,14 @@ pub enum CliError {
     Http(#[from] reqwest::Error),
     #[error("subprocess `{label}` exceeded the {timeout_seconds}-second governed timeout")]
     SubprocessTimeout { label: String, timeout_seconds: u64 },
+    #[error("delegated mutation subprocess `{label}` was not started")]
+    SubprocessNotStarted { label: String },
+    #[error(
+        "delegated mutation subprocess `{label}` started, but no complete receipt is available"
+    )]
+    SubprocessReceiptUnavailable { label: String },
+    #[error("delegated mutation was not attempted: {message}")]
+    DelegatedMutationNotAttempted { message: String },
     /// A CLI-level blocker that carries its own stable code and a specific,
     /// copy-pasteable next command for the agent. Prefer this over
     /// `Input(String)` whenever the failure has a knowable recovery step.
@@ -200,10 +208,31 @@ impl CliError {
             )),
             Self::SubprocessTimeout { .. } => Some((
                 "CFCTL_SUBPROCESS_TIMEOUT",
-                "The governed subprocess exceeded its bound. If this occurred during `plans run`, inspect that consumed operation with `cfctl plans status <operation-id> --json`, then `cfctl plans rectify <operation-id> --json`; do not replay the mutation."
+                "The governed subprocess did not return a complete receipt. If this occurred during `plans run`, inspect `cfctl plans status <operation-id> --json`; do not assume the plan was consumed or replay the mutation until durable status proves the correct recovery path."
                     .to_owned(),
             )),
+            Self::SubprocessReceiptUnavailable { .. } => Some((
+                "CFCTL_SUBPROCESS_RECEIPT_UNAVAILABLE",
+                "The mutation-capable subprocess started but did not return a complete receipt. Inspect `cfctl plans status <operation-id> --json`, then use its exact disposition; do not replay the mutation."
+                    .to_owned(),
+            )),
+            Self::SubprocessNotStarted { .. } | Self::DelegatedMutationNotAttempted { .. } => {
+                Some((
+                    "CFCTL_DELEGATED_MUTATION_NOT_ATTEMPTED",
+                    "The mutation-capable subprocess was not started. Inspect `cfctl plans status <operation-id> --json` and the local blocker; do not infer a provider write from plan consumption alone."
+                        .to_owned(),
+                ))
+            }
             _ => None,
+        }
+    }
+
+    fn delegated_mutation_not_attempted(error: Self) -> Self {
+        match error {
+            Self::SubprocessNotStarted { .. } | Self::DelegatedMutationNotAttempted { .. } => error,
+            other => Self::DelegatedMutationNotAttempted {
+                message: other.to_string(),
+            },
         }
     }
 }
@@ -7882,9 +7911,19 @@ async fn run_delegated_cli_with_timeout(
             .env("CLOUDFLARE_API_KEY", key),
     };
     let label = capability.path.clone();
-    let output = command.output_bytes().await.map_err(|_| {
-        CliError::Input("governed delegated subprocess could not start or complete".to_owned())
-    })?;
+    let running = command
+        .start()
+        .await
+        .map_err(|_| CliError::SubprocessNotStarted {
+            label: label.clone(),
+        })?;
+    let output =
+        running
+            .output_bytes()
+            .await
+            .map_err(|_| CliError::SubprocessReceiptUnavailable {
+                label: label.clone(),
+            })?;
     if output.timed_out() {
         return Err(CliError::SubprocessTimeout {
             label: label.clone(),
@@ -16951,6 +16990,7 @@ fn recover_standing_lineage(store: &StateStore, authority_id: &str) -> Result<Ve
     Ok(evidence)
 }
 
+#[derive(Default)]
 struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
@@ -17106,7 +17146,7 @@ async fn execute_consumed_plan(
             Err(error)
                 if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted =>
             {
-                persist_delegated_pre_response_failure(store, plan, secrets)?;
+                persist_delegated_pre_response_failure(store, plan, &error, secrets)?;
                 let mut envelope = delegated_pre_response_failure_envelope(plan, &error);
                 prepend_live_precondition_evidence(&mut envelope, evidence);
                 Ok(envelope)
@@ -17148,14 +17188,20 @@ async fn execute_consumed_plan(
 fn persist_delegated_pre_response_failure(
     store: &StateStore,
     plan: &mut PlanV1,
+    error: &CliError,
     secrets: &dyn SecretStore,
 ) -> Result<()> {
     plan.status = PlanStatus::RectificationRequired;
+    let outcome = if delegated_mutation_was_attempted(error) {
+        "no_receipt"
+    } else {
+        "not_attempted"
+    };
     persist_transaction_stage_with_artifact(
         store,
         plan,
         TransactionStageV1::BoundaryResponsePersisted,
-        boundary_failure_artifact("delegated_cli", "no_receipt"),
+        boundary_failure_artifact("delegated_cli", outcome),
     )?;
     persist_secret_lifecycle(store, plan, false, None, secrets)?;
     Ok(())
@@ -17172,24 +17218,39 @@ fn delegated_pre_response_failure_envelope(plan: &PlanV1, error: &CliError) -> R
         &error.to_string(),
         Some(&next_step),
     );
+    let performed = delegated_mutation_was_attempted(error);
     envelope.result = json!({
         "success": false,
-        "outcome": "unknown",
+        "outcome": if performed { "unknown" } else { "not_attempted" },
         "receipt_available": false,
         "boundary_replayed": false,
     });
-    envelope.performed = true;
+    envelope.performed = performed;
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());
     envelope.profile_id = Some(plan.profile_id.clone());
     envelope.account_id = Some(plan.account_id.clone());
     envelope.policy_decision = Some(plan.policy.clone());
-    envelope.verification.state = VerificationState::Pending;
-    envelope.verification.basis = Some(
-        "the delegated subprocess was attempted, but no complete boundary receipt exists; provider acceptance is unknown and the consumed plan requires rectification without replay"
-            .to_owned(),
-    );
+    envelope.verification.state = if performed {
+        VerificationState::Pending
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(if performed {
+        "the mutation-capable delegated subprocess started, but no complete boundary receipt exists; provider acceptance is unknown and the consumed plan requires rectification without replay"
+            .to_owned()
+    } else {
+        "no mutation-capable delegated subprocess was started; plan consumption is preserved for rectification, but no provider write is claimed"
+            .to_owned()
+    });
     envelope
+}
+
+fn delegated_mutation_was_attempted(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::SubprocessTimeout { .. } | CliError::SubprocessReceiptUnavailable { .. }
+    )
 }
 
 fn prepend_live_precondition_evidence(
@@ -31071,7 +31132,7 @@ mod tests {
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
         ImportPrerequisiteContext, KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions,
-        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
+        LivePreconditionEvidence, Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
         OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, OAUTH_CLIENT_UPDATE_STATE_PRECONDITION,
         PAGES_PROJECT_ABSENCE_PRECONDITION, PAGES_PROJECT_CREATE_CAPABILITY_ID,
         PAGES_PROJECT_DETAIL_PATH, PAGES_PROJECT_READ_CAPABILITY_ID, PlanAuthority,
@@ -31170,8 +31231,8 @@ mod tests {
         SearchArgs,
     };
     use cfctl_auth::{
-        AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind, ProfileMetadata,
-        SecretStore,
+        AuthCredential, AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind,
+        ProfileMetadata, SecretStore,
     };
     use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
     use cfctl_cloudflare::{
@@ -31644,8 +31705,9 @@ mod tests {
             assert_eq!(error.code(), "CFCTL_SUBPROCESS_TIMEOUT");
             let next_step = error.next_step().expect("typed timeout guidance");
             assert!(next_step.contains("plans status"));
-            assert!(next_step.contains("plans rectify"));
-            assert!(next_step.contains("do not replay"));
+            assert!(next_step.contains("do not assume the plan was consumed"));
+            assert!(next_step.contains("replay the mutation"));
+            assert!(!next_step.contains("plans rectify"));
         }
     }
 
@@ -31718,6 +31780,43 @@ mod tests {
             }
             assert!(!alive, "timed-out delegated process {pid} survived");
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_launch_failure_is_typed_as_not_started() {
+        let root = tempfile::tempdir().expect("delegated launch-failure root");
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).expect("cache root");
+        let mut capability =
+            CapabilityV1::new("wrangler.deploy", "deploy Worker", "CLI", "wrangler deploy");
+        capability.method = "CLI".to_owned();
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let missing_program = root.path().join("missing-wrangler");
+
+        let error = super::run_delegated_cli_with_timeout(
+            &capability,
+            &CallInput {
+                selectors: json!({}),
+                query: json!({}),
+                ..CallInput::default()
+            },
+            &AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            Some("fixture-account"),
+            &cache,
+            Some(&missing_program),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("missing delegated executable must fail before launch");
+
+        assert!(
+            matches!(&error, CliError::SubprocessNotStarted { .. }),
+            "unexpected launch classification: {error}"
+        );
+        assert_eq!(error.code(), "CFCTL_DELEGATED_MUTATION_NOT_ATTEMPTED");
     }
 
     #[cfg(windows)]
@@ -46277,6 +46376,7 @@ mod tests {
         super::persist_delegated_pre_response_failure(
             &store,
             &mut plan,
+            &timeout,
             &MemorySecretStore::default(),
         )
         .expect("persist timeout recovery state");
@@ -46314,6 +46414,79 @@ mod tests {
         assert!(next_step.contains(&format!("cfctl plans status {} --json", plan.operation_id)));
         assert!(next_step.contains(&format!("cfctl plans rectify {} --json", plan.operation_id)));
         assert!(next_step.contains("Do not replay"));
+    }
+
+    #[tokio::test]
+    async fn delegated_local_failure_after_consumption_does_not_claim_a_provider_attempt() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut capability = CapabilityV1::new(
+            "invalid.delegate",
+            "Invalid delegate",
+            "CLI",
+            "unreviewed-tool",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DelegatedCli;
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            &catalog.schema_hash,
+            capability,
+            json!({}),
+        )
+        .expect("delegated plan");
+        plan.approve(true, None).expect("approval");
+        plan.mark_consumed().expect("consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary checkpoint");
+        store.save_plan(&plan).expect("persist consumed plan");
+
+        let envelope = super::execute_consumed_plan(
+            &store,
+            &catalog,
+            &mut plan,
+            &CallInput::default(),
+            &AuthCredential::Bearer {
+                token: "fixture-token".to_owned(),
+            },
+            &MemorySecretStore::default(),
+            LivePreconditionEvidence::default(),
+        )
+        .await
+        .expect("local delegated failure becomes a typed recovery envelope");
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(envelope.result["outcome"], "not_attempted");
+        assert_eq!(envelope.result["receipt_available"], false);
+        assert_eq!(envelope.result["boundary_replayed"], false);
+        assert_eq!(envelope.verification.state, VerificationState::Failed);
+        assert!(envelope.verification.basis.as_deref().is_some_and(|basis| {
+            basis.contains("no mutation-capable delegated subprocess was started")
+        }));
+        let durable = store
+            .load_plan(&plan.operation_id)
+            .expect("not-attempted plan reloads");
+        assert_eq!(durable.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("body-free not-attempted checkpoint")["outcome"],
+            "not_attempted"
+        );
+        durable
+            .validate_transaction_journal()
+            .expect("not-attempted recovery journal is coherent");
     }
 
     #[tokio::test]
