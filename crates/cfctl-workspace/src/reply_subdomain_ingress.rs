@@ -229,7 +229,7 @@ fn validate_surface(bytes: &[u8], operation_kind: &str) -> Result<()> {
         "`account_id`, `reply_domain`, and `worker_script_name`",
         PROJECTION,
         "`exact_reply_subdomain`",
-        "`exact_reply_subdomain_catch_all_to_worker`",
+        "`parent_zone_catch_all_to_worker_covering_exact_reply_subdomain`",
         "`provider_output_retained:false`",
         "`body_returned:false`",
     ];
@@ -339,7 +339,7 @@ mod tests {
         fs::write(
             root.path().join(SURFACE_PATH),
             format!(
-                "{CAPABILITY_ID}\n{ACTIVATE_CAPABILITY_ID}\n`account_id`, `reply_domain`, and `worker_script_name`\n{PROJECTION}\n`exact_reply_subdomain`\n`exact_reply_subdomain_catch_all_to_worker`\n`provider_output_retained:false`\n`body_returned:false`\n`plan_v2_required`\n`account_plan_exactly_one_non_destructive_change`\n"
+                "{CAPABILITY_ID}\n{ACTIVATE_CAPABILITY_ID}\n`account_id`, `reply_domain`, and `worker_script_name`\n{PROJECTION}\n`exact_reply_subdomain`\n`parent_zone_catch_all_to_worker_covering_exact_reply_subdomain`\n`provider_output_retained:false`\n`body_returned:false`\n`plan_v2_required`\n`account_plan_exactly_one_non_destructive_change`\n"
             ),
         )
         .expect("surface");
