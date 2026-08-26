@@ -604,8 +604,8 @@ async fn email_routing_subdomain_verifier_binds_exact_requested_name() {
     let response = json!({
         "success":true,
         "result":{
-            "errors":[],
-            "record":[
+            "errors":null,
+            "records":[
                 {"type":"MX","name":"reply.maildesk.example.com","content":"mx.example.net"},
                 {"type":"TXT","name":"reply.maildesk.example.com","content":"provider-secret"}
             ]

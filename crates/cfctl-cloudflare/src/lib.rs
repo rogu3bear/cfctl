@@ -5004,12 +5004,12 @@ impl Executor {
             },
         )?;
         let readback = self.send(&request, credential).await?;
-        let errors_empty = readback
-            .result
-            .get("errors")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
-        let records = readback.result.get("record").and_then(Value::as_array);
+        let errors_empty = match readback.result.get("errors") {
+            Some(Value::Null) => true,
+            Some(Value::Array(errors)) => errors.is_empty(),
+            _ => false,
+        };
+        let records = readback.result.get("records").and_then(Value::as_array);
         let records_match = records.is_some_and(|records| {
             !records.is_empty()
                 && records.iter().all(|record| {
