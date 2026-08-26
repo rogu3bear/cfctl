@@ -1392,6 +1392,15 @@ fn compile_private_candidate(
     source: &Path,
     runtime: &CompilerRuntime,
 ) -> Result<Vec<u8>> {
+    let compiler_path = Path::new(&contract.repository_root).join(&contract.compiler_path);
+    let compiler_relative_path = Path::new(&contract.compiler_path);
+    let support_relative_path = compiler_support_relative_path(compiler_relative_path)?;
+    let support_file_name = support_relative_path
+        .file_name()
+        .ok_or_else(|| {
+            CliError::Input("reply-admission compiler support path is invalid".to_owned())
+        })?
+        .to_os_string();
     let source_bytes = read_private_candidate(source)?;
     let input_stage = stage_private_candidate(store, &source_bytes)?;
     let input_stage = input_stage
@@ -1404,12 +1413,7 @@ fn compile_private_candidate(
         .to_path_buf();
     let output_path = directory.join("d1-reply-admission-compiled.json");
     let staged_compiler_path = directory.join("reply-admission-compiler.ts");
-    let compiler_path = Path::new(&contract.repository_root).join(&contract.compiler_path);
-    let compiler_relative_path = Path::new(&contract.compiler_path);
-    let support_relative_path = compiler_support_relative_path(compiler_relative_path)?;
-    let support_path = directory.join(support_relative_path.file_name().ok_or_else(|| {
-        CliError::Input("reply-admission compiler support path is invalid".to_owned())
-    })?);
+    let support_path = directory.join(support_file_name);
     let staged_runtime_path = directory.join("bun");
     let compiled = (|| {
         let compiler_bytes = read_compiler_bytes(&compiler_path, &contract.compiler_sha256)?;
@@ -2449,6 +2453,19 @@ writeFileSync(output, JSON.stringify({ sealed: seal(JSON.parse(readFileSync(inpu
                 .next()
                 .is_none(),
             "private compiler stages must be removed",
+        );
+
+        let mut unsupported_contract = contract.clone();
+        unsupported_contract.compiler_path = "scripts/other-compiler.ts".to_owned();
+        let error = compile_private_candidate(&store, &unsupported_contract, &source, &runtime)
+            .expect_err("unsupported compiler path");
+        assert!(error.to_string().contains("no admitted support module"));
+        assert!(
+            fs::read_dir(store.paths().data_dir.join("private-operation-stages"))
+                .expect("private stages after unsupported compiler")
+                .next()
+                .is_none(),
+            "unsupported compiler path must not retain a private candidate stage",
         );
     }
 }
