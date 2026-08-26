@@ -17,10 +17,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::cloudflare_api::BASE_URL as API_BASE_URL;
 use super::{
-    API_BASE_URL, ApiVerificationOutcome, CliError, Result, api_plan_result_envelope, http_client,
-    persist_secret_lifecycle, persist_transaction_stage, persist_transaction_stage_with_artifact,
-    post_boundary_failure_envelope, verification_response_artifact,
+    api_boundary::{
+        ApiVerificationOutcome, api_plan_result_envelope, persist_secret_lifecycle,
+        post_boundary_failure_envelope, verification_response_artifact,
+    },
+    plan_commands::{persist_transaction_stage, persist_transaction_stage_with_artifact},
+    prelude::{CliError, Result},
+    support::http_client,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

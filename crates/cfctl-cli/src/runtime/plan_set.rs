@@ -1,11 +1,3 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    fs::OpenOptions,
-    io::Read,
-    path::{Component, Path, PathBuf},
-};
-
 use cfctl_core::{
     DeploymentPlanSetChildV1, DeploymentPlanSetRepositoryV1, DeploymentPlanSetV1, EvidenceClass,
     PlanStatus, PlanV2, ResultEnvelopeV2, VerificationState, hash_value,
@@ -18,14 +10,24 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::{
-    CallInput, CatalogSnapshot, CliError, ProfilesConfig, Result, StateStore,
-    active_admission_policy, catalog_is_stale, current_build_info, ensure_catalog,
-    fresh_credential, git_authority_output, normalize_reviewed_git_repository_id, platform_secrets,
-    prepend_live_precondition_evidence, resolved_plan_input,
-    validate_live_plan_precondition_evidence, validate_plan_preconditions,
-    validate_plan_v2_runtime_pins, validate_worker_deployment_local_authority,
+    credential_resolution::{ensure_catalog, fresh_credential, platform_secrets},
+    import_planning::{git_authority_output, normalize_reviewed_git_repository_id},
+    plan_commands::{
+        prepend_live_precondition_evidence, validate_live_plan_precondition_evidence,
+        validate_plan_v2_runtime_pins,
+    },
+    policy_commands::active_admission_policy,
+    prelude::{
+        BTreeSet, CallInput, CatalogSnapshot, CliError, OpenOptions, Path, PathBuf, ProfilesConfig,
+        Read, Result, StateStore, fs,
+    },
+    secret_io::resolved_plan_input,
+    support::catalog_is_stale,
+    workspace_state::{validate_plan_preconditions, validate_worker_deployment_local_authority},
 };
+use crate::build_identity::current_build_info;
 use crate::{DeploymentPlanSetCreateArgs, DeploymentPlanSetSelector};
+use std::path::Component;
 
 const MAX_SPEC_BYTES: u64 = 1024 * 1024;
 
