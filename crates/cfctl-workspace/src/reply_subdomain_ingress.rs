@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use super::{RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional};
 
 pub const CAPABILITY_ID: &str = "star-maildesk-cf.reply-subdomain-ingress-read";
+pub const ACTIVATE_CAPABILITY_ID: &str = "star-maildesk-cf.reply-subdomain-ingress-activate";
 pub const PROJECTION: &str = "workspace_reply_subdomain_ingress_v1";
 const SURFACE_PATH: &str = "ops/cfctl/maildesk-cf.surface.md";
 const CONSUMER_PATH: &str = "scripts/maildesk-control-plane-capabilities.ts";
@@ -18,9 +19,14 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    if capability_id != CAPABILITY_ID {
+    if !matches!(capability_id, CAPABILITY_ID | ACTIVATE_CAPABILITY_ID) {
         return Ok(None);
     }
+    let operation_kind = if capability_id == ACTIVATE_CAPABILITY_ID {
+        "activate"
+    } else {
+        "read"
+    };
     let registered = roots
         .iter()
         .map(|path| RegisteredRoot::new(path))
@@ -50,9 +56,10 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
             .ok_or_else(|| invariant("reply-subdomain ingress authority has no origin"))?;
         let surface = committed_file(repository.path.as_path(), SURFACE_PATH)?;
         let consumer = committed_file(repository.path.as_path(), CONSUMER_PATH)?;
-        validate_surface(&surface)?;
-        validate_consumer(&consumer)?;
+        validate_surface(&surface, operation_kind)?;
+        validate_consumer(&consumer, operation_kind)?;
         matches.push(capability(WorkspaceReplySubdomainIngressContractV1 {
+            operation_kind: operation_kind.to_owned(),
             repository_root: repository.path.display().to_string(),
             repository_head: head.to_owned(),
             repository_origin: origin,
@@ -73,6 +80,9 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
 }
 
 fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV1 {
+    if contract.operation_kind == "activate" {
+        return activate_capability(contract);
+    }
     let mut capability = CapabilityV1::new(
         CAPABILITY_ID,
         "Read one exact Maildesk reply-subdomain ingress",
@@ -142,10 +152,79 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
     capability
 }
 
-fn validate_surface(bytes: &[u8]) -> Result<()> {
+fn activate_capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        ACTIVATE_CAPABILITY_ID,
+        "Activate one exact Maildesk reply-subdomain ingress",
+        "POST",
+        "workspace maildesk reply-subdomain ingress activation",
+    );
+    capability.description = Some(
+        "Uses Cloudflare's account routing planner to bind one exact subdomain catch-all, creates one PlanV2, and verifies through the body-free account rule inventory."
+            .to_owned(),
+    );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
+    "Email Routing".clone_into(&mut capability.product);
+    "workspace-maildesk-surface-v1".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.selectors = ["account_id", "reply_domain", "worker_script_name"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.permissions = vec![
+        "Workers Scripts Read".to_owned(),
+        "Email Routing Rules Read".to_owned(),
+        "Email Routing Rules Write".to_owned(),
+        "Zone Zone Read".to_owned(),
+        "Zone Settings Read".to_owned(),
+    ];
+    capability.mutating = true;
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.entitlement = EntitlementV1 {
+        available: Some(true),
+        source: Some("Cloudflare Email Routing subdomain and account-plan contracts".to_owned()),
+        ..EntitlementV1::default()
+    };
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: None,
+        basis: Some("Email Routing rule planning and one catch-all update".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::None,
+        exposure: CostExposureV1::None,
+        references: Vec::new(),
+    };
+    capability.verification = VerificationSpecV1 {
+        required: true,
+        strategy: "workspace_reply_subdomain_ingress_activation_body_free_readback".to_owned(),
+    };
+    capability.rollback = RollbackSpecV1 {
+        supported: false,
+        strategy: None,
+        warning: Some(
+            "On ambiguous apply or failed readback, do not replay; reconcile the exact subdomain catch-all and create a fresh explicit recovery plan."
+                .to_owned(),
+        ),
+    };
+    capability.adapter_status = AdapterStatus::DelegatedCli;
+    capability.workspace_reply_subdomain_ingress = Some(contract);
+    capability
+}
+
+fn validate_surface(bytes: &[u8], operation_kind: &str) -> Result<()> {
     let source = std::str::from_utf8(bytes)
         .map_err(|_| invariant("reply-subdomain ingress surface is not UTF-8"))?;
-    for required in [
+    let mut required = vec![
         CAPABILITY_ID,
         "`account_id`, `reply_domain`, and `worker_script_name`",
         PROJECTION,
@@ -153,7 +232,15 @@ fn validate_surface(bytes: &[u8]) -> Result<()> {
         "`exact_reply_subdomain_catch_all_to_worker`",
         "`provider_output_retained:false`",
         "`body_returned:false`",
-    ] {
+    ];
+    if operation_kind == "activate" {
+        required.extend([
+            ACTIVATE_CAPABILITY_ID,
+            "`plan_v2_required`",
+            "`account_plan_exactly_one_non_destructive_change`",
+        ]);
+    }
+    for required in required {
         if !source.contains(required) {
             return Err(invariant(format!(
                 "reply-subdomain ingress surface omitted `{required}`"
@@ -163,10 +250,13 @@ fn validate_surface(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn validate_consumer(bytes: &[u8]) -> Result<()> {
+fn validate_consumer(bytes: &[u8], operation_kind: &str) -> Result<()> {
     let source = std::str::from_utf8(bytes)
         .map_err(|_| invariant("reply-subdomain ingress consumer contract is not UTF-8"))?;
-    if !source.contains(CAPABILITY_ID) || !source.contains(PROJECTION) {
+    if !source.contains(CAPABILITY_ID)
+        || !source.contains(PROJECTION)
+        || (operation_kind == "activate" && !source.contains(ACTIVATE_CAPABILITY_ID))
+    {
         return Err(invariant(
             "reply-subdomain ingress consumer does not name the exact capability and projection",
         ));
@@ -249,13 +339,13 @@ mod tests {
         fs::write(
             root.path().join(SURFACE_PATH),
             format!(
-                "{CAPABILITY_ID}\n`account_id`, `reply_domain`, and `worker_script_name`\n{PROJECTION}\n`exact_reply_subdomain`\n`exact_reply_subdomain_catch_all_to_worker`\n`provider_output_retained:false`\n`body_returned:false`\n"
+                "{CAPABILITY_ID}\n{ACTIVATE_CAPABILITY_ID}\n`account_id`, `reply_domain`, and `worker_script_name`\n{PROJECTION}\n`exact_reply_subdomain`\n`exact_reply_subdomain_catch_all_to_worker`\n`provider_output_retained:false`\n`body_returned:false`\n`plan_v2_required`\n`account_plan_exactly_one_non_destructive_change`\n"
             ),
         )
         .expect("surface");
         fs::write(
             root.path().join(CONSUMER_PATH),
-            format!("export const CAP = \"{CAPABILITY_ID}\";\nexport const ADAPTER = \"{PROJECTION}\";\n"),
+            format!("export const CAP = \"{CAPABILITY_ID}\";\nexport const ACTIVATE = \"{ACTIVATE_CAPABILITY_ID}\";\nexport const ADAPTER = \"{PROJECTION}\";\n"),
         )
         .expect("consumer");
         git(root.path(), &["add", "."]);
@@ -291,6 +381,40 @@ mod tests {
                 .projection,
             PROJECTION
         );
+    }
+
+    #[test]
+    fn loads_exact_plan_v2_activation_capability() {
+        let root = fixture();
+        let capability = load_workspace_reply_subdomain_ingress_capability(
+            &[root.path().to_path_buf()],
+            ACTIVATE_CAPABILITY_ID,
+        )
+        .expect("load")
+        .expect("capability");
+        assert_eq!(
+            capability.permissions,
+            [
+                "Workers Scripts Read",
+                "Email Routing Rules Read",
+                "Email Routing Rules Write",
+                "Zone Zone Read",
+                "Zone Settings Read",
+            ]
+        );
+        assert!(capability.mutating);
+        assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+        assert_eq!(capability.adapter_status, AdapterStatus::DelegatedCli);
+        assert_eq!(
+            capability
+                .workspace_reply_subdomain_ingress
+                .as_ref()
+                .expect("contract")
+                .operation_kind,
+            "activate"
+        );
+        assert!(capability.verification_contract_supported());
+        assert!(capability.mutation_contract_gaps().is_empty());
     }
 
     #[test]

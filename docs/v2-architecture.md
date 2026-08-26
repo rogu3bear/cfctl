@@ -263,6 +263,26 @@ the outer call envelope, while credential generation remains bound by the
 operational-proof record; the closed Maildesk result exposes only the two
 public identity hashes and typed configuration states.
 
+The corresponding workspace activation adapter treats Cloudflare's
+account-level Email Routing planner as a read-only resolver, not as mutation
+proof. It submits one exact subdomain catch-all target and accepts only one
+non-destructive `added` or `updated` change. The returned zone identity is private PlanV2 input for one
+catch-all update only when it equals the independently resolved nearest active
+parent zone; an optional `zone_name` must name that parent, and neither identity
+is retained in the body-free receipt. Execution and the catalog-native
+catch-all PUT share one cross-process lock for the normalized account and exact
+provider parent-zone ID while the activation path refreshes the parent zone,
+hashes the direct catch-all state, refreshes the complete Worker inventory and
+account plan, applies once, persists the boundary receipt, and reads back.
+The apply preserves the planner's Worker ownership tag and disables automatic
+mutation retries. Conflicts, deletes, no-ops, target drift, catch-all drift,
+ownership drift, or cardinality ambiguity stop before apply. Verification joins
+the direct catch-all shape/source observation with the independent complete
+account-inventory projection; ambiguous provider outcomes remain terminally
+rectification-required rather than replayable. The lock serializes local cfctl
+writers but does not claim atomic exclusion of external writers because the
+provider exposes no documented conditional catch-all write.
+
 ## Executable guidance projection
 
 The public explanation layer is a projection of the executable contracts, not

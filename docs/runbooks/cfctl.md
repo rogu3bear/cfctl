@@ -495,6 +495,38 @@ A separate reply-domain zone, the parent-zone catch-all, incomplete account
 pagination, ambiguous exact rules, or a merely similar Worker never satisfy
 the contract.
 
+The paired `star-maildesk-cf.reply-subdomain-ingress-activate` capability is
+the only write lane for a missing Maildesk reply-subdomain catch-all. It first
+uses the complete `listWorkers` projection to resolve one exact Worker tag,
+then calls Cloudflare's account-scoped Email Routing plan endpoint with one
+`*@reply-domain` target. Only one exact non-destructive `added` or `updated`
+change is admissible. A zero change, conflict, delete, duplicate zone,
+duplicate change, malformed plan, or target mismatch stops before PlanV2
+creation. The provider-returned zone must equal the nearest exact active parent
+zone resolved through the complete zone read; an optional planner `zone_name`
+must name that parent zone, not the reply subdomain. Execution acquires the
+same cross-process lock used by the catalog-native catch-all PUT, keyed by the
+exact account and provider parent-zone ID, and holds it
+through final reads, the apply receipt, and readback. Inside that lock cfctl
+repeats the active-parent-zone read, reads and hash-binds the direct catch-all
+state, refreshes the complete Worker inventory, and runs the exact account
+plan; every target, catch-all state, Worker tag, payload digest, and change type
+must still match the approved PlanV2. The one catch-all body preserves the same
+Worker ownership tag used by the planner and runs with automatic retries
+disabled. Apply success is insufficient: the plan closes only when both the
+direct catch-all shape/source read and the existing body-free reply-subdomain
+account-inventory read prove the intended one-all-matcher Worker rule and DNS.
+Any fresh-state drift, ambiguous apply, or failed readback requires
+reconciliation and a fresh plan; the consumed plan is never replayed.
+
+Cloudflare's documented catch-all API exposes an unconditional PUT and no
+compare-and-swap token. The provider-zone lock prevents competing cfctl processes on
+this machine and the final reads minimize the provider race, but they do not
+make the provider write atomic against dashboard, Wrangler, Terraform, or
+direct-API writers. Keep those external writers quiescent for this one change
+window. A successful shape/source readback proves final state, not that no
+external actor wrote between the last plan response and the PUT.
+
 An account-scoped API-token profile remains the normal read credential. If the
 provider denies that exact account inventory to an otherwise correctly scoped
 token, an explicitly named emergency global-key profile may perform this one
