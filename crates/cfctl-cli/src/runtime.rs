@@ -24462,6 +24462,9 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if r2_private_upload_rectification_eligible(&plan) {
         return rectify_r2_private_upload(store, &mut plan).await;
     }
+    if email_routing_subdomain_dns_rectification_eligible(&plan) {
+        return rectify_email_routing_subdomain_dns(store, &mut plan).await;
+    }
     if worker_version_rollback_rectification_eligible(&plan) {
         return rectify_worker_version_rollback(store, &mut plan).await;
     }
@@ -24956,6 +24959,141 @@ fn persist_r2_private_upload_rectification_result(
             "retry":true,
         }),
     )
+}
+
+fn email_routing_subdomain_dns_rectification_eligible(plan: &PlanV1) -> bool {
+    let boundary = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted);
+    plan.capability.verification.required
+        && plan.capability.verification.strategy == "email_routing_subdomain_dns_records_match"
+        && plan.capability.email_routing_subdomain_dns.is_some()
+        && plan.status == PlanStatus::RectificationRequired
+        && plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted
+        && boundary.is_some_and(|receipt| {
+            receipt.get("http_status").and_then(Value::as_u64) == Some(200)
+                && receipt.get("success").and_then(Value::as_bool) == Some(true)
+        })
+}
+
+async fn rectify_email_routing_subdomain_dns(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    if profile.account_id.as_deref() != Some(plan.account_id.as_str()) {
+        return Err(CliError::Input(
+            "Email Routing subdomain rectification profile no longer belongs to the plan account"
+                .to_owned(),
+        ));
+    }
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let boundary = plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Email Routing subdomain rectification omitted the successful boundary receipt"
+                    .to_owned(),
+            )
+        })?;
+    let status = boundary
+        .get("http_status")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .filter(|status| *status == 200)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Email Routing subdomain rectification boundary status is not exactly 200"
+                    .to_owned(),
+            )
+        })?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
+    let apply_response = CloudflareResponseV1 {
+        status,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let verification = Executor::new(http_client()?, API_BASE_URL)?
+        .verify_plan_with_input(plan, &apply_response, &input, &credential)
+        .await?;
+    persist_email_routing_subdomain_dns_rectification(store, plan, verification)
+}
+
+fn persist_email_routing_subdomain_dns_rectification(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    verification: OperationVerificationV1,
+) -> Result<ResultEnvelopeV2> {
+    if !email_routing_subdomain_dns_rectification_eligible(plan)
+        || verification.strategy != "email_routing_subdomain_dns_records_match"
+    {
+        return Err(CliError::Input(
+            "Email Routing subdomain DNS rectification is not bound to one eligible consumed operation"
+                .to_owned(),
+        ));
+    }
+    let passed = verification.passed;
+    let basis = verification.basis.clone();
+    let mut projected = serde_json::to_value(verification)?;
+    let object = projected.as_object_mut().ok_or_else(|| {
+        CliError::Input("Email Routing subdomain verification projection is malformed".to_owned())
+    })?;
+    object.insert("verification_only".to_owned(), Value::Bool(true));
+    object.insert("boundary_replayed".to_owned(), Value::Bool(false));
+    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &projected)?;
+    if passed {
+        plan.status = PlanStatus::Verified;
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::Closed,
+            json!({
+                "rectification_verification_hash":evidence.content_hash,
+                "retry":false,
+                "boundary_replayed":false,
+            }),
+        )?;
+    } else {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+    }
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans rectify",
+        json!({
+            "operation_id":plan.operation_id,
+            "status":plan.status,
+            "verification_only":true,
+            "boundary_replayed":false,
+            "message":basis,
+        }),
+    )
+    .with_evidence(evidence);
+    envelope.ok = passed;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.verification.state = if passed {
+        VerificationState::Passed
+    } else {
+        VerificationState::Failed
+    };
+    envelope.verification.basis = Some(basis.clone());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis,
+            next_step: Some(
+                "Keep the Email Routing operation frozen, inspect the projected DNS readback, and do not replay the POST."
+                    .to_owned(),
+            ),
+        });
+    }
+    Ok(envelope)
 }
 
 fn workspace_d1_projection_rectification_eligible(plan: &PlanV1) -> bool {
@@ -30968,7 +31106,8 @@ mod tests {
         approved_mln_import_execution_error_envelope, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request, configured_origin,
-        credential_generation_for_read, d1_recovery_anchor_matches, entitlement_probe_selectors,
+        credential_generation_for_read, d1_recovery_anchor_matches,
+        email_routing_subdomain_dns_rectification_eligible, entitlement_probe_selectors,
         exact_accepted_ingest_bookmarks, exact_durable_poll_exhaustion,
         exact_durable_provider_complete_boundary, exact_durable_provider_failure_boundary,
         exact_in_progress_poll_receipt, execute_native_workflow, execute_read, find_secret_value,
@@ -30982,7 +31121,8 @@ mod tests {
         mln_0143_restore_anchor_matches, non_readback_verification_basis,
         normalize_reviewed_mln_repository_id, operational_proof_coverage, pages_deployment,
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
-        permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
+        permission_inventory_envelope, persist_d1_import_checkpoint,
+        persist_email_routing_subdomain_dns_rectification, persist_prepared_plan,
         persist_r2_private_upload_rectification_result, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage,
         persist_worker_version_rollback_rectification,
@@ -31059,16 +31199,16 @@ mod tests {
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
         CreatedResourceContractV1, D1FullExportGovernedExecutionBindingV1, EffectClass,
-        EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
-        Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
-        OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1,
-        PlanV2, QuerySerializationV1, R2PrivateFileUploadContractV1, ResponseBodyModeV1,
-        ResponseContractV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
-        SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
-        WorkflowStepV1, WorkspaceD1MigrationContractV1, WorkspaceD1PolicyProjectionContractV1,
-        hash_value,
+        EmailRoutingSubdomainDnsContractV1, EntitlementProbeV1, EvidenceClass, EvidenceV1,
+        Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
+        OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
+        PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
+        R2PrivateFileUploadContractV1, ResponseBodyModeV1, ResponseContractV1, ResultEnvelopeV2,
+        RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
+        SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
+        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
+        WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1,
+        WorkspaceD1PolicyProjectionContractV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -45608,6 +45748,145 @@ mod tests {
                 .expect("reload open rollback")
                 .status,
             PlanStatus::RectificationRequired
+        );
+    }
+
+    fn email_routing_subdomain_dns_rectification_plan() -> PlanV1 {
+        let mut capability = CapabilityV1::new(
+            "email-routing-settings-enable-email-routing-dns",
+            "Enable explicit Email Routing subdomain",
+            "POST",
+            "/zones/{zone_id}/email/routing/dns",
+        );
+        capability.mutating = true;
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.verification.required = true;
+        capability.verification.strategy = "email_routing_subdomain_dns_records_match".to_owned();
+        capability.email_routing_subdomain_dns = Some(EmailRoutingSubdomainDnsContractV1 {
+            read_capability_id: "email-routing-settings-email-routing-dns-settings".to_owned(),
+            read_path: "/zones/{zone_id}/email/routing/dns".to_owned(),
+            request_name_field: "name".to_owned(),
+            read_query_field: "subdomain".to_owned(),
+        });
+        let input = CallInput {
+            selectors: json!({"zone_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+            body: Some(json!({"name":"reply.maildesk.example.com"})),
+            ..CallInput::default()
+        };
+        let mut plan = PlanV1::draft(
+            "maildesk-deploy",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sha256:catalog",
+            capability,
+            json!({}),
+        )
+        .expect("Email Routing DNS plan");
+        plan.input = serde_json::to_value(input).expect("Email Routing DNS input");
+        plan.refresh_hash().expect("bind Email Routing DNS input");
+        plan.approve(true, None)
+            .expect("approve Email Routing DNS plan");
+        plan.mark_consumed()
+            .expect("consume Email Routing DNS plan");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("Email Routing DNS boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"http_status":200,"success":true}),
+        )
+        .expect("Email Routing DNS boundary response");
+        plan.record_transaction_stage(TransactionStageV1::SecretSinkPersisted)
+            .expect("Email Routing DNS sink");
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("Email Routing DNS verification attempt");
+        plan.status = PlanStatus::RectificationRequired;
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"failed"}),
+        )
+        .expect("Email Routing DNS verification response");
+        plan
+    }
+
+    #[test]
+    fn email_routing_subdomain_dns_rectification_closes_only_from_fresh_get_proof() {
+        let root = tempfile::tempdir().expect("Email Routing rectification root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut plan = email_routing_subdomain_dns_rectification_plan();
+        assert!(email_routing_subdomain_dns_rectification_eligible(&plan));
+        store
+            .save_plan(&plan)
+            .expect("persist open Email Routing plan");
+        let verification = OperationVerificationV1 {
+            strategy: "email_routing_subdomain_dns_records_match".to_owned(),
+            passed: true,
+            basis: "the exact subdomain returned a complete DNS record set".to_owned(),
+            readback: CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({
+                    "subdomain":"reply.maildesk.example.com",
+                    "errors_empty":true,
+                    "records_match":true,
+                    "record_count":4,
+                }),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+            correlated_resource_id: None,
+        };
+        let envelope =
+            persist_email_routing_subdomain_dns_rectification(&store, &mut plan, verification)
+                .expect("GET-only Email Routing rectification");
+        assert!(envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(plan.status, PlanStatus::Verified);
+        assert_eq!(plan.transaction_stage, TransactionStageV1::Closed);
+        let evidence = store
+            .read_evidence_value(&envelope.evidence[0].content_hash)
+            .expect("Email Routing rectification evidence");
+        assert_eq!(evidence["verification_only"], true);
+        assert_eq!(evidence["boundary_replayed"], false);
+        assert_eq!(evidence["readback"]["result"]["record_count"], 4);
+        assert!(evidence.to_string().contains("reply.maildesk.example.com"));
+        assert!(!evidence.to_string().contains("record-content"));
+
+        let mut failed = email_routing_subdomain_dns_rectification_plan();
+        store.save_plan(&failed).expect("persist failed proof plan");
+        let failed_verification = OperationVerificationV1 {
+            strategy: "email_routing_subdomain_dns_records_match".to_owned(),
+            passed: false,
+            basis: "the exact subdomain DNS records remain incomplete".to_owned(),
+            readback: CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({
+                    "subdomain":"reply.maildesk.example.com",
+                    "errors_empty":false,
+                    "records_match":false,
+                    "record_count":0,
+                }),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+            correlated_resource_id: None,
+        };
+        let envelope = persist_email_routing_subdomain_dns_rectification(
+            &store,
+            &mut failed,
+            failed_verification,
+        )
+        .expect("failed GET proof remains inspectable");
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(failed.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            failed.transaction_stage,
+            TransactionStageV1::VerificationResponsePersisted
         );
     }
 
