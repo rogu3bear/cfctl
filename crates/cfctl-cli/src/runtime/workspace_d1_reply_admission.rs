@@ -1064,7 +1064,6 @@ fn validate_record(record: &Map<String, Value>) -> Result<()> {
         "relay_id",
         "thread_id",
         "route_id",
-        "identity_profile_ref",
         "signature_profile_ref",
     ] {
         if !record
@@ -1077,6 +1076,7 @@ fn validate_record(record: &Map<String, Value>) -> Result<()> {
             )));
         }
     }
+    validate_identity_profile_ref(record)?;
     let public_identity = record
         .get("public_identity")
         .and_then(Value::as_str)
@@ -1123,6 +1123,19 @@ fn validate_record(record: &Map<String, Value>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_identity_profile_ref(record: &Map<String, Value>) -> Result<()> {
+    if record
+        .get("identity_profile_ref")
+        .and_then(Value::as_str)
+        .is_some_and(valid_identity_profile_ref)
+    {
+        return Ok(());
+    }
+    Err(CliError::Input(
+        "reply-admission activation reference `identity_profile_ref` is invalid".to_owned(),
+    ))
 }
 
 fn validate_projection_record_bindings(
@@ -1809,6 +1822,44 @@ fn safe_ref(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-' | b'/'))
 }
+fn valid_identity_profile_ref(value: &str) -> bool {
+    if safe_ref(value) {
+        return true;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    (1..=240).contains(&value.len())
+        && !local.is_empty()
+        && value == value.to_ascii_lowercase()
+        && valid_domain(domain)
+        && local.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'.' | b'!'
+                        | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                )
+        })
+}
 fn valid_domain(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
@@ -2050,6 +2101,40 @@ mod tests {
         let sql = insert_sql("reply_admissions", &admitted.record).expect("compiler SQL");
         assert!(sql.starts_with("INSERT INTO reply_admissions"));
         assert!(!sql.contains("controller:activation:one"));
+    }
+
+    #[test]
+    fn compiled_candidate_accepts_router_owned_public_address_profile_refs() {
+        let mut value = candidate();
+        value["pre_send_identity_projection"]["identity_profile_ref"] =
+            Value::String("security@example.com".to_owned());
+        value["activation"]["record"]["identity_profile_ref"] =
+            Value::String("security@example.com".to_owned());
+        value["pre_send_identity_projection_sha256"] =
+            Value::String(hash_json(&value["pre_send_identity_projection"]));
+        value["activation_record_sha256"] =
+            Value::String(hash_json(&value["activation"]["record"]));
+
+        validate_candidate_bytes(&serde_json::to_vec(&value).expect("candidate bytes"))
+            .expect("public-address identity profile ref");
+
+        for invalid in ["Security@example.com", "security@@example.com", "security@"] {
+            let mut value = candidate();
+            value["pre_send_identity_projection"]["identity_profile_ref"] =
+                Value::String(invalid.to_owned());
+            value["activation"]["record"]["identity_profile_ref"] =
+                Value::String(invalid.to_owned());
+            value["pre_send_identity_projection_sha256"] =
+                Value::String(hash_json(&value["pre_send_identity_projection"]));
+            value["activation_record_sha256"] =
+                Value::String(hash_json(&value["activation"]["record"]));
+
+            assert!(
+                validate_candidate_bytes(&serde_json::to_vec(&value).expect("candidate bytes"))
+                    .is_err(),
+                "invalid public-address profile ref must fail closed: {invalid}",
+            );
+        }
     }
 
     #[test]
