@@ -2044,6 +2044,7 @@ pub struct WorkspaceD1ReplyAdmissionContractV1 {
 /// reduced inside cfctl and never become part of the public projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceReplySubdomainIngressContractV1 {
+    pub operation_kind: String,
     pub repository_root: String,
     pub repository_head: String,
     pub repository_origin: String,
@@ -2880,7 +2881,28 @@ impl CapabilityV1 {
                         .workspace_reply_subdomain_ingress
                         .as_ref()
                         .is_some_and(|contract| {
-                            !contract.repository_root.is_empty()
+                            contract.operation_kind == "read"
+                                && !contract.repository_root.is_empty()
+                                && !contract.repository_head.is_empty()
+                                && !contract.surface_sha256.is_empty()
+                                && !contract.consumer_contract_sha256.is_empty()
+                                && contract.projection
+                                    == "workspace_reply_subdomain_ingress_v1"
+                        })
+            }
+            "workspace_reply_subdomain_ingress_activation_body_free_readback" => {
+                self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.method == "POST"
+                    && self.mutating
+                    && self.risk == RiskClass::ScopedWrite
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self
+                        .workspace_reply_subdomain_ingress
+                        .as_ref()
+                        .is_some_and(|contract| {
+                            contract.operation_kind == "activate"
+                                && !contract.repository_root.is_empty()
                                 && !contract.repository_head.is_empty()
                                 && !contract.surface_sha256.is_empty()
                                 && !contract.consumer_contract_sha256.is_empty()

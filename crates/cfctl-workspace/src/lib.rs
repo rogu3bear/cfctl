@@ -27,6 +27,7 @@ pub use d1_operation::load_workspace_d1_migration_capability;
 pub use d1_policy_projection::load_workspace_d1_policy_projection_capability;
 pub use d1_reply_admission::load_workspace_d1_reply_admission_capability;
 pub use reply_subdomain_ingress::{
+    ACTIVATE_CAPABILITY_ID as MAILDESK_REPLY_SUBDOMAIN_INGRESS_ACTIVATE_CAPABILITY_ID,
     CAPABILITY_ID as MAILDESK_REPLY_SUBDOMAIN_INGRESS_CAPABILITY_ID,
     PROJECTION as MAILDESK_REPLY_SUBDOMAIN_INGRESS_PROJECTION,
     load_workspace_reply_subdomain_ingress_capability,

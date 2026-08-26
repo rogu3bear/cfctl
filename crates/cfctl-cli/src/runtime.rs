@@ -1579,6 +1579,46 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         };
         adapter_targets.insert("worker_deployment".to_owned(), target);
     }
+    if capability
+        .workspace_reply_subdomain_ingress
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "activate")
+    {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace reply-subdomain activation requires an explicit account pin or --account"
+                    .to_owned(),
+            )
+        })?;
+        let credential_generation_id = credential_generation_for_read(profile)?;
+        let credential = fresh_credential(profile, &secrets).await?;
+        let target = Box::pin(
+            workspace_reply_subdomain_ingress::prepare_activation_target(
+                store,
+                &catalog,
+                &capability,
+                &prepared.input,
+                &credential,
+                profile,
+                &account_id,
+                arguments.account.as_deref(),
+                &credential_generation_id,
+            ),
+        )
+        .await?;
+        adapter_targets.insert(
+            "workspace_reply_subdomain_ingress_activation".to_owned(),
+            target,
+        );
+    }
     if let Some(security_action) = security_action {
         adapter_targets.insert("security_action".to_owned(), security_action);
     }
@@ -6439,7 +6479,7 @@ async fn execute_delegated_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let mut receipt = run_delegated_plan_boundary(store, plan, input, credential).await?;
+    let mut receipt = Box::pin(run_delegated_plan_boundary(store, plan, input, credential)).await?;
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -6447,6 +6487,11 @@ async fn execute_delegated_plan(
     let evidence = store.write_evidence(EvidenceClass::Apply, &receipt)?;
     persist_delegated_boundary_result(store, plan, success, &receipt, &evidence, secrets)?;
     if !success {
+        if workspace_reply_subdomain_ingress::is_unperformed_fresh_precondition_failure(&receipt) {
+            return Ok(reply_subdomain_fresh_precondition_failure_envelope(
+                plan, receipt, evidence,
+            ));
+        }
         // A delegated CLI can fail after applying part of a mutation (Wrangler
         // may upload and promote a Worker before a trigger update fails). Keep
         // the transaction open for rectification and report that the boundary
@@ -6547,6 +6592,7 @@ fn persist_delegated_boundary_result(
             "adapter": "delegated_cli",
             "apply_evidence_hash": evidence.content_hash,
             "success": success,
+            "boundary_crossed": receipt.get("boundary_crossed").and_then(Value::as_bool),
         }),
     )?;
     persist_secret_lifecycle(store, plan, success, Some(receipt), secrets).map(|_| ())
@@ -6558,6 +6604,17 @@ async fn run_delegated_plan_boundary(
     input: &CallInput,
     credential: &AuthCredential,
 ) -> Result<Value> {
+    if plan
+        .capability
+        .workspace_reply_subdomain_ingress
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "activate")
+    {
+        return Box::pin(workspace_reply_subdomain_ingress::run(
+            store, plan, credential,
+        ))
+        .await;
+    }
     if plan.capability.workspace_d1_migration.is_some() {
         return workspace_d1_migration::run(store, plan, credential).await;
     }
@@ -6641,6 +6698,41 @@ fn delegated_cli_failure_envelope(
     envelope
 }
 
+fn reply_subdomain_fresh_precondition_failure_envelope(
+    plan: &PlanV1,
+    receipt: Value,
+    evidence: EvidenceV1,
+) -> ResultEnvelopeV2 {
+    let status = receipt
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("fresh_provider_precondition_unproved")
+        .to_owned();
+    let mut envelope = ResultEnvelopeV2::success("plans run", receipt).with_evidence(evidence);
+    envelope.ok = false;
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Failed;
+    envelope.verification.basis = Some(format!(
+        "fresh reply-subdomain provider precondition `{status}` stopped before the catch-all PUT"
+    ));
+    envelope.error = Some(ErrorV1 {
+        code: "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_FRESH_PRECONDITION_FAILED".to_owned(),
+        message: format!(
+            "fresh reply-subdomain provider state `{status}` no longer matches the approved plan; the catch-all PUT was not attempted"
+        ),
+        next_step: Some(format!(
+            "The plan is consumed and must not be replayed. Inspect `cfctl plans status {} --json`, reconcile `{status}`, and create a fresh PlanV2.",
+            plan.operation_id
+        )),
+    });
+    envelope
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the delegated verification dispatcher keeps every closed strategy explicit and fails unknown strategies without an implicit fallback"
@@ -6653,6 +6745,14 @@ async fn verify_delegated_cli_plan(
     receipt: &Value,
     credential: &AuthCredential,
 ) -> Value {
+    if plan
+        .capability
+        .workspace_reply_subdomain_ingress
+        .as_ref()
+        .is_some_and(|contract| contract.operation_kind == "activate")
+    {
+        return workspace_reply_subdomain_ingress::verify(store, plan, credential).await;
+    }
     if plan.capability.workspace_d1_migration.is_some() {
         return workspace_d1_migration::verify(store, plan, credential).await;
     }
@@ -15707,6 +15807,9 @@ fn append_local_artifact_diffs(
 }
 
 fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Result<Vec<PathBuf>> {
+    if let Some(paths) = workspace_reply_subdomain_ingress::local_artifact_paths(capability) {
+        return Ok(paths);
+    }
     if let Some(paths) = workspace_d1_migration::local_artifact_paths(capability)? {
         return Ok(paths);
     }
@@ -16217,6 +16320,12 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     } else {
         None
     };
+    let _email_routing_catch_all_lock =
+        workspace_reply_subdomain_ingress::acquire_activation_target_lock(
+            store,
+            &plan,
+            &execution_input,
+        )?;
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
@@ -16317,6 +16426,12 @@ async fn run_plan_under_standing_authority(
     } else {
         None
     };
+    let _email_routing_catch_all_lock =
+        workspace_reply_subdomain_ingress::acquire_activation_target_lock(
+            store,
+            &plan,
+            &execution_input,
+        )?;
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
@@ -16825,9 +16940,15 @@ async fn execute_consumed_plan(
         return result;
     }
     if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
-        let result =
-            execute_delegated_plan(store, catalog, plan, execution_input, credential, secrets)
-                .await;
+        let result = Box::pin(execute_delegated_plan(
+            store,
+            catalog,
+            plan,
+            execution_input,
+            credential,
+            secrets,
+        ))
+        .await;
         return match result {
             Ok(mut envelope) => {
                 prepend_live_precondition_evidence(&mut envelope, evidence);
@@ -28572,6 +28693,7 @@ fn current_pages_source_remote_precondition(
 }
 
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    workspace_reply_subdomain_ingress::validate_bound_plan(store, plan)?;
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;
     workspace_d1_reply_admission::validate_bound_plan(store, plan)?;
@@ -30971,6 +31093,56 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn reply_subdomain_fresh_precondition_failure_is_not_promoted_to_a_partial_mutation() {
+        let capability = CapabilityV1::new(
+            "star-maildesk-cf.reply-subdomain-ingress-activate",
+            "Activate reply ingress",
+            "POST",
+            "workspace maildesk reply-subdomain ingress activation",
+        );
+        let plan = PlanV1::draft(
+            "maildesk-deploy",
+            "account-a",
+            "sha256:catalog",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        let receipt = json!({
+            "adapter":"workspace_reply_subdomain_ingress_activation_apply_v1",
+            "success":false,
+            "boundary_crossed":false,
+            "failure_code":"CFCTL_WORKSPACE_REPLY_SUBDOMAIN_FRESH_PRECONDITION_FAILED",
+            "status":"fresh_account_plan_drifted",
+            "provider_output_retained":false,
+            "body_returned":false,
+        });
+        let envelope = super::reply_subdomain_fresh_precondition_failure_envelope(
+            &plan,
+            receipt,
+            EvidenceV1::new(EvidenceClass::Apply, "sha256:evidence", "evidence.json"),
+        );
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(
+            envelope.operation_id.as_deref(),
+            Some(plan.operation_id.as_str())
+        );
+        let error = envelope.error.expect("typed error");
+        assert_eq!(
+            error.code,
+            "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_FRESH_PRECONDITION_FAILED"
+        );
+        assert!(error.message.contains("was not attempted"));
+        assert!(!error.message.contains("subprocess"));
+        assert!(!error.message.contains("partial mutation"));
+        let next_step = error.next_step.expect("next step");
+        assert!(next_step.contains("must not be replayed"));
+        assert!(next_step.contains(&plan.operation_id));
+        assert!(next_step.contains("create a fresh PlanV2"));
     }
 
     #[test]

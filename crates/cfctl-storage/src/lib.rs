@@ -119,6 +119,8 @@ pub enum StorageError {
         account_id: String,
         script_name: String,
     },
+    #[error("Email Routing catch-all target `{account_id}/{zone_id}` is already locked")]
+    EmailRoutingCatchAllLocked { account_id: String, zone_id: String },
     #[error("system clock is before the Unix epoch")]
     Clock,
     #[error("operational proof is invalid: {0}")]
@@ -985,6 +987,51 @@ impl StateStore {
                 account_id: account_id.to_owned(),
                 script_name: script_name.to_owned(),
             }),
+            Err(std::fs::TryLockError::Error(source)) => Err(io_error(&path, source)),
+        }
+    }
+
+    /// Serializes cfctl writes for one exact account and provider-zone
+    /// catch-all resource. Cloudflare's catch-all PUT has no documented
+    /// conditional request primitive, so this lock closes concurrent local
+    /// cfctl writers while the caller performs its final reads, one write,
+    /// receipt persistence, and immediate readback. External writers remain a
+    /// provider-boundary risk and must be kept out of the change window.
+    pub fn lock_email_routing_catch_all(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+    ) -> Result<EmailRoutingCatchAllLock> {
+        if account_id.len() != 32
+            || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || zone_id.len() != 32
+            || !zone_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(StorageError::UnsafeManagedDocument {
+                path: "email-routing-catch-all-lock".to_owned(),
+                reason: "account_id or zone_id is outside the closed Email Routing catch-all selector contract"
+                    .to_owned(),
+            });
+        }
+        let key = hex::encode(Sha256::digest(
+            format!("{account_id}\0{zone_id}").as_bytes(),
+        ));
+        let path = self
+            .paths
+            .data_dir
+            .join("locks")
+            .join("email-routing-catch-alls")
+            .join(format!("{key}.lock"));
+        let _existing_regular_file = validate_existing_managed_file(&path)?;
+        let file = open_lock_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(EmailRoutingCatchAllLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(StorageError::EmailRoutingCatchAllLocked {
+                    account_id: account_id.to_owned(),
+                    zone_id: zone_id.to_owned(),
+                })
+            }
             Err(std::fs::TryLockError::Error(source)) => Err(io_error(&path, source)),
         }
     }
@@ -1920,6 +1967,11 @@ pub struct WorkerDeploymentLock {
 }
 
 #[derive(Debug)]
+pub struct EmailRoutingCatchAllLock {
+    _file: fs::File,
+}
+
+#[derive(Debug)]
 struct AdmissionPolicyLock {
     _file: fs::File,
 }
@@ -2184,6 +2236,33 @@ mod durability_tests {
             store
                 .lock_worker_deployment(&account, "jkca-web-drop")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn email_routing_catch_all_lock_serializes_one_exact_account_and_zone() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let account = "a".repeat(32);
+        let zone = "b".repeat(32);
+        let first = store
+            .lock_email_routing_catch_all(&account, &zone)
+            .expect("first exact target lock");
+        assert!(matches!(
+            store.lock_email_routing_catch_all(&account, &zone),
+            Err(StorageError::EmailRoutingCatchAllLocked { .. })
+        ));
+        assert!(
+            store
+                .lock_email_routing_catch_all(&account, &"c".repeat(32))
+                .is_ok()
+        );
+        drop(first);
+        assert!(store.lock_email_routing_catch_all(&account, &zone).is_ok());
+        assert!(
+            store
+                .lock_email_routing_catch_all(&account, "not-a-zone-id")
+                .is_err()
         );
     }
 }
