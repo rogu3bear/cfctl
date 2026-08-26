@@ -90,7 +90,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
         "workspace maildesk reply-subdomain ingress",
     );
     capability.description = Some(
-        "Proves exact reply-subdomain DNS and one exact all-matcher Worker rule through Cloudflare's complete body-free account rule inventory."
+        "Proves exact reply-subdomain DNS and the parent zone's one exact all-matcher Worker catch-all through bounded body-free reads."
             .to_owned(),
     );
     capability.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
@@ -120,7 +120,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
     capability.entitlement = EntitlementV1 {
         available: Some(true),
         source: Some(
-            "workspace source requires exact parent-zone and subdomain-DNS reads plus complete account Email Routing rule inventory"
+            "workspace source requires exact parent-zone resolution, exact subdomain-DNS readback, and direct parent-zone catch-all readback"
                 .to_owned(),
         ),
         ..EntitlementV1::default()
@@ -130,7 +130,7 @@ fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV
         currency: None,
         maximum: None,
         basis: Some(
-            "bounded parent-zone resolution, one exact subdomain-DNS read, and complete account rule pagination"
+            "bounded parent-zone resolution, one exact subdomain-DNS read, and one direct parent-zone catch-all read"
                 .to_owned(),
         ),
         known: true,
@@ -160,7 +160,7 @@ fn activate_capability(contract: WorkspaceReplySubdomainIngressContractV1) -> Ca
         "workspace maildesk reply-subdomain ingress activation",
     );
     capability.description = Some(
-        "Uses Cloudflare's account routing planner to bind one exact subdomain catch-all, creates one PlanV2, and verifies through the body-free account rule inventory."
+        "Uses Cloudflare's account routing planner to bind one exact subdomain catch-all, creates one PlanV2, and verifies exact DNS plus the parent-zone catch-all through body-free readback."
             .to_owned(),
     );
     capability.authority_scope = Some(CapabilityAuthorityScopeV1::WorkspaceOwned);
@@ -374,6 +374,27 @@ mod tests {
         assert_eq!(capability.effect, EffectClass::ReadOnly);
         assert!(capability.request_schema.is_none());
         assert!(capability.verification_contract_supported());
+        assert!(
+            capability
+                .description
+                .as_deref()
+                .is_some_and(|description| description
+                    .contains("parent zone's one exact all-matcher Worker catch-all"))
+        );
+        assert!(
+            capability
+                .entitlement
+                .source
+                .as_deref()
+                .is_some_and(|source| source.contains("direct parent-zone catch-all readback"))
+        );
+        assert!(
+            capability
+                .cost
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("one direct parent-zone catch-all read"))
+        );
         assert_eq!(
             capability
                 .workspace_reply_subdomain_ingress
@@ -415,6 +436,13 @@ mod tests {
         );
         assert!(capability.verification_contract_supported());
         assert!(capability.mutation_contract_gaps().is_empty());
+        assert!(
+            capability
+                .description
+                .as_deref()
+                .is_some_and(|description| description
+                    .contains("parent-zone catch-all through body-free readback"))
+        );
     }
 
     #[test]
