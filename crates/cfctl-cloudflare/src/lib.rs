@@ -9345,9 +9345,8 @@ fn normalize_deployable_worker_versions(response: &mut CloudflareResponseV1) -> 
             .map(Some)
             .ok_or(CloudflareError::PaginationMetadataInvalid)
     };
-    if metadata_u64("page")?.is_some_and(|page| page == 0)
-        || metadata_u64("per_page")?.is_some_and(|per_page| per_page == 0)
-    {
+    metadata_u64("page")?;
+    if metadata_u64("per_page")?.is_some_and(|per_page| per_page == 0) {
         return Err(CloudflareError::PaginationMetadataInvalid);
     }
     if let Some(expected) = metadata_u64("count")?
