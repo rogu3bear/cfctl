@@ -16,22 +16,28 @@ leaves them untouched), and runs both doctors:
 cargo install --path crates/cfctl-cli --locked
 ```
 
-Prebuilt binaries ship from the GitHub release. Releases are unsigned by
-operator decision: integrity is checksum-based, so verify every download
-against the release's `SHA256SUMS` (each binary is also reproducible from the
-tagged source and carries an SPDX SBOM).
+Prebuilt binaries may ship from the GitHub release only after v1.3.0 is signed,
+notarized, published, and read back. Both macOS binaries must carry the reviewed
+Developer ID Application identity and accepted Apple notarization receipts;
+`SHA256SUMS` and provenance must carry Sigstore bundles for the certificate
+identity and OIDC issuer recorded independently in `SECURITY.md`. Every binary
+must remain reproducible from the tagged source and carry an SPDX SBOM.
 
-```bash
-curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.3.0/cfctl-aarch64-apple-darwin
-curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.3.0/SHA256SUMS
-shasum -a 256 --check --ignore-missing SHA256SUMS
-install -m 0755 cfctl-aarch64-apple-darwin ~/.local/bin/cfctl
-```
+Do not execute a downloaded formula or installer by trusting identity values
+embedded in that same release. Until `SECURITY.md` names the exact Developer ID
+authority, TeamIdentifier, Sigstore certificate identity, and OIDC issuer and
+the published release has a separate readback receipt, use the source install
+above. The release procedure will add platform installation commands only when
+those independent trust roots can authenticate them.
 
-On macOS the release's Homebrew formula (`cfctl.rb`) pins the same checksums:
-`brew install --formula ./cfctl.rb`. The identity-verifying Linux installer is
-not shipped while releases are unsigned; use the direct download + checksum
-path with the `-unknown-linux-musl` binary for your architecture.
+The reserved artifact namespace is
+`https://github.com/rogu3bear/cfctl/releases/download/v1.3.0/`; its presence in
+source documentation is a version pin, not evidence that a release or any
+asset exists there.
+
+The unsigned `cargo xtask assemble` output is local qualification evidence and
+is deliberately not a published release. A source install is a separate local
+build, not proof that a published binary was installed.
 
 Confirm the exact running build after any install path:
 

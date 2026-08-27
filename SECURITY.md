@@ -75,6 +75,27 @@ These checks are local proof. They do not prove that an account mutation,
 signature, notarization, upload, deployment, domain verification, or OAuth
 promotion occurred.
 
-Releases are unsigned by operator decision: integrity is checksum-based, so
-verify every download against the release's `SHA256SUMS`. Each binary is
-reproducible from the tagged source and carries an SPDX SBOM.
+v1.3.0 must not be published unless both macOS binaries carry the reviewed
+Developer ID Application identity, hardened runtime, secure timestamps, and
+accepted Apple notarization receipts. `SHA256SUMS` and commit-bound provenance
+must carry Sigstore bundles for the reviewed certificate identity and OIDC
+issuer. Reproducible double-builds, checksum verification, and per-binary SPDX
+SBOMs remain independent requirements; signatures never replace them. Unsigned
+`cargo xtask assemble` outputs are local evidence and must not be published or
+represented as a release.
+
+The exact Developer ID authority, TeamIdentifier, Sigstore certificate
+identity, and OIDC issuer must be committed here before publication. Until
+those non-secret trust roots are present, no downloaded formula or installer
+is an authenticated bootstrap path and v1.3.0 remains held from publication.
+
+Machine-read release trust roots (non-secret):
+
+- Developer ID Application identity: `UNBOUND`
+- Developer ID TeamIdentifier: `UNBOUND`
+- Sigstore certificate identity: `UNBOUND`
+- Sigstore OIDC issuer: `UNBOUND`
+
+`cargo xtask release` and `cargo xtask publish` reject `UNBOUND`, missing, or
+mismatched values. Provisioning credentials alone cannot bypass this committed
+public identity boundary.
