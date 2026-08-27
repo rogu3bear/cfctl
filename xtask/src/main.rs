@@ -32,12 +32,21 @@ const MACOS_RELEASE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-
 /// musl arches reproducibly. Must be one of `RELEASE_TARGETS`.
 const VERIFY_CROSS_TARGET: &str = "x86_64-unknown-linux-musl";
 const CARGO_AUDITABLE_VERSION: &str = "0.7.5";
+const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
 
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
 struct Arguments {
     #[command(subcommand)]
     command: Task,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseTrustRoots {
+    macos_signing_identity: String,
+    macos_team_identifier: String,
+    certificate_identity: String,
+    certificate_oidc_issuer: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1560,6 +1569,107 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
         &render_guide_topic_markdown(GuideTopicV1::StandingAuthority),
     )?;
     verify_quickstart_pins_the_release_version(repository_root)?;
+    verify_signed_release_posture_contract(repository_root)?;
+    Ok(())
+}
+
+fn verify_signed_release_posture_contract(repository_root: &Path) -> Result<(), TaskError> {
+    let paths = [
+        "README.md",
+        "QUICKSTART.md",
+        "SECURITY.md",
+        "CONTRIBUTING.md",
+        "site/docs/LAUNCH_CHECKLIST.md",
+    ];
+    let documents = paths
+        .iter()
+        .map(|path| {
+            let absolute_path = repository_root.join(path);
+            fs::read_to_string(&absolute_path)
+                .map(|content| (*path, content))
+                .map_err(|source| io_error(&absolute_path, source))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let borrowed = documents
+        .iter()
+        .map(|(path, content)| (*path, content.as_str()))
+        .collect::<Vec<_>>();
+    validate_signed_release_posture_contract(&borrowed)?;
+    let security = borrowed
+        .iter()
+        .find_map(|(path, content)| (*path == "SECURITY.md").then_some(*content))
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract(
+                "signed release posture does not observe SECURITY.md".to_owned(),
+            )
+        })?;
+    parse_release_trust_roots(security)?;
+    Ok(())
+}
+
+fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Result<(), TaskError> {
+    for (path, required) in [
+        (
+            "README.md",
+            "v1.3.0 must not be published unless its two macOS binaries",
+        ),
+        (
+            "QUICKSTART.md",
+            "Prebuilt binaries may ship from the GitHub release only after v1.3.0 is signed",
+        ),
+        (
+            "SECURITY.md",
+            "v1.3.0 must not be published unless both macOS binaries",
+        ),
+        (
+            "CONTRIBUTING.md",
+            "The v1.3.0 operator posture requires the identity-bearing lane.",
+        ),
+        ("CONTRIBUTING.md", "create `v1.3.0` as a new annotated tag"),
+        (
+            "CONTRIBUTING.md",
+            "Create an empty draft GitHub release from the verified tag",
+        ),
+        (
+            "site/docs/LAUNCH_CHECKLIST.md",
+            "The v1.3.0 CLI posture requires signed and notarized publication",
+        ),
+        (
+            "SECURITY.md",
+            "The exact Developer ID authority, TeamIdentifier, Sigstore certificate identity, and OIDC issuer must be committed here before publication.",
+        ),
+    ] {
+        let content = documents
+            .iter()
+            .find_map(|(candidate, content)| (*candidate == path).then_some(*content))
+            .ok_or_else(|| {
+                TaskError::InvalidSourceContract(format!(
+                    "signed release posture does not observe required document `{path}`"
+                ))
+            })?;
+        let normalized_content = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized_required = required.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !normalized_content.contains(&normalized_required) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} omits signed v1.3.0 release posture anchor `{required}`"
+            )));
+        }
+    }
+
+    for (path, content) in documents {
+        let normalized_content = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        for retired in [
+            "Published releases are unsigned by operator decision",
+            "Releases are unsigned by operator decision",
+            "unsigned posture versus the signed-only",
+        ] {
+            if normalized_content.contains(retired) {
+                return Err(TaskError::InvalidSourceContract(format!(
+                    "{path} retains retired unsigned release posture `{retired}`"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1627,12 +1737,106 @@ fn verify_generated_guidance_section_text(
     Ok(())
 }
 
+fn release_trust_roots() -> Result<ReleaseTrustRoots, TaskError> {
+    let path = repository_root()?.join("SECURITY.md");
+    let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+    parse_release_trust_roots(&content)
+}
+
+fn release_trust_roots_at_commit(commit: &str) -> Result<ReleaseTrustRoots, TaskError> {
+    if !is_full_git_object_id(commit) {
+        return Err(TaskError::InvalidProvenance(
+            "git_commit must be a full hexadecimal object ID".to_owned(),
+        ));
+    }
+    let revision = format!("{commit}:SECURITY.md");
+    let content = output("git", &["--no-replace-objects", "show", &revision])?;
+    parse_release_trust_roots(&content)
+}
+
+fn is_full_git_object_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_release_trust_roots(content: &str) -> Result<ReleaseTrustRoots, TaskError> {
+    Ok(ReleaseTrustRoots {
+        macos_signing_identity: parse_release_trust_root(
+            content,
+            "Developer ID Application identity",
+        )?,
+        macos_team_identifier: parse_release_trust_root(content, "Developer ID TeamIdentifier")?,
+        certificate_identity: parse_release_trust_root(content, "Sigstore certificate identity")?,
+        certificate_oidc_issuer: parse_release_trust_root(content, "Sigstore OIDC issuer")?,
+    })
+}
+
+fn parse_release_trust_root(content: &str, label: &str) -> Result<String, TaskError> {
+    let prefix = format!("- {label}: `");
+    let values = content
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix('`'))
+        })
+        .collect::<Vec<_>>();
+    if values.len() != 1 || values[0].trim().is_empty() {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "SECURITY.md must contain exactly one non-empty `{label}` trust root"
+        )));
+    }
+    Ok(values[0].to_owned())
+}
+
+fn validate_release_identity_inputs(
+    trust_roots: &ReleaseTrustRoots,
+    certificate_identity: &str,
+    certificate_oidc_issuer: &str,
+    macos_signing_identity: &str,
+) -> Result<(), TaskError> {
+    for (label, committed, supplied) in [
+        (
+            "Developer ID Application identity",
+            trust_roots.macos_signing_identity.as_str(),
+            macos_signing_identity,
+        ),
+        (
+            "Sigstore certificate identity",
+            trust_roots.certificate_identity.as_str(),
+            certificate_identity,
+        ),
+        (
+            "Sigstore OIDC issuer",
+            trust_roots.certificate_oidc_issuer.as_str(),
+            certificate_oidc_issuer,
+        ),
+    ] {
+        if committed == "UNBOUND" || committed != supplied {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "release {label} must be bound in SECURITY.md and exactly match the supplied non-secret identity"
+            )));
+        }
+    }
+    if trust_roots.macos_team_identifier == "UNBOUND" {
+        return Err(TaskError::InvalidSourceContract(
+            "release Developer ID TeamIdentifier must be bound in SECURITY.md".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn release(
     certificate_identity: &str,
     certificate_oidc_issuer: &str,
     macos_signing_identity: &str,
     apple_notary_profile: &str,
 ) -> Result<(), TaskError> {
+    let trust_roots = release_trust_roots()?;
+    validate_release_identity_inputs(
+        &trust_roots,
+        certificate_identity,
+        certificate_oidc_issuer,
+        macos_signing_identity,
+    )?;
     ensure_clean_source_tree()?;
     run("cosign", &["version"])?;
     run("xcrun", &["notarytool", "--version"])?;
@@ -1648,6 +1852,7 @@ fn release(
         certificate_identity,
         certificate_oidc_issuer,
         macos_signing_identity,
+        &trust_roots,
     )?;
     Ok(())
 }
@@ -1658,8 +1863,8 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
     let targets = validated_release_targets(requested_targets)?;
     ensure_release_build_tools(&targets)?;
     let source_date_epoch = release_source_date_epoch()?;
-    let git_commit = output("git", &["rev-parse", "HEAD"])?;
-    let git_tree = output("git", &["rev-parse", "HEAD^{tree}"])?;
+    let git_commit = output("git", &["--no-replace-objects", "rev-parse", "HEAD"])?;
+    let git_tree = output("git", &["--no-replace-objects", "rev-parse", "HEAD^{tree}"])?;
     let source_tree_clean = source_tree_status()?.is_empty();
     let dist = PathBuf::from("dist");
     remove_directory_if_present(&dist)?;
@@ -1768,15 +1973,51 @@ fn sign_release_artifacts() -> Result<(), TaskError> {
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedArtifact {
+    path: PathBuf,
+    digest: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedRelease {
+    commit: String,
+    artifacts: Vec<VerifiedArtifact>,
+}
+
+fn snapshot_release_artifacts(paths: &[PathBuf]) -> Result<Vec<VerifiedArtifact>, TaskError> {
+    paths
+        .iter()
+        .map(|path| {
+            Ok(VerifiedArtifact {
+                path: path.clone(),
+                digest: sha256_file(path)?,
+                size: fs::metadata(path)
+                    .map_err(|source| io_error(path, source))?
+                    .len(),
+            })
+        })
+        .collect()
+}
+
 fn verify_signed_release(
     certificate_identity: &str,
     certificate_oidc_issuer: &str,
     macos_signing_identity: &str,
-) -> Result<String, TaskError> {
+    trust_roots: &ReleaseTrustRoots,
+) -> Result<VerifiedRelease, TaskError> {
     let artifacts = release_files()?;
+    let verified_artifacts = snapshot_release_artifacts(&artifacts)?;
     validate_signed_release_file_set(&artifacts)?;
     verify_checksum_manifest()?;
     let team_identifier = verify_macos_distribution(macos_signing_identity)?;
+    if team_identifier != trust_roots.macos_team_identifier {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "signed macOS TeamIdentifier `{team_identifier}` does not match SECURITY.md `{}`",
+            trust_roots.macos_team_identifier
+        )));
+    }
     let commit = validate_release_provenance(macos_signing_identity, &team_identifier)?;
     for (bundle, blob) in [
         ("dist/SHA256SUMS.sigstore.json", "dist/SHA256SUMS"),
@@ -1796,7 +2037,15 @@ fn verify_signed_release(
             ],
         )?;
     }
-    Ok(commit)
+    if snapshot_release_artifacts(&artifacts)? != verified_artifacts {
+        return Err(TaskError::Command(
+            "release artifact bytes changed while verification was in progress".to_owned(),
+        ));
+    }
+    Ok(VerifiedRelease {
+        commit,
+        artifacts: verified_artifacts,
+    })
 }
 
 fn source_tree_status() -> Result<String, TaskError> {
@@ -1859,7 +2108,10 @@ fn ensure_release_build_tools(targets: &[String]) -> Result<(), TaskError> {
 fn release_source_date_epoch() -> Result<String, TaskError> {
     let value = match env::var("SOURCE_DATE_EPOCH") {
         Ok(value) => value,
-        Err(_) => output("git", &["show", "-s", "--format=%ct", "HEAD"])?,
+        Err(_) => output(
+            "git",
+            &["--no-replace-objects", "show", "-s", "--format=%ct", "HEAD"],
+        )?,
     };
     value
         .parse::<u64>()
@@ -2398,6 +2650,7 @@ fn publish(
     certificate_oidc_issuer: &str,
     macos_signing_identity: &str,
 ) -> Result<(), TaskError> {
+    ensure_canonical_github_origin()?;
     let expected_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     if !release_tag_is_exact_version(tag) {
         return Err(TaskError::ReleaseTagMismatch {
@@ -2405,11 +2658,7 @@ fn publish(
             expected: expected_tag,
         });
     }
-    let provenance_commit = verify_signed_release(
-        certificate_identity,
-        certificate_oidc_issuer,
-        macos_signing_identity,
-    )?;
+    let provenance_commit = release_provenance_commit()?;
     let tag_commit = remote_tag_commit(tag)?;
     if tag_commit != provenance_commit {
         return Err(TaskError::ReleaseCommitMismatch {
@@ -2418,28 +2667,131 @@ fn publish(
             provenance_commit,
         });
     }
-    ensure_empty_draft_release(tag)?;
-    let artifacts = release_files()?;
-    for artifact in artifacts {
-        let mut command = Command::new("gh");
-        command.args(["release", "upload", tag]);
-        command.arg(&artifact);
-        if let Err(error) = run_command(
-            &mut command,
-            &format!("gh release upload {tag} {}", artifact.display()),
-        ) {
-            let rollback_failures = rollback_draft_release_assets(tag);
-            return Err(TaskError::PublishFailed {
-                upload: error.to_string(),
-                rollback: if rollback_failures.is_empty() {
-                    "none; all newly uploaded assets were removed".to_owned()
-                } else {
-                    rollback_failures.join("; ")
-                },
-            });
-        }
+    let trust_roots = release_trust_roots_at_commit(&provenance_commit)?;
+    validate_release_identity_inputs(
+        &trust_roots,
+        certificate_identity,
+        certificate_oidc_issuer,
+        macos_signing_identity,
+    )?;
+    let verified_release = verify_signed_release(
+        certificate_identity,
+        certificate_oidc_issuer,
+        macos_signing_identity,
+        &trust_roots,
+    )?;
+    if verified_release.commit != provenance_commit {
+        return Err(TaskError::ReleaseCommitMismatch {
+            tag: tag.to_owned(),
+            tag_commit: provenance_commit,
+            provenance_commit: verified_release.commit,
+        });
+    }
+    let draft = ensure_empty_draft_release(tag)?;
+    let mut uploaded_assets = Vec::new();
+    for artifact in verified_release.artifacts {
+        upload_release_asset(&draft, &mut uploaded_assets, &artifact)?;
     }
     Ok(())
+}
+
+fn upload_release_asset(
+    draft: &BoundDraftRelease,
+    uploaded_assets: &mut Vec<ReleaseAsset>,
+    artifact: &VerifiedArtifact,
+) -> Result<(), TaskError> {
+    ensure_same_draft_release(draft, uploaded_assets)
+        .map_err(|error| publish_failure(error, draft, uploaded_assets))?;
+    let Some(artifact_name) = artifact.path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Err(publish_failure(
+            TaskError::Command(format!(
+                "release artifact has no UTF-8 file name: {}",
+                artifact.path.display()
+            )),
+            draft,
+            uploaded_assets,
+        ));
+    };
+    let observed_digest = sha256_file(&artifact.path)
+        .map_err(|error| publish_failure(error, draft, uploaded_assets))?;
+    let observed_size = fs::metadata(&artifact.path)
+        .map_err(|source| {
+            publish_failure(io_error(&artifact.path, source), draft, uploaded_assets)
+        })?
+        .len();
+    if observed_digest != artifact.digest || observed_size != artifact.size {
+        return Err(publish_failure(
+            TaskError::Command(format!(
+                "release artifact `{}` drifted after signed verification",
+                artifact.path.display()
+            )),
+            draft,
+            uploaded_assets,
+        ));
+    }
+    let mut command = Command::new("gh");
+    command.args(["release", "upload", &draft.tag, "--repo", GITHUB_REPOSITORY]);
+    command.arg(&artifact.path);
+    run_command(
+        &mut command,
+        &format!(
+            "gh release upload {} {}",
+            draft.tag,
+            artifact.path.display()
+        ),
+    )
+    .map_err(|error| publish_failure(error, draft, uploaded_assets))?;
+    let release = github_release_state(&draft.tag)
+        .and_then(|release| validate_bound_draft_release(draft, &release))
+        .map_err(|error| publish_failure(error, draft, uploaded_assets))?;
+    let asset = bind_new_uploaded_asset(
+        &release,
+        artifact_name,
+        &artifact.digest,
+        artifact.size,
+        uploaded_assets,
+    )
+    .map_err(|error| publish_failure(error, draft, uploaded_assets))?;
+    uploaded_assets.push(asset);
+    ensure_same_draft_release(draft, uploaded_assets)
+        .map_err(|error| publish_failure(error, draft, uploaded_assets))
+}
+
+fn publish_failure(
+    error: TaskError,
+    draft: &BoundDraftRelease,
+    uploaded_assets: &[ReleaseAsset],
+) -> TaskError {
+    let rollback_failures = rollback_draft_release_assets(draft, uploaded_assets);
+    TaskError::PublishFailed {
+        upload: error.to_string(),
+        rollback: if rollback_failures.is_empty() {
+            "none; all previously identity-bound assets from this attempt were removed; an interrupted current upload still requires readback".to_owned()
+        } else {
+            rollback_failures.join("; ")
+        },
+    }
+}
+
+fn ensure_canonical_github_origin() -> Result<(), TaskError> {
+    let origin = output("git", &["remote", "get-url", "origin"])?;
+    if is_canonical_github_origin(&origin) {
+        Ok(())
+    } else {
+        Err(TaskError::Command(format!(
+            "origin `{origin}` does not match canonical GitHub repository `{GITHUB_REPOSITORY}`"
+        )))
+    }
+}
+
+fn is_canonical_github_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "https://github.com/rogu3bear/cfctl.git"
+            | "https://github.com/rogu3bear/cfctl"
+            | "git@github.com:rogu3bear/cfctl.git"
+            | "ssh://git@github.com/rogu3bear/cfctl.git"
+    )
 }
 
 fn remote_tag_commit(tag: &str) -> Result<String, TaskError> {
@@ -2448,7 +2800,7 @@ fn remote_tag_commit(tag: &str) -> Result<String, TaskError> {
     let remote = output("git", &["ls-remote", "origin", &direct, &peeled])?;
     parse_remote_tag_commit(&remote, tag).ok_or_else(|| {
         TaskError::Command(format!(
-            "origin does not expose a commit for release tag `{tag}`"
+            "origin does not expose an annotated release tag `{tag}` and its peeled commit"
         ))
     })
 }
@@ -2456,30 +2808,58 @@ fn remote_tag_commit(tag: &str) -> Result<String, TaskError> {
 fn parse_remote_tag_commit(remote: &str, tag: &str) -> Option<String> {
     let direct = format!("refs/tags/{tag}");
     let peeled = format!("{direct}^{{}}");
-    let mut direct_commit = None;
+    let mut direct_object = None;
+    let mut peeled_commit = None;
     for line in remote.lines() {
         let (object, reference) = line.split_once('\t')?;
         if reference == peeled {
-            return Some(object.to_owned());
+            peeled_commit = Some(object.to_owned());
         }
         if reference == direct {
-            direct_commit = Some(object.to_owned());
+            direct_object = Some(object.to_owned());
         }
     }
-    direct_commit
+    match (direct_object, peeled_commit) {
+        (Some(tag_object), Some(commit)) if tag_object != commit => Some(commit),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseAsset {
+    id: String,
+    name: String,
+    api_path: String,
+    digest: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundDraftRelease {
+    id: String,
+    tag: String,
+    assets: Vec<ReleaseAsset>,
 }
 
 fn github_release_state(tag: &str) -> Result<serde_json::Value, TaskError> {
     let release = output(
         "gh",
-        &["release", "view", tag, "--json", "assets,isDraft,tagName"],
+        &[
+            "release",
+            "view",
+            tag,
+            "--repo",
+            GITHUB_REPOSITORY,
+            "--json",
+            "id,assets,isDraft,tagName",
+        ],
     )?;
     serde_json::from_str(&release)
         .map_err(|error| TaskError::Command(format!("parse GitHub release state: {error}")))
 }
 
-fn release_asset_names(release: &serde_json::Value) -> Result<Vec<String>, TaskError> {
-    release
+fn release_assets(release: &serde_json::Value) -> Result<Vec<ReleaseAsset>, TaskError> {
+    let mut assets = release
         .get("assets")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| TaskError::Command("GitHub release assets are missing".to_owned()))?
@@ -2488,53 +2868,199 @@ fn release_asset_names(release: &serde_json::Value) -> Result<Vec<String>, TaskE
             asset
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
+                .zip(asset.get("id").and_then(serde_json::Value::as_str))
+                .zip(asset.get("apiUrl").and_then(serde_json::Value::as_str))
+                .zip(asset.get("digest").and_then(serde_json::Value::as_str))
+                .zip(asset.get("size").and_then(serde_json::Value::as_u64))
+                .map(|((((name, id), api_url), digest), size)| ReleaseAsset {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    api_path: api_url.to_owned(),
+                    digest: digest.to_owned(),
+                    size,
+                })
                 .ok_or_else(|| {
-                    TaskError::Command("GitHub release asset name is missing".to_owned())
+                    TaskError::Command("GitHub release asset identity is missing".to_owned())
                 })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    assets.sort_by(|left, right| left.name.cmp(&right.name));
+    for asset in &mut assets {
+        let expected_prefix =
+            format!("https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/assets/");
+        let Some(asset_database_id) = asset.api_path.strip_prefix(&expected_prefix) else {
+            return Err(TaskError::Command(format!(
+                "GitHub release asset `{}` points outside canonical repository",
+                asset.name
+            )));
+        };
+        if asset_database_id.is_empty()
+            || !asset_database_id.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(TaskError::Command(format!(
+                "GitHub release asset `{}` has a noncanonical database ID",
+                asset.name
+            )));
+        }
+        asset.api_path = format!("repos/{GITHUB_REPOSITORY}/releases/assets/{asset_database_id}");
+    }
+    Ok(assets)
 }
 
-fn rollback_draft_release_assets(tag: &str) -> Vec<String> {
-    let expected = expected_signed_release_file_names();
-    let names = match github_release_state(tag).and_then(|release| release_asset_names(&release)) {
-        Ok(names) => names,
-        Err(error) => return vec![error.to_string()],
-    };
+fn rollback_draft_release_assets(
+    draft: &BoundDraftRelease,
+    uploaded_assets: &[ReleaseAsset],
+) -> Vec<String> {
     let mut failures = Vec::new();
-    for name in names.into_iter().filter(|name| expected.contains(name)) {
-        if let Err(error) = run("gh", &["release", "delete-asset", tag, &name, "--yes"]) {
+    for (index, asset) in uploaded_assets.iter().enumerate().rev() {
+        let state = match github_release_state(&draft.tag)
+            .and_then(|release| validate_bound_draft_release(draft, &release))
+        {
+            Ok(state) => state,
+            Err(error) => {
+                failures.push(error.to_string());
+                break;
+            }
+        };
+        if state.assets != uploaded_assets[..=index] {
+            failures.push(format!(
+                "refusing to compensate drifted release asset set before deleting `{}`",
+                asset.name
+            ));
+            break;
+        }
+        if let Err(error) = run("gh", &["api", "--method", "DELETE", &asset.api_path]) {
             failures.push(error.to_string());
+            break;
+        }
+        let readback = github_release_state(&draft.tag).and_then(|release| {
+            validate_rollback_readback(draft, &release, &uploaded_assets[..index])
+        });
+        if let Err(error) = readback {
+            failures.push(format!(
+                "release asset `{}` DELETE lacked identity-bound post-delete readback: {error}",
+                asset.name
+            ));
+            break;
         }
     }
     failures
 }
 
-fn ensure_empty_draft_release(tag: &str) -> Result<(), TaskError> {
+fn validate_rollback_readback(
+    draft: &BoundDraftRelease,
+    release: &serde_json::Value,
+    remaining_assets: &[ReleaseAsset],
+) -> Result<(), TaskError> {
+    let state = validate_bound_draft_release(draft, release)?;
+    if state.assets == remaining_assets {
+        Ok(())
+    } else {
+        Err(TaskError::Command(format!(
+            "GitHub draft release `{}` asset set did not match the post-delete denominator",
+            draft.tag
+        )))
+    }
+}
+
+fn ensure_empty_draft_release(tag: &str) -> Result<BoundDraftRelease, TaskError> {
     let release = github_release_state(tag)?;
+    let draft = parse_bound_draft_release(&release)?;
     if release.get("isDraft").and_then(serde_json::Value::as_bool) != Some(true) {
         return Err(TaskError::ReleaseMustBeDraft(tag.to_owned()));
     }
-    if release.get("tagName").and_then(serde_json::Value::as_str) != Some(tag) {
+    if draft.tag != tag {
         return Err(TaskError::ReleaseTagMismatch {
-            actual: release
-                .get("tagName")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("<missing>")
-                .to_owned(),
+            actual: draft.tag,
             expected: tag.to_owned(),
         });
     }
-    let assets = release_asset_names(&release)?;
-    if assets.is_empty() {
-        Ok(())
+    if draft.assets.is_empty() {
+        Ok(draft)
     } else {
         Err(TaskError::ReleaseAlreadyHasAssets {
             tag: tag.to_owned(),
-            assets: assets.join(", "),
+            assets: draft
+                .assets
+                .iter()
+                .map(|asset| asset.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         })
     }
+}
+
+fn parse_bound_draft_release(release: &serde_json::Value) -> Result<BoundDraftRelease, TaskError> {
+    Ok(BoundDraftRelease {
+        id: release
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| TaskError::Command("GitHub release ID is missing".to_owned()))?
+            .to_owned(),
+        tag: release
+            .get("tagName")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| TaskError::Command("GitHub release tag is missing".to_owned()))?
+            .to_owned(),
+        assets: release_assets(release)?,
+    })
+}
+
+fn validate_bound_draft_release(
+    expected: &BoundDraftRelease,
+    release: &serde_json::Value,
+) -> Result<BoundDraftRelease, TaskError> {
+    if release.get("isDraft").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(TaskError::ReleaseMustBeDraft(expected.tag.clone()));
+    }
+    let actual = parse_bound_draft_release(release)?;
+    if actual.id != expected.id || actual.tag != expected.tag {
+        return Err(TaskError::Command(format!(
+            "GitHub draft release identity drifted from {}/{} to {}/{}",
+            expected.id, expected.tag, actual.id, actual.tag
+        )));
+    }
+    Ok(actual)
+}
+
+fn ensure_same_draft_release(
+    expected: &BoundDraftRelease,
+    uploaded_assets: &[ReleaseAsset],
+) -> Result<(), TaskError> {
+    let release = github_release_state(&expected.tag)?;
+    let actual = validate_bound_draft_release(expected, &release)?;
+    if actual.assets != uploaded_assets {
+        return Err(TaskError::Command(format!(
+            "GitHub draft release `{}` asset set drifted",
+            expected.tag
+        )));
+    }
+    Ok(())
+}
+
+fn bind_new_uploaded_asset(
+    release: &BoundDraftRelease,
+    expected_name: &str,
+    expected_digest: &str,
+    expected_size: u64,
+    known_assets: &[ReleaseAsset],
+) -> Result<ReleaseAsset, TaskError> {
+    let matching = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name == expected_name)
+        .collect::<Vec<_>>();
+    let expected_digest = format!("sha256:{expected_digest}");
+    if matching.len() != 1
+        || known_assets.iter().any(|known| known.id == matching[0].id)
+        || matching[0].digest != expected_digest
+        || matching[0].size != expected_size
+    {
+        return Err(TaskError::Command(format!(
+            "GitHub did not expose one new identity-bound asset named `{expected_name}`"
+        )));
+    }
+    Ok(matching[0].clone())
 }
 
 fn release_files() -> Result<Vec<PathBuf>, TaskError> {
@@ -2634,6 +3160,23 @@ fn verify_checksum_manifest() -> Result<(), TaskError> {
     }
 }
 
+fn release_provenance_commit() -> Result<String, TaskError> {
+    let path = Path::new("dist/provenance.json");
+    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+    let provenance: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| TaskError::InvalidProvenance(error.to_string()))?;
+    let commit = provenance
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| TaskError::InvalidProvenance("git_commit is missing".to_owned()))?;
+    if !is_full_git_object_id(commit) {
+        return Err(TaskError::InvalidProvenance(
+            "git_commit must be a full hexadecimal object ID".to_owned(),
+        ));
+    }
+    Ok(commit.to_owned())
+}
+
 fn validate_release_provenance(
     expected_macos_identity: &str,
     expected_team_identifier: &str,
@@ -2697,7 +3240,7 @@ fn validate_release_provenance(
         .ok_or_else(|| TaskError::InvalidProvenance("git_commit is missing".to_owned()))?
         .to_owned();
     let revision = format!("{commit}^{{tree}}");
-    let actual_tree = output("git", &["rev-parse", &revision])?;
+    let actual_tree = output("git", &["--no-replace-objects", "rev-parse", &revision])?;
     let bound_tree = provenance
         .get("git_tree")
         .and_then(serde_json::Value::as_str)
@@ -2914,21 +3457,25 @@ mod tests {
     };
 
     use super::{
-        PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, classify_pre_push_registration,
-        collect_workflow_paths, contains_retired_public_domain, expected_signed_release_file_names,
-        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
-        is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_linux_musl,
+        PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, bind_new_uploaded_asset,
+        classify_pre_push_registration, collect_workflow_paths, contains_retired_public_domain,
+        expected_signed_release_file_names, extract_cfctl_command_references,
+        extract_cfctl_command_refs, extract_prose_command_refs, is_canonical_github_origin,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_full_git_object_id,
+        is_linux_musl, parse_bound_draft_release, parse_release_trust_roots,
         parse_remote_tag_commit, release_build_driver, release_build_subcommand,
         release_tag_is_exact_version, render_linux_installer_text, repository_root,
-        security_proof_commands, validate_bootstrap_contract, validate_codesign_details,
-        validate_command_refs, validate_extracted_command_refs, validate_local_only_ci_contract,
-        validate_notary_receipt_value, validate_public_domain_anchor,
-        validate_signed_release_file_set, validated_release_targets,
+        security_proof_commands, validate_bootstrap_contract, validate_bound_draft_release,
+        validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
+        validate_local_only_ci_contract, validate_notary_receipt_value,
+        validate_public_domain_anchor, validate_release_identity_inputs,
+        validate_rollback_readback, validate_signed_release_file_set,
+        validate_signed_release_posture_contract, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
         verify_generated_guidance_section_text, verify_managed_agent_documents,
         verify_public_domain_contract, verify_quickstart_pins_the_release_version,
-        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
-        verify_workspace_dependency_versions,
+        verify_signed_release_posture_contract, verify_tracked_cfctl_command_references,
+        verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -3645,6 +4192,195 @@ mod tests {
     }
 
     #[test]
+    fn signed_release_posture_is_consistent_across_authority_and_consumers() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has a repository parent");
+        let result = verify_signed_release_posture_contract(repository_root);
+        assert!(result.is_ok(), "{result:?}");
+
+        let paths = [
+            "README.md",
+            "QUICKSTART.md",
+            "SECURITY.md",
+            "CONTRIBUTING.md",
+            "site/docs/LAUNCH_CHECKLIST.md",
+        ];
+        let mut documents = paths
+            .iter()
+            .map(|path| {
+                (
+                    *path,
+                    fs::read_to_string(repository_root.join(path)).expect("read posture document"),
+                )
+            })
+            .collect::<Vec<_>>();
+        documents
+            .iter_mut()
+            .find(|(path, _)| *path == "README.md")
+            .expect("README document")
+            .1
+            .push_str("\nPublished releases are unsigned by operator decision\n");
+        let borrowed = documents
+            .iter()
+            .map(|(path, content)| (*path, content.as_str()))
+            .collect::<Vec<_>>();
+        let error = validate_signed_release_posture_contract(&borrowed)
+            .expect_err("retired unsigned posture must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("retired unsigned release posture")
+        );
+    }
+
+    #[test]
+    fn publication_receiver_is_bound_to_origin_and_one_draft_identity() {
+        assert!(is_canonical_github_origin(
+            "https://github.com/rogu3bear/cfctl.git"
+        ));
+        assert!(is_canonical_github_origin(
+            "git@github.com:rogu3bear/cfctl.git"
+        ));
+        assert!(!is_canonical_github_origin(
+            "https://github.com/example/cfctl.git"
+        ));
+
+        let release = serde_json::json!({
+            "id": "RELEASE_1",
+            "tagName": "v1.3.0",
+            "isDraft": true,
+            "assets": [{
+                "id": "ASSET_1",
+                "name": "SHA256SUMS",
+                "apiUrl": "https://api.github.com/repos/rogu3bear/cfctl/releases/assets/1",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 42
+            }]
+        });
+        let bound = parse_bound_draft_release(&release).expect("bound draft");
+        assert!(validate_bound_draft_release(&bound, &release).is_ok());
+        let uploaded = bind_new_uploaded_asset(
+            &bound,
+            "SHA256SUMS",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            42,
+            &[],
+        )
+        .expect("one new identity-bound asset");
+        assert!(bind_new_uploaded_asset(&bound, "missing", "a", 42, &[]).is_err());
+        assert!(
+            bind_new_uploaded_asset(&bound, "SHA256SUMS", "b", 42, &[]).is_err(),
+            "provider digest drift must fail closed"
+        );
+        assert!(
+            bind_new_uploaded_asset(
+                &bound,
+                "SHA256SUMS",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                41,
+                &[],
+            )
+            .is_err(),
+            "provider size drift must fail closed"
+        );
+        assert!(
+            bind_new_uploaded_asset(
+                &bound,
+                "SHA256SUMS",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                42,
+                &[uploaded],
+            )
+            .is_err()
+        );
+
+        let mut changed_id = release.clone();
+        changed_id["id"] = serde_json::json!("RELEASE_2");
+        assert!(validate_bound_draft_release(&bound, &changed_id).is_err());
+
+        let mut published = release.clone();
+        published["isDraft"] = serde_json::json!(false);
+        assert!(validate_bound_draft_release(&bound, &published).is_err());
+
+        let empty_readback = serde_json::json!({
+            "id": "RELEASE_1",
+            "tagName": "v1.3.0",
+            "isDraft": true,
+            "assets": []
+        });
+        assert!(validate_rollback_readback(&bound, &empty_readback, &[]).is_ok());
+        assert!(
+            validate_rollback_readback(&bound, &release, &[]).is_err(),
+            "a residual asset must keep compensation unresolved"
+        );
+        let invalid_readback = serde_json::json!({
+            "tagName": "v1.3.0",
+            "isDraft": true,
+            "assets": []
+        });
+        assert!(
+            validate_rollback_readback(&bound, &invalid_readback, &[]).is_err(),
+            "a readback without the bound release identity must fail closed"
+        );
+
+        let mut crossed_repository = release;
+        crossed_repository["assets"][0]["apiUrl"] =
+            serde_json::json!("https://api.github.com/repos/example/cfctl/releases/assets/1");
+        assert!(parse_bound_draft_release(&crossed_repository).is_err());
+    }
+
+    #[test]
+    fn release_inputs_must_match_committed_non_secret_trust_roots() {
+        let content = concat!(
+            "- Developer ID Application identity: `Developer ID Application: Example (TEAM123)`\n",
+            "- Developer ID TeamIdentifier: `TEAM123`\n",
+            "- Sigstore certificate identity: `release@example.com`\n",
+            "- Sigstore OIDC issuer: `https://issuer.example`\n",
+        );
+        let roots = parse_release_trust_roots(content).expect("parse trust roots");
+        assert!(
+            validate_release_identity_inputs(
+                &roots,
+                "release@example.com",
+                "https://issuer.example",
+                "Developer ID Application: Example (TEAM123)",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_release_identity_inputs(
+                &roots,
+                "attacker@example.com",
+                "https://issuer.example",
+                "Developer ID Application: Example (TEAM123)",
+            )
+            .is_err()
+        );
+
+        let unbound = parse_release_trust_roots(
+            &content.replace("Developer ID Application: Example (TEAM123)", "UNBOUND"),
+        )
+        .expect("parse unbound marker");
+        assert!(
+            validate_release_identity_inputs(
+                &unbound,
+                "release@example.com",
+                "https://issuer.example",
+                "UNBOUND",
+            )
+            .is_err()
+        );
+        assert!(is_full_git_object_id(
+            "2ca2ebb98fc0a19b34afdc39d668c12ebfc5db70"
+        ));
+        assert!(!is_full_git_object_id("HEAD"));
+        assert!(!is_full_git_object_id(
+            "-ca2ebb98fc0a19b34afdc39d668c12ebfc5db70"
+        ));
+    }
+
+    #[test]
     fn linux_musl_release_builds_use_the_zig_cross_linker() {
         assert_eq!(
             release_build_driver("aarch64-unknown-linux-musl"),
@@ -3749,6 +4485,12 @@ mod tests {
             parse_remote_tag_commit(output, "v2.0.0-alpha.1").expect("peeled tag"),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
+    }
+
+    #[test]
+    fn lightweight_remote_release_tags_are_rejected() {
+        let output = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.3.0\n";
+        assert!(parse_remote_tag_commit(output, "v1.3.0").is_none());
     }
 
     #[test]

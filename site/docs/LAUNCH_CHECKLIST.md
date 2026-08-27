@@ -220,8 +220,12 @@ provider drift, or inability to prove the running source.
 
 ## Explicitly separate future work
 
-- A new CLI release needs a version decision and resolution of the documented
-  unsigned posture versus the signed-only `cargo xtask publish` contract.
+- The v1.3.0 CLI posture requires signed and notarized publication in
+  `README.md` and `CONTRIBUTING.md`. Its trust-root binding, source merge,
+  annotated tag, empty draft, signing,
+  notarization, artifact upload, public-release transition, installation, and
+  provider readback each retain separate receipts and remain outside this
+  website launch.
 - Public OAuth needs a separate security/privacy decision, client plan,
   callback configuration, log-redaction proof, approval, promotion, and revoke
   path.

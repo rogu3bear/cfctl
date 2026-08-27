@@ -346,10 +346,20 @@ workflow or hosted CI service is required. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 
-Published releases are unsigned by operator decision, with integrity from
-`SHA256SUMS`, reproducible double-builds, SPDX SBOMs, and commit-bound
-provenance. Install by direct download plus checksum verification, the
-release's Homebrew formula, or a source build.
+v1.3.0 must not be published unless its two macOS binaries carry one reviewed
+Developer ID Application identity, hardened runtime, secure timestamps, and
+accepted Apple notarization receipts. `SHA256SUMS` and the commit-bound
+provenance must each carry a Sigstore bundle for the certificate identity and
+OIDC issuer recorded independently in `SECURITY.md`. Reproducible
+double-builds, SPDX SBOMs, and checksum verification remain part of the same
+release contract; signatures do not replace them.
+
+`cargo xtask assemble` remains an unsigned, local qualification lane. Its
+outputs are not public release artifacts and the rendered installer refuses
+them. Release installation guidance remains withheld until those independent
+trust roots and the published artifact set have both been read back. A source
+build is a separate local build and is not evidence that a published binary was
+used.
 
 `cfctl.com` site publication, publisher-domain verification, permanent
 Cloudflare OAuth promotion, and release publication each require explicit
