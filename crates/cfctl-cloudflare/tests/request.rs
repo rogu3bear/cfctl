@@ -5065,6 +5065,33 @@ async fn worker_versions_deployable_accepts_nullable_pagination_metadata() {
 }
 
 #[tokio::test]
+async fn worker_versions_deployable_accepts_provider_zero_page_sentinel() {
+    let items = (0..100)
+        .map(|index| json!({"id": format!("version-{index}")}))
+        .collect::<Vec<_>>();
+    let body = json!({
+        "success": true,
+        "result": {"items": items},
+        "errors": [],
+        "result_info": {"page": 0, "per_page": 100, "count": 100, "total_count": 100}
+    })
+    .to_string();
+    let (address, server) = json_response_sequence_server(vec![&body]).await;
+
+    let response = execute_worker_versions_read(&address, json!({"deployable":true}))
+        .await
+        .expect("deployable inventory accepts Cloudflare's ignored-pagination sentinel");
+
+    assert_eq!(response.result["items"].as_array().map(Vec::len), Some(100));
+    let info = response.result_info.expect("bounded result info");
+    assert_eq!(info["count"], json!(100));
+    assert_eq!(info["page"], json!(0));
+    assert_eq!(info["cfctl_pages"], json!(1));
+    assert_eq!(info["cfctl_single_page_complete"], json!(true));
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
 async fn worker_versions_deployable_rejects_an_active_cursor() {
     let (address, server) = json_response_sequence_server(vec![
         r#"{"success":true,"result":{"items":[{"id":"version-1"}]},"errors":[],"result_info":{"count":1,"cursor":"next-page"}}"#,
