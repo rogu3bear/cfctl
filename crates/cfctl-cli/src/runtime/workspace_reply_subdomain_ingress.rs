@@ -318,7 +318,7 @@ async fn observe_catch_all(
             credential,
         )
         .await
-        .map_err(|_| failure("catch_all_read_failed", "catch_all", true, None))?;
+        .map_err(|error| executor_failure("catch_all_read_failed", "catch_all", &error))?;
     project_catch_all(&response, target)
 }
 
@@ -475,13 +475,8 @@ async fn observe_worker_tag(
             credential,
         )
         .await
-        .map_err(|_| {
-            failure(
-                "worker_inventory_read_failed",
-                "worker_inventory",
-                true,
-                None,
-            )
+        .map_err(|error| {
+            executor_failure("worker_inventory_read_failed", "worker_inventory", &error)
         })?;
     project_worker_tag(&response, target)
 }
@@ -526,7 +521,7 @@ async fn observe_activation_plan(
             credential,
         )
         .await
-        .map_err(|_| failure("account_plan_read_failed", "account_plan", true, None))?;
+        .map_err(|error| executor_failure("account_plan_read_failed", "account_plan", &error))?;
     project_activation_account_plan(&response, target, parent_zone)
 }
 
@@ -1092,7 +1087,7 @@ pub(super) async fn read(
         Err(receipt) => return Ok(receipt),
     };
 
-    let Ok(dns) = executor
+    let dns = match executor
         .execute_read(
             dns_capability,
             &CallInput {
@@ -1103,8 +1098,9 @@ pub(super) async fn read(
             credential,
         )
         .await
-    else {
-        return Ok(failure("dns_read_failed", "dns", true, None));
+    {
+        Ok(response) => response,
+        Err(error) => return Ok(executor_failure("dns_read_failed", "dns", &error)),
     };
     let dns_state = match project_subdomain_dns(&dns, &target.reply_domain) {
         Ok(state) => state,
@@ -1221,7 +1217,7 @@ async fn resolve_active_parent_zone_id(
                 credential,
             )
             .await
-            .map_err(|_| failure("parent_zone_read_failed", "parent_zone", true, None))?;
+            .map_err(|error| executor_failure("parent_zone_read_failed", "parent_zone", &error))?;
         match project_zone(&zone, &target.account_id, &parent_zone)? {
             ZoneState::Missing => {}
             ZoneState::Drift => {
@@ -1243,6 +1239,18 @@ fn project_zone(
     account_id: &str,
     expected_zone: &str,
 ) -> std::result::Result<ZoneState, Value> {
+    if !response.success {
+        let denied = matches!(response.status, 401 | 403)
+            || response
+                .errors
+                .iter()
+                .any(|error| error.code.is_some_and(|code| matches!(code, 9109 | 10000)));
+        return Err(provider_failure(
+            "zone_read_incomplete",
+            "zone",
+            if denied { "denied" } else { "rejected" },
+        ));
+    }
     if !successful_complete_page(response) {
         return Err(failure("zone_read_incomplete", "zone", true, None));
     }
@@ -1608,9 +1616,9 @@ fn project_activation_account_plan(
 
 mod provider_contract;
 use provider_contract::{
-    activation_apply_body, exact_capability, exact_zone_list_capability, failure, is_sha256,
-    lower_hex, normalize_domain, sha256, successful_complete_page, valid_worker_name,
-    validate_activation_provider_contracts, validate_provider_contracts,
+    activation_apply_body, exact_capability, exact_zone_list_capability, executor_failure, failure,
+    is_sha256, lower_hex, normalize_domain, provider_failure, sha256, successful_complete_page,
+    valid_worker_name, validate_activation_provider_contracts, validate_provider_contracts,
 };
 
 #[cfg(test)]

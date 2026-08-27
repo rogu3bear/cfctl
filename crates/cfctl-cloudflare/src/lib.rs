@@ -177,6 +177,94 @@ pub enum CloudflareError {
     MissingVerificationTarget(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudflareReadErrorClass {
+    RequestContract,
+    TransportAmbiguous,
+    PaginationContract,
+    ResponseContract,
+    ExecutorContract,
+}
+
+impl CloudflareReadErrorClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestContract => "request_contract",
+            Self::TransportAmbiguous => "transport_ambiguous",
+            Self::PaginationContract => "pagination_contract",
+            Self::ResponseContract => "response_contract",
+            Self::ExecutorContract => "executor_contract",
+        }
+    }
+
+    #[must_use]
+    pub const fn boundary_crossed(self) -> bool {
+        !matches!(self, Self::RequestContract)
+    }
+}
+
+impl CloudflareError {
+    #[must_use]
+    pub const fn read_error_class(&self) -> CloudflareReadErrorClass {
+        match self {
+            Self::Url(_)
+            | Self::MissingSelector(_)
+            | Self::MissingHeaderSelector(_)
+            | Self::InvalidSelector(_)
+            | Self::InvalidSelectorObject
+            | Self::UndeclaredSelector(_)
+            | Self::InvalidSelectorSchema { .. }
+            | Self::InvalidQueryObject
+            | Self::UndeclaredQuerySelector(_)
+            | Self::MissingQuerySelector(_)
+            | Self::InvalidQuerySelector { .. }
+            | Self::InvalidQuerySelectorSchema { .. }
+            | Self::UnsupportedQuerySerialization { .. }
+            | Self::MissingRequestBody(_)
+            | Self::InvalidRequestBody(_)
+            | Self::InvalidAnalyticsQuery(_)
+            | Self::InvalidR2LogRetrieval(_)
+            | Self::InvalidBaseUrl
+            | Self::InvalidMethod(_)
+            | Self::InvalidAuthenticationHeader
+            | Self::InvalidConditionalHeader
+            | Self::ReservedHeaderSelector(_)
+            | Self::InvalidHeaderSelector(_)
+            | Self::UnsupportedResponseContract(_)
+            | Self::R2LogCredentialsRequired
+            | Self::R2LogOutputFileRequired
+            | Self::ApprovedPlanRequired(_)
+            | Self::InvalidEventBatchPlan { .. }
+            | Self::CatalogDrift { .. }
+            | Self::Plan(_)
+            | Self::UnsupportedVerificationStrategy(_)
+            | Self::MissingVerificationTarget(_) => CloudflareReadErrorClass::RequestContract,
+            Self::Http(_) => CloudflareReadErrorClass::TransportAmbiguous,
+            Self::PaginationLimit(_)
+            | Self::PaginationMetadataInvalid
+            | Self::QueueConsumersSinglePageMetadataInvalid { .. }
+            | Self::PaginationCountMismatch { .. }
+            | Self::PaginationCursorLoop
+            | Self::PaginationCursorMetadataMissing => CloudflareReadErrorClass::PaginationContract,
+            Self::GraphqlSchemaDrift { .. }
+            | Self::UnexpectedResponseMediaType { .. }
+            | Self::InvalidResponseEnvelope { .. }
+            | Self::Mln0143ResponseClassification { .. }
+            | Self::UnexpectedSuccessStatus { .. }
+            | Self::UnexpectedResponseBody { .. }
+            | Self::Json(_) => CloudflareReadErrorClass::ResponseContract,
+            Self::OutputFile { .. }
+            | Self::D1ImportProviderFailure
+            | Self::D1ImportUploadResponseIntegrityFailure
+            | Self::D1ImportInitResponseFailure
+            | Self::D1ImportIngestResponseFailure
+            | Self::D1ImportPollResponseFailure
+            | Self::D1ImportPollInProgressExhausted => CloudflareReadErrorClass::ExecutorContract,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CloudflareError>;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -6,6 +6,7 @@ use super::{
     ACCOUNT_PLAN_ID, ACCOUNT_PLAN_PATH, CATCH_ALL_GET_ID, CATCH_ALL_GET_PATH, CATCH_ALL_UPDATE_ID,
     CATCH_ALL_UPDATE_PATH, WORKERS_LIST_ID, WORKERS_LIST_PATH, ZONE_LIST_ID, ZONE_LIST_PATH,
 };
+use cfctl_cloudflare::CloudflareError;
 
 pub(super) fn failure(
     status: &str,
@@ -24,6 +25,28 @@ pub(super) fn failure(
         "provider_output_retained":false,
         "body_returned":false,
     })
+}
+
+pub(super) fn executor_failure(status: &str, stage: &str, error: &CloudflareError) -> Value {
+    let class = error.read_error_class();
+    json!({
+        "adapter":cfctl_workspace::MAILDESK_REPLY_SUBDOMAIN_INGRESS_PROJECTION,
+        "success":false,
+        "boundary_crossed":class.boundary_crossed(),
+        "schema_version":1,
+        "status":status,
+        "stage":stage,
+        "match_count":Value::Null,
+        "executor_error_class":class.as_str(),
+        "provider_output_retained":false,
+        "body_returned":false,
+    })
+}
+
+pub(super) fn provider_failure(status: &str, stage: &str, disposition: &str) -> Value {
+    let mut receipt = failure(status, stage, true, None);
+    receipt["provider_error_class"] = json!(disposition);
+    receipt
 }
 
 pub(super) fn successful_complete_page(response: &CloudflareResponseV1) -> bool {
