@@ -1,6 +1,6 @@
 #![allow(clippy::wildcard_imports, reason = "white-box domain tests")]
 
-use cfctl_cloudflare::CloudflareApiErrorV1;
+use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareError};
 use cfctl_core::ResponseBodyModeV1;
 use serde_json::json;
 
@@ -291,6 +291,8 @@ fn provider_errors_and_malformed_rows_fail_closed_body_free() {
     }];
     let failure = project_zone(&denied, &target.account_id, "example.com").expect_err("denied");
     let serialized = serde_json::to_string(&failure).expect("failure");
+    assert_eq!(failure["status"], "zone_read_incomplete");
+    assert_eq!(failure["provider_error_class"], "denied");
     assert!(!serialized.contains("provider-payload"));
     assert!(!serialized.contains("provider marker"));
     assert_eq!(failure["provider_output_retained"], false);
@@ -317,6 +319,55 @@ fn provider_errors_and_malformed_rows_fail_closed_body_free() {
         json!("parent_zone_catch_all_to_worker_covering_exact_reply_subdomain");
     expanded["provider_payload"] = json!({"raw":true});
     assert!(!receipt_is_complete(&expanded));
+}
+
+#[test]
+fn executor_failures_preserve_body_free_recovery_class() {
+    let cases = [
+        (
+            CloudflareError::MissingQuerySelector("private-selector".to_owned()),
+            "request_contract",
+            false,
+        ),
+        (
+            CloudflareError::PaginationMetadataInvalid,
+            "pagination_contract",
+            true,
+        ),
+        (
+            CloudflareError::InvalidResponseEnvelope { status: 599 },
+            "response_contract",
+            true,
+        ),
+        (
+            CloudflareError::R2LogCredentialsRequired,
+            "request_contract",
+            false,
+        ),
+    ];
+
+    for (error, expected_class, boundary_crossed) in cases {
+        let receipt = executor_failure("parent_zone_read_failed", "parent_zone", &error);
+        let serialized = serde_json::to_string(&receipt).expect("receipt");
+        assert_eq!(receipt["status"], "parent_zone_read_failed");
+        assert_eq!(receipt["executor_error_class"], expected_class);
+        assert_eq!(receipt["boundary_crossed"], boundary_crossed);
+        assert!(receipt["executor_error_class"].as_str().is_some());
+        assert_eq!(receipt["match_count"], Value::Null);
+        assert_eq!(receipt["provider_output_retained"], false);
+        assert_eq!(receipt["body_returned"], false);
+        assert!(!serialized.contains("private-selector"));
+        assert!(!serialized.contains("599"));
+    }
+
+    let worker = executor_failure(
+        "worker_inventory_read_failed",
+        "worker_inventory",
+        &CloudflareError::PaginationMetadataInvalid,
+    );
+    assert_eq!(worker["status"], "worker_inventory_read_failed");
+    assert_eq!(worker["stage"], "worker_inventory");
+    assert_eq!(worker["executor_error_class"], "pagination_contract");
 }
 
 #[test]

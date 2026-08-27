@@ -2,8 +2,8 @@
 
 use cfctl_auth::AuthCredential;
 use cfctl_cloudflare::{
-    CallInput, CloudflareError, CloudflareResponseV1, Executor, R2LogRetrievalCredentials,
-    RequestBuilder, validate_request_contract,
+    CallInput, CloudflareError, CloudflareReadErrorClass, CloudflareResponseV1, Executor,
+    R2LogRetrievalCredentials, RequestBuilder, validate_request_contract,
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
@@ -372,6 +372,50 @@ async fn r2_private_digest_transport_failure_returns_no_object_material() {
     .await
     .expect_err("transport failure");
     assert!(matches!(error, CloudflareError::Http(_)));
+    assert_eq!(
+        error.read_error_class(),
+        CloudflareReadErrorClass::TransportAmbiguous
+    );
+}
+
+#[test]
+fn read_error_classification_is_fixed_and_payload_free() {
+    let cases = [
+        (
+            CloudflareError::MissingQuerySelector("private-selector".to_owned()),
+            CloudflareReadErrorClass::RequestContract,
+        ),
+        (
+            CloudflareError::PaginationCountMismatch {
+                expected: 7,
+                actual: 3,
+            },
+            CloudflareReadErrorClass::PaginationContract,
+        ),
+        (
+            CloudflareError::InvalidResponseEnvelope { status: 599 },
+            CloudflareReadErrorClass::ResponseContract,
+        ),
+        (
+            CloudflareError::D1ImportProviderFailure,
+            CloudflareReadErrorClass::ExecutorContract,
+        ),
+        (
+            CloudflareError::R2LogCredentialsRequired,
+            CloudflareReadErrorClass::RequestContract,
+        ),
+    ];
+
+    for (error, expected) in cases {
+        let class = error.read_error_class();
+        assert_eq!(class, expected);
+        assert_eq!(
+            class.boundary_crossed(),
+            !matches!(expected, CloudflareReadErrorClass::RequestContract)
+        );
+        assert!(!class.as_str().contains("private-selector"));
+        assert!(!class.as_str().contains("599"));
+    }
 }
 
 #[tokio::test]
