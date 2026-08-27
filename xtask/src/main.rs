@@ -45,6 +45,8 @@ struct Arguments {
 struct ReleaseTrustRoots {
     macos_signing_identity: String,
     macos_team_identifier: String,
+    macos_certificate_sha1: String,
+    macos_certificate_sha256: String,
     certificate_identity: String,
     certificate_oidc_issuer: String,
 }
@@ -1636,7 +1638,7 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
         ),
         (
             "SECURITY.md",
-            "The exact Developer ID authority, TeamIdentifier, Sigstore certificate identity, and OIDC issuer must be committed here before publication.",
+            "The exact Developer ID authority, TeamIdentifier, certificate fingerprints, Sigstore certificate identity, and OIDC issuer must be committed here before publication.",
         ),
     ] {
         let content = documents
@@ -1765,6 +1767,14 @@ fn parse_release_trust_roots(content: &str) -> Result<ReleaseTrustRoots, TaskErr
             "Developer ID Application identity",
         )?,
         macos_team_identifier: parse_release_trust_root(content, "Developer ID TeamIdentifier")?,
+        macos_certificate_sha1: parse_release_trust_root(
+            content,
+            "Developer ID certificate SHA-1",
+        )?,
+        macos_certificate_sha256: parse_release_trust_root(
+            content,
+            "Developer ID certificate SHA-256",
+        )?,
         certificate_identity: parse_release_trust_root(content, "Sigstore certificate identity")?,
         certificate_oidc_issuer: parse_release_trust_root(content, "Sigstore OIDC issuer")?,
     })
@@ -1821,6 +1831,28 @@ fn validate_release_identity_inputs(
             "release Developer ID TeamIdentifier must be bound in SECURITY.md".to_owned(),
         ));
     }
+    validate_hex_fingerprint(
+        "Developer ID certificate SHA-1",
+        &trust_roots.macos_certificate_sha1,
+        40,
+    )?;
+    validate_hex_fingerprint(
+        "Developer ID certificate SHA-256",
+        &trust_roots.macos_certificate_sha256,
+        64,
+    )?;
+    Ok(())
+}
+
+fn validate_hex_fingerprint(label: &str, value: &str, length: usize) -> Result<(), TaskError> {
+    if value == "UNBOUND"
+        || value.len() != length
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "release {label} must be bound in SECURITY.md as exactly {length} hexadecimal characters"
+        )));
+    }
     Ok(())
 }
 
@@ -1843,6 +1875,8 @@ fn release(
     assemble(&[])?;
     sign_and_notarize_macos_artifacts(
         macos_signing_identity,
+        &trust_roots.macos_certificate_sha1,
+        &trust_roots.macos_certificate_sha256,
         apple_notary_profile,
         certificate_identity,
         certificate_oidc_issuer,
@@ -2011,14 +2045,23 @@ fn verify_signed_release(
     let verified_artifacts = snapshot_release_artifacts(&artifacts)?;
     validate_signed_release_file_set(&artifacts)?;
     verify_checksum_manifest()?;
-    let team_identifier = verify_macos_distribution(macos_signing_identity)?;
+    let team_identifier = verify_macos_distribution(
+        macos_signing_identity,
+        &trust_roots.macos_certificate_sha1,
+        &trust_roots.macos_certificate_sha256,
+    )?;
     if team_identifier != trust_roots.macos_team_identifier {
         return Err(TaskError::InvalidSourceContract(format!(
             "signed macOS TeamIdentifier `{team_identifier}` does not match SECURITY.md `{}`",
             trust_roots.macos_team_identifier
         )));
     }
-    let commit = validate_release_provenance(macos_signing_identity, &team_identifier)?;
+    let commit = validate_release_provenance(
+        macos_signing_identity,
+        &team_identifier,
+        &trust_roots.macos_certificate_sha1,
+        &trust_roots.macos_certificate_sha256,
+    )?;
     for (bundle, blob) in [
         ("dist/SHA256SUMS.sigstore.json", "dist/SHA256SUMS"),
         ("dist/provenance.sigstore.json", "dist/provenance.json"),
@@ -2276,6 +2319,8 @@ fn shell_single_quote_fragment(value: &str) -> String {
 
 fn sign_and_notarize_macos_artifacts(
     signing_identity: &str,
+    signing_certificate_sha1: &str,
+    signing_certificate_sha256: &str,
     notary_profile: &str,
     sigstore_identity: &str,
     sigstore_issuer: &str,
@@ -2299,7 +2344,7 @@ fn sign_and_notarize_macos_artifacts(
             &[
                 "--force",
                 "--sign",
-                signing_identity,
+                signing_certificate_sha1,
                 "--options",
                 "runtime",
                 "--timestamp",
@@ -2312,6 +2357,12 @@ fn sign_and_notarize_macos_artifacts(
         )?;
         let details = output_combined("codesign", &["-dvvv", artifact_text])?;
         team_identifiers.insert(validate_codesign_details(&details, signing_identity)?);
+        verify_macos_signing_certificate(
+            &artifact,
+            target,
+            signing_certificate_sha1,
+            signing_certificate_sha256,
+        )?;
     }
     if team_identifiers.len() != 1 {
         return Err(TaskError::InvalidMacosSignature(
@@ -2329,6 +2380,8 @@ fn sign_and_notarize_macos_artifacts(
     refresh_macos_distribution_metadata(
         signing_identity,
         &team_identifier,
+        signing_certificate_sha1,
+        signing_certificate_sha256,
         sigstore_identity,
         sigstore_issuer,
     )
@@ -2444,6 +2497,8 @@ fn write_notary_receipt(
 fn refresh_macos_distribution_metadata(
     signing_identity: &str,
     team_identifier: &str,
+    signing_certificate_sha1: &str,
+    signing_certificate_sha256: &str,
     sigstore_identity: &str,
     sigstore_issuer: &str,
 ) -> Result<(), TaskError> {
@@ -2477,6 +2532,8 @@ fn refresh_macos_distribution_metadata(
     provenance["macos_distribution"] = serde_json::json!({
         "signing_identity": signing_identity,
         "team_identifier": team_identifier,
+        "certificate_sha1": signing_certificate_sha1,
+        "certificate_sha256": signing_certificate_sha256,
         "hardened_runtime": true,
         "secure_timestamp": true,
         "notarization_receipts": MACOS_RELEASE_TARGETS
@@ -2496,7 +2553,11 @@ fn refresh_macos_distribution_metadata(
     )
 }
 
-fn verify_macos_distribution(expected_identity: &str) -> Result<String, TaskError> {
+fn verify_macos_distribution(
+    expected_identity: &str,
+    expected_certificate_sha1: &str,
+    expected_certificate_sha256: &str,
+) -> Result<String, TaskError> {
     let mut team_identifiers = BTreeSet::new();
     for target in MACOS_RELEASE_TARGETS {
         let artifact = Path::new("dist").join(format!("cfctl-{target}"));
@@ -2507,6 +2568,12 @@ fn verify_macos_distribution(expected_identity: &str) -> Result<String, TaskErro
         )?;
         let details = output_combined("codesign", &["-dvvv", artifact_text])?;
         team_identifiers.insert(validate_codesign_details(&details, expected_identity)?);
+        verify_macos_signing_certificate(
+            &artifact,
+            target,
+            expected_certificate_sha1,
+            expected_certificate_sha256,
+        )?;
         let receipt_path = notary_receipt_path(target);
         let receipt: serde_json::Value = serde_json::from_slice(
             &fs::read(&receipt_path).map_err(|source| io_error(&receipt_path, source))?,
@@ -2523,6 +2590,59 @@ fn verify_macos_distribution(expected_identity: &str) -> Result<String, TaskErro
         .into_iter()
         .next()
         .ok_or_else(|| TaskError::InvalidMacosSignature("missing TeamIdentifier".to_owned()))
+}
+
+fn verify_macos_signing_certificate(
+    artifact: &Path,
+    target: &str,
+    expected_certificate_sha1: &str,
+    expected_certificate_sha256: &str,
+) -> Result<(), TaskError> {
+    let directory = Path::new("target/release-proof/signature");
+    fs::create_dir_all(directory).map_err(|source| io_error(directory, source))?;
+    let prefix = directory.join(format!("{target}-certificate-"));
+    for index in 0..=3 {
+        remove_file_if_present(&PathBuf::from(format!("{}{index}", prefix.display())))?;
+    }
+    let extract_argument = format!("--extract-certificates={}", path_text(&prefix)?);
+    run("codesign", &["-d", &extract_argument, path_text(artifact)?])?;
+    let leaf = PathBuf::from(format!("{}0", prefix.display()));
+    let actual_sha1 = output("shasum", &["-a", "1", path_text(&leaf)?])?
+        .split_whitespace()
+        .next()
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            TaskError::InvalidMacosSignature(
+                "shasum did not return a valid signing certificate SHA-1".to_owned(),
+            )
+        })?;
+    let actual_sha256 = sha256_file(&leaf)?;
+    validate_macos_certificate_fingerprints(
+        &actual_sha1,
+        &actual_sha256,
+        expected_certificate_sha1,
+        expected_certificate_sha256,
+    )
+}
+
+fn validate_macos_certificate_fingerprints(
+    actual_sha1: &str,
+    actual_sha256: &str,
+    expected_sha1: &str,
+    expected_sha256: &str,
+) -> Result<(), TaskError> {
+    if !actual_sha1.eq_ignore_ascii_case(expected_sha1) {
+        return Err(TaskError::InvalidMacosSignature(format!(
+            "signing certificate SHA-1 `{actual_sha1}` does not match SECURITY.md `{expected_sha1}`"
+        )));
+    }
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(TaskError::InvalidMacosSignature(format!(
+            "signing certificate SHA-256 `{actual_sha256}` does not match SECURITY.md `{expected_sha256}`"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_codesign_details(details: &str, expected_identity: &str) -> Result<String, TaskError> {
@@ -3180,6 +3300,8 @@ fn release_provenance_commit() -> Result<String, TaskError> {
 fn validate_release_provenance(
     expected_macos_identity: &str,
     expected_team_identifier: &str,
+    expected_certificate_sha1: &str,
+    expected_certificate_sha256: &str,
 ) -> Result<String, TaskError> {
     let path = Path::new("dist/provenance.json");
     let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
@@ -3233,6 +3355,8 @@ fn validate_release_provenance(
         &provenance,
         expected_macos_identity,
         expected_team_identifier,
+        expected_certificate_sha1,
+        expected_certificate_sha256,
     )?;
     let commit = provenance
         .get("git_commit")
@@ -3257,6 +3381,8 @@ fn validate_macos_provenance(
     provenance: &serde_json::Value,
     expected_identity: &str,
     expected_team_identifier: &str,
+    expected_certificate_sha1: &str,
+    expected_certificate_sha256: &str,
 ) -> Result<(), TaskError> {
     let macos = provenance
         .get("macos_distribution")
@@ -3270,6 +3396,16 @@ fn validate_macos_provenance(
         return Err(TaskError::InvalidProvenance(
             "macOS signing identity does not match the expected identity".to_owned(),
         ));
+    }
+    for (field, expected) in [
+        ("certificate_sha1", expected_certificate_sha1),
+        ("certificate_sha256", expected_certificate_sha256),
+    ] {
+        if macos.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+            return Err(TaskError::InvalidProvenance(format!(
+                "macOS {field} does not match the expected certificate fingerprint"
+            )));
+        }
     }
     if macos
         .get("team_identifier")
@@ -3467,15 +3603,16 @@ mod tests {
         release_tag_is_exact_version, render_linux_installer_text, repository_root,
         security_proof_commands, validate_bootstrap_contract, validate_bound_draft_release,
         validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
-        validate_local_only_ci_contract, validate_notary_receipt_value,
-        validate_public_domain_anchor, validate_release_identity_inputs,
-        validate_rollback_readback, validate_signed_release_file_set,
-        validate_signed_release_posture_contract, validated_release_targets,
-        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
-        verify_generated_guidance_section_text, verify_managed_agent_documents,
-        verify_public_domain_contract, verify_quickstart_pins_the_release_version,
-        verify_signed_release_posture_contract, verify_tracked_cfctl_command_references,
-        verify_v1_cutover_contract, verify_workspace_dependency_versions,
+        validate_local_only_ci_contract, validate_macos_certificate_fingerprints,
+        validate_macos_provenance, validate_notary_receipt_value, validate_public_domain_anchor,
+        validate_release_identity_inputs, validate_rollback_readback,
+        validate_signed_release_file_set, validate_signed_release_posture_contract,
+        validated_release_targets, verify_active_guidance_has_no_v1_commands,
+        verify_documented_contracts, verify_generated_guidance_section_text,
+        verify_managed_agent_documents, verify_public_domain_contract,
+        verify_quickstart_pins_the_release_version, verify_signed_release_posture_contract,
+        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
+        verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -4335,6 +4472,8 @@ mod tests {
         let content = concat!(
             "- Developer ID Application identity: `Developer ID Application: Example (TEAM123)`\n",
             "- Developer ID TeamIdentifier: `TEAM123`\n",
+            "- Developer ID certificate SHA-1: `0123456789abcdef0123456789abcdef01234567`\n",
+            "- Developer ID certificate SHA-256: `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`\n",
             "- Sigstore certificate identity: `release@example.com`\n",
             "- Sigstore OIDC issuer: `https://issuer.example`\n",
         );
@@ -4368,6 +4507,34 @@ mod tests {
                 "release@example.com",
                 "https://issuer.example",
                 "UNBOUND",
+            )
+            .is_err()
+        );
+        let malformed_sha1 = parse_release_trust_roots(&content.replace(
+            "0123456789abcdef0123456789abcdef01234567",
+            "0123456789abcdef0123456789abcdef0123456g",
+        ))
+        .expect("parse malformed fingerprint");
+        assert!(
+            validate_release_identity_inputs(
+                &malformed_sha1,
+                "release@example.com",
+                "https://issuer.example",
+                "Developer ID Application: Example (TEAM123)",
+            )
+            .is_err()
+        );
+        let malformed_sha256 = parse_release_trust_roots(&content.replace(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+        ))
+        .expect("parse malformed fingerprint");
+        assert!(
+            validate_release_identity_inputs(
+                &malformed_sha256,
+                "release@example.com",
+                "https://issuer.example",
+                "Developer ID Application: Example (TEAM123)",
             )
             .is_err()
         );
@@ -4514,6 +4681,52 @@ mod tests {
             validate_codesign_details(&valid.replace("Timestamp=", "NoTimestamp="), identity)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn macos_provenance_binds_both_certificate_fingerprints() {
+        let mut provenance = serde_json::json!({
+            "macos_distribution": {
+                "signing_identity": "Developer ID Application: Example Corp (TEAM123456)",
+                "team_identifier": "TEAM123456",
+                "certificate_sha1": "0123456789abcdef0123456789abcdef01234567",
+                "certificate_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "hardened_runtime": true,
+                "secure_timestamp": true,
+                "notarization_receipts": [
+                    "notary-aarch64-apple-darwin.json",
+                    "notary-x86_64-apple-darwin.json"
+                ]
+            }
+        });
+        let result = validate_macos_provenance(
+            &provenance,
+            "Developer ID Application: Example Corp (TEAM123456)",
+            "TEAM123456",
+            "0123456789abcdef0123456789abcdef01234567",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        assert!(result.is_ok());
+        provenance["macos_distribution"]["certificate_sha256"] = serde_json::json!("drifted");
+        assert!(
+            validate_macos_provenance(
+                &provenance,
+                "Developer ID Application: Example Corp (TEAM123456)",
+                "TEAM123456",
+                "0123456789abcdef0123456789abcdef01234567",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn macos_leaf_certificate_must_match_both_committed_fingerprints() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(validate_macos_certificate_fingerprints(sha1, sha256, sha1, sha256).is_ok());
+        assert!(validate_macos_certificate_fingerprints("drifted", sha256, sha1, sha256).is_err());
+        assert!(validate_macos_certificate_fingerprints(sha1, "drifted", sha1, sha256).is_err());
     }
 
     #[test]
