@@ -91,10 +91,10 @@ is an authenticated bootstrap path and v1.3.0 remains held from publication.
 
 Machine-read release trust roots (non-secret):
 
-- Developer ID Application identity: `UNBOUND`
-- Developer ID TeamIdentifier: `UNBOUND`
-- Sigstore certificate identity: `UNBOUND`
-- Sigstore OIDC issuer: `UNBOUND`
+- Developer ID Application identity: `Developer ID Application: MLNavigator Inc. (4JB58L7BTZ)`
+- Developer ID TeamIdentifier: `4JB58L7BTZ`
+- Sigstore certificate identity: `vats-springs0m@icloud.com`
+- Sigstore OIDC issuer: `https://github.com/login/oauth`
 
 `cargo xtask release` and `cargo xtask publish` reject `UNBOUND`, missing, or
 mismatched values. Provisioning credentials alone cannot bypass this committed
