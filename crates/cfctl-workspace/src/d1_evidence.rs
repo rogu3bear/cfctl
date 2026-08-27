@@ -51,19 +51,20 @@ pub const MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1: &[&str] = &[
     "provider_accepted_count",
 ];
 pub const MAILDESK_INBOUND_ACCEPTANCE_SQL_V1: &str = r"SELECT
-  id AS inbound_delivery_id,
-  relay_id,
-  thread_id,
-  route_id,
-  policy_sha256,
-  updated_at AS provider_accepted_at,
-  status,
-  (SELECT COUNT(*) FROM inbound_recipient_deliveries rd WHERE rd.delivery_id = inbound_deliveries.id) AS recipient_count,
-  (SELECT COUNT(*) FROM inbound_recipient_deliveries rd WHERE rd.delivery_id = inbound_deliveries.id AND rd.status = 'provider_accepted') AS provider_accepted_count
-FROM inbound_deliveries
-WHERE fingerprint_sha256 = '__MAILDESK_FINGERPRINT_SHA256__'
-  AND route_id = '__MAILDESK_ROUTE_ID__'
-  AND policy_sha256 = '__MAILDESK_POLICY_SHA256__'
+  inbound.id AS inbound_delivery_id,
+  inbound.relay_id,
+  inbound.thread_id,
+  inbound.route_id,
+  inbound.policy_sha256,
+  rh.last_inbound_provider_accepted_at AS provider_accepted_at,
+  inbound.status,
+  (SELECT COUNT(*) FROM inbound_recipient_deliveries rd WHERE rd.delivery_id = inbound.id) AS recipient_count,
+  (SELECT COUNT(*) FROM inbound_recipient_deliveries rd WHERE rd.delivery_id = inbound.id AND rd.status = 'provider_accepted') AS provider_accepted_count
+FROM inbound_deliveries inbound
+JOIN route_health rh ON rh.route_id = inbound.route_id AND rh.policy_sha256 = inbound.policy_sha256
+WHERE inbound.fingerprint_sha256 = '__MAILDESK_FINGERPRINT_SHA256__'
+  AND inbound.route_id = '__MAILDESK_ROUTE_ID__'
+  AND inbound.policy_sha256 = '__MAILDESK_POLICY_SHA256__'
 LIMIT 2;";
 
 /// Compiler-owned Maildesk readiness projection. Every source table, column,
@@ -582,6 +583,14 @@ mod tests {
             sha256(MAILDESK_INBOUND_ACCEPTANCE_SQL_V1.as_bytes())
         );
         assert_eq!(MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1.len(), 9);
+        assert!(
+            MAILDESK_INBOUND_ACCEPTANCE_SQL_V1
+                .contains("rh.last_inbound_provider_accepted_at AS provider_accepted_at")
+        );
+        assert!(MAILDESK_INBOUND_ACCEPTANCE_SQL_V1.contains(
+            "JOIN route_health rh ON rh.route_id = inbound.route_id AND rh.policy_sha256 = inbound.policy_sha256"
+        ));
+        assert!(!MAILDESK_INBOUND_ACCEPTANCE_SQL_V1.contains("updated_at AS provider_accepted_at"));
     }
 
     #[test]
