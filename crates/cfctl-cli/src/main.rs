@@ -77,7 +77,9 @@ async fn main() -> ExitCode {
                         "cfctl",
                         "CFCTL_USAGE",
                         &error.to_string(),
-                        Some("Run `cfctl --help` and correct the rejected arguments."),
+                        Some(
+                            "Run the nearest `cfctl <command path> --help`; use `cfctl commands` to see the complete command map.",
+                        ),
                     );
                     let Ok(output) = runtime::render(&envelope, true) else {
                         return ExitCode::from(1);

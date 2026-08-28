@@ -21,6 +21,7 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "auth",
     "call",
     "catalog",
+    "commands",
     "docs",
     "doctor",
     "events",
@@ -61,7 +62,7 @@ impl CommandNodeV1 {
 
 /// Exact sorted inventory of every public v2 subcommand below each verb that
 /// takes subcommands. Verbs without subcommands (`call`, `resolve`, `guide`,
-/// `doctor`, `version`, `update`) are absent by design.
+/// `commands`, `doctor`, `version`, `update`) are absent by design.
 ///
 /// The CLI test binds this tree to the live clap tree recursively, while `xtask`
 /// uses it to reject stale checked-in `cfctl <verb> <sub>` examples.

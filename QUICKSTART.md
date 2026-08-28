@@ -42,6 +42,7 @@ build, not proof that a published binary was installed.
 Confirm the exact running build after any install path:
 
 ```bash
+cfctl commands
 cfctl version --json
 cfctl doctor --json
 cfctl agents doctor --json

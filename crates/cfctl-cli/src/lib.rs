@@ -8,6 +8,7 @@ use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 pub mod build_identity;
 #[doc(hidden)]
 pub mod build_support;
+mod command_help;
 mod profiles;
 pub mod runtime;
 mod telemetry_product;
@@ -16,7 +17,8 @@ mod telemetry_product;
 #[command(
     name = "cfctl",
     version,
-    about = "Universal governed Cloudflare control plane"
+    about = "Universal governed Cloudflare control plane",
+    after_help = "Learn the whole command language at once: cfctl commands"
 )]
 pub struct Cli {
     /// Emit the stable `ResultEnvelopeV2` JSON contract.
@@ -28,6 +30,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print the complete command map, grammar, and memorable starting paths.
+    Commands,
     /// Manage credential profiles and login state.
     Auth(AuthArgs),
     /// Inspect and govern Cloudflare token lifecycles.
@@ -74,14 +78,21 @@ pub struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
+    /// Start or complete OAuth login for one named profile.
     Login(AuthLoginArgs),
+    /// Inspect the selected profile and its authentication state.
     Status(ProfileSelector),
+    /// List configured profiles and the active selection.
     Profiles,
+    /// Select the profile used when a command does not name one.
     Use(ProfileSelector),
     /// Rewrite one opaque credential with the unattended platform-reader ACL.
     RepairKeychainAccess(ProfileSelector),
+    /// Remove one profile and its stored credential.
     Logout(ProfileSelector),
+    /// Import an account-pinned API token from protected input.
     ImportApiToken(ImportApiTokenArgs),
+    /// Import an emergency global API key from protected input.
     ImportGlobalKey(ImportGlobalKeyArgs),
 }
 
@@ -158,13 +169,18 @@ pub struct KeysArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum KeysCommand {
+    /// Read the permission groups available to an account or user token.
     Permissions(KeyPermissionArgs),
+    /// Create a narrowly scoped token through a governed plan.
     Mint(KeyMutationArgs),
+    /// Replace a token and write its secret to a protected file.
     Rotate(KeyRotateArgs),
     /// Renew a managed analytics child and atomically switch one profile only
     /// after the staged child passes governed live reads.
     RenewAnalyticsProfile(KeyRenewAnalyticsProfileArgs),
+    /// Revoke one account-owned or user-owned token.
     Revoke(KeyRevokeArgs),
+    /// Create, inspect, approve, or revoke standing token authority.
     Policy(KeyPolicyArgs),
 }
 
@@ -366,10 +382,15 @@ pub struct CatalogArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CatalogCommand {
+    /// Refresh the local executable capability catalog.
     Sync,
+    /// Search catalog capabilities by intent or feature.
     Search(SearchArgs),
+    /// Show one capability's exact executable contract.
     Show(CapabilitySelector),
+    /// Show changes between current and previous catalog snapshots.
     Changes,
+    /// Report executable, delegated, UI, and blocked capability coverage.
     Coverage,
 }
 
@@ -479,11 +500,17 @@ pub struct PlansArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PlansCommand {
+    /// Show one redacted, hash-bound plan.
     Show(PlanSelector),
+    /// Approve one exact plan, with an explicit confirmation flag.
     Approve(PlanApproveArgs),
+    /// Execute one approved plan across its pinned adapter boundary.
     Run(PlanSelector),
+    /// Inspect durable execution, verification, and recovery state.
     Status(PlanSelector),
+    /// Continue an interrupted plan only from its durable checkpoint.
     Resume(PlanSelector),
+    /// Reconcile a plan whose provider-boundary outcome needs proof.
     Rectify(PlanSelector),
     /// Retire a draft or approved plan immediately without consuming it
     Cancel(PlanSelector),
@@ -540,10 +567,15 @@ pub struct WorkspaceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCommand {
+    /// Register one repository root and its optional account boundary.
     Add(WorkspaceAddArgs),
+    /// Remove one explicitly registered repository root.
     Remove(WorkspaceRemoveArgs),
+    /// Discover supported Cloudflare configuration in registered roots.
     Discover,
+    /// Show relationships among registered roots and resources.
     Graph,
+    /// Report workspace drift, impact, and ownership findings.
     Audit,
 }
 
@@ -567,18 +599,31 @@ pub struct RegistryArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RegistryCommand {
+    /// Discover and govern the registry's explicit scan boundaries.
     Scopes(RegistryScopesArgs),
+    /// Reconcile configured scopes into the local resource projection.
     Sync,
+    /// Report projection freshness and rebuild state.
     Status,
+    /// Report provider-kind and field coverage of the projection.
     Coverage,
+    /// List projected resources, optionally filtered by kind.
     List(RegistryListArgs),
+    /// Show one projected resource by exact key.
     Get(RegistryResourceArgs),
+    /// Show relationships among projected resources.
     Graph,
+    /// Compare projected resources with registered source declarations.
     Diff(RegistryOptionalResourceArgs),
+    /// Show durable history for one projected resource.
     History(RegistryResourceArgs),
+    /// Export the redacted local registry projection.
     Export,
+    /// Rebuild derived registry state from durable inputs.
     Rebuild,
+    /// Validate, compare, or plan from repository declarations.
     Declarations(RegistryDeclarationsArgs),
+    /// Inspect or check declared resource ownership.
     Ownership(RegistryOwnershipArgs),
 }
 
@@ -590,9 +635,13 @@ pub struct RegistryScopesArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RegistryScopesCommand {
+    /// List explicitly adopted registry scopes.
     List,
+    /// Discover candidate scopes without adopting them.
     Discover,
+    /// Adopt one exact organization, account, zone, or resource scope.
     Adopt(RegistryScopeArgs),
+    /// Remove one exact scope from future registry reconciliation.
     Remove(RegistryScopeArgs),
 }
 
@@ -642,8 +691,11 @@ pub struct RegistryDeclarationsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RegistryDeclarationsCommand {
+    /// Validate registered repository declarations without planning changes.
     Validate,
+    /// Compare declarations with the current registry projection.
     Diff(RegistryOptionalResourceArgs),
+    /// Create governed plans for declaration drift.
     Plan(RegistryOptionalResourceArgs),
 }
 
@@ -661,7 +713,9 @@ pub struct PolicyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PolicyCommand {
+    /// Stage, review, approve, activate, or roll back local admission policy.
     Admission(AdmissionPolicyArgs),
+    /// Read Cloudflare policy and create governed reconciliation plans.
     Cloudflare(CloudflarePolicyArgs),
 }
 
@@ -673,12 +727,19 @@ pub struct AdmissionPolicyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AdmissionPolicyCommand {
+    /// Stage a policy bundle from a local JSON file.
     Stage(FileInputArgs),
+    /// List staged, approved, active, and retired bundles.
     List,
+    /// Show one exact policy bundle.
     Show(BundleSelector),
+    /// Compare one bundle with the active policy.
     Diff(BundleSelector),
+    /// Approve one exact staged bundle with explicit confirmation.
     Approve(BundleApproveArgs),
+    /// Make one approved bundle the active admission policy.
     Activate(BundleSelector),
+    /// Restore a previously active bundle.
     Rollback(BundleSelector),
 }
 
@@ -708,16 +769,23 @@ pub struct CloudflarePolicyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CloudflarePolicyCommand {
+    /// List policy-bearing resources from live Cloudflare state.
     List,
+    /// Read live policy for one exact registered resource.
     Get(RegistryResourceArgs),
+    /// Compare live policy with local declarations.
     Diff(RegistryOptionalResourceArgs),
+    /// Create governed plans for policy drift.
     Plan(RegistryOptionalResourceArgs),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum RegistryOwnershipCommand {
+    /// List declared owners for projected resources.
     List,
+    /// Show the declared owner of one exact resource.
     Get(RegistryResourceArgs),
+    /// Check ownership completeness and conflicts.
     Check,
 }
 
@@ -729,10 +797,15 @@ pub struct EventsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EventsCommand {
+    /// List configured event sources and their boundaries.
     Sources,
+    /// Report event ingestion and reconciliation health.
     Status,
+    /// Show bounded durable event history.
     History(EventHistoryArgs),
+    /// Enqueue reconciliation for one exact resource.
     Reconcile(EventReconcileArgs),
+    /// Inspect or prepare the governed event bridge.
     Bridge(EventBridgeArgs),
 }
 
@@ -756,8 +829,11 @@ pub struct EventBridgeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EventBridgeCommand {
+    /// Inspect bridge requirements without changing local or provider state.
     Inspect,
+    /// Prepare a governed bridge plan without executing it.
     Prepare,
+    /// Report the bridge's durable local status.
     Status,
 }
 
@@ -769,8 +845,11 @@ pub struct AgentsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentsCommand {
+    /// Install managed cfctl guidance into detected agent homes.
     Install(AgentsInstallArgs),
+    /// Check installed guidance against the running cfctl build.
     Doctor,
+    /// Refresh previously installed managed guidance.
     Sync,
 }
 
@@ -788,8 +867,11 @@ pub struct DocsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DocsCommand {
+    /// Search the compact official Cloudflare documentation index.
     Search(SearchArgs),
+    /// Show recent official Cloudflare documentation changes.
     Changes,
+    /// Report documentation index coverage and freshness.
     Coverage,
 }
 
@@ -807,6 +889,7 @@ pub struct MigrateArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum MigrateCommand {
+    /// Import explicitly supported non-secret state from the v1 runtime.
     V1,
 }
 
