@@ -37,6 +37,21 @@ Aliases are projected explicitly. The baseline has no custom aliases, and this
 change adds none: a second spelling would be another memory burden unless a
 specific compatibility requirement justified it.
 
+The capability denominator is every entry in the executable catalog, exhausted
+by the catalog owner's five adapter statuses. The command map projects this
+status-to-grammar matrix without copying capability IDs:
+
+| Adapter status | Canonical invocation | Observable result |
+| --- | --- | --- |
+| `native` | `cfctl call <capability-id>` | run the cfctl-owned adapter or draft its governed mutation plan |
+| `dynamic_api` | `cfctl call <capability-id>` | run the catalog-bound API read or draft its governed mutation plan |
+| `delegated_cli` | `cfctl call <capability-id>` | run the catalog-pinned CLI and retain its bounded receipt |
+| `governed_ui` | `cfctl call <capability-id>` | return the target-bound UI handoff without widening authority |
+| `blocked` | `cfctl guide <capability-id>` | stop at the exact blocker and follow `next_action`; `call` remains fail-closed |
+
+Every row uses `resolve` for intent discovery, `catalog show` for the executable
+contract, and `guide` for selectors, lifecycle, blockers, and next action.
+
 ## Acceptance criteria
 
 ### AC1 — One exhaustive map
@@ -51,7 +66,7 @@ aliases without opening or changing mutable runtime state.
 
 ### AC2 — Help is locally discoverable
 
-Given root help, when a user reads `cfctl --help`, then it points to
+Given root help, when a user reads the root help screen, then it points to
 `cfctl commands` for the whole language.
 
 Given any command group, when a user runs `cfctl <path> --help`, then every
@@ -86,6 +101,11 @@ list may claim to be exhaustive.
 Given a catalog capability is added or changed, when the command map is built,
 then the catalog remains its owner; the map describes only the stable `call`,
 `resolve`, `guide`, and catalog-management paths.
+
+Given any capability in any current adapter status, when a user reads the
+catalog-to-grammar matrix, then there is exactly one canonical discovery,
+inspection, explanation, and invocation route, with blocked capabilities
+stopping at their exact `next_action`.
 
 ### AC6 — Qualification stays plane-specific
 

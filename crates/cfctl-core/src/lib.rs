@@ -829,6 +829,17 @@ pub enum AdapterStatus {
     Blocked,
 }
 
+impl AdapterStatus {
+    /// Complete adapter-status denominator for user-visible routing projections.
+    pub const ALL: [Self; 5] = [
+        Self::Native,
+        Self::DynamicApi,
+        Self::DelegatedCli,
+        Self::GovernedUi,
+        Self::Blocked,
+    ];
+}
+
 /// Identifies whose authority makes a catalog capability executable.
 ///
 /// This is deliberately independent of [`AdapterStatus`]: a native adapter can

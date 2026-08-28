@@ -155,6 +155,18 @@ fn commands_projects_the_complete_language_without_touching_runtime_state() {
                 .is_some_and(|summary| !summary.is_empty())
             && entry["aliases"].is_array()
     }));
+    let catalog_routes = envelope["result"]["catalog_routes"]
+        .as_array()
+        .expect("catalog-to-grammar routes");
+    assert_eq!(catalog_routes.len(), 5);
+    assert!(catalog_routes.iter().all(|route| {
+        route["adapter_status"].as_str().is_some()
+            && route["discover"] == "cfctl resolve \"<intent>\""
+            && route["inspect"] == "cfctl catalog show <capability-id>"
+            && route["explain"] == "cfctl guide <capability-id>"
+            && route["invoke"].as_str().is_some()
+            && route["result"].as_str().is_some()
+    }));
     assert!(
         fs::read_dir(runtime.path())
             .expect("inspect untouched runtime root")
