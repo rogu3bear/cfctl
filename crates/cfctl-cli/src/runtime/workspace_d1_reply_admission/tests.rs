@@ -10,6 +10,30 @@ fn reply_admission_separates_d1_read_and_apply_timeouts() {
     assert_eq!(APPLY_TIMEOUT, Duration::from_mins(5));
 }
 
+#[test]
+fn candidate_validation_precedes_credential_generation_binding() {
+    let mut profile = ProfileMetadata::new(
+        "profile-without-generation",
+        cfctl_auth::ProfileKind::ApiToken,
+        Some("account"),
+    );
+    profile.credential_generation_id = None;
+
+    let error = control_plane_binding::validate_candidate(
+        b"not-json",
+        &profile,
+        "account",
+        "production-database",
+    )
+    .err()
+    .expect("candidate validation must fail before credential generation binding");
+
+    assert_eq!(
+        error.to_string(),
+        "reply-admission candidate is not valid JSON"
+    );
+}
+
 fn prefixed(byte: char) -> String {
     format!("sha256:{}", byte.to_string().repeat(64))
 }

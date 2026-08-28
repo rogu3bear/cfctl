@@ -5,6 +5,7 @@ use chrono::Utc;
 use super::super::{
     cli_io,
     prelude::{CliError, ProfileMetadata, Result},
+    read_execution::credential_generation_for_read,
 };
 use super::{Candidate, hex_sha, validate_candidate_bytes, validate_candidate_fresh};
 
@@ -12,11 +13,11 @@ pub(super) fn validate_candidate(
     bytes: &[u8],
     profile: &ProfileMetadata,
     account_id: &str,
-    credential_generation: &str,
     production_database_id: &str,
-) -> Result<Candidate> {
+) -> Result<(Candidate, String)> {
     let candidate = validate_candidate_bytes(bytes)?;
     validate_candidate_fresh(&candidate, Utc::now())?;
+    let credential_generation = credential_generation_for_read(profile)?;
     let executable = std::env::current_exe().map_err(|error| {
         CliError::Input(format!("cfctl executable identity is unavailable: {error}"))
     })?;
@@ -54,5 +55,5 @@ pub(super) fn validate_candidate(
             )));
         }
     }
-    Ok(candidate)
+    Ok((candidate, credential_generation))
 }
