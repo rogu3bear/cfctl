@@ -84,15 +84,18 @@ SBOMs remain independent requirements; signatures never replace them. Unsigned
 `cargo xtask assemble` outputs are local evidence and must not be published or
 represented as a release.
 
-The exact Developer ID authority, TeamIdentifier, Sigstore certificate
-identity, and OIDC issuer must be committed here before publication. Until
-those non-secret trust roots are present, no downloaded formula or installer
-is an authenticated bootstrap path and v1.3.0 remains held from publication.
+The exact Developer ID authority, TeamIdentifier, certificate fingerprints,
+Sigstore certificate identity, and OIDC issuer must be committed here before
+publication. Until those non-secret trust roots are present, no downloaded
+formula or installer is an authenticated bootstrap path and v1.3.0 remains
+held from publication.
 
 Machine-read release trust roots (non-secret):
 
 - Developer ID Application identity: `Developer ID Application: MLNavigator Inc. (4JB58L7BTZ)`
 - Developer ID TeamIdentifier: `4JB58L7BTZ`
+- Developer ID certificate SHA-1: `092DB0E5D9AC568FD4CD8D2C1D55A4EA0C09E71E`
+- Developer ID certificate SHA-256: `7816780FD8364DCC521D14973D26DD3681A42B12AF73C7FE3F39A25EF2C2D232`
 - Sigstore certificate identity: `vats-springs0m@icloud.com`
 - Sigstore OIDC issuer: `https://github.com/login/oauth`
 
