@@ -637,8 +637,7 @@ pub(super) fn persist_prepared_plan(
     store.save_plan_v2(&plan_v2)?;
     let evidence =
         store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan_v2)?)?;
-    let mut envelope = ResultEnvelopeV2::success(
-        "call",
+    let result = if plan.capability.execution_supported {
         json!({
             "plan": plan,
             "plan_v2": plan_v2,
@@ -649,9 +648,15 @@ pub(super) fn persist_prepared_plan(
             } else {
                 "Plan created. Review it, then approve the exact operation ID with y/n."
             }
-        }),
-    )
-    .with_evidence(evidence);
+        })
+    } else {
+        json!({
+            "plan": plan,
+            "plan_v2": plan_v2,
+            "message": "Planning-only PlanV2 created. It has no approval, run, resume, rectification, or provider-execution lane."
+        })
+    };
+    let mut envelope = ResultEnvelopeV2::success("call", result).with_evidence(evidence);
     envelope.capability_id = Some(plan.capability.id.clone());
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.profile_id = Some(profile.id.clone());

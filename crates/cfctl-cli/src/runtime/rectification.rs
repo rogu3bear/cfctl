@@ -8,10 +8,10 @@ use super::credential_resolution::platform_secrets;
 use super::import_failures::exact_durable_init_response_failure;
 use super::import_lineage::exact_durable_provider_complete_boundary;
 use super::import_planning::SECURITY_ACTION_STATE_PRECONDITION;
-use super::plan_commands::load_validated_plan;
 use super::plan_commands::persist_transaction_stage;
 use super::plan_commands::persist_transaction_stage_with_artifact;
 use super::plan_commands::reconcile_standing_lineage_from_plan;
+use super::plan_commands::{ensure_plan_execution_contract, load_validated_plan};
 use super::plan_create::create_plan;
 use super::plan_create::exact_worker_deployment_read_capability;
 use super::plan_secret::D1_READ_REPLICATION_PRECONDITION;
@@ -41,6 +41,7 @@ pub(super) async fn rectify_plan(
 ) -> Result<ResultEnvelopeV2> {
     let _plan_lock = store.lock_plan(&selector.operation_id)?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
+    ensure_plan_execution_contract(store, &plan)?;
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, &mut plan);
     }

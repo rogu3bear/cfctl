@@ -80,8 +80,8 @@ use cfctl_core::{
     RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
     SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
     StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-    WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1,
-    WorkspaceD1PolicyProjectionContractV1, hash_value,
+    WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, WorkflowContractV1, WorkflowStepV1,
+    WorkspaceD1MigrationContractV1, WorkspaceD1PolicyProjectionContractV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore};
 use chrono::{Duration as ChronoDuration, Utc};

@@ -14,8 +14,8 @@ use cfctl_core::{
     SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
     SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
     StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
-    UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
-    redact_json_schema, render_guide_topic_markdown,
+    UpdatedResourceContractV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, guide_stages,
+    guide_topic_document, hash_value, redact_json, redact_json_schema, render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -213,6 +213,71 @@ fn deployment_plan_set_binds_order_without_aggregating_approval() {
     drifted.children[0].depends_on = vec![second.to_owned()];
     drifted.refresh_hash().expect("rehash malformed set");
     assert!(drifted.validate().is_err());
+}
+
+#[test]
+fn maildesk_worker_plan_children_compile_as_two_serial_non_authorizing_operations() {
+    let router_id = "00000000-0000-4000-8000-000000000021";
+    let outbound_id = "00000000-0000-4000-8000-000000000022";
+    let mut router = deployment_plan_set_child(
+        1,
+        router_id,
+        Vec::new(),
+        &format!("sha256:{}", "a".repeat(64)),
+    );
+    router.capability_id = WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID.to_owned();
+    router.affected_resources = vec!["worker:relay_router".to_owned()];
+    router.provider_snapshot_hashes = [(
+        "worker_deployment_state:relay_router".to_owned(),
+        format!("sha256:{}", "a".repeat(64)),
+    )]
+    .into_iter()
+    .collect();
+    let mut outbound = deployment_plan_set_child(
+        2,
+        outbound_id,
+        vec![router_id.to_owned()],
+        &format!("sha256:{}", "b".repeat(64)),
+    );
+    outbound.capability_id = WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID.to_owned();
+    outbound.affected_resources = vec!["worker:relay_outbound".to_owned()];
+    outbound.provider_snapshot_hashes = [(
+        "worker_deployment_state:relay_outbound".to_owned(),
+        format!("sha256:{}", "b".repeat(64)),
+    )]
+    .into_iter()
+    .collect();
+    let bundle = DeploymentPlanSetV1::new(
+        "Maildesk relay deployment".to_owned(),
+        format!("sha256:{}", "4".repeat(64)),
+        "profile-a".to_owned(),
+        vec!["account-a".to_owned()],
+        format!("sha256:{}", "5".repeat(64)),
+        format!("sha256:{}", "6".repeat(64)),
+        "credential-generation-a".to_owned(),
+        format!("compiled:sha256:{}", "7".repeat(64)),
+        format!("sha256:{}", "8".repeat(64)),
+        vec![DeploymentPlanSetRepositoryV1 {
+            repository_id: "maildesk".to_owned(),
+            root_sha256: format!("sha256:{}", "9".repeat(64)),
+            origin_identity: "maildesk".to_owned(),
+            head: "a".repeat(40),
+            tree: "b".repeat(40),
+        }],
+        vec![router, outbound],
+        vec!["provider execution".to_owned()],
+    )
+    .expect("serial Maildesk plan set");
+    bundle.validate().expect("serial children validate");
+    assert_eq!(
+        bundle.children[0].capability_id,
+        WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID
+    );
+    assert_eq!(bundle.children[1].depends_on, [router_id]);
+    assert_ne!(
+        bundle.children[0].provider_snapshot_hashes,
+        bundle.children[1].provider_snapshot_hashes
+    );
 }
 
 #[test]

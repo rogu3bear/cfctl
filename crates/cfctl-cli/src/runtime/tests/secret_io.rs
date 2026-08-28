@@ -1026,3 +1026,59 @@ pub(super) fn metadata_only_secret_response_is_rejected_without_creating_a_sink(
     assert!(sink_secret_result(&plan, &json!({"id":"token-id","status":"active"})).is_err());
     assert!(!path.exists());
 }
+#[test]
+pub(super) fn planning_only_plan_cannot_enter_approval_or_execution_contract() {
+    let root = tempfile::tempdir().expect("state root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+    let mut capability = CapabilityV1::new(
+        WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+        "Compile Worker deployment",
+        "POST",
+        "/cfctl/plans/accounts/{account_id}/workers/deployment",
+    );
+    capability.execution_supported = false;
+    let plan = PlanV1::draft(
+        "profile-a",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({"adapter":{"worker_deployment":{"service_name":"relay-router"}}}),
+    )
+    .expect("planning-only draft");
+    let error = ensure_plan_execution_contract(&store, &plan)
+        .expect_err("planning-only plan must fail closed")
+        .to_string();
+    assert!(error.contains("has no execution authority"));
+}
+
+#[tokio::test]
+pub(super) async fn planning_only_plan_cannot_enter_rectification() {
+    let root = tempfile::tempdir().expect("state root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+    let mut capability = CapabilityV1::new(
+        WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+        "Compile Worker deployment",
+        "POST",
+        "/cfctl/plans/accounts/{account_id}/workers/deployment",
+    );
+    capability.execution_supported = false;
+    let plan = PlanV1::draft(
+        "profile-a",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({"adapter":{"worker_deployment":{"service_name":"relay-router"}}}),
+    )
+    .expect("planning-only draft");
+    save_current_test_plan(&store, &plan);
+    let error = Box::pin(rectify_plan(
+        &store,
+        &PlanSelector {
+            operation_id: plan.operation_id,
+        },
+    ))
+    .await
+    .expect_err("planning-only rectification must fail closed")
+    .to_string();
+    assert!(error.contains("has no execution authority"));
+}

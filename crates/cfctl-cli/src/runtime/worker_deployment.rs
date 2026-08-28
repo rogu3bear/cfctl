@@ -7,7 +7,9 @@ use std::{
 };
 
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
-use cfctl_core::{CapabilityV1, PlanV1, hash_value, redact_json};
+use cfctl_core::{
+    CapabilityV1, PlanV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, hash_value, redact_json,
+};
 use cfctl_workspace::{WorkspaceGraph, load_wrangler_config, load_wrangler_config_snapshot};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,7 +33,7 @@ const NOT_FOUND_ERROR_CODE: i64 = 10_007;
 pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
     matches!(
         capability.id.as_str(),
-        "wrangler.deploy" | "wrangler.versions-upload"
+        "wrangler.deploy" | "wrangler.versions-upload" | WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID
     )
 }
 
@@ -221,6 +223,8 @@ pub(super) fn prepare_target(
     let mut config_target = json!({
         "path": config,
         "sha256": config_sha256,
+        "settings_sha256": deployment_config_section_hash(document, false)?,
+        "bindings_sha256": deployment_config_section_hash(document, true)?,
     });
     if let Some(authority) = private_config_authority {
         config_target["authority"] = Value::String("private_d1_identity_overlay".to_owned());
@@ -234,6 +238,34 @@ pub(super) fn prepare_target(
         "repository": repository.path,
         "config": config_target,
         "version_message": expected_message,
+        "execution": {
+            "supported": capability.execution_supported,
+            "provider_effect_on_call": false,
+        },
+        "post_deploy_verification": {
+            "steps": [
+                {
+                    "capability_id": DEPLOYMENTS_CAPABILITY_ID,
+                    "path": DEPLOYMENTS_PATH,
+                    "proves": "the new version is the sole latest active version at 100 percent traffic",
+                },
+                {
+                    "capability_id": VERSION_CAPABILITY_ID,
+                    "path": VERSION_PATH,
+                    "proves": "the active version detail reports the exact compiled source and artifact message",
+                },
+                {
+                    "capability_id": SETTINGS_CAPABILITY_ID,
+                    "path": SETTINGS_PATH,
+                    "proves": "provider-observable settings and bindings match the exact compiled configuration projection",
+                }
+            ],
+            "artifact_and_config_identity_source": "worker_deployment target hashes",
+        },
+        "rollback": {
+            "capability_id": ROLLBACK_CAPABILITY_ID,
+            "identity_source": "worker_deployment_state.current_active",
+        },
     });
     let target_object = target
         .as_object_mut()
@@ -243,6 +275,38 @@ pub(super) fn prepare_target(
     })?;
     target_object.extend(operation_object.clone());
     Ok(Some(target))
+}
+
+fn deployment_config_section_hash(document: &Value, bindings: bool) -> Result<String, CliError> {
+    const BINDING_KEYS: &[&str] = &[
+        "ai",
+        "analytics_engine_datasets",
+        "browser",
+        "d1_databases",
+        "dispatch_namespaces",
+        "durable_objects",
+        "hyperdrive",
+        "images",
+        "kv_namespaces",
+        "mtls_certificates",
+        "queues",
+        "r2_buckets",
+        "services",
+        "unsafe",
+        "vars",
+        "vectorize",
+        "version_metadata",
+        "workflows",
+    ];
+    let object = document.as_object().ok_or_else(|| {
+        CliError::Input("Wrangler configuration root must be an object".to_owned())
+    })?;
+    let section = object
+        .iter()
+        .filter(|(key, _)| BINDING_KEYS.contains(&key.as_str()) == bindings)
+        .map(|(key, value)| (key.clone(), redact_json(value)))
+        .collect::<serde_json::Map<_, _>>();
+    hash_value(&Value::Object(section)).map_err(Into::into)
 }
 
 pub(super) fn prepare_rollback_target(
@@ -742,6 +806,7 @@ pub(super) fn apply_state_responses(
     service_name: &str,
     settings: &CloudflareResponseV1,
     deployments: Option<&CloudflareResponseV1>,
+    require_singular_active: bool,
 ) -> Result<Value, CliError> {
     let exact_not_found = settings.status == 404
         && !settings.success
@@ -774,7 +839,7 @@ pub(super) fn apply_state_responses(
         && deployments.success
         && (200..300).contains(&deployments.status)
     {
-        return Ok(json!({
+        let mut receipt = json!({
             "schema_version": 1,
             "source_capability_id": SETTINGS_CAPABILITY_ID,
             "source_path": SETTINGS_PATH,
@@ -787,12 +852,58 @@ pub(super) fn apply_state_responses(
             "exists": true,
             "redacted_settings_hash": hash_value(&redact_json(&settings.result))?,
             "redacted_deployments_hash": hash_value(&redact_json(&deployments.result))?,
-        }));
+        });
+        if require_singular_active {
+            let (current_deployment_id, current_version_id) =
+                current_active_deployment_identity(&deployments.result)?;
+            receipt["current_active"] = json!({
+                "deployment_id": current_deployment_id,
+                "version_id": current_version_id,
+                "traffic_percentage": 100,
+            });
+        }
+        return Ok(receipt);
     }
     Err(CliError::Input(format!(
         "Worker settings/deployments reads for `{service_name}` returned HTTP {}/{} and cannot prove exact current state",
         settings.status, deployments.status
     )))
+}
+
+fn current_active_deployment_identity(deployments: &Value) -> Result<(&str, &str), CliError> {
+    let history = deployments
+        .get("deployments")
+        .and_then(Value::as_array)
+        .or_else(|| deployments.as_array())
+        .ok_or_else(|| {
+            CliError::Input("Worker deployments readback omitted deployment history".to_owned())
+        })?;
+    let current = history.first().ok_or_else(|| {
+        CliError::Input("Worker deployments readback has no current deployment".to_owned())
+    })?;
+    let deployment_id = current
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| CliError::Input("Worker current deployment has no identity".to_owned()))?;
+    let versions = current
+        .get("versions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input("Worker current deployment has no version allocation".to_owned())
+        })?;
+    if versions.len() != 1 || versions[0].get("percentage").and_then(Value::as_f64) != Some(100.0) {
+        return Err(CliError::Input(
+            "Worker deployment planning requires one current version serving exactly 100 percent"
+                .to_owned(),
+        ));
+    }
+    let version_id = versions[0]
+        .get("version_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| CliError::Input("Worker current version has no identity".to_owned()))?;
+    Ok((deployment_id, version_id))
 }
 
 #[expect(

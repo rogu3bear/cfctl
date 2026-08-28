@@ -1043,6 +1043,7 @@ pub(super) async fn read_live_worker_deployment_state(
             service_name,
             &settings,
             deployments.as_ref(),
+            capability.id == cfctl_core::WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
         )?
     };
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
