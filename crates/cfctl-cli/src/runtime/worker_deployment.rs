@@ -291,6 +291,7 @@ fn deployment_config_section_hash(document: &Value, bindings: bool) -> Result<St
         "mtls_certificates",
         "queues",
         "r2_buckets",
+        "send_email",
         "services",
         "unsafe",
         "vars",

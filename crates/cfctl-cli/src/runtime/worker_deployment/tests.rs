@@ -662,6 +662,48 @@ database_id = "11111111-1111-4111-8111-111111111111"
 }
 
 #[test]
+fn send_email_drift_is_bound_as_a_binding_not_a_setting() {
+    let parse = |text: &str| {
+        let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
+        serde_json::to_value(document).expect("Wrangler JSON")
+    };
+    let baseline = parse(
+        r#"name = "relay-router"
+main = "build/worker.js"
+
+send_email = [
+  { name = "EMAIL" }
+]
+"#,
+    );
+    let changed = parse(
+        r#"name = "relay-router"
+main = "build/worker.js"
+
+send_email = [
+  { name = "OUTBOUND" }
+]
+"#,
+    );
+
+    assert_eq!(
+        deployment_config_section_hash(&baseline, false).expect("baseline settings hash"),
+        deployment_config_section_hash(&changed, false).expect("changed settings hash"),
+        "send_email-only drift must not change settings_sha256"
+    );
+    assert_ne!(
+        deployment_config_section_hash(&baseline, true).expect("baseline bindings hash"),
+        deployment_config_section_hash(&changed, true).expect("changed bindings hash"),
+        "send_email-only drift must change bindings_sha256"
+    );
+    assert_ne!(
+        hash_value(&baseline).expect("baseline configuration hash"),
+        hash_value(&changed).expect("changed configuration hash"),
+        "send_email-only drift must remain bound by the complete configuration hash"
+    );
+}
+
+#[test]
 fn private_config_template_path_is_role_specific() {
     assert_eq!(
         private_config_template_path(Path::new("/repo/wrangler.mail-router.production.toml")),
