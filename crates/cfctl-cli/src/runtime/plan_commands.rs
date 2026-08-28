@@ -110,7 +110,7 @@ pub(super) fn load_validated_plan(store: &StateStore, operation_id: &str) -> Res
     Ok(plan)
 }
 
-pub(super) fn ensure_plan_execution_contract(store: &StateStore, plan: &PlanV1) -> Result<()> {
+pub(super) fn ensure_capability_execution_supported(plan: &PlanV1) -> Result<()> {
     if !plan.capability.execution_supported {
         return Err(CliError::guided(
             "CFCTL_PLAN_EXECUTION_UNSUPPORTED",
@@ -121,6 +121,11 @@ pub(super) fn ensure_plan_execution_contract(store: &StateStore, plan: &PlanV1) 
             "Keep this plan as a source-qualified child receipt. Do not approve, run, resume, or rectify it; introduce and qualify a separate native execution capability before any provider effect.",
         ));
     }
+    Ok(())
+}
+
+pub(super) fn ensure_plan_execution_contract(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    ensure_capability_execution_supported(plan)?;
     match store.load_stored_plan_record(&plan.operation_id)? {
         StoredPlanRecord::Current(_) => Ok(()),
         StoredPlanRecord::LegacyReadable(_) => Err(CliError::guided(
