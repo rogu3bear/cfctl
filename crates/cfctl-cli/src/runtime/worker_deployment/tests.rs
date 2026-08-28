@@ -1042,8 +1042,12 @@ fn live_state_receipts_distinguish_absence_from_redacted_existing_state() {
         etag: None,
         cf_ray: None,
     };
-    let absent =
-        apply_state_responses("account-a", "cfctl-site", &absent, None, true).expect("absence");
+    let error = apply_state_responses("account-a", "cfctl-site", &absent, None, true)
+        .expect_err("planning capability requires a prior active rollback identity")
+        .to_string();
+    assert!(error.contains("requires one prior active version for rollback"));
+    let absent = apply_state_responses("account-a", "cfctl-site", &absent, None, false)
+        .expect("legacy lane may represent absence");
     assert_eq!(absent["exists"], false);
     assert!(absent.get("redacted_settings_hash").is_none());
     assert!(absent.get("redacted_deployments_hash").is_none());

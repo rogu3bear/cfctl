@@ -820,6 +820,12 @@ pub(super) fn apply_state_responses(
                 "absent Worker state must not carry a deployments response".to_owned(),
             ));
         }
+        if require_singular_active {
+            return Err(CliError::Input(
+                "Worker deployment planning requires one prior active version for rollback; the exact Worker does not exist"
+                    .to_owned(),
+            ));
+        }
         return Ok(json!({
             "schema_version": 1,
             "source_capability_id": SETTINGS_CAPABILITY_ID,
