@@ -2383,6 +2383,15 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -2409,6 +2418,11 @@ pub struct CapabilityV1 {
     pub aliases: Vec<String>,
     pub permissions: Vec<String>,
     pub mutating: bool,
+    /// Whether an approved plan for this capability may cross into execution.
+    /// Planning-only capabilities still compile fully pinned `PlanV2` previews,
+    /// but approval, run, resume, and rectification must fail closed.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub execution_supported: bool,
     pub risk: RiskClass,
     pub effect: EffectClass,
     pub maturity: Maturity,
@@ -2490,6 +2504,12 @@ pub struct CapabilityV1 {
 /// one authority instead of four literals.
 pub const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
 
+/// Native compiler surface for an exact Worker deployment plan. It deliberately
+/// has no provider executor; consumers use the resulting `PlanV2` as a reviewed
+/// child operation and a later executable capability must be introduced under
+/// its own proof and release denominator.
+pub const WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID: &str = "worker-deployment-plan";
+
 /// The capability id the catalog derives for [`DNS_RECORD_DETAIL_PATH`]. Pinned
 /// by `dns_record_detail_constants_pin_the_wire_contract`; every consumer reads
 /// this constant rather than restating the slug.
@@ -2529,6 +2549,7 @@ impl CapabilityV1 {
             aliases: Vec::new(),
             permissions: Vec::new(),
             mutating: !is_read,
+            execution_supported: true,
             risk: if is_read {
                 RiskClass::Read
             } else {
@@ -3434,6 +3455,22 @@ impl CapabilityV1 {
                                     "message".to_owned(),
                                     "target_version_id".to_owned(),
                                 ])
+                    })
+            }
+            "worker_deployment_plan_binds_artifact_config_prior_active_and_post_deploy_verifier" => {
+                self.id == WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID
+                    && self.method == "POST"
+                    && self.path == "/cfctl/plans/accounts/{account_id}/workers/deployment"
+                    && self.adapter_status == AdapterStatus::Native
+                    && !self.execution_supported
+                    && self.risk == RiskClass::CrossConfig
+                    && self.effect == EffectClass::ReversibleWrite
+                    && self.permissions == ["Workers Scripts Write", "Workers Scripts Read"]
+                    && self.selectors.len() == 4
+                    && ["account_id", "config", "message", "name"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name && selector.required
+                        })
                     })
             }
             "trycloudflare_https_url_reaches_reviewed_origin" => {

@@ -20,8 +20,8 @@ use cfctl_core::{
     ResponseContractV1, RiskClass, RollbackSpecV1, SamePathReadContractV1,
     SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
     SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
-    UpdatedResourceContractV1, VerificationSpecV1, WorkflowContractV1, WorkflowStepV1, hash_value,
-    request_header_is_reserved,
+    UpdatedResourceContractV1, VerificationSpecV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+    WorkflowContractV1, WorkflowStepV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -2591,6 +2591,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
     for capability in vec![
+        worker_deployment_plan_capability(),
         worker_version_rollback_capability(),
         mln_0143_data_invariants_capability(),
         mln_0142_post_import_schema_capability(),
@@ -2611,6 +2612,98 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+fn worker_deployment_plan_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+        "Compile one exact Worker deployment PlanV2",
+        "POST",
+        "/cfctl/plans/accounts/{account_id}/workers/deployment",
+    );
+    capability.description = Some(
+        "Compile a preview-only PlanV2 that binds one clean Git source, new Worker artifact, exact configuration settings and bindings, current active version for rollback, operation-specific risk/effect/cost, and required post-deploy verification. The capability has no approval or execution lane and performs no provider mutation."
+            .to_owned(),
+    );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::ProviderGeneric);
+    "Cloudflare Workers".clone_into(&mut capability.product);
+    "cfctl native Worker deployment plan compiler".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "plan exact Worker deployment".to_owned(),
+        "compile Worker deployment child".to_owned(),
+    ];
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact Cloudflare account identifier".to_owned()),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({"type":"string","minLength":32,"maxLength":32}),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "config".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Absolute reviewed Worker configuration path".to_owned()),
+            contract: None,
+        },
+        SelectorV1 {
+            name: "name".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact Worker service name; must match the configuration".to_owned()),
+            contract: None,
+        },
+        SelectorV1 {
+            name: "message".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact source and artifact identity derived by cfctl".to_owned()),
+            contract: None,
+        },
+    ];
+    capability.permissions = vec![
+        "Workers Scripts Write".to_owned(),
+        "Workers Scripts Read".to_owned(),
+    ];
+    capability.adapter_status = AdapterStatus::Native;
+    capability.execution_supported = false;
+    capability.blocked_reason = None;
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.maturity = Maturity::Experimental;
+    capability.entitlement.available = Some(true);
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "compiling the plan has no provider cost; a future separately qualified deployment can create ordinary downstream Worker usage"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Workers pricing".to_owned(),
+        url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    "worker_deployment_plan_binds_artifact_config_prior_active_and_post_deploy_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some(
+        "a future deployment must use a separate worker-version-rollback plan targeting the prior active deployment/version captured by this PlanV2; this planning capability itself performs no provider effect"
+            .to_owned(),
+    );
+    capability
 }
 
 fn worker_version_rollback_capability() -> CapabilityV1 {

@@ -216,6 +216,25 @@ fn target_binds_clean_source_config_service_and_complete_artifact() {
     assert_eq!(projection["service_name"], "cfctl-site");
     assert_eq!(projection["source_sha"], source_sha);
     assert_eq!(projection["artifact"]["sha256"], artifact_sha256);
+    assert!(projection["config"]["settings_sha256"].as_str().is_some());
+    assert!(projection["config"]["bindings_sha256"].as_str().is_some());
+    assert_eq!(projection["execution"]["supported"], true);
+    assert_eq!(
+        projection["post_deploy_verification"]["steps"][0]["capability_id"],
+        DEPLOYMENTS_CAPABILITY_ID
+    );
+    assert_eq!(
+        projection["post_deploy_verification"]["steps"][1]["capability_id"],
+        VERSION_CAPABILITY_ID
+    );
+    assert_eq!(
+        projection["post_deploy_verification"]["steps"][2]["capability_id"],
+        SETTINGS_CAPABILITY_ID
+    );
+    assert_eq!(
+        projection["rollback"]["capability_id"],
+        ROLLBACK_CAPABILITY_ID
+    );
     assert_eq!(
         projection["artifact"]["roots"],
         json!([build.canonicalize().unwrap(), site.canonicalize().unwrap()])
@@ -643,6 +662,48 @@ database_id = "11111111-1111-4111-8111-111111111111"
 }
 
 #[test]
+fn send_email_drift_is_bound_as_a_binding_not_a_setting() {
+    let parse = |text: &str| {
+        let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
+        serde_json::to_value(document).expect("Wrangler JSON")
+    };
+    let baseline = parse(
+        r#"name = "relay-router"
+main = "build/worker.js"
+
+send_email = [
+  { name = "EMAIL" }
+]
+"#,
+    );
+    let changed = parse(
+        r#"name = "relay-router"
+main = "build/worker.js"
+
+send_email = [
+  { name = "OUTBOUND" }
+]
+"#,
+    );
+
+    assert_eq!(
+        deployment_config_section_hash(&baseline, false).expect("baseline settings hash"),
+        deployment_config_section_hash(&changed, false).expect("changed settings hash"),
+        "send_email-only drift must not change settings_sha256"
+    );
+    assert_ne!(
+        deployment_config_section_hash(&baseline, true).expect("baseline bindings hash"),
+        deployment_config_section_hash(&changed, true).expect("changed bindings hash"),
+        "send_email-only drift must change bindings_sha256"
+    );
+    assert_ne!(
+        hash_value(&baseline).expect("baseline configuration hash"),
+        hash_value(&changed).expect("changed configuration hash"),
+        "send_email-only drift must remain bound by the complete configuration hash"
+    );
+}
+
+#[test]
 fn private_config_template_path_is_role_specific() {
     assert_eq!(
         private_config_template_path(Path::new("/repo/wrangler.mail-router.production.toml")),
@@ -981,7 +1042,12 @@ fn live_state_receipts_distinguish_absence_from_redacted_existing_state() {
         etag: None,
         cf_ray: None,
     };
-    let absent = apply_state_responses("account-a", "cfctl-site", &absent, None).expect("absence");
+    let error = apply_state_responses("account-a", "cfctl-site", &absent, None, true)
+        .expect_err("planning capability requires a prior active rollback identity")
+        .to_string();
+    assert!(error.contains("requires one prior active version for rollback"));
+    let absent = apply_state_responses("account-a", "cfctl-site", &absent, None, false)
+        .expect("legacy lane may represent absence");
     assert_eq!(absent["exists"], false);
     assert!(absent.get("redacted_settings_hash").is_none());
     assert!(absent.get("redacted_deployments_hash").is_none());
@@ -998,7 +1064,7 @@ fn live_state_receipts_distinguish_absence_from_redacted_existing_state() {
         etag: None,
         cf_ray: None,
     };
-    assert!(apply_state_responses("account-a", "cfctl-site", &ambiguous, None).is_err());
+    assert!(apply_state_responses("account-a", "cfctl-site", &ambiguous, None, true).is_err());
 
     let existing = CloudflareResponseV1 {
         status: 200,
@@ -1022,18 +1088,75 @@ fn live_state_receipts_distinguish_absence_from_redacted_existing_state() {
         result: json!([{"id": "deployment-b", "versions": [{"version_id": "version-b", "percentage": 100}]}]),
         ..deployment_a.clone()
     };
-    let existing_a =
-        apply_state_responses("account-a", "cfctl-site", &existing, Some(&deployment_a))
-            .expect("existing");
-    let existing_b =
-        apply_state_responses("account-a", "cfctl-site", &existing, Some(&deployment_b))
-            .expect("drifted deployment");
+    let existing_a = apply_state_responses(
+        "account-a",
+        "cfctl-site",
+        &existing,
+        Some(&deployment_a),
+        true,
+    )
+    .expect("existing");
+    let existing_b = apply_state_responses(
+        "account-a",
+        "cfctl-site",
+        &existing,
+        Some(&deployment_b),
+        true,
+    )
+    .expect("drifted deployment");
     let existing = existing_a;
     assert_eq!(existing["exists"], true);
+    assert_eq!(existing["current_active"]["deployment_id"], "deployment-a");
+    assert_eq!(existing["current_active"]["version_id"], "version-a");
+    assert_eq!(existing["current_active"]["traffic_percentage"], 100);
     assert!(existing["redacted_settings_hash"].as_str().is_some());
     assert!(existing["redacted_deployments_hash"].as_str().is_some());
     assert_ne!(existing, existing_b);
     assert!(!existing.to_string().contains("hidden"));
+}
+
+#[test]
+fn split_traffic_cannot_supply_a_truthful_prior_active_rollback_identity() {
+    let settings = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"compatibility_date": "2026-08-05"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let deployments = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"deployments":[{"id":"deployment-a","versions":[
+            {"version_id":"version-a","percentage":50},
+            {"version_id":"version-b","percentage":50}
+        ]}]}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let legacy = apply_state_responses(
+        "account-a",
+        "relay-router",
+        &settings,
+        Some(&deployments),
+        false,
+    )
+    .expect("legacy deploy/upload lanes retain split-traffic planning");
+    assert!(legacy.get("current_active").is_none());
+    let error = apply_state_responses(
+        "account-a",
+        "relay-router",
+        &settings,
+        Some(&deployments),
+        true,
+    )
+    .expect_err("split traffic has no sole rollback identity")
+    .to_string();
+    assert!(error.contains("one current version serving exactly 100 percent"));
 }
 
 #[test]

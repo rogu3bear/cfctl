@@ -14,8 +14,8 @@ use cfctl_core::{
     CostExposureV1, CreatedResourceContractV1, DeletedResourceContractV1,
     EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID, EffectClass, KnowledgeReferenceV1, PaginationModeV1,
     ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
-    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, TimestampFormatV1, hash_value,
-    is_email_routing_rules_list_capability,
+    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, TimestampFormatV1,
+    WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, hash_value, is_email_routing_rules_list_capability,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -14781,4 +14781,34 @@ fn native_control_overlay_graduates_d1_import_to_a_closed_provider_generic_contr
         resume.request_schema.as_ref().expect("resume body")["additionalProperties"],
         false
     );
+}
+
+#[test]
+fn native_worker_deployment_plan_is_preview_only_and_operation_complete() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let plan = snapshot
+        .get(WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID)
+        .expect("Worker deployment plan compiler");
+    assert_eq!(plan.adapter_status, AdapterStatus::Native);
+    assert!(!plan.execution_supported);
+    assert_eq!(plan.risk, RiskClass::CrossConfig);
+    assert_eq!(plan.effect, EffectClass::ReversibleWrite);
+    assert!(plan.verification_contract_supported());
+    assert!(plan.rollback_contract_declared());
+    assert!(plan.mutation_contract_gaps().is_empty());
+    let encoded = serde_json::to_string(plan).expect("capability JSON");
+    for forbidden in ["wrangler deploy", "routing_health", "governed_ui"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "leaked forbidden lane: {forbidden}"
+        );
+    }
 }
