@@ -110,33 +110,23 @@ cfctl plans rectify <operation-id> --json
 
 ## Public commands
 
+The public grammar is:
+
 ```text
-cfctl "<natural-language request>"
-cfctl version
-cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
-cfctl keys permissions|mint|rotate|revoke|policy
-cfctl keys policy create|list|approve|revoke
-cfctl catalog sync|search|show|changes|coverage
-cfctl resolve "<natural-language intent>"
-cfctl call <capability-id> [selectors/body]
-cfctl guide <capability-id>
-cfctl guide --topic system|standing-authority
-cfctl plans show|approve|run|status|resume|rectify|cancel
-cfctl policy admission stage|list|show|diff|approve|activate|rollback
-cfctl policy cloudflare list|get|diff|plan
-cfctl registry scopes list|discover|adopt|remove
-cfctl registry sync|status|coverage|list|get|graph|diff|history|export|rebuild
-cfctl registry declarations validate|diff|plan
-cfctl registry ownership list|get|check
-cfctl events sources|status|history|reconcile
-cfctl events bridge inspect|prepare|status
-cfctl workspace add|remove|discover|graph|audit
-cfctl agents install|doctor|sync
-cfctl docs search|changes|coverage
-cfctl doctor
-cfctl update
-cfctl migrate v1
+cfctl <area> <action> [target] [flags]
 ```
+
+The area stays first and the action says what happens. Direct operations such
+as `resolve`, `guide`, and `call` omit the area. Run `cfctl commands` to read
+the complete executable command map at once, `cfctl commands --json` to consume
+the same map as data, or `cfctl <command path> --help` for exact arguments.
+The map is generated from the Clap command tree, so this document does not
+maintain a second command registry.
+
+Open-ended intent remains available as `cfctl "<natural-language request>"`.
+Existing v2 paths remain compatible; the command map includes newer paths such
+as `auth repair-keychain-access`, `keys renew-analytics-profile`, and
+`plans bundle` that a hand-maintained list could omit.
 
 Every command has concise human output and stable `--json` output, shaped by
 the public contracts `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,

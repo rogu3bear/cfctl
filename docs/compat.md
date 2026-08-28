@@ -18,3 +18,18 @@ metadata so affected profile stores remain inspectable. It cannot be selected
 or used as a credential. `cfctl doctor --json` reports the exact metadata-only
 logout command; removal does not touch the platform credential store. Create a
 supported OAuth or API-token profile afterward.
+
+## Command migration
+
+Run `cfctl commands` for the complete v2 grammar and one-line purpose of every
+deterministic path. For a Cloudflare operation, use `cfctl resolve "<intent>"`,
+inspect the selected contract with `cfctl catalog show <capability-id>`, read
+its lifecycle with `cfctl guide <capability-id>`, and invoke only the emitted
+`cfctl call <capability-id>` path. That sequence covers native, dynamic API,
+delegated CLI, governed UI, and blocked catalog entries without reviving v1
+backend scripts.
+
+Retired v1 command shapes deliberately have no shorthand aliases. They fail
+closed with usage guidance instead of launching an agent or silently changing
+meaning. `cfctl migrate v1` migrates supported non-secret state; it does not
+translate or execute a v1 command.

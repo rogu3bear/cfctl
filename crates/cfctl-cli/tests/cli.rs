@@ -51,6 +51,7 @@ fn every_public_command_group_is_parseable() {
             "auth" => vec!["cfctl", "auth", "status"],
             "keys" => vec!["cfctl", "keys", "permissions", "--account", "account-a"],
             "catalog" => vec!["cfctl", "catalog", "coverage"],
+            "commands" => vec!["cfctl", "commands"],
             "call" => vec!["cfctl", "call", "dns-records-list"],
             "resolve" => vec!["cfctl", "resolve", "list dns records"],
             "guide" => vec!["cfctl", "guide", "dns-records-delete"],
@@ -120,6 +121,62 @@ fn version_reports_structured_build_identity_without_touching_runtime_state() {
 }
 
 #[test]
+fn commands_projects_the_complete_language_without_touching_runtime_state() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["commands", "--json"])
+        .output()
+        .expect("run command map");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("command-map envelope");
+    assert_eq!(envelope["command"], "commands");
+    assert_eq!(envelope["result"]["schema_version"], 1);
+    assert_eq!(
+        envelope["result"]["grammar"],
+        "cfctl <area> <action> [target] [flags]"
+    );
+    let commands = envelope["result"]["commands"]
+        .as_array()
+        .expect("command entries");
+    assert!(
+        commands.len() >= 100,
+        "unexpectedly small map: {commands:?}"
+    );
+    assert!(commands.iter().all(|entry| {
+        entry["path"].as_str().is_some_and(|path| !path.is_empty())
+            && entry["summary"]
+                .as_str()
+                .is_some_and(|summary| !summary.is_empty())
+            && entry["aliases"].is_array()
+    }));
+    let catalog_routes = envelope["result"]["catalog_routes"]
+        .as_array()
+        .expect("catalog-to-grammar routes");
+    assert_eq!(catalog_routes.len(), 5);
+    assert!(catalog_routes.iter().all(|route| {
+        route["adapter_status"].as_str().is_some()
+            && route["discover"] == "cfctl resolve \"<intent>\""
+            && route["inspect"] == "cfctl catalog show <capability-id>"
+            && route["explain"] == "cfctl guide <capability-id>"
+            && route["invoke"].as_str().is_some()
+            && route["result"].as_str().is_some()
+    }));
+    assert!(
+        fs::read_dir(runtime.path())
+            .expect("inspect untouched runtime root")
+            .next()
+            .is_none(),
+        "the command map must not initialize mutable runtime state"
+    );
+}
+
+#[test]
 fn clap_human_version_behavior_remains_compatible() {
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
         .arg("--version")
@@ -152,6 +209,12 @@ fn json_parser_failures_are_v2_usage_envelopes_with_exit_two() {
             .is_some_and(|message| message.contains("--account")),
         "{envelope}"
     );
+    assert!(
+        envelope["error"]["next_step"]
+            .as_str()
+            .is_some_and(|step| step.contains("cfctl commands")),
+        "{envelope}"
+    );
 }
 
 #[test]
@@ -175,6 +238,17 @@ fn human_parser_failures_and_metadata_keep_clap_behavior() {
         assert!(!metadata.stdout.is_empty(), "{argument}");
         assert!(metadata.stderr.is_empty(), "{argument}");
     }
+}
+
+#[test]
+fn root_help_points_to_the_complete_command_map() {
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .arg("--help")
+        .output()
+        .expect("run root help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("help is UTF-8");
+    assert!(help.contains("Learn the whole command language at once: cfctl commands"));
 }
 
 #[test]

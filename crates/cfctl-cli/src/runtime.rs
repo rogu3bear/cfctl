@@ -109,8 +109,12 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     if matches!(command, Command::Version) {
         return version_command();
     }
+    if matches!(command, Command::Commands) {
+        return Ok(crate::command_help::envelope());
+    }
     let store = StateStore::open(RuntimePaths::discover()?)?;
     match command {
+        Command::Commands => Ok(crate::command_help::envelope()),
         Command::Auth(arguments) => auth_command(&store, arguments.command).await,
         Command::Keys(arguments) => Box::pin(keys_command(&store, arguments.command)).await,
         Command::Catalog(arguments) => catalog_command(&store, arguments.command).await,
