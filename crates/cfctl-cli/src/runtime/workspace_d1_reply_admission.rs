@@ -10,7 +10,6 @@ use super::{
         OpenOptionsExt, Path, PathBuf, PermissionsExt, PlanV1, ProfileMetadata, Read, Result,
         StateStore, Stdio, Write,
     },
-    read_execution::credential_generation_for_read,
     workspace_d1_migration,
 };
 use std::{
@@ -157,16 +156,12 @@ pub(super) fn prepare_plan_target(
     let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
     let compiler_runtime = compiler_runtime(store, contract)?;
     let bytes = compile_private_candidate(store, contract, source, &compiler_runtime)?;
-    let candidate = validate_candidate_bytes(&bytes)?;
-    validate_candidate_fresh(&candidate, Utc::now())?;
-    let generation = credential_generation_for_read(profile)?;
-    let authority = (
+    let (candidate, generation) = control_plane_binding::validate_candidate(
+        &bytes,
         profile,
         account_id,
-        generation.as_str(),
         config.database_id.as_str(),
-    );
-    control_plane_binding::validate(&candidate, authority)?;
+    )?;
     let stage = stage_private_candidate(store, &bytes)?;
     let recovery = workspace_d1_migration::fresh_recovery_proof(
         store,
@@ -567,16 +562,12 @@ pub(super) async fn read(
     let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
     let runtime = compiler_runtime(store, contract)?;
     let bytes = compile_private_candidate(store, contract, source, &runtime)?;
-    let candidate = validate_candidate_bytes(&bytes)?;
-    validate_candidate_fresh(&candidate, Utc::now())?;
-    let generation = credential_generation_for_read(profile)?;
-    let authority = (
+    let (candidate, _generation) = control_plane_binding::validate_candidate(
+        &bytes,
         profile,
         account_id,
-        generation.as_str(),
         config.database_id.as_str(),
-    );
-    control_plane_binding::validate(&candidate, authority)?;
+    )?;
     for (key, expected) in [
         ("transaction_sha256", candidate.transaction_sha256.as_str()),
         (
