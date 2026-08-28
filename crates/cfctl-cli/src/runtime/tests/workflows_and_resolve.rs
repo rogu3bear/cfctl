@@ -536,6 +536,24 @@ pub(super) fn worker_deployment_identity_drift_stops_before_delegated_boundary()
             .expect("promotion state authority"),
         Some(planned_hash.as_str())
     );
+    let mut grafted_legacy = plan.clone();
+    let grafted_receipt = grafted_legacy
+        .targets
+        .pointer_mut("/live_preconditions/worker_deployment_state")
+        .expect("legacy state receipt");
+    grafted_receipt["current_active"] = json!({
+        "deployment_id": "deployment-a",
+        "version_id": "version-a",
+        "traffic_percentage": 100,
+    });
+    grafted_legacy.precondition_hashes.insert(
+        super::worker_deployment::STATE_PRECONDITION.to_owned(),
+        hash_value(grafted_receipt).expect("grafted state hash"),
+    );
+    assert!(
+        super::required_worker_deployment_state_precondition(&grafted_legacy).is_err(),
+        "legacy receipt schema must reject a grafted strict rollback identity"
+    );
     let mut delegated_boundary_crossed = false;
 
     let result = (|| -> std::result::Result<(), super::CliError> {
@@ -547,6 +565,86 @@ pub(super) fn worker_deployment_identity_drift_stops_before_delegated_boundary()
     assert!(result.is_err());
     assert!(!delegated_boundary_crossed);
     assert_eq!(plan.status, PlanStatus::Draft);
+}
+
+#[test]
+pub(super) fn worker_planning_receipt_requires_exact_prior_active_identity() {
+    let planned = json!({
+        "schema_version": 1,
+        "source_capability_id": "worker-script-get-settings",
+        "source_path": "/accounts/{account_id}/workers/scripts/{script_name}/settings",
+        "deployment_source_capability_id": "worker-deployments-list-deployments",
+        "deployment_source_path": "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+        "account_id": "account-a",
+        "service_name": "relay-router",
+        "http_status": 200,
+        "deployment_http_status": 200,
+        "exists": true,
+        "redacted_settings_hash": "sha256:settings",
+        "redacted_deployments_hash": "sha256:deployments",
+        "current_active": {
+            "deployment_id": "deployment-a",
+            "version_id": "version-a",
+            "traffic_percentage": 100,
+        },
+    });
+    let planned_hash = hash_value(&planned).expect("strict state hash");
+    let mut capability = CapabilityV1::new(
+        WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+        "Compile Worker deployment",
+        "POST",
+        "/cfctl/plans/accounts/{account_id}/workers/deployment",
+    );
+    capability.mutating = true;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.execution_supported = false;
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "catalog-sha",
+        capability,
+        json!({
+            "adapter": {
+                "worker_deployment": {
+                    "schema_version": 1,
+                    "service_name": "relay-router",
+                },
+            },
+            "live_preconditions": {
+                "worker_deployment_state": planned,
+            },
+        }),
+    )
+    .expect("planning-only plan");
+    plan.precondition_hashes.insert(
+        super::worker_deployment::STATE_PRECONDITION.to_owned(),
+        planned_hash.clone(),
+    );
+    assert_eq!(
+        super::required_worker_deployment_state_precondition(&plan)
+            .expect("strict planning state authority"),
+        Some(planned_hash.as_str())
+    );
+
+    let malformed_receipt = plan
+        .targets
+        .pointer_mut("/live_preconditions/worker_deployment_state/current_active")
+        .expect("current active identity");
+    malformed_receipt["traffic_percentage"] = json!(50);
+    let malformed_hash = hash_value(
+        plan.targets
+            .pointer("/live_preconditions/worker_deployment_state")
+            .expect("malformed state receipt"),
+    )
+    .expect("malformed state hash");
+    plan.precondition_hashes.insert(
+        super::worker_deployment::STATE_PRECONDITION.to_owned(),
+        malformed_hash,
+    );
+    assert!(
+        super::required_worker_deployment_state_precondition(&plan).is_err(),
+        "strict planning receipt must reject a non-100-percent active identity"
+    );
 }
 
 #[test]

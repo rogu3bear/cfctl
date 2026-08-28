@@ -1125,10 +1125,12 @@ pub(super) fn validate_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<(
         return Ok(());
     }
     let exists = receipt.get("exists").and_then(Value::as_bool);
-    let exact_field_count = match exists {
-        Some(false) => 7,
-        Some(true) => 12,
-        None => 0,
+    let strict_planning = plan.capability.id == WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID;
+    let exact_field_count = match (strict_planning, exists) {
+        (false, Some(false)) => 7,
+        (false, Some(true)) => 12,
+        (true, Some(true)) => 13,
+        _ => 0,
     };
     let exact = receipt
         .as_object()
@@ -1157,7 +1159,23 @@ pub(super) fn validate_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<(
                 .get("redacted_deployments_hash")
                 .and_then(Value::as_str)
                 .is_some());
-    if !exact || !existing_state_is_exact {
+    let strict_current_active_is_exact = !strict_planning
+        || receipt
+            .get("current_active")
+            .and_then(Value::as_object)
+            .is_some_and(|current| {
+                current.len() == 3
+                    && current
+                        .get("deployment_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && current
+                        .get("version_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && current.get("traffic_percentage").and_then(Value::as_u64) == Some(100)
+            });
+    if !exact || !existing_state_is_exact || !strict_current_active_is_exact {
         return Err(CliError::Input(
             "Worker deployment live-state receipt is malformed or targets another service"
                 .to_owned(),
