@@ -60,6 +60,9 @@ async fn workspace_d1_timeout_terminates_and_reaps_the_full_wrangler_process_tre
             "fixture-account",
             &task_cache,
             Duration::from_secs(5),
+            None,
+            None,
+            None,
         )
         .await
     });
@@ -132,6 +135,9 @@ async fn workspace_d1_timeout_windows_job_contains_the_full_wrangler_tree() {
             "fixture-account",
             &task_cache,
             Duration::from_secs(5),
+            None,
+            None,
+            None,
         )
         .await
     });
@@ -275,6 +281,8 @@ fn query_failure_diagnostics_are_bounded_and_content_addressed() {
         exit_status: Some(1),
         stdout: "provider output".to_owned(),
         stderr: "private diagnostic detail".to_owned(),
+        provider_output_retained: true,
+        private_config_sha256: None,
     };
     let diagnostic = QueryFailureDiagnostic::from(&failed);
     assert_eq!(diagnostic.exit_status, "1");
@@ -283,6 +291,370 @@ fn query_failure_diagnostics_are_bounded_and_content_addressed() {
     let rendered = format!("{diagnostic:?}");
     assert!(!rendered.contains("provider output"));
     assert!(!rendered.contains("private diagnostic detail"));
+}
+
+#[test]
+fn private_query_projection_rejects_token_and_structural_smuggling() {
+    let assertion_sql = "WITH assertions(assertion, passed) AS (VALUES ('assertion_0', 1)) SELECT assertion, passed FROM assertions";
+    let arguments = vec!["--command".to_owned(), assertion_sql.to_owned()];
+    let valid = br#"[{"success":true,"results":[{"assertion":"assertion_0","passed":1}]}]"#;
+    assert!(project_private_json_query(valid, &arguments).is_ok());
+
+    for rejected in [
+        br#"[{"success":true,"results":[{"assertion":"assertion_0","passed":1,"name":"73656e6465722e707269766174652e6578616d706c65"}]}]"#.as_slice(),
+        br#"[{"success":true,"results":[{"assertion":"assertion_0","passed":1,"extra":{"private":"value"}}]}]"#.as_slice(),
+        br#"[{"success":true,"results":[{"assertion":"assertion_0","passed":1,"extra":["value"]}]}]"#.as_slice(),
+        br#"[{"success":true,"results":[{"assertion":"assertion_0","passed":"1"}]}]"#.as_slice(),
+    ] {
+        assert!(
+            project_private_json_query(rejected, &arguments).is_err(),
+            "unowned fields and wrong typed values must fail closed"
+        );
+    }
+
+    let unknown = vec![
+        "--command".to_owned(),
+        "SELECT arbitrary FROM private".to_owned(),
+    ];
+    assert!(project_private_json_query(valid, &unknown).is_err());
+
+    let ledger = vec![
+        "--command".to_owned(),
+        "SELECT name FROM d1_migrations ORDER BY id".to_owned(),
+    ];
+    assert!(
+        project_private_json_query(
+            br#"[{"success":true,"results":[{"name":"0001_create_mail.sql"}]}]"#,
+            &ledger,
+        )
+        .is_ok()
+    );
+    assert!(
+        project_private_json_query(
+            br#"[{"success":true,"results":[{"name":"73656e6465722e707269766174652e6578616d706c65"}]}]"#,
+            &ledger,
+        )
+        .is_err(),
+        "private-shaped values may not escape under the owned ledger field"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one private-D1 boundary regression binds immutable config staging to query, apply, failure, collision, and pre-launch drift assertions without allowing raw provider output between phases"
+)]
+async fn private_workspace_d1_output_is_projected_before_return() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PRIVATE_D1: &str = "11111111-1111-4111-8111-111111111111";
+    const PRIVATE_SENDER: &str = "security@private.example";
+    const PRIVATE_DOMAIN_32: &str = "aaaaaaaaaaaaaaaaaaaaaaaa.example";
+    const PRIVATE_DOMAIN_32_HEX: &str =
+        "6161616161616161616161616161616161616161616161612e6578616d706c65";
+    const PRIVATE_DOMAINS: &str =
+        "sender.private.example,relay.private.example,aaaaaaaaaaaaaaaaaaaaaaaa.example";
+    let root = tempfile::tempdir().expect("private D1 root");
+    let template = root.path().join("wrangler.toml");
+    let production = root.path().join("wrangler.production.toml");
+    fs::write(
+        &template,
+        r#"name = "tracked-role-template"
+main = "worker.js"
+send_email = [{ name = "EMAIL" }]
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
+[[d1_databases]]
+binding = "DB"
+database_name = "tracked-template-database"
+database_id = "00000000-0000-4000-8000-000000000000"
+preview_database_id = "00000000-0000-4000-8000-000000000000"
+"#,
+    )
+    .expect("tracked D1 template");
+    fs::write(
+        &production,
+        format!(
+            r#"name = "relay-router"
+main = "worker.js"
+send_email = [{{ name = "EMAIL", allowed_sender_addresses = ["{PRIVATE_SENDER}"] }}]
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "enabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = "{PRIVATE_DOMAINS}"
+[[d1_databases]]
+binding = "DB"
+database_name = "maildesk"
+database_id = "{PRIVATE_D1}"
+preview_database_id = "{PRIVATE_D1}"
+"#
+        ),
+    )
+    .expect("private D1 config");
+    fs::set_permissions(&production, fs::Permissions::from_mode(0o600)).expect("private D1 mode");
+    let expected_sha256 = sha256(&fs::read(&production).expect("private D1 bytes"));
+    let expected_sha256 = expected_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&expected_sha256)
+        .to_owned();
+    let expected_template_sha256 = sha256(&fs::read(&template).expect("template D1 bytes"));
+    let cache = root.path().join("cache");
+    fs::create_dir(&cache).expect("private D1 cache");
+    let invoked_config = root.path().join("invoked-config");
+    let program = root.path().join("fake-wrangler-query.sh");
+    fs::write(
+        &program,
+        format!(
+            r#"#!/bin/sh
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--config' ]; then printf '%s' "$argument" > '{}'; fi
+  previous="$argument"
+done
+printf '%s\n' '[{{"success":true,"results":[{{"present":1}}],"nested":"MAILDESK_INBOUND_RELAY_MODE=enabled","encoded":"c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ=="}}]'
+printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e707269766174652e6578616d706c65' >&2
+"#,
+            invoked_config.display()
+        ),
+    )
+    .expect("fake D1 Wrangler");
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700))
+        .expect("fake D1 Wrangler mode");
+    let arguments = [
+        "d1".to_owned(),
+        "execute".to_owned(),
+        "maildesk".to_owned(),
+        "--remote".to_owned(),
+        "--config".to_owned(),
+        production.display().to_string(),
+        "--command".to_owned(),
+        "SELECT COUNT(*) AS present FROM sqlite_schema WHERE type = 'table' AND name = 'd1_migrations'".to_owned(),
+        "--json".to_owned(),
+    ];
+    let output = run_wrangler_program(
+        &program,
+        &arguments,
+        root.path(),
+        &AuthCredential::Bearer {
+            token: "fixture-token".to_owned(),
+        },
+        "fixture-account",
+        &cache,
+        QUERY_TIMEOUT,
+        Some(&expected_sha256),
+        Some(&expected_template_sha256),
+        Some("DB"),
+    )
+    .await
+    .expect("typed private D1 projection");
+    assert!(output.success);
+    assert!(!output.provider_output_retained);
+    assert_eq!(
+        output.private_config_sha256.as_deref(),
+        Some(expected_sha256.as_str())
+    );
+    assert_eq!(output.stderr, "");
+    assert_eq!(
+        parse_query_rows(&output.stdout).expect("projected D1 rows"),
+        vec![Map::from_iter([("present".to_owned(), json!(1))])]
+    );
+    let rendered = format!("{output:?}");
+    for private in [
+        PRIVATE_D1,
+        PRIVATE_SENDER,
+        PRIVATE_DOMAINS,
+        "enabled",
+        "c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==",
+        "73656e6465722e707269766174652e6578616d706c65",
+    ] {
+        assert!(
+            !rendered.contains(private),
+            "typed D1 output retained private material"
+        );
+    }
+
+    let collision_program = root
+        .path()
+        .join("fake-wrangler-representation-collision.sh");
+    fs::write(
+        &collision_program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '[{{\"success\":true,\"results\":[{{\"state_key\":\"active_policy_sha256\",\"state_value\":\"{PRIVATE_DOMAIN_32_HEX}\"}}]}}]'\n"
+        ),
+    )
+    .expect("private-representation collision fixture");
+    fs::set_permissions(&collision_program, fs::Permissions::from_mode(0o700))
+        .expect("private-representation collision fixture mode");
+    let collision_arguments = [
+        "d1".to_owned(),
+        "execute".to_owned(),
+        "maildesk".to_owned(),
+        "--remote".to_owned(),
+        "--config".to_owned(),
+        production.display().to_string(),
+        "--command".to_owned(),
+        "SELECT state_key AS state_key, state_value AS state_value FROM runtime_state WHERE state_key IN ('active_policy_sha256','desired_state_sha256','semantic_projection_sha256') ORDER BY state_key".to_owned(),
+        "--json".to_owned(),
+    ];
+    let collision = run_wrangler_program(
+        &collision_program,
+        &collision_arguments,
+        root.path(),
+        &AuthCredential::Bearer {
+            token: "fixture-token".to_owned(),
+        },
+        "fixture-account",
+        &cache,
+        QUERY_TIMEOUT,
+        Some(&expected_sha256),
+        Some(&expected_template_sha256),
+        Some("DB"),
+    )
+    .await
+    .expect("private-representation collision projection");
+    assert!(!collision.success);
+    assert_eq!(collision.stdout, "");
+    assert_eq!(collision.stderr, "");
+    assert!(!collision.provider_output_retained);
+    let collision_debug = format!("{collision:?}");
+    for private in [PRIVATE_DOMAIN_32, PRIVATE_DOMAIN_32_HEX] {
+        assert!(
+            !collision_debug.contains(private),
+            "encoded private value survived the typed projection boundary"
+        );
+    }
+    let invoked = fs::read_to_string(&invoked_config).expect("invoked config path");
+    assert_ne!(invoked, production.display().to_string());
+    assert!(
+        !Path::new(&invoked).exists(),
+        "staged config must be removed after child reaping"
+    );
+
+    let apply_arguments = [
+        "d1".to_owned(),
+        "migrations".to_owned(),
+        "apply".to_owned(),
+        "maildesk".to_owned(),
+        "--remote".to_owned(),
+        "--config".to_owned(),
+        production.display().to_string(),
+    ];
+    let apply = run_wrangler_program(
+        &program,
+        &apply_arguments,
+        root.path(),
+        &AuthCredential::Bearer {
+            token: "fixture-token".to_owned(),
+        },
+        "fixture-account",
+        &cache,
+        APPLY_TIMEOUT,
+        Some(&expected_sha256),
+        Some(&expected_template_sha256),
+        Some("DB"),
+    )
+    .await
+    .expect("private D1 apply projection");
+    assert!(apply.success);
+    assert_eq!(apply.stdout, "");
+    assert_eq!(apply.stderr, "");
+    assert!(!apply.provider_output_retained);
+    for private in [PRIVATE_D1, PRIVATE_SENDER, PRIVATE_DOMAINS, "enabled"] {
+        assert!(!format!("{apply:?}").contains(private));
+    }
+
+    let failure_program = root.path().join("fake-wrangler-failure.sh");
+    fs::write(
+        &failure_program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{PRIVATE_D1}' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' 'c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==' >&2\nexit 7\n"
+        ),
+    )
+    .expect("failing D1 Wrangler");
+    fs::set_permissions(&failure_program, fs::Permissions::from_mode(0o700))
+        .expect("failing D1 Wrangler mode");
+    let failed = run_wrangler_program(
+        &failure_program,
+        &apply_arguments,
+        root.path(),
+        &AuthCredential::Bearer {
+            token: "fixture-token".to_owned(),
+        },
+        "fixture-account",
+        &cache,
+        APPLY_TIMEOUT,
+        Some(&expected_sha256),
+        Some(&expected_template_sha256),
+        Some("DB"),
+    )
+    .await
+    .expect("private D1 failure projection");
+    assert!(!failed.success);
+    assert_eq!(failed.exit_status, Some(7));
+    assert_eq!(failed.stdout, "");
+    assert_eq!(failed.stderr, "");
+    assert!(!failed.provider_output_retained);
+    for private in [
+        PRIVATE_D1,
+        PRIVATE_SENDER,
+        PRIVATE_DOMAINS,
+        "enabled",
+        "c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==",
+    ] {
+        assert!(!format!("{failed:?}").contains(private));
+    }
+
+    let marker = root.path().join("unexpected-execution");
+    let drift_program = root.path().join("must-not-run.sh");
+    fs::write(
+        &drift_program,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .expect("drift probe");
+    fs::set_permissions(&drift_program, fs::Permissions::from_mode(0o700))
+        .expect("drift probe mode");
+    let error = run_wrangler_program(
+        &drift_program,
+        &arguments,
+        root.path(),
+        &AuthCredential::Bearer {
+            token: "fixture-token".to_owned(),
+        },
+        "fixture-account",
+        &cache,
+        QUERY_TIMEOUT,
+        Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        Some(&expected_template_sha256),
+        Some("DB"),
+    )
+    .await
+    .expect_err("persistent config identity drift must fail before launch");
+    assert!(error.to_string().contains("reviewed content identity"));
+    assert!(
+        !marker.exists(),
+        "identity drift crossed the subprocess boundary"
+    );
+    let template_error = run_wrangler_program(
+        &drift_program,
+        &arguments,
+        root.path(),
+        &AuthCredential::Bearer {
+            token: "fixture-token".to_owned(),
+        },
+        "fixture-account",
+        &cache,
+        QUERY_TIMEOUT,
+        Some(&expected_sha256),
+        Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        Some("DB"),
+    )
+    .await
+    .expect_err("persistent template identity drift must fail before launch");
+    assert!(template_error.to_string().contains("template"));
+    assert!(!marker.exists(), "template drift reached subprocess launch");
 }
 
 #[test]
@@ -439,6 +811,7 @@ enabled = true
 [vars]
 MAILDESK_INBOUND_RELAY_MODE = "disabled"
 MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
 
 [[d1_databases]]
 binding = "DB"
@@ -448,7 +821,7 @@ preview_database_id = "00000000-0000-0000-0000-000000000000"
 "#,
     )
     .expect("template");
-    let mut production: toml::Value = toml::from_str(
+    let production: toml::Value = toml::from_str(
         r#"
 name = "production-worker"
 main = "build/_worker.js"
@@ -463,6 +836,7 @@ enabled = true
 [vars]
 MAILDESK_INBOUND_RELAY_MODE = "enabled"
 MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = "sender.example.com,relay.example.org"
 
 [[d1_databases]]
 binding = "DB"
@@ -472,110 +846,179 @@ preview_database_id = "11111111-1111-4111-8111-111111111111"
 "#,
     )
     .expect("production");
-    let identity = production_identity(&production, "DB").expect("identity");
-    assert_eq!(identity.0, "production-db");
-    normalize_production_identity(&mut production, &template, "DB").expect("normalize");
-    assert_eq!(production, template);
+    let template = serde_json::to_value(template).expect("template JSON");
+    let production = serde_json::to_value(production).expect("production JSON");
+    let mut normalized = production.clone();
+    let identity =
+        worker_deployment::normalize_workspace_d1_private_config(&mut normalized, &template, "DB")
+            .expect("normalize");
+    assert_eq!(identity.database_name, "production-db");
+    assert_eq!(normalized, template);
 
-    production["main"] = toml::Value::String("other.js".to_owned());
-    normalize_production_identity(&mut production, &template, "DB").expect("normalize");
-    assert_ne!(production, template);
+    let mut drifted = production;
+    drifted["main"] = json!("other.js");
+    drifted["vars"]["MAILDESK_VERIFIED_SENDER_DOMAINS"] =
+        json!("sender.example.com,relay.example.org");
+    worker_deployment::normalize_workspace_d1_private_config(&mut drifted, &template, "DB")
+        .expect("normalize");
+    assert_ne!(drifted, template);
 }
 
 #[test]
-fn production_relay_activation_rejects_invalid_values_and_legacy_authority() {
-    let template: toml::Value = toml::from_str(
-        r#"
+fn malformed_private_production_config_error_does_not_echo_source() {
+    let private = br#"[vars]
+MAILDESK_VERIFIED_SENDER_DOMAINS = "private.example.com
+"#;
+    let error = parse_private_production_config(private)
+        .expect_err("malformed private TOML must fail")
+        .to_string();
+    assert!(error.contains("production Wrangler config is invalid"));
+    assert!(!error.contains("private.example.com"));
+}
+
+fn workspace_d1_overlay_documents() -> (Value, Value) {
+    let parse = |text: &str| {
+        let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
+        serde_json::to_value(document).expect("Wrangler JSON")
+    };
+    let template = parse(
+        r#"name = "tracked-role"
+main = "worker.js"
+send_email = [{ name = "EMAIL" }]
 [vars]
 MAILDESK_INBOUND_RELAY_MODE = "disabled"
 MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
+[[d1_databases]]
+binding = "DB"
+database_name = "tracked-db"
+database_id = "00000000-0000-4000-8000-000000000000"
 "#,
-    )
-    .expect("template");
-
-    for invalid in [
-        toml::Value::String("preview".to_owned()),
-        toml::Value::Boolean(true),
-        toml::Value::Integer(1),
-    ] {
-        let mut production = template.clone();
-        production["vars"]["MAILDESK_INBOUND_RELAY_MODE"] = invalid;
-        assert!(normalize_relay_activation(&mut production, &template).is_err());
-    }
-
-    let mut legacy = template.clone();
-    legacy["vars"].as_table_mut().expect("vars table").insert(
-        "MAILDESK_RELAY_PROCESSING_MODE".to_owned(),
-        toml::Value::String("enabled".to_owned()),
     );
-    normalize_relay_activation(&mut legacy, &template).expect("normalize allowed fields");
-    assert_ne!(
-        legacy, template,
-        "legacy combined activation must remain forbidden drift"
-    );
-}
-
-#[test]
-fn production_sender_identity_rejects_malformed_or_unbounded_addresses() {
-    for addresses in [
-        toml::Value::Array(Vec::new()),
-        toml::Value::Array(vec![toml::Value::String("not-an-address".to_owned())]),
-        toml::Value::Array(vec![toml::Value::String(
-            "bad address@example.com".to_owned(),
-        )]),
-        toml::Value::String("security@example.com".to_owned()),
-    ] {
-        assert!(validate_sender_addresses(&addresses).is_err());
-    }
-    assert!(
-        validate_sender_addresses(&toml::Value::Array(vec![toml::Value::String(
-            "security@example.com".to_owned()
-        )]))
-        .is_ok()
-    );
-}
-
-#[test]
-fn production_identity_accepts_a_preview_free_production_binding() {
-    let production: toml::Value = toml::from_str(
-        r#"
-name = "production-worker"
-
+    let production = parse(
+        r#"name = "production-role"
+main = "worker.js"
+send_email = [{ name = "EMAIL", allowed_sender_addresses = ["security@example.com"] }]
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "enabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = "sender.example.com,relay.example.org"
 [[d1_databases]]
 binding = "DB"
 database_name = "production-db"
 database_id = "11111111-1111-4111-8111-111111111111"
 "#,
-    )
-    .expect("production");
-
-    assert_eq!(
-        production_identity(&production, "DB").expect("preview-free identity"),
-        (
-            "production-db".to_owned(),
-            "11111111-1111-4111-8111-111111111111".to_owned()
-        )
     );
+    (template, production)
 }
 
 #[test]
-fn production_identity_rejects_a_distinct_or_malformed_inline_preview_binding() {
+fn workspace_d1_shared_overlay_preserves_closed_private_field_rules() {
+    let (template, production) = workspace_d1_overlay_documents();
+    let mut allowed = production.clone();
+    let identity =
+        worker_deployment::normalize_workspace_d1_private_config(&mut allowed, &template, "DB")
+            .expect("closed workspace-D1 overlay");
+    assert_eq!(identity.database_name, "production-db");
+    assert_eq!(identity.database_id, "11111111-1111-4111-8111-111111111111");
+    assert_eq!(allowed, template);
+
+    for invalid in [json!("preview"), json!(true), Value::Null] {
+        let mut rejected = production.clone();
+        rejected["vars"]["MAILDESK_INBOUND_RELAY_MODE"] = invalid;
+        assert!(
+            worker_deployment::normalize_workspace_d1_private_config(
+                &mut rejected,
+                &template,
+                "DB"
+            )
+            .is_err()
+        );
+    }
+    for invalid in [json!([]), json!(["not-an-address"])] {
+        let mut rejected = production.clone();
+        rejected["send_email"][0]["allowed_sender_addresses"] = invalid;
+        assert!(
+            worker_deployment::normalize_workspace_d1_private_config(
+                &mut rejected,
+                &template,
+                "DB"
+            )
+            .is_err()
+        );
+    }
+
+    let mut unrelated = production;
+    unrelated["vars"]["UNRELATED_PRIVATE_VAR"] = json!("forbidden");
+    worker_deployment::normalize_workspace_d1_private_config(&mut unrelated, &template, "DB")
+        .expect("normalize only closed fields");
+    assert_ne!(unrelated, template);
+}
+
+#[test]
+fn workspace_d1_shared_overlay_rejects_bad_domains_without_disclosure() {
+    let (template, production) = workspace_d1_overlay_documents();
+    for invalid in [
+        "",
+        "*.example.com",
+        "sender.example.com,sender.example.com",
+        "sender.example.com,SENDER.EXAMPLE.COM",
+        "bad_label.example.com",
+        "https://sender.example.com",
+        "sender.example.com/path",
+        "security@sender.example.com",
+        "sender.example.com:443",
+        "sender.example.com, relay.example.org",
+        "sender.example.com\n",
+        ".sender.example.com",
+        "sender.example.com.",
+        "sender.example.com,,relay.example.org",
+    ] {
+        let mut rejected = production.clone();
+        rejected["vars"]["MAILDESK_VERIFIED_SENDER_DOMAINS"] = json!(invalid);
+        let error = worker_deployment::normalize_workspace_d1_private_config(
+            &mut rejected,
+            &template,
+            "DB",
+        )
+        .expect_err("invalid domain overlay must fail")
+        .to_string();
+        assert!(invalid.is_empty() || !error.contains(invalid));
+    }
+}
+
+#[test]
+fn workspace_d1_shared_overlay_closes_selected_identity_shape() {
+    let (template, production) = workspace_d1_overlay_documents();
+    let mut preview_free = production.clone();
+    assert!(
+        worker_deployment::normalize_workspace_d1_private_config(
+            &mut preview_free,
+            &template,
+            "DB"
+        )
+        .is_ok()
+    );
+
     for preview in [
         "22222222-2222-4222-8222-222222222222",
         "not-a-canonical-uuid",
     ] {
-        let production: toml::Value = toml::from_str(&format!(
-            r#"
-name = "production-worker"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "production-db"
-database_id = "11111111-1111-4111-8111-111111111111"
-preview_database_id = "{preview}"
-"#
-        ))
-        .expect("production");
-        assert!(production_identity(&production, "DB").is_err());
+        let mut rejected = production.clone();
+        rejected["d1_databases"][0]["preview_database_id"] = json!(preview);
+        assert!(
+            worker_deployment::normalize_workspace_d1_private_config(
+                &mut rejected,
+                &template,
+                "DB"
+            )
+            .is_err()
+        );
     }
+
+    let mut extra = production;
+    extra["d1_databases"][0]["unowned"] = json!(true);
+    worker_deployment::normalize_workspace_d1_private_config(&mut extra, &template, "DB")
+        .expect("validate selected identity without hiding extras");
+    assert_ne!(extra, template);
 }

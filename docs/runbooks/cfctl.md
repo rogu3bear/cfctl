@@ -546,7 +546,12 @@ All mutating repository operations bind an exact Wrangler version, the ignored p
 path and D1 binding, a fresh pre-change bookmark, and a separately approved
 exact-bookmark recovery capability. The production config must be a regular
 mode-restricted file and may differ from its tracked template only in the
-allowed Worker and D1 identity fields. A deployable production Worker binding
+closed private fields plus the operation's exact selected Worker/D1 identity.
+The planned database binding selects that one entry for both planning and
+launch: its production Worker name and `database_name` may differ from template
+sentinels, while its canonical `database_id` and optional equal
+`preview_database_id` remain the selected operational identity. Nonselected
+bindings and other selected-entry fields remain exact. A deployable production Worker binding
 may omit `preview_database_id`; an isolated preview database belongs in its own
 repository-declared Wrangler config and operation. If a production binding
 does declare `preview_database_id`, cfctl requires a canonical UUID equal to
@@ -1094,16 +1099,55 @@ older cfctl build does not preserve it.
 The selected config ordinarily must be an exact tracked `HEAD` blob. A private
 role config named `wrangler.<role>.production.toml` may instead remain ignored
 only when it is a regular mode-`0600` file next to the exact tracked
-`wrangler.<role>.toml` template. The two parsed documents must be identical
-after replacing canonical lowercase `d1_databases[].database_id` values with
-the matching tracked binding values; Worker name, entry point, assets,
-bindings, queues, buckets, variables, compatibility settings, and every other
-field remain exact tracked authority. The plan records the private-config hash
-and tracked-template path/hash without retaining a database ID. Execution
-recomputes the same closed overlay and fails before Wrangler if either file,
-the source commit, or an artifact drifts. An arbitrary ignored config, a
-broader private difference, permissive file mode, missing template, or
-noncanonical database ID remains blocked.
+`wrangler.<role>.toml` template. The two parsed documents must become identical
+after normalizing exactly this closed overlay: canonical lowercase
+`d1_databases[].database_id` values to their matching tracked bindings; bounded
+canonical `send_email[].allowed_sender_addresses`; the separate
+`MAILDESK_INBOUND_RELAY_MODE` and `MAILDESK_REPLY_RELAY_MODE` values when each
+is exactly `disabled` or `enabled`; and
+`vars.MAILDESK_VERIFIED_SENDER_DOMAINS`. The tracked template must explicitly
+declare that last key as `""`, while the private production file must materialize
+a non-empty comma-separated list of no more than 256 canonical lowercase DNS
+domains and 4,096 bytes. Wildcards, addresses, schemes, paths, ports,
+whitespace or control characters, leading or trailing dots, empty or malformed
+labels, empty members, and duplicates after lowercase normalization are
+rejected. Worker name, entry point, assets, all unrelated variables and
+bindings, queues, buckets, compatibility settings, and every other field
+remain exact tracked authority.
+
+Normalization is used only for the final parsed-document equality check. The
+plan's config, settings, and bindings identities continue to derive from the
+actual materialized private production document; the target retains only its
+hash plus the tracked-template path/hash. Private database IDs, sender
+addresses, verified-sender domains, and split-relay values never enter retained
+subprocess output. The plan labels config authority explicitly as
+`exact_head_blob` or `private_d1_identity_overlay`; execution never infers that
+authority from a filename. Immediately before private launch, cfctl opens the
+config and exact planned template with no-follow semantics, captures each
+bounded byte set once, and hashes and parses only those bytes. Both must match
+their planned identities before cfctl writes a private temporary config beside
+the original so Wrangler preserves
+relative path semantics without reopening the mutable source pathname. The
+temporary config remains owned until the complete child is reaped and is then
+removed.
+
+For that private execution lane, stdout and stderr are never persisted or
+returned, regardless of encoding or subprocess exit status. cfctl projects only
+the typed fields required by the operation: a canonical lowercase UUID Worker version identity,
+the exact deployment-status match, the exact version/message match, or the
+closed workspace-D1 query rows. Apply receipts retain only categorical status,
+exit disposition, config hash, and the explicit fact that provider output was
+not retained. Parse failures remain value-opaque. Generic delegated reads,
+tracked public configs, and configless service verification retain their
+ordinary diagnostic behavior. A workspace-D1 plan's separately governed
+selected database ID remains an operational target identity; this promise
+covers private subprocess representations, not that explicit plan selector.
+Execution fails before Wrangler when the captured bytes do not match the
+reviewed content identity, the closed overlay is invalid, the source commit or
+artifact drifted, or the private execution file cannot preserve the captured
+bytes. An arbitrary ignored config, a broader private difference, permissive
+file mode, missing or non-empty template sentinel, empty private domain list,
+or noncanonical closed-overlay value remains blocked.
 
 Artifact roots may be shared directories outside the config directory only
 when their canonical paths remain inside the same registered repository as the

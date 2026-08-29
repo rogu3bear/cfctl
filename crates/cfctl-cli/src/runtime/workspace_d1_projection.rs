@@ -5,9 +5,9 @@ use tokio::time::Duration;
 
 use super::{
     prelude::{
-        AuthCredential, BTreeMap, CallInput, CapabilityV1, CatalogSnapshot, CliError, OpenOptions,
-        OpenOptionsExt, Path, PathBuf, PermissionsExt, PlanV1, ProfileMetadata, Read, Result,
-        StateStore, Uuid, Write,
+        AuthCredential, BTreeMap, BTreeSet, CallInput, CapabilityV1, CatalogSnapshot, CliError,
+        OpenOptions, OpenOptionsExt, Path, PathBuf, PermissionsExt, PlanV1, ProfileMetadata, Read,
+        Result, StateStore, Uuid, Write,
     },
     read_execution::credential_generation_for_read,
     support::cli_io,
@@ -19,6 +19,91 @@ const TARGET_KEY: &str = "workspace_d1_policy_projection";
 const QUERY_TIMEOUT: Duration = Duration::from_mins(2);
 const APPLY_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_PROJECTION_BYTES: u64 = 64 * 1024 * 1024;
+
+pub(super) fn project_private_query_rows(
+    sql: &str,
+    rows: &[Map<String, Value>],
+) -> Option<Result<()>> {
+    if sql.starts_with("SELECT COUNT(*) AS route_count ") {
+        return Some((|| {
+            if rows.len() != 1 {
+                return Err(CliError::Input(
+                    "private D1 route-count readback had invalid cardinality".to_owned(),
+                ));
+            }
+            exact_row_fields(&rows[0], &["route_count"])?;
+            if rows[0].get("route_count").and_then(Value::as_u64).is_none() {
+                return Err(CliError::Input(
+                    "private D1 route-count readback had an invalid value".to_owned(),
+                ));
+            }
+            Ok(())
+        })());
+    }
+    if sql.starts_with("SELECT ")
+        && sql.contains(" AS state_key, ")
+        && sql.contains(" AS state_value FROM ")
+    {
+        return Some((|| {
+            let expected_keys = projected_state_keys(sql).ok_or_else(|| {
+                CliError::Input("private D1 runtime-state query contract was invalid".to_owned())
+            })?;
+            if rows.len() > 3 {
+                return Err(CliError::Input(
+                    "private D1 runtime-state readback exceeded its closed row limit".to_owned(),
+                ));
+            }
+            for row in rows {
+                exact_row_fields(row, &["state_key", "state_value"])?;
+                let key = row
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        CliError::Input("private D1 runtime-state key was invalid".to_owned())
+                    })?;
+                let value = row
+                    .get("state_value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        CliError::Input("private D1 runtime-state value was invalid".to_owned())
+                    })?;
+                if key.is_empty()
+                    || key.len() > 128
+                    || !expected_keys.contains(key)
+                    || value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(CliError::Input(
+                        "private D1 runtime-state readback was outside its closed value contract"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(())
+        })());
+    }
+    None
+}
+
+fn projected_state_keys(sql: &str) -> Option<BTreeSet<String>> {
+    let values = sql.split_once(" IN ('")?.1.split_once("') ORDER BY ")?.0;
+    let keys = values
+        .split("','")
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    (keys.len() == 3 && keys.iter().all(|key| !key.is_empty() && key.len() <= 128)).then_some(keys)
+}
+
+fn exact_row_fields(row: &Map<String, Value>, expected: &[&str]) -> Result<()> {
+    if row.len() != expected.len() || expected.iter().any(|field| !row.contains_key(*field)) {
+        return Err(CliError::Input(
+            "private D1 policy readback contained an unowned field".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 pub(super) fn load(store: &StateStore, capability_id: &str) -> Result<Option<CapabilityV1>> {
     Ok(
@@ -187,6 +272,7 @@ pub(super) async fn run(
     let target = target(plan)?;
     let database_name = target_string(target, "database_name")?;
     let config = target_string(target, "production_config")?;
+    let config_sha256 = target_string(target, "production_config_sha256")?;
     let stage = private_stage(target)?;
     let stage_path = private_stage_path(store, stage)?;
 
@@ -207,7 +293,7 @@ pub(super) async fn run(
             contract.wrangler_version, observed_version
         )));
     }
-    let apply = workspace_d1_migration::run_wrangler(
+    let apply = workspace_d1_migration::run_wrangler_with_config_identity(
         &[
             "d1".to_owned(),
             "execute".to_owned(),
@@ -223,6 +309,9 @@ pub(super) async fn run(
         &plan.account_id,
         &store.paths().cache_dir,
         APPLY_TIMEOUT,
+        config_sha256,
+        &contract.config_template_sha256,
+        &contract.database_binding,
     )
     .await?;
     Ok(json!({
@@ -301,6 +390,7 @@ async fn verify_inner_with_authority(
     let target = target(plan)?;
     let database_name = target_string(target, "database_name")?;
     let config = target_string(target, "production_config")?;
+    let config_sha256 = target_string(target, "production_config_sha256")?;
     let root = Path::new(&contract.repository_root);
     let policy_sha = target_string(target, "policy_sha256")?;
     let desired_sha = target_string(target, "desired_state_sha256")?;
@@ -312,14 +402,17 @@ async fn verify_inner_with_authority(
             CliError::Input("workspace D1 target omitted expected_route_count".to_owned())
         })?;
     let count_sql = route_count_sql(contract, policy_sha)?;
-    let count_rows = workspace_d1_migration::execute_json_query(
+    let count_rows = workspace_d1_migration::execute_json_query_with_config_identity(
         database_name,
+        &contract.database_binding,
         config,
         &count_sql,
         root,
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        config_sha256,
+        &contract.config_template_sha256,
     )
     .await?;
     let observed_count = count_rows
@@ -338,14 +431,17 @@ async fn verify_inner_with_authority(
         desired_key = state_key(&contract.desired_state_digest_key)?,
         projection_key = state_key(&contract.projection_digest_key)?,
     );
-    let state_rows = workspace_d1_migration::execute_json_query(
+    let state_rows = workspace_d1_migration::execute_json_query_with_config_identity(
         database_name,
+        &contract.database_binding,
         config,
         &state_sql,
         root,
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        config_sha256,
+        &contract.config_template_sha256,
     )
     .await?;
     let observed = state_rows

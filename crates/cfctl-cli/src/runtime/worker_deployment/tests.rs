@@ -29,6 +29,26 @@ fn every_local_worker_traffic_mutation_resolves_to_one_shared_lock_target() {
 }
 
 #[test]
+fn versions_promotion_requires_canonical_lowercase_worker_uuid() {
+    let canonical = "11111111-2222-3333-4444-555555555555";
+    let input = |argument: &str| CallInput {
+        query: json!({"argument": argument}),
+        ..CallInput::default()
+    };
+    assert_eq!(
+        versions_deploy_version_id(&input(&format!("{canonical}@100"))).expect("canonical UUID"),
+        canonical
+    );
+    for rejected in [
+        "11111111-2222-3333-4444-55555555555A@100",
+        "{11111111-2222-3333-4444-555555555555}@100",
+        "73656e6465722e707269766174652e6578616d706c65@100",
+    ] {
+        assert!(versions_deploy_version_id(&input(rejected)).is_err());
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn config_selector_rejects_symlink_provenance_before_canonicalization() {
     use std::os::unix::fs::symlink;
@@ -133,6 +153,22 @@ fn artifact_hash_matches_the_repository_shell_contract() {
 }
 
 #[test]
+fn tracked_template_capture_is_one_handle_and_byte_immutable() {
+    let root = tempfile::tempdir().expect("template capture root");
+    let template = root.path().join("wrangler.toml");
+    let original = b"name = \"reviewed\"\n";
+    fs::write(&template, original).expect("reviewed template");
+    let captured = capture_regular_config_bytes(&template, "tracked Worker template")
+        .expect("single-handle template capture");
+    fs::write(&template, b"name = \"transient\"\n").expect("transient template replacement");
+    fs::write(&template, original).expect("restore reviewed template");
+    assert_eq!(
+        captured, original,
+        "A-B-A pathname changes cannot retarget captured bytes"
+    );
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one executable repository fixture proves upload and promotion projections share exact source authority"
@@ -147,8 +183,10 @@ fn target_binds_clean_source_config_service_and_complete_artifact() {
     fs::write(build.join("_worker.js"), "worker\n").expect("worker");
     fs::write(build.join("index.wasm"), b"wasm").expect("wasm");
     fs::write(site.join("index.html"), "site\n").expect("site");
-    let config = worker.join("wrangler.toml");
-    let config_text = "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n";
+    let template = root.path().join("wrangler.site.toml");
+    let config = root.path().join("wrangler.site.production.toml");
+    let config_text = "name = \"cfctl-site\"\nmain = \"cloudflare/site/build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n";
+    fs::write(&template, config_text).expect("tracked role template");
     fs::write(&config, config_text).expect("config");
     assert!(
         Command::new("git")
@@ -216,6 +254,20 @@ fn target_binds_clean_source_config_service_and_complete_artifact() {
     assert_eq!(projection["service_name"], "cfctl-site");
     assert_eq!(projection["source_sha"], source_sha);
     assert_eq!(projection["artifact"]["sha256"], artifact_sha256);
+    assert_eq!(projection["config"]["authority"], "exact_head_blob");
+    let planned = planned_config_execution(&json!({"worker_deployment": projection.clone()}))
+        .expect("planned public config")
+        .expect("public config authority");
+    assert!(matches!(planned, PlannedConfigExecution::Public { .. }));
+    assert!(
+        bind_planned_config_path_for_execution(
+            &config.canonicalize().expect("canonical public config"),
+            &planned,
+        )
+        .expect("public execution binding")
+        .is_none(),
+        "tracked public production configs must retain ordinary output"
+    );
     assert!(projection["config"]["settings_sha256"].as_str().is_some());
     assert!(projection["config"]["bindings_sha256"].as_str().is_some());
     assert_eq!(projection["execution"]["supported"], true);
@@ -248,10 +300,22 @@ fn target_binds_clean_source_config_service_and_complete_artifact() {
         .find(|source| source.path == config.canonicalize().unwrap())
         .expect("config source");
     config_source.head_content_hash = None;
+    // Isolate the public exact-HEAD branch: a clean source without a HEAD blob
+    // is intentionally eligible for the ignored private-overlay lane.
+    config_source.dirty = true;
     let missing_blob = prepare_target(&missing_blob_graph, &capability, &input)
         .expect_err("config without an exact HEAD blob must fail")
         .to_string();
-    assert!(missing_blob.contains("does not match an exact Git HEAD blob"));
+    assert_eq!(
+        missing_blob,
+        format!(
+            "Wrangler configuration `{}` does not match an exact Git HEAD blob",
+            config
+                .canonicalize()
+                .expect("canonical public config")
+                .display()
+        )
+    );
 
     fs::write(&config, format!("# changed after discovery\n{config_text}"))
         .expect("mutate config after workspace discovery");
@@ -311,7 +375,7 @@ fn target_binds_clean_source_config_service_and_complete_artifact() {
     ));
     fs::write(
             &config,
-            "name = \"retargeted-service\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n",
+            "name = \"retargeted-service\"\nmain = \"cloudflare/site/build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
         )
         .expect("retarget config after approval");
     let mut delegated_boundary_crossed = false;
@@ -333,11 +397,7 @@ fn target_binds_clean_source_config_service_and_complete_artifact() {
     assert_eq!(promotion_plan.status, PlanStatus::Approved);
     assert_eq!(configless_input.query["name"], "cfctl-site");
     assert!(configless_input.query.get("config").is_none());
-    fs::write(
-            &config,
-            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"../../target/site\"\n",
-        )
-        .expect("restore config for artifact drift proof");
+    fs::write(&config, config_text).expect("restore config for artifact drift proof");
 
     fs::write(site.join("index.html"), "drift\n").expect("artifact drift");
     let error = prepare_target(&graph, &capability, &input)
@@ -367,6 +427,7 @@ main = "build/worker.js"
 [vars]
 MAILDESK_INBOUND_RELAY_MODE = "disabled"
 MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
 
 [[d1_databases]]
 binding = "MAILDESK_DB"
@@ -381,6 +442,10 @@ database_id = "00000000-0000-4000-8000-000000000000"
         .replace(
             "MAILDESK_INBOUND_RELAY_MODE = \"disabled\"",
             "MAILDESK_INBOUND_RELAY_MODE = \"enabled\"",
+        )
+        .replace(
+            "MAILDESK_VERIFIED_SENDER_DOMAINS = \"\"",
+            "MAILDESK_VERIFIED_SENDER_DOMAINS = \"sender.example.com\"",
         );
     fs::write(&template, template_text).expect("tracked template");
     fs::write(&private, &private_text).expect("private config");
@@ -477,20 +542,42 @@ database_id = "00000000-0000-4000-8000-000000000000"
             .contains("11111111-1111-4111-8111-111111111111"),
         "private D1 identity escaped into the plan target"
     );
+    assert!(
+        !serde_json::to_string(&projection)
+            .expect("projection JSON")
+            .contains("sender.example.com"),
+        "private verified-sender domain escaped into the plan target"
+    );
 
     let adapter_targets = json!({"worker_deployment": projection.clone()});
-    fs::write(
-        &private,
-        template_text.replace(
-            "00000000-0000-4000-8000-000000000000",
-            "22222222-2222-4222-8222-222222222222",
-        ),
-    )
-    .expect("drift private D1 identity");
+    let changed_allowlist = private_text.replace("sender.example.com", "relay.example.com");
+    fs::write(&private, &changed_allowlist).expect("drift private verified-sender allowlist");
+    let changed_graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("changed-allowlist graph");
+    let changed_projection = prepare_target(&changed_graph, &capability, &input)
+        .expect("changed private production projection")
+        .expect("changed Worker projection");
+    assert_ne!(
+        projection["config"]["sha256"], changed_projection["config"]["sha256"],
+        "actual private-config hash must bind verified-sender allowlist changes"
+    );
+    assert_eq!(
+        projection["config"]["settings_sha256"], changed_projection["config"]["settings_sha256"],
+        "a Worker variable change must not alter the settings projection"
+    );
+    assert_ne!(
+        projection["config"]["bindings_sha256"], changed_projection["config"]["bindings_sha256"],
+        "the bindings hash must consume the materialized private allowlist"
+    );
+    let changed_json = serde_json::to_string(&changed_projection).expect("changed projection JSON");
+    assert!(!changed_json.contains("sender.example.com"));
+    assert!(!changed_json.contains("relay.example.com"));
     let error = validate_current_target(&graph, &capability, &input, &adapter_targets)
         .expect_err("private config whose hash drifted after planning must fail")
         .to_string();
     assert!(error.contains("drifted after workspace discovery"));
+    assert!(!error.contains("sender.example.com"));
+    assert!(!error.contains("relay.example.com"));
 
     fs::write(
         &private,
@@ -502,9 +589,7 @@ database_id = "00000000-0000-4000-8000-000000000000"
     let error = prepare_target(&forbidden_graph, &capability, &input)
         .expect_err("private config with extra field must fail")
         .to_string();
-    assert!(error.contains(
-        "outside canonical D1 identity, sender restriction, and split relay activation fields"
-    ));
+    assert!(error.contains("outside the closed private-config overlay"));
 
     for mode in [0o644, 0o400] {
         fs::write(&private, &private_text).expect("restore private config");
@@ -535,6 +620,7 @@ enabled = true
 [vars]
 MAILDESK_INBOUND_RELAY_MODE = "disabled"
 MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
 
 [[d1_databases]]
 binding = "MAILDESK_DB"
@@ -551,6 +637,7 @@ enabled = true
 [vars]
 MAILDESK_INBOUND_RELAY_MODE = "enabled"
 MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = "sender.example.com"
 
 [[d1_databases]]
 binding = "MAILDESK_DB"
@@ -616,6 +703,9 @@ send_email = [
   { name = "EMAIL" }
 ]
 
+[vars]
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
+
 [[d1_databases]]
 binding = "MAILDESK_DB"
 database_name = "relay-db"
@@ -629,6 +719,9 @@ main = "build/worker.js"
 send_email = [
   { name = "EMAIL", allowed_sender_addresses = ["security@example.com"] }
 ]
+
+[vars]
+MAILDESK_VERIFIED_SENDER_DOMAINS = "sender.example.com"
 
 [[d1_databases]]
 binding = "MAILDESK_DB"
@@ -658,6 +751,115 @@ database_id = "11111111-1111-4111-8111-111111111111"
     assert_ne!(
         forbidden, template,
         "unrelated binding drift must remain visible"
+    );
+}
+
+#[test]
+fn private_config_normalizes_only_bounded_canonical_verified_sender_domains() {
+    let parse = |text: &str| {
+        let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
+        serde_json::to_value(document).expect("Wrangler JSON")
+    };
+    let template = parse(
+        r#"name = "relay-router"
+main = "build/worker.js"
+
+[vars]
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "00000000-0000-4000-8000-000000000000"
+"#,
+    );
+    let production = |allowlist: &str| {
+        parse(&format!(
+            r#"name = "relay-router"
+main = "build/worker.js"
+
+[vars]
+MAILDESK_VERIFIED_SENDER_DOMAINS = "{allowlist}"
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "relay-db"
+database_id = "11111111-1111-4111-8111-111111111111"
+"#
+        ))
+    };
+
+    for allowlist in ["sender.example.com", "sender.example.com,relay.example.org"] {
+        let mut allowed = production(allowlist);
+        normalize_private_d1_identity(&mut allowed, &template).expect("normalize allowlist");
+        assert_eq!(allowed, template);
+    }
+
+    let too_many = std::iter::repeat_n("sender.example.com", 257)
+        .collect::<Vec<_>>()
+        .join(",");
+    let too_large = format!("{}.example.com", "a".repeat(4_084));
+    for invalid in [
+        "",
+        "*.example.com",
+        "sender.example.com,sender.example.com",
+        "sender.example.com,SENDER.EXAMPLE.COM",
+        "-sender.example.com",
+        "sender-.example.com",
+        "sender..example.com",
+        "https://sender.example.com",
+        "sender.example.com/path",
+        "security@sender.example.com",
+        "sender.example.com:443",
+        " sender.example.com",
+        "sender.example.com\t",
+        ".sender.example.com",
+        "sender.example.com.",
+        "sender.example.com,,relay.example.com",
+        &too_many,
+        &too_large,
+    ] {
+        let mut rejected = production("sender.example.com");
+        rejected["vars"]["MAILDESK_VERIFIED_SENDER_DOMAINS"] = json!(invalid);
+        let error = normalize_private_d1_identity(&mut rejected, &template)
+            .expect_err("invalid verified-sender allowlist must fail")
+            .to_string();
+        if !invalid.is_empty() {
+            assert!(
+                !error.contains(invalid),
+                "private allowlist escaped in error"
+            );
+        }
+    }
+
+    let mut missing_key_template = template.clone();
+    missing_key_template["vars"]
+        .as_object_mut()
+        .expect("template vars")
+        .remove("MAILDESK_VERIFIED_SENDER_DOMAINS");
+    assert!(
+        normalize_private_d1_identity(
+            &mut production("sender.example.com"),
+            &missing_key_template,
+        )
+        .is_err()
+    );
+
+    let mut unrelated = production("sender.example.com");
+    unrelated["vars"]["UNRELATED_PRIVATE_VAR"] = json!("forbidden");
+    normalize_private_d1_identity(&mut unrelated, &template)
+        .expect("normalize only closed overlay");
+    assert_ne!(
+        unrelated, template,
+        "unrelated private variable must remain visible"
+    );
+
+    let first = production("sender.example.com");
+    let second = production("relay.example.com");
+    assert_ne!(
+        hash_value(&first).expect("first private hash"),
+        hash_value(&second).expect("second private hash"),
+        "actual private document hash must change with the allowlist"
     );
 }
 

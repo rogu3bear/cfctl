@@ -86,6 +86,490 @@ pub(super) fn security_action_create_capability() -> CapabilityV1 {
     capability
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end security regression proves private representations remain absent across subprocess receipts, retained evidence, verification, result envelopes, collision failures, immutable staging, and pre-launch drift rejection"
+)]
+pub(super) async fn private_worker_output_is_redacted_before_retained_surfaces() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const PRIVATE_D1: &str = "11111111-1111-4111-8111-111111111111";
+    const PRIVATE_SENDER: &str = "security@private.example";
+    const PRIVATE_DOMAINS: &str = "sender.private.example,relay.private.example";
+    const VERSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let root = tempfile::tempdir().expect("private Worker boundary root");
+    let template = root.path().join("wrangler.mail-router.toml");
+    let production = root.path().join("wrangler.mail-router.production.toml");
+    std::fs::write(
+        &template,
+        r#"name = "relay-router"
+main = "worker.js"
+
+send_email = [
+  { name = "EMAIL" }
+]
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "disabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "maildesk"
+database_id = "00000000-0000-4000-8000-000000000000"
+"#,
+    )
+    .expect("tracked template");
+    std::fs::write(
+        &production,
+        format!(
+            r#"name = "relay-router"
+main = "worker.js"
+
+send_email = [
+  {{ name = "EMAIL", allowed_sender_addresses = ["{PRIVATE_SENDER}"] }}
+]
+
+[vars]
+MAILDESK_INBOUND_RELAY_MODE = "enabled"
+MAILDESK_REPLY_RELAY_MODE = "disabled"
+MAILDESK_VERIFIED_SENDER_DOMAINS = "{PRIVATE_DOMAINS}"
+
+[[d1_databases]]
+binding = "MAILDESK_DB"
+database_name = "maildesk"
+database_id = "{PRIVATE_D1}"
+"#
+        ),
+    )
+    .expect("private production config");
+    std::fs::set_permissions(&production, std::fs::Permissions::from_mode(0o600))
+        .expect("private production mode");
+    std::fs::write(
+        root.path().join(".gitignore"),
+        "wrangler.mail-router.production.toml\n",
+    )
+    .expect("private production ignore");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(root.path())
+            .status()
+            .expect("git init")
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", ".gitignore", "wrangler.mail-router.toml"])
+            .current_dir(root.path())
+            .status()
+            .expect("git add tracked template")
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=cfctl test",
+                "-c",
+                "user.email=cfctl-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(root.path())
+            .status()
+            .expect("git commit tracked template")
+            .success()
+    );
+
+    let success_program = root.path().join("fake-wrangler-success.sh");
+    std::fs::write(
+        &success_program,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' \
+  'upload complete' \
+  'Current Version ID: {VERSION_ID}' \
+  'D1=({PRIVATE_D1}),{PRIVATE_D1}' \
+  'allowed_sender_addresses=["{PRIVATE_SENDER}"] encoded=security%40private.example' \
+  'MAILDESK_VERIFIED_SENDER_DOMAINS="{PRIVATE_DOMAINS}" again={PRIVATE_DOMAINS}' \
+  '| MAILDESK_INBOUND_RELAY_MODE | enabled |' \
+  '| MAILDESK_REPLY_RELAY_MODE | disabled |'
+printf '%s\n' \
+  'D1=({PRIVATE_D1}),{PRIVATE_D1}' \
+  'allowed_sender_addresses=["{PRIVATE_SENDER}"] encoded=security%40private.example' \
+  'MAILDESK_VERIFIED_SENDER_DOMAINS="{PRIVATE_DOMAINS}" again={PRIVATE_DOMAINS}' \
+  '| MAILDESK_INBOUND_RELAY_MODE | enabled |' \
+  '{{"MAILDESK_REPLY_RELAY_MODE":"disabled","ordinary":"diagnostic"}}' \
+  '{{"name":"MAILDESK_INBOUND_RELAY_MODE","value":"enabled"}}' \
+  '["MAILDESK_REPLY_RELAY_MODE","disabled"]' \
+  '{{"diagnostic":"MAILDESK_INBOUND_RELAY_MODE=enabled"}}' \
+  'MAILDESK_REPLY_RELAY_MODE' \
+  'disabled' \
+  'base64=c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==' \
+  'hex=73656e6465722e707269766174652e6578616d706c65' \
+  'punctuation:[sender.private.example];relay.private.example' \
+  'credential=fixture-token' >&2
+"#
+        ),
+    )
+    .expect("fake Wrangler");
+    std::fs::set_permissions(&success_program, std::fs::Permissions::from_mode(0o700))
+        .expect("fake Wrangler mode");
+    let cache = root.path().join("cache");
+    std::fs::create_dir(&cache).expect("cache root");
+    let mut capability =
+        CapabilityV1::new("wrangler.deploy", "deploy Worker", "CLI", "wrangler deploy");
+    capability.method = "CLI".to_owned();
+    capability.adapter_status = AdapterStatus::DelegatedCli;
+    let input = CallInput {
+        selectors: json!({}),
+        query: json!({"config": production.canonicalize().expect("canonical private config")}),
+        ..CallInput::default()
+    };
+    let credential = AuthCredential::Bearer {
+        token: "fixture-token".to_owned(),
+    };
+    let planned = worker_deployment::PlannedConfigExecution::Private {
+        path: production.canonicalize().expect("canonical private config"),
+        sha256: hex::encode(Sha256::digest(
+            std::fs::read(&production).expect("private bytes"),
+        )),
+        template_path: template.canonicalize().expect("canonical template"),
+        template_sha256: hex::encode(Sha256::digest(
+            std::fs::read(&template).expect("template bytes"),
+        )),
+    };
+    let receipt = super::run_delegated_cli_with_private_config_identity(
+        &capability,
+        &input,
+        &credential,
+        Some("fixture-account"),
+        &cache,
+        Some(&success_program),
+        Some(Path::new("/bin/sh")),
+        Some(&planned),
+    )
+    .await
+    .expect("private Worker boundary receipt");
+    assert_eq!(receipt["success"], true);
+    assert_eq!(receipt["exit_status"], 0);
+    assert_eq!(receipt["stdout"], "");
+    assert_eq!(receipt["stderr"], "");
+    assert_eq!(
+        receipt["structured_output"]["produced_version_id"],
+        VERSION_ID
+    );
+    assert_eq!(
+        receipt["structured_output"]["provider_output_retained"],
+        false
+    );
+    assert!(
+        receipt["structured_output"]["diagnostic"]
+            .as_str()
+            .expect("safe categorical diagnostic")
+            .contains("completed")
+    );
+
+    let private_values = [
+        PRIVATE_D1,
+        PRIVATE_SENDER,
+        PRIVATE_DOMAINS,
+        "sender.private.example",
+        "relay.private.example",
+        "security%40private.example",
+        "enabled",
+        "disabled",
+        "fixture-token",
+        "c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==",
+        "73656e6465722e707269766174652e6578616d706c65",
+    ];
+    let assert_absent = |label: &str, value: &Value| {
+        let rendered = serde_json::to_string(value).expect("retained JSON");
+        for private in private_values {
+            assert!(
+                !rendered.contains(private),
+                "{label} retained private material"
+            );
+        }
+    };
+    assert_absent("subprocess receipt", &receipt);
+
+    let collision_program = root.path().join("fake-wrangler-version-collision.sh");
+    std::fs::write(
+        &collision_program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' 'Current Version ID: {PRIVATE_D1}' 'Worker Version ID: {PRIVATE_D1}'\n"
+        ),
+    )
+    .expect("private Worker version-collision fixture");
+    std::fs::set_permissions(&collision_program, std::fs::Permissions::from_mode(0o700))
+        .expect("private Worker version-collision fixture mode");
+    for capability_id in ["wrangler.deploy", "wrangler.versions-upload"] {
+        let collision_path = capability_id.replace('.', " ");
+        let mut collision_capability = CapabilityV1::new(
+            capability_id,
+            "private Worker collision probe",
+            "CLI",
+            &collision_path,
+        );
+        collision_capability.method = "CLI".to_owned();
+        collision_capability.adapter_status = AdapterStatus::DelegatedCli;
+        let collision = super::run_delegated_cli_with_private_config_identity(
+            &collision_capability,
+            &input,
+            &credential,
+            Some("fixture-account"),
+            &cache,
+            Some(&collision_program),
+            Some(Path::new("/bin/sh")),
+            Some(&planned),
+        )
+        .await
+        .expect("private Worker collision receipt");
+        assert_eq!(collision["success"], false);
+        assert_eq!(collision["stdout"], "");
+        assert_eq!(collision["stderr"], "");
+        assert_absent("private Worker collision receipt", &collision);
+    }
+
+    let state = tempfile::tempdir().expect("state root");
+    let store = StateStore::open(RuntimePaths::from_root(state.path())).expect("state store");
+    let evidence = store
+        .write_evidence(EvidenceClass::Apply, &receipt)
+        .expect("Apply evidence");
+    let retained = store
+        .read_evidence_value(&evidence.content_hash)
+        .expect("retained Apply evidence");
+    assert_absent("Apply evidence", &retained);
+    let verification = json!({
+        "passed": true,
+        "basis": "typed private Wrangler projection matched the reviewed version",
+        "version_id": receipt["structured_output"]["produced_version_id"],
+        "provider_output_retained": false,
+    });
+    let verification_evidence = store
+        .write_evidence(EvidenceClass::PostChangeVerification, &verification)
+        .expect("PostChangeVerification evidence");
+    assert_absent(
+        "PostChangeVerification evidence",
+        &store
+            .read_evidence_value(&verification_evidence.content_hash)
+            .expect("retained PostChangeVerification evidence"),
+    );
+    let envelope = ResultEnvelopeV2::success("plans run", receipt.clone()).with_evidence(evidence);
+    assert_absent(
+        "result envelope",
+        &serde_json::to_value(envelope).expect("envelope JSON"),
+    );
+
+    let failure_program = root.path().join("fake-wrangler-failure.sh");
+    std::fs::write(
+        &failure_program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{PRIVATE_D1}' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' 'c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==' >&2\nexit 9\n"
+        ),
+    )
+    .expect("failing fake Wrangler");
+    std::fs::set_permissions(&failure_program, std::fs::Permissions::from_mode(0o700))
+        .expect("failing fake Wrangler mode");
+    let failed = super::run_delegated_cli_with_private_config_identity(
+        &capability,
+        &input,
+        &credential,
+        Some("fixture-account"),
+        &cache,
+        Some(&failure_program),
+        Some(Path::new("/bin/sh")),
+        Some(&planned),
+    )
+    .await
+    .expect("failed private Worker boundary receipt");
+    assert_eq!(failed["success"], false);
+    assert_eq!(failed["exit_status"], 9);
+    assert_eq!(failed["stdout"], "");
+    assert_eq!(failed["stderr"], "");
+    assert_absent("failed subprocess receipt", &failed);
+
+    let bound =
+        worker_deployment::bind_private_config_for_execution(&capability, &input, Some(&planned))
+            .expect("bind private execution config")
+            .expect("private binding");
+
+    let verification_stdout = format!(
+        r#"{{"deployments":[{{"version_id":"{VERSION_ID}","percentage":100}}],"name":"MAILDESK_INBOUND_RELAY_MODE","value":"enabled","private":"{PRIVATE_D1}","encoded":"c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ=="}}"#
+    );
+    let status_projection = super::private_deployment_status_projection(
+        true,
+        Some(0),
+        verification_stdout.as_bytes(),
+        VERSION_ID,
+        &bound,
+    );
+    assert_eq!(status_projection["passed"], true);
+    assert_absent("deployment-status projection", &status_projection);
+    let version_id = "22222222-2222-4222-8222-222222222222";
+    let expected_message = "source=abc artifact-sha256=def";
+    let version_stdout = format!(
+        r#"{{"id":"{version_id}","annotations":{{"workers/message":"{expected_message}"}},"private":"{PRIVATE_SENDER}","nested":"MAILDESK_REPLY_RELAY_MODE=disabled","hex":"73656e6465722e707269766174652e6578616d706c65"}}"#
+    );
+    let version_projection = super::private_version_projection(
+        true,
+        Some(0),
+        version_stdout.as_bytes(),
+        version_id,
+        expected_message,
+        &bound,
+    );
+    assert_eq!(version_projection["passed"], true);
+    assert_absent("version-view projection", &version_projection);
+    let opaque_parse_failure = super::private_version_projection(
+        true,
+        Some(0),
+        format!("not-json {PRIVATE_DOMAINS} enabled").as_bytes(),
+        version_id,
+        expected_message,
+        &bound,
+    );
+    assert_eq!(opaque_parse_failure["passed"], false);
+    assert_absent("opaque verifier parse failure", &opaque_parse_failure);
+
+    let status_collision = super::private_deployment_status_projection(
+        true,
+        Some(0),
+        format!(r#"{{"deployments":[{{"version_id":"{PRIVATE_D1}","percentage":100}}]}}"#)
+            .as_bytes(),
+        PRIVATE_D1,
+        &bound,
+    );
+    assert_eq!(status_collision["passed"], false);
+    assert_absent("deployment-status identity collision", &status_collision);
+    let version_collision = super::private_version_projection(
+        true,
+        Some(0),
+        format!(r#"{{"id":"{PRIVATE_D1}","annotations":{{"workers/message":"safe"}}}}"#).as_bytes(),
+        PRIVATE_D1,
+        "safe",
+        &bound,
+    );
+    assert_eq!(version_collision["passed"], false);
+    assert_absent("version-view identity collision", &version_collision);
+
+    let captured = std::fs::read(bound.path()).expect("captured immutable bytes");
+    let original = std::fs::read(&production).expect("original private config");
+    assert_eq!(captured, original);
+    std::fs::write(
+        &production,
+        "[vars]\nMAILDESK_VERIFIED_SENDER_DOMAINS = \"drift.example\"\n",
+    )
+    .expect("transient drift");
+    std::fs::write(&production, &original).expect("restore original bytes");
+    assert_eq!(
+        std::fs::read(bound.path()).expect("immutable execution bytes after A-B-A"),
+        captured,
+        "transient A-B-A changes to the source path cannot alter the staged execution bytes"
+    );
+    let private_alias = root.path().join("reviewed-private-alias.toml");
+    std::fs::write(&private_alias, &original).expect("private alias bytes");
+    std::fs::set_permissions(&private_alias, std::fs::Permissions::from_mode(0o600))
+        .expect("private alias mode");
+    let alias_path = private_alias
+        .canonicalize()
+        .expect("canonical private alias");
+    let alias_sha256 = hex::encode(Sha256::digest(&original));
+    let alias_template_path = template.canonicalize().expect("canonical alias template");
+    let alias_template_sha256 = hex::encode(Sha256::digest(
+        std::fs::read(&template).expect("alias template bytes"),
+    ));
+    let alias_plan = worker_deployment::PlannedConfigExecution::Private {
+        path: alias_path.clone(),
+        sha256: alias_sha256.clone(),
+        template_path: alias_template_path.clone(),
+        template_sha256: alias_template_sha256.clone(),
+    };
+    assert!(
+        worker_deployment::bind_planned_config_path_for_execution(
+            &private_alias.canonicalize().expect("canonical alias path"),
+            &alias_plan,
+        )
+        .expect("private alias binding")
+        .is_some(),
+        "private authority must remain opaque regardless of filename"
+    );
+    let bad_template_plan = worker_deployment::PlannedConfigExecution::Private {
+        path: alias_path.clone(),
+        sha256: alias_sha256.clone(),
+        template_path: alias_template_path,
+        template_sha256: "f".repeat(64),
+    };
+    assert!(
+        worker_deployment::bind_planned_config_path_for_execution(
+            &private_alias
+                .canonicalize()
+                .expect("canonical bad-template path"),
+            &bad_template_plan,
+        )
+        .is_err(),
+        "planned template-hash drift must fail before launch"
+    );
+    let template_alias = root.path().join("template-alias.toml");
+    std::os::unix::fs::symlink(&template, &template_alias).expect("template symlink");
+    let symlink_template_plan = worker_deployment::PlannedConfigExecution::Private {
+        path: alias_path,
+        sha256: alias_sha256,
+        template_path: template_alias,
+        template_sha256: alias_template_sha256,
+    };
+    assert!(
+        worker_deployment::bind_planned_config_path_for_execution(
+            &private_alias
+                .canonicalize()
+                .expect("canonical symlink-template path"),
+            &symlink_template_plan,
+        )
+        .is_err(),
+        "template symlinks must fail the single-handle O_NOFOLLOW capture"
+    );
+    assert!(
+        worker_deployment::bind_private_config_for_execution(
+            &capability,
+            &input,
+            Some(&worker_deployment::PlannedConfigExecution::Private {
+                path: production.canonicalize().expect("canonical drift path"),
+                sha256: "f".repeat(64),
+                template_path: template.canonicalize().expect("canonical drift template"),
+                template_sha256: hex::encode(Sha256::digest(
+                    std::fs::read(&template).expect("template bytes"),
+                )),
+            }),
+        )
+        .is_err(),
+        "persistent identity drift must fail closed before subprocess launch"
+    );
+    let mut ambiguous_input = input.clone();
+    ambiguous_input.selectors = json!({"argument": "--config=other.toml"});
+    assert!(
+        super::run_delegated_cli_with_private_config_identity(
+            &capability,
+            &ambiguous_input,
+            &credential,
+            Some("fixture-account"),
+            &cache,
+            Some(&success_program),
+            Some(Path::new("/bin/sh")),
+            Some(&planned),
+        )
+        .await
+        .is_err(),
+        "alternate private config arguments must fail before subprocess launch"
+    );
+}
+
 pub(super) fn list_security_action_create_capability() -> CapabilityV1 {
     let mut capability = CapabilityV1::new(
         SECURITY_LIST_MEMBER_CREATE_ID,
@@ -774,6 +1258,34 @@ pub(super) fn wrangler_deploy_receipt_and_status_bind_the_promoted_version() {
         wrangler_deploy_version_id(&receipt).as_deref(),
         Some(version_id)
     );
+    for rejected in [
+        "safe-version-id",
+        "73656e6465722e707269766174652e6578616d706c65",
+        "c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ",
+        "11111111-2222-3333-4444-55555555555A",
+        "{11111111-2222-3333-4444-555555555555}",
+    ] {
+        assert!(
+            wrangler_deploy_version_id(&json!({
+                "structured_output": {"produced_version_id": rejected},
+                "stdout": format!("Current Version ID: {rejected}")
+            }))
+            .is_none(),
+            "noncanonical Worker identity escaped into a typed receipt"
+        );
+        assert!(
+            wrangler_worker_version_id(&json!({
+                "structured_output": {"produced_version_id": rejected},
+                "stdout": format!("Worker Version ID: {rejected}")
+            }))
+            .is_none(),
+            "noncanonical upload identity escaped into a typed receipt"
+        );
+        assert!(
+            wrangler_versions_deploy_version_id(&format!("{rejected}@100")).is_none(),
+            "noncanonical promotion identity escaped plan admission"
+        );
+    }
 
     let promoted = json!([{
         "strategy": "percentage",
