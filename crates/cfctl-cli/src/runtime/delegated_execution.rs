@@ -1,8 +1,7 @@
 use super::api_boundary::persist_secret_lifecycle;
 use super::cloudflare_api::BASE_URL as API_BASE_URL;
 use super::governed_cli::governed_cli_workspace_env;
-use super::governed_cli::redact_subprocess_text;
-use super::governed_cli::run_delegated_cli;
+use super::governed_cli::run_delegated_cli_with_private_config_identity;
 use super::governed_cli::run_quick_tunnel;
 use super::governed_cli::verify_quick_tunnel_plan;
 use super::plan_commands::persist_transaction_stage;
@@ -202,10 +201,11 @@ pub(super) async fn run_delegated_plan_boundary(
         pages_deployment::validate_staged_artifact(adapter_targets, &delegated_input)?;
         pages_deployment::validate_bound_producer(&plan.capability, adapter_targets)?;
     }
+    let planned_config = worker_deployment::planned_config_execution(adapter_targets)?;
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
         run_quick_tunnel(store, plan, input).await?
     } else {
-        run_delegated_cli(
+        run_delegated_cli_with_private_config_identity(
             &plan.capability,
             &delegated_input,
             credential,
@@ -213,6 +213,7 @@ pub(super) async fn run_delegated_plan_boundary(
             &store.paths().cache_dir,
             bound_program.as_deref(),
             bound_interpreter.as_deref(),
+            planned_config.as_ref(),
         )
         .await?
     };
@@ -409,6 +410,18 @@ pub(super) async fn verify_delegated_cli_plan(
             "version_id": version_id,
         });
     };
+    let planned_config = match worker_deployment::planned_config_execution(
+        plan.targets.get("adapter").unwrap_or(&Value::Null),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("the deployment plan omitted its reviewed private config identity: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
 
     verify_wrangler_deployment_status(
         WranglerDeploymentStatusTarget::Config(config),
@@ -416,6 +429,7 @@ pub(super) async fn verify_delegated_cli_plan(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        planned_config.as_ref(),
     )
     .await
 }
@@ -447,6 +461,18 @@ pub(super) async fn verify_wrangler_worker_version_upload_plan(
             "version_id": version_id,
         });
     };
+    let planned_config = match worker_deployment::planned_config_execution(
+        plan.targets.get("adapter").unwrap_or(&Value::Null),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("the version upload plan omitted its reviewed private config identity: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
     verify_wrangler_worker_version(
         config,
         &version_id,
@@ -454,6 +480,7 @@ pub(super) async fn verify_wrangler_worker_version_upload_plan(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        planned_config.as_ref(),
     )
     .await
 }
@@ -489,6 +516,7 @@ pub(super) async fn verify_wrangler_worker_versions_deploy_plan(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        None,
     )
     .await
 }
@@ -759,21 +787,45 @@ pub(super) struct WranglerDeploymentStatusCommand<'a> {
     pub(super) command: ProcessCommand,
     pub(super) isolated_directory: Option<tempfile::TempDir>,
     pub(super) exact_service_name: Option<&'a str>,
+    pub(super) private_config: Option<worker_deployment::BoundPrivateConfig>,
 }
 
+#[cfg(test)]
 pub(super) fn prepare_wrangler_deployment_status_command<'a>(
     target: WranglerDeploymentStatusTarget<'a>,
     account_id: &str,
     cache_dir: &Path,
 ) -> Result<WranglerDeploymentStatusCommand<'a>> {
+    prepare_wrangler_deployment_status_command_with_private_config_identity(
+        target, account_id, cache_dir, None,
+    )
+}
+
+fn prepare_wrangler_deployment_status_command_with_private_config_identity<'a>(
+    target: WranglerDeploymentStatusTarget<'a>,
+    account_id: &str,
+    cache_dir: &Path,
+    planned_config: Option<&worker_deployment::PlannedConfigExecution>,
+) -> Result<WranglerDeploymentStatusCommand<'a>> {
     let mut command = ProcessCommand::new("wrangler");
     command.args(["deployments", "status"]);
-    let (isolated_directory, exact_service_name) = match target {
+    let (isolated_directory, exact_service_name, private_config) = match target {
         WranglerDeploymentStatusTarget::Config(config) => {
+            let bound = planned_config.map_or(Ok(None), |planned| {
+                worker_deployment::bind_planned_config_path_for_execution(
+                    Path::new(config),
+                    planned,
+                )
+            })?;
+            let execution_config = bound.as_ref().map_or_else(
+                || Path::new(config),
+                worker_deployment::BoundPrivateConfig::path,
+            );
             command
-                .args(["--config", config])
+                .arg("--config")
+                .arg(execution_config)
                 .current_dir(wrangler_config_directory(config)?);
-            (None, None)
+            (None, None, bound)
         }
         WranglerDeploymentStatusTarget::Service(service_name) => {
             command.args(["--name", service_name]);
@@ -782,7 +834,7 @@ pub(super) fn prepare_wrangler_deployment_status_command<'a>(
                 .tempdir()
                 .map_err(|source| cli_io(cache_dir, source))?;
             command.current_dir(directory.path());
-            (Some(directory), Some(service_name))
+            (Some(directory), Some(service_name), None)
         }
     };
     command
@@ -802,19 +854,42 @@ pub(super) fn prepare_wrangler_deployment_status_command<'a>(
         command,
         isolated_directory,
         exact_service_name,
+        private_config,
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the verifier keeps exact target preparation, private-config lifetime, credential injection, timeout classification, and the private/public output-retention split in one fail-closed verification boundary"
+)]
 pub(super) async fn verify_wrangler_deployment_status(
     target: WranglerDeploymentStatusTarget<'_>,
     version_id: &str,
     credential: &AuthCredential,
     account_id: &str,
     cache_dir: &Path,
+    planned_config: Option<&worker_deployment::PlannedConfigExecution>,
 ) -> Value {
-    let prepared = match prepare_wrangler_deployment_status_command(target, account_id, cache_dir) {
+    let private_config_target = matches!(target, WranglerDeploymentStatusTarget::Config(_))
+        && matches!(
+            planned_config,
+            Some(worker_deployment::PlannedConfigExecution::Private { .. })
+        );
+    let prepared = match prepare_wrangler_deployment_status_command_with_private_config_identity(
+        target,
+        account_id,
+        cache_dir,
+        planned_config,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
+            if private_config_target {
+                return json!({
+                    "passed": false,
+                    "basis": format!("private Wrangler deployment-status verification could not bind its immutable config: {error}"),
+                    "provider_output_retained": false,
+                });
+            }
             return json!({
                 "passed": false,
                 "basis": format!("Wrangler deployment-status verification could not prepare its exact target: {error}"),
@@ -826,7 +901,17 @@ pub(super) async fn verify_wrangler_deployment_status(
         mut command,
         isolated_directory: _isolated_directory,
         exact_service_name,
+        private_config,
     } = prepared;
+    if private_config.as_ref().is_some_and(|private_config| {
+        private_config.retained_text_contains_private_representation(version_id)
+    }) {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler deployment-status version identity collided with private config material",
+            "provider_output_retained": false,
+        });
+    }
     match credential {
         AuthCredential::Bearer { token } => {
             command.env("CLOUDFLARE_API_TOKEN", token);
@@ -854,8 +939,23 @@ pub(super) async fn verify_wrangler_deployment_status(
             });
         }
     };
-    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
-    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    if let Some(private_config) = private_config {
+        return private_deployment_status_projection(
+            output.status.success(),
+            output.status.code(),
+            &output.stdout,
+            version_id,
+            &private_config,
+        );
+    }
+    let stdout = super::governed_cli::redact_subprocess_text(
+        &String::from_utf8_lossy(&output.stdout),
+        credential,
+    );
+    let stderr = super::governed_cli::redact_subprocess_text(
+        &String::from_utf8_lossy(&output.stderr),
+        credential,
+    );
     if !output.status.success() {
         return json!({
             "passed": false,
@@ -899,6 +999,10 @@ pub(super) async fn verify_wrangler_deployment_status(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the verifier keeps immutable config binding, exact version and message identity, subprocess lifetime, and the private/public output-retention split in one fail-closed verification boundary"
+)]
 pub(super) async fn verify_wrangler_worker_version(
     config: &str,
     version_id: &str,
@@ -906,10 +1010,50 @@ pub(super) async fn verify_wrangler_worker_version(
     credential: &AuthCredential,
     account_id: &str,
     cache_dir: &Path,
+    planned_config: Option<&worker_deployment::PlannedConfigExecution>,
 ) -> Value {
+    let private_config_target = matches!(
+        planned_config,
+        Some(worker_deployment::PlannedConfigExecution::Private { .. })
+    );
+    let private_config = match planned_config.map_or(Ok(None), |planned| {
+        worker_deployment::bind_planned_config_path_for_execution(Path::new(config), planned)
+    }) {
+        Ok(bound) => bound,
+        Err(error) => {
+            if private_config_target {
+                return json!({
+                    "passed": false,
+                    "basis": format!("private Wrangler version verification could not bind its immutable config: {error}"),
+                    "provider_output_retained": false,
+                });
+            }
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version verification could not bind its immutable private config: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
+    if private_config.as_ref().is_some_and(|private_config| {
+        private_config.retained_text_contains_private_representation(version_id)
+    }) {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler version identity collided with private config material",
+            "provider_output_retained": false,
+        });
+    }
     let working_directory = match wrangler_config_directory(config) {
         Ok(directory) => directory,
         Err(error) => {
+            if private_config.is_some() {
+                return json!({
+                    "passed": false,
+                    "basis": format!("private Wrangler version verification could not resolve the reviewed config directory: {error}"),
+                    "provider_output_retained": false,
+                });
+            }
             return json!({
                 "passed": false,
                 "basis": format!("Wrangler version verification could not resolve the reviewed config directory: {error}"),
@@ -919,7 +1063,13 @@ pub(super) async fn verify_wrangler_worker_version(
     };
     let mut command = ProcessCommand::new("wrangler");
     command
-        .args(["versions", "view", version_id, "--config", config, "--json"])
+        .args(["versions", "view", version_id])
+        .arg("--config")
+        .arg(private_config.as_ref().map_or_else(
+            || Path::new(config),
+            worker_deployment::BoundPrivateConfig::path,
+        ))
+        .arg("--json")
         .current_dir(working_directory)
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
@@ -959,8 +1109,24 @@ pub(super) async fn verify_wrangler_worker_version(
             });
         }
     };
-    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
-    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    if let Some(private_config) = private_config {
+        return private_version_projection(
+            output.status.success(),
+            output.status.code(),
+            &output.stdout,
+            version_id,
+            expected_message,
+            &private_config,
+        );
+    }
+    let stdout = super::governed_cli::redact_subprocess_text(
+        &String::from_utf8_lossy(&output.stdout),
+        credential,
+    );
+    let stderr = super::governed_cli::redact_subprocess_text(
+        &String::from_utf8_lossy(&output.stderr),
+        credential,
+    );
     if !output.status.success() {
         return json!({
             "passed": false,
@@ -997,36 +1163,140 @@ pub(super) async fn verify_wrangler_worker_version(
     })
 }
 
+pub(super) fn private_deployment_status_projection(
+    subprocess_succeeded: bool,
+    exit_status: Option<i32>,
+    stdout: &[u8],
+    version_id: &str,
+    private_config: &worker_deployment::BoundPrivateConfig,
+) -> Value {
+    if private_config.retained_text_contains_private_representation(version_id) {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler deployment-status version identity collided with private config material",
+            "provider_output_retained": false,
+        });
+    }
+    let private_config_sha256 = private_config.content_sha256();
+    if !subprocess_succeeded {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler deployment-status verification returned a failing exit status; raw output was not retained",
+            "version_id": version_id,
+            "exit_status": exit_status,
+            "private_config_sha256": private_config_sha256,
+            "provider_output_retained": false,
+        });
+    }
+    let Ok(status) = serde_json::from_slice::<Value>(stdout) else {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler deployment-status output was not valid JSON; raw output was not retained",
+            "version_id": version_id,
+            "private_config_sha256": private_config_sha256,
+            "provider_output_retained": false,
+        });
+    };
+    let passed = wrangler_status_has_promoted_version(&status, version_id);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            format!("Wrangler production deployment reports promoted version {version_id}")
+        } else {
+            format!("Wrangler production deployment does not report version {version_id} at 100 percent")
+        },
+        "version_id": version_id,
+        "private_config_sha256": private_config_sha256,
+        "provider_output_retained": false,
+    })
+}
+
+pub(super) fn private_version_projection(
+    subprocess_succeeded: bool,
+    exit_status: Option<i32>,
+    stdout: &[u8],
+    version_id: &str,
+    expected_message: &str,
+    private_config: &worker_deployment::BoundPrivateConfig,
+) -> Value {
+    if private_config.retained_text_contains_private_representation(version_id) {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler version identity collided with private config material",
+            "provider_output_retained": false,
+        });
+    }
+    let private_config_sha256 = private_config.content_sha256();
+    if !subprocess_succeeded {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler version verification returned a failing exit status; raw output was not retained",
+            "version_id": version_id,
+            "exit_status": exit_status,
+            "private_config_sha256": private_config_sha256,
+            "provider_output_retained": false,
+        });
+    }
+    let Ok(version) = serde_json::from_slice::<Value>(stdout) else {
+        return json!({
+            "passed": false,
+            "basis": "private Wrangler version output was not valid JSON; raw output was not retained",
+            "version_id": version_id,
+            "private_config_sha256": private_config_sha256,
+            "provider_output_retained": false,
+        });
+    };
+    let passed = wrangler_version_readback_matches(&version, version_id, expected_message);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            format!("Wrangler reports uploaded version {version_id} with the reviewed message")
+        } else {
+            format!("Wrangler version readback did not bind {version_id} to the reviewed message")
+        },
+        "version_id": version_id,
+        "private_config_sha256": private_config_sha256,
+        "provider_output_retained": false,
+    })
+}
+
 pub(super) fn wrangler_deploy_version_id(receipt: &Value) -> Option<String> {
+    if let Some(value) = receipt
+        .pointer("/structured_output/produced_version_id")
+        .and_then(Value::as_str)
+    {
+        return worker_deployment::canonical_worker_version_id(value).then(|| value.to_owned());
+    }
     receipt
         .get("stdout")
         .and_then(Value::as_str)?
         .lines()
         .find_map(|line| line.trim().strip_prefix("Current Version ID:"))
         .map(str::trim)
-        .filter(|value| {
-            !value.is_empty()
-                && value
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        })
+        .filter(|value| worker_deployment::canonical_worker_version_id(value))
         .map(str::to_owned)
 }
 
 pub(super) fn wrangler_worker_version_id(receipt: &Value) -> Option<String> {
+    if let Some(value) = receipt
+        .pointer("/structured_output/produced_version_id")
+        .and_then(Value::as_str)
+    {
+        return worker_deployment::canonical_worker_version_id(value).then(|| value.to_owned());
+    }
     receipt
         .get("stdout")
         .and_then(Value::as_str)?
         .lines()
         .find_map(|line| line.trim().strip_prefix("Worker Version ID:"))
         .map(str::trim)
-        .filter(|value| Uuid::parse_str(value).is_ok())
+        .filter(|value| worker_deployment::canonical_worker_version_id(value))
         .map(str::to_owned)
 }
 
 pub(super) fn wrangler_versions_deploy_version_id(spec: &str) -> Option<String> {
     let (version_id, percentage) = spec.split_once('@')?;
-    if percentage == "100" && Uuid::parse_str(version_id).is_ok() {
+    if percentage == "100" && worker_deployment::canonical_worker_version_id(version_id) {
         Some(version_id.to_owned())
     } else {
         None

@@ -45,6 +45,13 @@ const ROUTE_HEALTH_KEYS: &[&str] = &[
     "last_error_code",
     "updated_at",
 ];
+const ROUTE_HEALTH_ERROR_CODES: &[&str] = &[
+    "E_HEADER_NOT_ALLOWED",
+    "failed",
+    "inbound_result_recovery_pending",
+    "partial_delivery",
+    "recovery_required",
+];
 const APPROVED_TABLE_KEYS: &[&str] = &[
     "alias_routes",
     "audit_events",
@@ -66,6 +73,100 @@ const AUDIT_EVENT_KEYS: &[&str] = &[
     "outbound_reply_recovery_required",
     "outbound_reply_failed",
 ];
+
+pub(super) fn project_private_query_rows(
+    sql: &str,
+    rows: &[Map<String, Value>],
+) -> Option<Result<()>> {
+    if sql == MAILDESK_D1_EVIDENCE_SQL_V1 {
+        return Some(project_evidence_rows(rows.to_vec()).map(|_| ()));
+    }
+    if !inbound_query_matches_contract(sql) {
+        return None;
+    }
+    Some(validate_inbound_query_rows(rows))
+}
+
+fn inbound_query_matches_contract(sql: &str) -> bool {
+    let Some((prefix, rest)) =
+        MAILDESK_INBOUND_ACCEPTANCE_SQL_V1.split_once("__MAILDESK_FINGERPRINT_SHA256__")
+    else {
+        return false;
+    };
+    let Some((between_fingerprint_route, rest)) = rest.split_once("__MAILDESK_ROUTE_ID__") else {
+        return false;
+    };
+    let Some((between_route_policy, suffix)) = rest.split_once("__MAILDESK_POLICY_SHA256__") else {
+        return false;
+    };
+    let Some(rest) = sql.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((fingerprint, rest)) = rest.split_once(between_fingerprint_route) else {
+        return false;
+    };
+    let Some((route_id, rest)) = rest.split_once(between_route_policy) else {
+        return false;
+    };
+    let Some(policy) = rest.strip_suffix(suffix) else {
+        return false;
+    };
+    raw_lowercase_sha256(fingerprint)
+        && valid_route_id(route_id)
+        && !route_id.contains('\'')
+        && raw_lowercase_sha256(policy)
+}
+
+fn raw_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_inbound_query_rows(rows: &[Map<String, Value>]) -> Result<()> {
+    if rows.len() > 2 {
+        return Err(CliError::Input(
+            "inbound acceptance readback exceeded its closed row limit".to_owned(),
+        ));
+    }
+    let expected = MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for row in rows {
+        let observed = row.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if observed != expected || observed.len() != MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1.len() {
+            return Err(CliError::Input(
+                "inbound acceptance readback contained a private, missing, or arbitrary field"
+                    .to_owned(),
+            ));
+        }
+        let inbound = bounded_string(row, "inbound_delivery_id", 80)?;
+        let relay = bounded_string(row, "relay_id", 80)?;
+        let thread = bounded_string(row, "thread_id", 240)?;
+        let route = bounded_string(row, "route_id", 240)?;
+        let policy = bounded_string(row, "policy_sha256", 64)?;
+        let status = bounded_string(row, "status", 32)?;
+        let recipient_count = count(row, "recipient_count")?;
+        let accepted_count = count(row, "provider_accepted_count")?;
+        required_timestamp(row, "provider_accepted_at")?;
+        if !inbound.starts_with("inbound:")
+            || !relay.starts_with("relay:")
+            || !valid_thread_id(&thread)
+            || !valid_route_id(&route)
+            || !raw_lowercase_sha256(&policy)
+            || status != "provider_accepted"
+            || recipient_count == 0
+            || accepted_count > recipient_count
+        {
+            return Err(CliError::Input(
+                "inbound acceptance readback contained an invalid typed value".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureStage {
@@ -284,13 +385,15 @@ pub(super) async fn execute(
             )),
         ));
     }
-    let query = workspace_d1_migration::run_wrangler(
+    let query = workspace_d1_migration::run_wrangler_with_config_identity(
         &compiler_query_arguments(&config.database_name, &config.path, &compiler_query.sql),
         Path::new(&contract.repository_root),
         credential,
         account_id,
         &store.paths().cache_dir,
         QUERY_TIMEOUT,
+        &config.sha256,
+        &contract.config_template_sha256,
     )
     .await
     .map_err(|error| {
@@ -575,6 +678,12 @@ fn escape_sql(value: &str) -> String {
 
 fn project_evidence(
     _contract: &WorkspaceD1EvidenceContractV1,
+    rows: Vec<Map<String, Value>>,
+) -> Result<(MaildeskD1EvidenceV1, MaildeskD1RouteHealthEvidenceV2)> {
+    project_evidence_rows(rows)
+}
+
+fn project_evidence_rows(
     mut rows: Vec<Map<String, Value>>,
 ) -> Result<(MaildeskD1EvidenceV1, MaildeskD1RouteHealthEvidenceV2)> {
     if rows.len() != 1 {
@@ -883,10 +992,7 @@ fn optional_error_code(row: &Map<String, Value>, field: &str) -> Result<Option<S
     let Some(value) = optional_string(row, field, 128)? else {
         return Ok(None);
     };
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
+    if !ROUTE_HEALTH_ERROR_CODES.contains(&value.as_str()) {
         return Err(CliError::Input(
             "workspace D1 route-health error code is outside the closed contract".to_owned(),
         ));

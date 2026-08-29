@@ -60,6 +60,28 @@ const RECORD_COLUMNS: &[&str] = &[
     "expires_at",
     "status",
 ];
+
+pub(super) fn project_private_query_rows(
+    sql: &str,
+    rows: &[Map<String, Value>],
+) -> Option<Result<()>> {
+    let expected_projection = format!("SELECT {} ", RECORD_COLUMNS.join(","));
+    if !sql.starts_with(&expected_projection) || !sql.contains(" LIMIT 2") {
+        return None;
+    }
+    Some((|| {
+        if rows.len() > 2 {
+            return Err(CliError::Input(
+                "private D1 reply readback exceeded its closed row limit".to_owned(),
+            ));
+        }
+        for row in rows {
+            exact_keys(row, RECORD_COLUMNS)?;
+            validate_record(row)?;
+        }
+        Ok(())
+    })())
+}
 const PROJECTION_KEYS: &[&str] = &[
     "schema_version",
     "transaction_sha256",
@@ -336,6 +358,7 @@ pub(super) async fn run(
     let target = target(plan)?;
     let root = Path::new(&contract.repository_root);
     let config = string(target, "production_config")?;
+    let config_sha256 = string(target, "production_config_sha256")?;
     let db = string(target, "database_name")?;
     let bytes = read_private_candidate(&private_stage_path(store, stage(target)?)?)?;
     let candidate = validate_candidate_bytes(&bytes)?;
@@ -359,7 +382,7 @@ pub(super) async fn run(
     }
     let sql = insert_sql(&contract.admission_table, &candidate.record)?;
     let sql_path = private_sql(store, &sql)?;
-    let result = workspace_d1_migration::run_wrangler(
+    let result = workspace_d1_migration::run_wrangler_with_config_identity(
         &[
             "d1".into(),
             "execute".into(),
@@ -375,6 +398,8 @@ pub(super) async fn run(
         &plan.account_id,
         &store.paths().cache_dir,
         APPLY_TIMEOUT,
+        config_sha256,
+        &contract.config_template_sha256,
     )
     .await;
     let _ = fs::remove_file(&sql_path);
@@ -612,7 +637,7 @@ pub(super) async fn read(
         escape(candidate.record["id"].as_str().unwrap_or_default()),
         escape(candidate.transaction_sha256.trim_start_matches("sha256:")),
     );
-    let rows = workspace_d1_migration::execute_json_query(
+    let rows = workspace_d1_migration::execute_json_query_with_config_identity(
         &config.database_name,
         &config.path,
         &sql,
@@ -620,6 +645,8 @@ pub(super) async fn read(
         credential,
         account_id,
         &store.paths().cache_dir,
+        &config.sha256,
+        &contract.config_template_sha256,
     )
     .await;
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -728,7 +755,7 @@ async fn verify_inner(
         identifier(&contract.admission_table)?,
         escape(&id)
     );
-    let rows = workspace_d1_migration::execute_json_query(
+    let rows = workspace_d1_migration::execute_json_query_with_config_identity(
         string(target, "database_name")?,
         string(target, "production_config")?,
         &sql,
@@ -736,6 +763,8 @@ async fn verify_inner(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        string(target, "production_config_sha256")?,
+        &contract.config_template_sha256,
     )
     .await?;
     let exact = rows.len() == 1

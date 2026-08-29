@@ -3,9 +3,14 @@ use std::{
     ffi::OsStr,
     fmt::Write as _,
     fs,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
 };
 
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
 use cfctl_core::{
     CapabilityV1, PlanV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, hash_value, redact_json,
@@ -230,6 +235,8 @@ pub(super) fn prepare_target(
         config_target["authority"] = Value::String("private_d1_identity_overlay".to_owned());
         config_target["template_path"] = json!(authority.path);
         config_target["template_sha256"] = Value::String(authority.sha256);
+    } else {
+        config_target["authority"] = Value::String("exact_head_blob".to_owned());
     }
     let mut target = json!({
         "schema_version": 1,
@@ -375,6 +382,177 @@ struct PrivateConfigAuthority {
     sha256: String,
 }
 
+pub(super) struct BoundPrivateConfig {
+    staged: tempfile::NamedTempFile,
+    content_sha256: String,
+    private_representations: PrivateRepresentationGuard,
+}
+
+impl BoundPrivateConfig {
+    pub(super) fn path(&self) -> &Path {
+        self.staged.path()
+    }
+
+    pub(super) fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    pub(super) fn retained_rows_contain_private_representation(
+        &self,
+        rows: &[serde_json::Map<String, Value>],
+    ) -> bool {
+        rows.iter().any(|row| {
+            row.values()
+                .any(|value| self.private_representations.contains_in_json(value))
+        })
+    }
+
+    pub(super) fn retained_text_contains_private_representation(&self, value: &str) -> bool {
+        self.private_representations.contains_in_text(value)
+    }
+}
+
+struct PrivateRepresentationGuard {
+    representations: BTreeSet<String>,
+}
+
+impl PrivateRepresentationGuard {
+    fn from_documents(production: &Value, normalized: &Value) -> Self {
+        let mut private_values = BTreeSet::new();
+        collect_changed_strings(production, normalized, &mut private_values);
+        let mut representations = BTreeSet::new();
+        for value in private_values {
+            insert_private_representations(&value, &mut representations);
+            for member in value.split(',').filter(|member| !member.is_empty()) {
+                insert_private_representations(member, &mut representations);
+            }
+            if let Some((_, domain)) = value.rsplit_once('@') {
+                insert_private_representations(domain, &mut representations);
+            }
+        }
+        Self { representations }
+    }
+
+    fn contains_in_json(&self, value: &Value) -> bool {
+        match value {
+            Value::String(value) => self
+                .representations
+                .iter()
+                .any(|representation| value.contains(representation)),
+            Value::Array(values) => values.iter().any(|value| self.contains_in_json(value)),
+            Value::Object(values) => values.values().any(|value| self.contains_in_json(value)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    fn contains_in_text(&self, value: &str) -> bool {
+        self.representations
+            .iter()
+            .any(|representation| value.contains(representation))
+    }
+}
+
+fn collect_changed_strings(production: &Value, normalized: &Value, output: &mut BTreeSet<String>) {
+    match (production, normalized) {
+        (Value::String(production), Value::String(normalized)) if production != normalized => {
+            if !production.is_empty() {
+                output.insert(production.clone());
+            }
+        }
+        (Value::Array(production), Value::Array(normalized))
+            if production.len() == normalized.len() =>
+        {
+            for (production, normalized) in production.iter().zip(normalized) {
+                collect_changed_strings(production, normalized, output);
+            }
+        }
+        (Value::Object(production), Value::Object(normalized)) => {
+            for (key, production) in production {
+                if let Some(normalized) = normalized.get(key) {
+                    collect_changed_strings(production, normalized, output);
+                } else {
+                    collect_all_strings(production, output);
+                }
+            }
+        }
+        (production, normalized) if production != normalized => {
+            collect_all_strings(production, output);
+        }
+        _ => {}
+    }
+}
+
+fn collect_all_strings(value: &Value, output: &mut BTreeSet<String>) {
+    match value {
+        Value::String(value) if !value.is_empty() => {
+            output.insert(value.clone());
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_all_strings(value, output);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                collect_all_strings(value, output);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn insert_private_representations(value: &str, output: &mut BTreeSet<String>) {
+    if value.is_empty() {
+        return;
+    }
+    let bytes = value.as_bytes();
+    output.insert(value.to_owned());
+    output.insert(hex_bytes(bytes, false));
+    output.insert(hex_bytes(bytes, true));
+    output.insert(STANDARD.encode(bytes));
+    output.insert(STANDARD_NO_PAD.encode(bytes));
+    output.insert(URL_SAFE.encode(bytes));
+    output.insert(URL_SAFE_NO_PAD.encode(bytes));
+    output.insert(percent_encode(bytes, false, false));
+    output.insert(percent_encode(bytes, true, false));
+    output.insert(percent_encode(bytes, false, true));
+    output.insert(percent_encode(bytes, true, true));
+}
+
+fn hex_bytes(bytes: &[u8], uppercase: bool) -> String {
+    bytes
+        .iter()
+        .map(|byte| {
+            if uppercase {
+                format!("{byte:02X}")
+            } else {
+                format!("{byte:02x}")
+            }
+        })
+        .collect()
+}
+
+fn percent_encode(bytes: &[u8], uppercase: bool, encode_all: bool) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(3));
+    let hex = if uppercase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    for byte in bytes {
+        if !encode_all
+            && (byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+        {
+            encoded.push(char::from(*byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(hex[usize::from(*byte >> 4)]));
+            encoded.push(char::from(hex[usize::from(*byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 fn private_d1_identity_overlay(
     repository: &cfctl_workspace::RepositoryNode,
     config: &Path,
@@ -441,7 +619,7 @@ fn private_d1_identity_overlay(
     normalize_private_d1_identity(&mut normalized, &template_snapshot.document)?;
     if normalized != template_snapshot.document {
         return Err(CliError::Input(
-            "private Worker production config differs from its tracked role template outside canonical D1 identity, sender restriction, and split relay activation fields"
+            "private Worker production config differs from its tracked role template outside the closed private-config overlay"
                 .to_owned(),
         ));
     }
@@ -465,7 +643,11 @@ fn exact_head_config_error(config: &Path) -> CliError {
     ))
 }
 
-fn private_config_template_path(config: &Path) -> Option<PathBuf> {
+pub(super) fn canonical_worker_version_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+pub(super) fn private_config_template_path(config: &Path) -> Option<PathBuf> {
     let name = config.file_name()?.to_str()?;
     let stem = name.strip_suffix(".production.toml")?;
     let role = stem.strip_prefix("wrangler.")?;
@@ -473,6 +655,343 @@ fn private_config_template_path(config: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(config.with_file_name(format!("{stem}.toml")))
+}
+
+pub(super) fn bind_private_config_for_execution(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    planned: Option<&PlannedConfigExecution>,
+) -> Result<Option<BoundPrivateConfig>, CliError> {
+    if !binds_artifact(capability) {
+        return Ok(None);
+    }
+    if input.query.get("config").and_then(Value::as_str).is_none() {
+        return Ok(None);
+    }
+    let Some(planned) = planned else {
+        return Ok(None);
+    };
+    bind_planned_config_path_for_execution(&canonical_config(input)?, planned)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PlannedConfigExecution {
+    Public {
+        path: PathBuf,
+        sha256: String,
+    },
+    Private {
+        path: PathBuf,
+        sha256: String,
+        template_path: PathBuf,
+        template_sha256: String,
+    },
+}
+
+pub(super) fn planned_config_execution(
+    adapter_targets: &Value,
+) -> Result<Option<PlannedConfigExecution>, CliError> {
+    let Some(target) = target(adapter_targets) else {
+        return Ok(None);
+    };
+    let config = target
+        .get("config")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("Worker deployment plan omitted its exact config target".to_owned())
+        })?;
+    let path = config
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input("Worker deployment plan omitted its config path".to_owned())
+        })?;
+    let sha256 = config
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker deployment plan omitted its exact config content identity".to_owned(),
+            )
+        })?
+        .to_owned();
+    match config.get("authority").and_then(Value::as_str) {
+        Some("exact_head_blob") => {
+            if config.contains_key("template_path") || config.contains_key("template_sha256") {
+                return Err(CliError::Input(
+                    "public Worker config plan contained private template authority".to_owned(),
+                ));
+            }
+            Ok(Some(PlannedConfigExecution::Public { path, sha256 }))
+        }
+        Some("private_d1_identity_overlay") => {
+            let template_path = config
+                .get("template_path")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    CliError::Input("private Worker plan omitted its template path".to_owned())
+                })?;
+            let template_sha256 = config
+                .get("template_sha256")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "private Worker plan omitted its template content identity".to_owned(),
+                    )
+                })?
+                .to_owned();
+            Ok(Some(PlannedConfigExecution::Private {
+                path,
+                sha256,
+                template_path,
+                template_sha256,
+            }))
+        }
+        _ => Err(CliError::Input(
+            "Worker deployment plan omitted its closed config authority".to_owned(),
+        )),
+    }
+}
+
+pub(super) fn bind_planned_config_path_for_execution(
+    config: &Path,
+    planned: &PlannedConfigExecution,
+) -> Result<Option<BoundPrivateConfig>, CliError> {
+    let planned_path = match planned {
+        PlannedConfigExecution::Public { path, .. }
+        | PlannedConfigExecution::Private { path, .. } => path,
+    };
+    if config != planned_path {
+        return Err(CliError::Input(
+            "Worker execution config does not match its planned path identity".to_owned(),
+        ));
+    }
+    match planned {
+        PlannedConfigExecution::Public { sha256, .. } => {
+            let observed = load_wrangler_config_snapshot(config)?;
+            if observed.content_hash.strip_prefix("sha256:") != Some(sha256.as_str()) {
+                return Err(CliError::Input(
+                    "public Worker config no longer matches its planned content identity"
+                        .to_owned(),
+                ));
+            }
+            Ok(None)
+        }
+        PlannedConfigExecution::Private {
+            sha256,
+            template_path,
+            template_sha256,
+            ..
+        } => bind_private_config_path_with_template_for_execution(
+            config,
+            template_path,
+            Some(sha256),
+            Some(template_sha256),
+        )
+        .map(Some),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one binding transaction keeps no-follow capture, bounded bytes, production and template hashes, closed-overlay equality, immutable staging, and staged-byte readback under one private-config lifetime"
+)]
+pub(super) fn bind_private_config_path_with_template_for_execution(
+    config: &Path,
+    template_path: &Path,
+    expected_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+) -> Result<BoundPrivateConfig, CliError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut source_file = options.open(config).map_err(|source| CliError::Io {
+        path: config.display().to_string(),
+        source,
+    })?;
+    let metadata = source_file.metadata().map_err(|source| CliError::Io {
+        path: config.display().to_string(),
+        source,
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1_048_576
+    {
+        return Err(CliError::Input(
+            "private Worker production config must be a regular file of at most 1 MiB".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(CliError::Input(
+                "private Worker production config must not grant group or world permissions"
+                    .to_owned(),
+            ));
+        }
+    }
+    let production_len = usize::try_from(metadata.len()).map_err(|_| {
+        CliError::Input(
+            "private Worker production config size exceeded this platform's addressable memory"
+                .to_owned(),
+        )
+    })?;
+    let mut production_bytes = Vec::with_capacity(production_len);
+    source_file
+        .read_to_end(&mut production_bytes)
+        .map_err(|source| CliError::Io {
+            path: config.display().to_string(),
+            source,
+        })?;
+    if production_bytes.len() > 1_048_576 {
+        return Err(CliError::Input(
+            "private Worker production config must be at most 1 MiB".to_owned(),
+        ));
+    }
+    let content_sha256 = hex::encode(Sha256::digest(&production_bytes));
+    if expected_sha256.is_some_and(|expected| {
+        expected.strip_prefix("sha256:").unwrap_or(expected) != content_sha256
+    }) {
+        return Err(CliError::Input(
+            "private Worker production config no longer matches the reviewed content identity"
+                .to_owned(),
+        ));
+    }
+    let production_text = std::str::from_utf8(&production_bytes).map_err(|_| {
+        CliError::Input("private Worker production config is not valid UTF-8".to_owned())
+    })?;
+    let production = toml::from_str::<toml::Value>(production_text)
+        .ok()
+        .and_then(|value| serde_json::to_value(value).ok())
+        .ok_or_else(|| {
+            CliError::Input("private Worker production config is malformed".to_owned())
+        })?;
+    let template_bytes = capture_regular_config_bytes(template_path, "tracked Worker template")?;
+    let template_content_sha256 = hex::encode(Sha256::digest(&template_bytes));
+    if expected_template_sha256.is_some_and(|expected| {
+        expected.strip_prefix("sha256:").unwrap_or(expected) != template_content_sha256
+    }) {
+        return Err(CliError::Input(
+            "tracked Worker template no longer matches the reviewed content identity".to_owned(),
+        ));
+    }
+    let template_text = std::str::from_utf8(&template_bytes)
+        .map_err(|_| CliError::Input("tracked Worker template is not valid UTF-8".to_owned()))?;
+    let template = toml::from_str::<toml::Value>(template_text)
+        .ok()
+        .and_then(|value| serde_json::to_value(value).ok())
+        .ok_or_else(|| CliError::Input("tracked Worker template is malformed".to_owned()))?;
+    let mut normalized = production.clone();
+    normalize_private_d1_identity(&mut normalized, &template)?;
+    if normalized != template {
+        return Err(CliError::Input(
+            "private Worker production config differs from its tracked role template outside the closed private-config overlay"
+                .to_owned(),
+        ));
+    }
+    let private_representations =
+        PrivateRepresentationGuard::from_documents(&production, &normalized);
+
+    let directory = config.parent().ok_or_else(|| {
+        CliError::Input("private Worker production config has no containing directory".to_owned())
+    })?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cfctl-private-execution-")
+        .suffix(".toml")
+        .tempfile_in(directory)
+        .map_err(|source| CliError::Io {
+            path: directory.display().to_string(),
+            source,
+        })?;
+    staged
+        .write_all(&production_bytes)
+        .and_then(|()| staged.flush())
+        .and_then(|()| staged.as_file().sync_data())
+        .map_err(|source| CliError::Io {
+            path: staged.path().display().to_string(),
+            source,
+        })?;
+    #[cfg(unix)]
+    fs::set_permissions(staged.path(), {
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(0o400)
+    })
+    .map_err(|source| CliError::Io {
+        path: staged.path().display().to_string(),
+        source,
+    })?;
+    let staged_bytes = fs::read(staged.path()).map_err(|source| CliError::Io {
+        path: staged.path().display().to_string(),
+        source,
+    })?;
+    if staged_bytes != production_bytes {
+        return Err(CliError::Input(
+            "private Worker execution config did not preserve the reviewed bytes".to_owned(),
+        ));
+    }
+    Ok(BoundPrivateConfig {
+        staged,
+        content_sha256,
+        private_representations,
+    })
+}
+
+fn capture_regular_config_bytes(path: &Path, label: &str) -> Result<Vec<u8>, CliError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let before = file.metadata().map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() || before.len() > 1_048_576
+    {
+        return Err(CliError::Input(format!(
+            "{label} must be a regular file of at most 1 MiB"
+        )));
+    }
+    let expected_len = usize::try_from(before.len()).map_err(|_| {
+        CliError::Input(format!(
+            "{label} size exceeded this platform's addressable memory"
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(expected_len);
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let after = file.metadata().map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if bytes.len() > 1_048_576 || bytes.len() != expected_len || after.len() != before.len() {
+        return Err(CliError::Input(format!(
+            "{label} changed during its bounded content capture"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn normalize_private_d1_identity(production: &mut Value, template: &Value) -> Result<(), CliError> {
@@ -527,6 +1046,101 @@ fn normalize_private_d1_identity(production: &mut Value, template: &Value) -> Re
     }
     normalize_private_sender_identity(production, template)?;
     normalize_private_relay_activation(production, template)?;
+    normalize_private_verified_sender_domains(production, template)?;
+    Ok(())
+}
+
+fn normalize_private_verified_sender_domains(
+    production: &mut Value,
+    template: &Value,
+) -> Result<(), CliError> {
+    const KEY: &str = "MAILDESK_VERIFIED_SENDER_DOMAINS";
+    let template_value = template
+        .get("vars")
+        .and_then(Value::as_object)
+        .and_then(|vars| vars.get(KEY))
+        .and_then(Value::as_str)
+        .filter(|value| value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "tracked Worker template must declare the empty verified-sender domain sentinel"
+                    .to_owned(),
+            )
+        })?;
+    let production_vars = production
+        .get_mut("vars")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            CliError::Input(
+                "private Worker production config must materialize verified-sender domains"
+                    .to_owned(),
+            )
+        })?;
+    let production_value = production_vars
+        .get(KEY)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "private Worker production config must materialize verified-sender domains"
+                    .to_owned(),
+            )
+        })?;
+    validate_maildesk_verified_sender_domains(production_value)?;
+    production_vars.insert(KEY.to_owned(), Value::String(template_value.to_owned()));
+    Ok(())
+}
+
+pub(super) fn validate_maildesk_verified_sender_domains(value: &str) -> Result<(), CliError> {
+    const MAX_ENTRIES: usize = 256;
+    const MAX_BYTES: usize = 4_096;
+    let invalid = || {
+        CliError::Input(
+            "private verified-sender domains must be a bounded comma-separated list of canonical lowercase DNS domains"
+                .to_owned(),
+        )
+    };
+    if value.is_empty() || value.len() > MAX_BYTES || !value.is_ascii() {
+        return Err(invalid());
+    }
+    let domains = value.split(',').collect::<Vec<_>>();
+    if !(1..=MAX_ENTRIES).contains(&domains.len()) {
+        return Err(invalid());
+    }
+    let mut normalized = BTreeSet::new();
+    for domain in domains {
+        let lowercase = domain.to_ascii_lowercase();
+        if domain != lowercase
+            || !normalized.insert(lowercase)
+            || domain.len() > 253
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+            || domain
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(invalid());
+        }
+        let labels = domain.split('.').collect::<Vec<_>>();
+        if labels.len() < 2
+            || labels.iter().any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    || !label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            })
+        {
+            return Err(invalid());
+        }
+    }
     Ok(())
 }
 
@@ -663,7 +1277,7 @@ fn versions_deploy_version_id(input: &CallInput) -> Result<&str, CliError> {
         CliError::Input("Worker Versions deployment target must be UUID@100".to_owned())
     })?;
     if percentage != "100"
-        || uuid::Uuid::parse_str(version_id).is_err()
+        || !canonical_worker_version_id(version_id)
         || spec.matches('@').count() != 1
     {
         return Err(CliError::Input(

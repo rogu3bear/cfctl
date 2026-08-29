@@ -91,7 +91,7 @@ pub(super) async fn run_delegated_cli(
     program_override: Option<&Path>,
     interpreter_override: Option<&Path>,
 ) -> Result<Value> {
-    run_delegated_cli_with_timeout(
+    run_delegated_cli_with_timeout_and_private_config_identity(
         capability,
         input,
         credential,
@@ -100,6 +100,35 @@ pub(super) async fn run_delegated_cli(
         program_override,
         interpreter_override,
         governed_delegated_cli_timeout(&capability.id),
+        None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact planned config identity is an execution-boundary input, not caller-selected subprocess behavior"
+)]
+pub(super) async fn run_delegated_cli_with_private_config_identity(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+    account_id: Option<&str>,
+    cache_dir: &Path,
+    program_override: Option<&Path>,
+    interpreter_override: Option<&Path>,
+    planned_config: Option<&worker_deployment::PlannedConfigExecution>,
+) -> Result<Value> {
+    run_delegated_cli_with_timeout_and_private_config_identity(
+        capability,
+        input,
+        credential,
+        account_id,
+        cache_dir,
+        program_override,
+        interpreter_override,
+        governed_delegated_cli_timeout(&capability.id),
+        planned_config,
     )
     .await
 }
@@ -108,10 +137,7 @@ pub(super) async fn run_delegated_cli(
     clippy::too_many_arguments,
     reason = "the test-only timeout seam retains every production boundary input without adding a caller-controlled capability selector"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the subprocess boundary keeps governed environment, structured output, timeout, process-tree containment, and redaction in one receipt-producing transaction"
-)]
+#[cfg(test)]
 pub(super) async fn run_delegated_cli_with_timeout(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -122,6 +148,58 @@ pub(super) async fn run_delegated_cli_with_timeout(
     interpreter_override: Option<&Path>,
     timeout: Duration,
 ) -> Result<Value> {
+    run_delegated_cli_with_timeout_and_private_config_identity(
+        capability,
+        input,
+        credential,
+        account_id,
+        cache_dir,
+        program_override,
+        interpreter_override,
+        timeout,
+        None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test seam and reviewed config identity remain explicit inputs to one subprocess boundary"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the subprocess boundary keeps governed environment, typed output, timeout, process-tree containment, and private config lifetime in one transaction"
+)]
+async fn run_delegated_cli_with_timeout_and_private_config_identity(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+    account_id: Option<&str>,
+    cache_dir: &Path,
+    program_override: Option<&Path>,
+    interpreter_override: Option<&Path>,
+    timeout: Duration,
+    planned_config: Option<&worker_deployment::PlannedConfigExecution>,
+) -> Result<Value> {
+    let bound_private_config =
+        worker_deployment::bind_private_config_for_execution(capability, input, planned_config)?;
+    let mut execution_input = input.clone();
+    if let Some(bound) = &bound_private_config {
+        if private_config_argument_is_ambiguous(&execution_input) {
+            return Err(CliError::Input(
+                "private Wrangler execution accepts exactly one canonical governed config selector"
+                    .to_owned(),
+            ));
+        }
+        execution_input
+            .query
+            .as_object_mut()
+            .ok_or_else(|| CliError::Input("delegated CLI query must be an object".to_owned()))?
+            .insert(
+                "config".to_owned(),
+                Value::String(bound.path().display().to_string()),
+            );
+    }
     let mut path_parts = capability.path.split_whitespace();
     let program = path_parts
         .next()
@@ -151,7 +229,7 @@ pub(super) async fn run_delegated_cli_with_timeout(
         } else {
             None
         };
-    if let Some(config) = input
+    if let Some(config) = execution_input
         .query
         .get("config")
         .and_then(Value::as_str)
@@ -169,14 +247,14 @@ pub(super) async fn run_delegated_cli_with_timeout(
         None
     };
     command = command
-        .args(cli_input_arguments(&input.selectors)?)
-        .args(cli_input_arguments(&input.query)?);
+        .args(cli_input_arguments(&execution_input.selectors)?)
+        .args(cli_input_arguments(&execution_input.query)?);
     if pages_deployment::binds_artifact(capability) {
         // cfctl already produced and hash-bound the closed worker bundle. A
         // second Wrangler bundle would reopen ambient project resolution.
         command = command.arg("--no-bundle");
     }
-    if input.body.is_some() {
+    if execution_input.body.is_some() {
         return Err(CliError::Input(
             "delegated CLI request bodies need a capability-specific native adapter".to_owned(),
         ));
@@ -220,9 +298,20 @@ pub(super) async fn run_delegated_cli_with_timeout(
             timeout_seconds: timeout.as_secs(),
         });
     }
-    let stdout = redact_subprocess_text(&String::from_utf8_lossy(output.stdout()), credential);
-    let stderr = redact_subprocess_text(output.stderr(), credential);
-    let structured_output = if let Some(path) = &wrangler_output_path {
+    let private_projection = bound_private_config.as_ref().map(|bound| {
+        private_wrangler_projection(&capability.id, output.is_success(), output.stdout(), bound)
+    });
+    let (stdout, stderr) = if private_projection.is_some() {
+        (String::new(), String::new())
+    } else {
+        (
+            redact_subprocess_text(&String::from_utf8_lossy(output.stdout()), credential),
+            redact_subprocess_text(output.stderr(), credential),
+        )
+    };
+    let structured_output = if let Some(projected) = private_projection {
+        projected
+    } else if let Some(path) = &wrangler_output_path {
         fs::read_to_string(path)
             .map_err(|source| cli_io(path, source))
             .and_then(|value| pages_deployment::parse_wrangler_output(&value))
@@ -709,4 +798,72 @@ pub(super) fn redact_subprocess_text(text: &str, credential: &AuthCredential) ->
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn private_wrangler_projection(
+    capability_id: &str,
+    subprocess_succeeded: bool,
+    stdout: &[u8],
+    private_config: &worker_deployment::BoundPrivateConfig,
+) -> Result<Value> {
+    let produced_version_id = if subprocess_succeeded {
+        let stdout = String::from_utf8_lossy(stdout);
+        let produced = match capability_id {
+            "wrangler.deploy" => projected_version_id(&stdout, "Current Version ID:"),
+            "wrangler.versions-upload" => projected_version_id(&stdout, "Worker Version ID:"),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            CliError::Input(
+                "private Wrangler subprocess succeeded without its required typed version identity"
+                    .to_owned(),
+            )
+        })?;
+        if private_config.retained_text_contains_private_representation(&produced) {
+            return Err(CliError::Input(
+                "private Wrangler typed version identity collided with private config material"
+                    .to_owned(),
+            ));
+        }
+        Some(produced)
+    } else {
+        None
+    };
+    Ok(json!({
+        "schema_version": 1,
+        "private_config_sha256": private_config.content_sha256(),
+        "provider_output_retained": false,
+        "diagnostic": if subprocess_succeeded {
+            "private Wrangler subprocess completed; raw output was not retained"
+        } else {
+            "private Wrangler subprocess failed; raw output was not retained"
+        },
+        "produced_version_id": produced_version_id,
+    }))
+}
+
+fn private_config_argument_is_ambiguous(input: &CallInput) -> bool {
+    let has_config_key = |value: &Value, allow_exact_config: bool| {
+        value.as_object().is_some_and(|fields| {
+            fields.iter().any(|(key, value)| {
+                let key = key.replace('_', "-");
+                ((!allow_exact_config || key != "config")
+                    && (key == "config" || key.starts_with("config=")))
+                    || value
+                        .as_str()
+                        .is_some_and(|value| value == "--config" || value.starts_with("--config="))
+            })
+        })
+    };
+    has_config_key(&input.selectors, false) || has_config_key(&input.query, true)
+}
+
+fn projected_version_id(stdout: &str, prefix: &str) -> Option<String> {
+    let values = stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|value| worker_deployment::canonical_worker_version_id(value))
+        .collect::<Vec<_>>();
+    (values.len() == 1).then(|| values[0].to_owned())
 }

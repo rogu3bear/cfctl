@@ -18,6 +18,8 @@ use super::{
     },
     read_execution::credential_generation_for_read,
     support::cli_io,
+    worker_deployment::{self, validate_maildesk_verified_sender_domains},
+    workspace_d1_evidence, workspace_d1_projection, workspace_d1_reply_admission,
 };
 
 const TARGET_KEY: &str = "workspace_d1_migration";
@@ -158,6 +160,7 @@ pub(super) async fn run(
     let target = target(plan)?;
     let database_name = target_string(target, "database_name")?;
     let config = target_string(target, "production_config")?;
+    let config_sha256 = target_string(target, "production_config_sha256")?;
 
     let version = run_wrangler(
         &["--version".to_owned()],
@@ -184,6 +187,8 @@ pub(super) async fn run(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        Some(config_sha256),
+        Some(&contract.config_template_sha256),
     )
     .await
     .map_err(CliError::delegated_mutation_not_attempted)?;
@@ -200,7 +205,7 @@ pub(super) async fn run(
         ));
     }
 
-    let apply = run_wrangler(
+    let apply = run_wrangler_with_expected_config(
         &[
             "d1".to_owned(),
             "migrations".to_owned(),
@@ -215,6 +220,8 @@ pub(super) async fn run(
         &plan.account_id,
         &store.paths().cache_dir,
         APPLY_TIMEOUT,
+        Some(config_sha256),
+        Some(&contract.config_template_sha256),
     )
     .await?;
     Ok(json!({
@@ -228,6 +235,8 @@ pub(super) async fn run(
         "declared_migrations": declared,
         "stdout": apply.stdout,
         "stderr": apply.stderr,
+        "provider_output_retained": apply.provider_output_retained,
+        "private_config_sha256": apply.private_config_sha256,
         "credential_environment": ["CLOUDFLARE_API_TOKEN"],
         "recovery": target.get("recovery").cloned().unwrap_or(Value::Null),
     }))
@@ -288,6 +297,7 @@ async fn verify_inner_with_authority(
     let target = target(plan)?;
     let database_name = target_string(target, "database_name")?;
     let config = target_string(target, "production_config")?;
+    let config_sha256 = target_string(target, "production_config_sha256")?;
     let root = Path::new(&contract.repository_root);
     let ledger = read_ledger(
         database_name,
@@ -296,11 +306,18 @@ async fn verify_inner_with_authority(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        Some(config_sha256),
+        Some(&contract.config_template_sha256),
     )
     .await?;
     let declared = declared_migration_names(contract)?;
+    if ledger.iter().any(|name| !declared.contains(name)) {
+        return Err(CliError::Input(
+            "Wrangler migration ledger contained an unowned migration identity".to_owned(),
+        ));
+    }
     let assertion_sql = compile_assertion_sql(&contract.assertions)?;
-    let assertion_rows = execute_json_query(
+    let assertion_rows = execute_json_query_with_expected_config(
         database_name,
         config,
         &assertion_sql,
@@ -308,6 +325,8 @@ async fn verify_inner_with_authority(
         credential,
         &plan.account_id,
         &store.paths().cache_dir,
+        Some(config_sha256),
+        Some(&contract.config_template_sha256),
     )
     .await?;
     let assertions_passed = assertion_rows_pass(&assertion_rows, contract.assertions.len());
@@ -410,16 +429,12 @@ pub(super) fn validated_config(
             .map_err(|_| CliError::Input("tracked Wrangler config is not UTF-8".to_owned()))?,
     )
     .map_err(|error| CliError::Input(format!("tracked Wrangler config is invalid: {error}")))?;
-    let mut production: toml::Value = toml::from_str(
-        std::str::from_utf8(&production_bytes)
-            .map_err(|_| CliError::Input("production Wrangler config is not UTF-8".to_owned()))?,
-    )
-    .map_err(|error| CliError::Input(format!("production Wrangler config is invalid: {error}")))?;
+    let mut production = parse_private_production_config(&production_bytes)?;
     let identity = production_identity(&production, &contract.database_binding)?;
     normalize_production_identity(&mut production, &template, &contract.database_binding)?;
     if production != template {
         return Err(CliError::Input(
-            "production Wrangler config differs from the tracked template outside the allowed Worker, D1 identity, sender restriction, and split relay activation fields"
+            "production Wrangler config differs from the tracked template outside the closed private-config overlay"
                 .to_owned(),
         ));
     }
@@ -439,6 +454,13 @@ pub(super) fn validated_config(
         database_name: identity.0,
         database_id: identity.1,
     })
+}
+
+fn parse_private_production_config(bytes: &[u8]) -> Result<toml::Value> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CliError::Input("production Wrangler config is not UTF-8".to_owned()))?;
+    toml::from_str(text)
+        .map_err(|_| CliError::Input("production Wrangler config is invalid".to_owned()))
 }
 
 fn production_identity(config: &toml::Value, binding: &str) -> Result<(String, String)> {
@@ -496,6 +518,48 @@ fn normalize_production_identity(
     *d1_entry_mut(production, binding)? = template_database;
     normalize_sender_identity(production, template)?;
     normalize_relay_activation(production, template)?;
+    normalize_verified_sender_domains(production, template)?;
+    Ok(())
+}
+
+fn normalize_verified_sender_domains(
+    production: &mut toml::Value,
+    template: &toml::Value,
+) -> Result<()> {
+    const KEY: &str = "MAILDESK_VERIFIED_SENDER_DOMAINS";
+    let template_value = template
+        .get("vars")
+        .and_then(toml::Value::as_table)
+        .and_then(|vars| vars.get(KEY))
+        .and_then(toml::Value::as_str)
+        .filter(|value| value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "tracked Wrangler template must declare the empty verified-sender domain sentinel"
+                    .to_owned(),
+            )
+        })?;
+    let production_vars = production
+        .get_mut("vars")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| {
+            CliError::Input(
+                "production Wrangler config must materialize verified-sender domains".to_owned(),
+            )
+        })?;
+    let production_value = production_vars
+        .get(KEY)
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "production Wrangler config must materialize verified-sender domains".to_owned(),
+            )
+        })?;
+    validate_maildesk_verified_sender_domains(production_value)?;
+    production_vars.insert(
+        KEY.to_owned(),
+        toml::Value::String(template_value.to_owned()),
+    );
     Ok(())
 }
 
@@ -810,6 +874,10 @@ fn require_target_string(target: &Map<String, Value>, field: &str, expected: &st
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "both immutable config identities must remain explicit alongside the fixed ledger query authority and subprocess boundary inputs"
+)]
 async fn read_ledger(
     database: &str,
     config: &str,
@@ -817,8 +885,10 @@ async fn read_ledger(
     credential: &AuthCredential,
     account_id: &str,
     cache_dir: &Path,
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
 ) -> Result<Vec<String>> {
-    let existence = execute_json_query(
+    let existence = execute_json_query_with_expected_config(
         database,
         config,
         "SELECT COUNT(*) AS present FROM sqlite_schema WHERE type = 'table' AND name = 'd1_migrations'",
@@ -826,6 +896,8 @@ async fn read_ledger(
         credential,
         account_id,
         cache_dir,
+        expected_config_sha256,
+        expected_template_sha256,
     )
     .await?;
     let present = existence
@@ -836,7 +908,7 @@ async fn read_ledger(
     if !present {
         return Ok(Vec::new());
     }
-    let rows = execute_json_query(
+    let rows = execute_json_query_with_expected_config(
         database,
         config,
         "SELECT name FROM d1_migrations ORDER BY id",
@@ -844,6 +916,8 @@ async fn read_ledger(
         credential,
         account_id,
         cache_dir,
+        expected_config_sha256,
+        expected_template_sha256,
     )
     .await?;
     rows.into_iter()
@@ -857,7 +931,11 @@ async fn read_ledger(
         .collect()
 }
 
-pub(super) async fn execute_json_query(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two immutable config identities are boundary inputs alongside the fixed query authority"
+)]
+pub(super) async fn execute_json_query_with_config_identity(
     database: &str,
     config: &str,
     sql: &str,
@@ -865,6 +943,37 @@ pub(super) async fn execute_json_query(
     credential: &AuthCredential,
     account_id: &str,
     cache_dir: &Path,
+    expected_config_sha256: &str,
+    expected_template_sha256: &str,
+) -> Result<Vec<Map<String, Value>>> {
+    execute_json_query_with_expected_config(
+        database,
+        config,
+        sql,
+        root,
+        credential,
+        account_id,
+        cache_dir,
+        Some(expected_config_sha256),
+        Some(expected_template_sha256),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact config content identity is a security-boundary input alongside the fixed query authority"
+)]
+async fn execute_json_query_with_expected_config(
+    database: &str,
+    config: &str,
+    sql: &str,
+    root: &Path,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
 ) -> Result<Vec<Map<String, Value>>> {
     let arguments = [
         "d1".to_owned(),
@@ -877,13 +986,15 @@ pub(super) async fn execute_json_query(
         sql.to_owned(),
         "--json".to_owned(),
     ];
-    let output = run_wrangler(
+    let output = run_wrangler_with_expected_config(
         &arguments,
         root,
         credential,
         account_id,
         cache_dir,
         QUERY_TIMEOUT,
+        expected_config_sha256,
+        expected_template_sha256,
     )
     .await?;
     if output.success {
@@ -921,6 +1032,8 @@ pub(super) struct WranglerOutput {
     pub(super) exit_status: Option<i32>,
     pub(super) stdout: String,
     pub(super) stderr: String,
+    pub(super) provider_output_retained: bool,
+    pub(super) private_config_sha256: Option<String>,
 }
 
 pub(super) async fn run_wrangler(
@@ -931,6 +1044,53 @@ pub(super) async fn run_wrangler(
     cache_dir: &Path,
     timeout: Duration,
 ) -> Result<WranglerOutput> {
+    run_wrangler_with_expected_config(
+        arguments, root, credential, account_id, cache_dir, timeout, None, None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two immutable config identities are boundary inputs, not ambient subprocess state"
+)]
+pub(super) async fn run_wrangler_with_config_identity(
+    arguments: &[String],
+    root: &Path,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+    timeout: Duration,
+    expected_config_sha256: &str,
+    expected_template_sha256: &str,
+) -> Result<WranglerOutput> {
+    run_wrangler_with_expected_config(
+        arguments,
+        root,
+        credential,
+        account_id,
+        cache_dir,
+        timeout,
+        Some(expected_config_sha256),
+        Some(expected_template_sha256),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the immutable config identity is a boundary input, not ambient subprocess state"
+)]
+async fn run_wrangler_with_expected_config(
+    arguments: &[String],
+    root: &Path,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+    timeout: Duration,
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+) -> Result<WranglerOutput> {
     run_wrangler_program(
         Path::new("wrangler"),
         arguments,
@@ -939,10 +1099,16 @@ pub(super) async fn run_wrangler(
         account_id,
         cache_dir,
         timeout,
+        expected_config_sha256,
+        expected_template_sha256,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test seam retains both immutable config identities at the subprocess boundary"
+)]
 async fn run_wrangler_program(
     program: &Path,
     arguments: &[String],
@@ -951,7 +1117,15 @@ async fn run_wrangler_program(
     account_id: &str,
     cache_dir: &Path,
     timeout: Duration,
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
 ) -> Result<WranglerOutput> {
+    let mut execution_arguments = arguments.to_vec();
+    let private_config = bind_private_config_from_arguments(
+        &mut execution_arguments,
+        expected_config_sha256,
+        expected_template_sha256,
+    )?;
     let token = credential.bearer_token().ok_or_else(|| {
         CliError::Input(
             "workspace D1 migrations require a scoped API-token profile; global-key execution is forbidden"
@@ -959,7 +1133,7 @@ async fn run_wrangler_program(
         )
     })?;
     let mut command = processkit::Command::new(program)
-        .args(arguments)
+        .args(&execution_arguments)
         .current_dir(root)
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
@@ -990,12 +1164,217 @@ async fn run_wrangler_program(
             timeout_seconds: timeout.as_secs(),
         });
     }
+    if let Some(private_config) = private_config {
+        let (success, stdout) = if output.is_success()
+            && execution_arguments
+                .iter()
+                .any(|argument| argument == "--json")
+        {
+            match project_private_json_query_with_guard(
+                output.stdout(),
+                &execution_arguments,
+                &private_config,
+            ) {
+                Ok(projected) => (true, projected),
+                Err(()) => (false, String::new()),
+            }
+        } else {
+            (output.is_success(), String::new())
+        };
+        return Ok(WranglerOutput {
+            success,
+            exit_status: output.code(),
+            stdout,
+            stderr: String::new(),
+            provider_output_retained: false,
+            private_config_sha256: Some(private_config.content_sha256().to_owned()),
+        });
+    }
     Ok(WranglerOutput {
         success: output.is_success(),
         exit_status: output.code(),
         stdout: redact_subprocess_text(&String::from_utf8_lossy(output.stdout()), credential),
         stderr: redact_subprocess_text(output.stderr(), credential),
+        provider_output_retained: true,
+        private_config_sha256: None,
     })
+}
+
+fn bind_private_config_from_arguments(
+    arguments: &mut [String],
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+) -> Result<Option<worker_deployment::BoundPrivateConfig>> {
+    if arguments
+        .iter()
+        .any(|argument| argument.starts_with("--config="))
+    {
+        return Err(CliError::Input(
+            "workspace D1 Wrangler arguments must bind config as one exact --config path pair"
+                .to_owned(),
+        ));
+    }
+    let positions = arguments
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, pair)| (pair[0] == "--config").then_some(index + 1))
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return Ok(None);
+    }
+    if positions.len() != 1
+        || arguments
+            .last()
+            .is_some_and(|argument| argument == "--config")
+    {
+        return Err(CliError::Input(
+            "workspace D1 Wrangler arguments require exactly one complete --config path pair"
+                .to_owned(),
+        ));
+    }
+    let position = positions[0];
+    let config = Path::new(&arguments[position]);
+    let template = if config.file_name().and_then(std::ffi::OsStr::to_str)
+        == Some("wrangler.production.toml")
+    {
+        config.with_file_name("wrangler.toml")
+    } else {
+        worker_deployment::private_config_template_path(config).ok_or_else(|| {
+            CliError::Input(
+                "workspace D1 closed operation contract requires a private production config"
+                    .to_owned(),
+            )
+        })?
+    };
+    let bound = Some(
+        worker_deployment::bind_private_config_path_with_template_for_execution(
+            config,
+            &template,
+            expected_config_sha256,
+            expected_template_sha256,
+        )?,
+    );
+    if let Some(bound) = &bound {
+        arguments[position] = bound.path().display().to_string();
+    }
+    Ok(bound)
+}
+
+#[cfg(test)]
+fn project_private_json_query(
+    stdout: &[u8],
+    arguments: &[String],
+) -> std::result::Result<String, ()> {
+    project_private_json_query_inner(stdout, arguments, None)
+}
+
+fn project_private_json_query_with_guard(
+    stdout: &[u8],
+    arguments: &[String],
+    private_config: &worker_deployment::BoundPrivateConfig,
+) -> std::result::Result<String, ()> {
+    project_private_json_query_inner(stdout, arguments, Some(private_config))
+}
+
+fn project_private_json_query_inner(
+    stdout: &[u8],
+    arguments: &[String],
+    private_config: Option<&worker_deployment::BoundPrivateConfig>,
+) -> std::result::Result<String, ()> {
+    let text = std::str::from_utf8(stdout).map_err(|_| ())?;
+    let sql = arguments
+        .windows(2)
+        .filter_map(|pair| (pair[0] == "--command").then_some(pair[1].as_str()))
+        .collect::<Vec<_>>();
+    if sql.len() != 1 {
+        return Err(());
+    }
+    let rows = parse_query_rows(text).map_err(|_| ())?;
+    project_migration_query_rows(sql[0], &rows)
+        .or_else(|| workspace_d1_evidence::project_private_query_rows(sql[0], &rows))
+        .or_else(|| workspace_d1_projection::project_private_query_rows(sql[0], &rows))
+        .or_else(|| workspace_d1_reply_admission::project_private_query_rows(sql[0], &rows))
+        .ok_or(())?
+        .map_err(|_| ())?;
+    if private_config.is_some_and(|private_config| {
+        private_config.retained_rows_contain_private_representation(&rows)
+    }) {
+        return Err(());
+    }
+    serde_json::to_string(&json!([{"success": true, "results": rows}])).map_err(|_| ())
+}
+
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "migration ledger names intentionally require the canonical lowercase .sql suffix; case-insensitive matching would widen the closed private query schema"
+)]
+fn project_migration_query_rows(sql: &str, rows: &[Map<String, Value>]) -> Option<Result<()>> {
+    if sql.starts_with("SELECT COUNT(*) AS present FROM sqlite_schema ") {
+        return Some((|| {
+            if rows.len() != 1 || !exact_query_fields(&rows[0], &["present"]) {
+                return Err(private_query_shape_error());
+            }
+            if !matches!(rows[0].get("present").and_then(Value::as_i64), Some(0 | 1)) {
+                return Err(private_query_value_error());
+            }
+            Ok(())
+        })());
+    }
+    if sql.starts_with("SELECT name FROM ") && sql.ends_with(" ORDER BY id") {
+        return Some((|| {
+            if rows.len() > 1_024 {
+                return Err(private_query_shape_error());
+            }
+            for row in rows {
+                if !exact_query_fields(row, &["name"])
+                    || row.get("name").and_then(Value::as_str).is_none_or(|name| {
+                        name.is_empty()
+                            || name.len() > 255
+                            || !name.ends_with(".sql")
+                            || name.starts_with('.')
+                            || name.bytes().any(|byte| {
+                                !(byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                            })
+                    })
+                {
+                    return Err(private_query_value_error());
+                }
+            }
+            Ok(())
+        })());
+    }
+    if sql.starts_with("WITH assertions(assertion, passed) AS (VALUES ")
+        && sql.ends_with(") SELECT assertion, passed FROM assertions")
+    {
+        return Some((|| {
+            if rows.len() > 1_024 {
+                return Err(private_query_shape_error());
+            }
+            for (index, row) in rows.iter().enumerate() {
+                if !exact_query_fields(row, &["assertion", "passed"])
+                    || row.get("assertion").and_then(Value::as_str)
+                        != Some(format!("assertion_{index}").as_str())
+                    || !matches!(row.get("passed").and_then(Value::as_i64), Some(0 | 1))
+                {
+                    return Err(private_query_value_error());
+                }
+            }
+            Ok(())
+        })());
+    }
+    None
+}
+
+fn exact_query_fields(row: &Map<String, Value>, fields: &[&str]) -> bool {
+    row.len() == fields.len() && fields.iter().all(|field| row.contains_key(*field))
+}
+
+fn private_query_shape_error() -> CliError {
+    CliError::Input("private D1 readback was outside its closed query schema".to_owned())
+}
+
+fn private_query_value_error() -> CliError {
+    CliError::Input("private D1 readback contained an invalid typed value".to_owned())
 }
 
 pub(super) fn parse_query_rows(stdout: &str) -> Result<Vec<Map<String, Value>>> {

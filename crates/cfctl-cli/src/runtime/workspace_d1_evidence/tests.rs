@@ -139,6 +139,106 @@ fn projects_only_the_typed_body_free_evidence_contract() {
 }
 
 #[test]
+fn shared_private_projector_reuses_the_exact_evidence_owner() {
+    let evidence_row = row();
+    assert!(
+        project_private_query_rows(
+            MAILDESK_D1_EVIDENCE_SQL_V1,
+            std::slice::from_ref(&evidence_row),
+        )
+        .expect("owned evidence query")
+        .is_ok()
+    );
+
+    for private in [
+        json!("73656e6465722e707269766174652e6578616d706c65"),
+        json!("c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ=="),
+        json!({"name":"private"}),
+        json!(["private"]),
+        json!("MAILDESK_VERIFIED_SENDER_DOMAINS\nsender.private.example"),
+    ] {
+        let mut smuggled = evidence_row.clone();
+        smuggled.insert("immutable_policy_object_key".to_owned(), private);
+        assert!(
+            project_private_query_rows(MAILDESK_D1_EVIDENCE_SQL_V1, &[smuggled])
+                .expect("owned evidence query")
+                .is_err(),
+            "private-shaped values must fail before typed evidence retention"
+        );
+    }
+
+    for private_shaped in [
+        "sender.private.example",
+        "73656e6465722e707269766174652e6578616d706c65",
+        "c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ",
+        "name=sender.private.example",
+        "{\"name\":\"sender.private.example\"}",
+        "[\"sender.private.example\"]",
+        "name\nsender.private.example",
+    ] {
+        let mut smuggled = evidence_row.clone();
+        let mut records = serde_json::from_str::<Vec<Value>>(
+            smuggled["route_health_rows_json"]
+                .as_str()
+                .expect("route-health JSON"),
+        )
+        .expect("route rows");
+        records[0]["last_error_code"] = json!(private_shaped);
+        smuggled.insert(
+            "route_health_rows_json".to_owned(),
+            json!(serde_json::to_string(&records).expect("route rows")),
+        );
+        assert!(
+            project_private_query_rows(MAILDESK_D1_EVIDENCE_SQL_V1, &[smuggled])
+                .expect("owned evidence query")
+                .is_err(),
+            "private-shaped last_error_code must fail before serialization"
+        );
+    }
+
+    let mut extra = evidence_row;
+    extra.insert("name".to_owned(), json!("private"));
+    assert!(
+        project_private_query_rows(MAILDESK_D1_EVIDENCE_SQL_V1, &[extra])
+            .expect("owned evidence query")
+            .is_err()
+    );
+    assert!(project_private_query_rows("SELECT arbitrary", &[]).is_none());
+}
+
+#[test]
+fn inbound_private_projector_accepts_only_compiler_owned_shape_and_values() {
+    let query = compiler_query(&inbound_contract(), &inbound_input()).expect("compiler query");
+    assert!(
+        project_private_query_rows(&query.sql, &[inbound_row()])
+            .expect("owned inbound query")
+            .is_ok()
+    );
+    for mutation in [
+        ("status", json!("c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ==")),
+        ("policy_sha256", json!("A".repeat(64))),
+        ("recipient_count", json!({"private":1})),
+        ("provider_accepted_count", json!([1])),
+        ("thread_id", json!("thread:73656e646572")),
+    ] {
+        let mut rejected = inbound_row();
+        rejected.insert(mutation.0.to_owned(), mutation.1);
+        assert!(
+            project_private_query_rows(&query.sql, &[rejected])
+                .expect("owned inbound query")
+                .is_err()
+        );
+    }
+    let mut extra = inbound_row();
+    extra.insert("name".to_owned(), json!("private"));
+    assert!(
+        project_private_query_rows(&query.sql, &[extra])
+            .expect("owned inbound query")
+            .is_err()
+    );
+}
+
+#[test]
 fn provider_typed_error_codes_remain_body_free_evidence() {
     let mut evidence_row = row();
     let mut records = serde_json::from_str::<Vec<Value>>(
@@ -229,6 +329,33 @@ fn missing_invalid_and_unbounded_values_fail_closed() {
         json!(serde_json::to_string(&records).expect("route rows")),
     );
     assert!(project_evidence(&contract(), vec![malformed_error]).is_err());
+
+    for private_shaped in [
+        "sender.private.example",
+        "73656e6465722e707269766174652e6578616d706c65",
+        "c2VuZGVyLnByaXZhdGUuZXhhbXBsZQ",
+        "name=sender.private.example",
+        "{\"name\":\"sender.private.example\"}",
+        "[\"sender.private.example\"]",
+        "name\nsender.private.example",
+    ] {
+        let mut rejected = row();
+        let mut records = serde_json::from_str::<Vec<Value>>(
+            rejected["route_health_rows_json"]
+                .as_str()
+                .expect("route-health JSON"),
+        )
+        .expect("route rows");
+        records[0]["last_error_code"] = json!(private_shaped);
+        rejected.insert(
+            "route_health_rows_json".to_owned(),
+            json!(serde_json::to_string(&records).expect("route rows")),
+        );
+        assert!(
+            project_evidence(&contract(), vec![rejected]).is_err(),
+            "private-shaped last_error_code must fail closed"
+        );
+    }
 }
 
 #[test]
