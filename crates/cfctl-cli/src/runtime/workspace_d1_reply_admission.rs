@@ -400,6 +400,7 @@ pub(super) async fn run(
         APPLY_TIMEOUT,
         config_sha256,
         &contract.config_template_sha256,
+        &contract.database_binding,
     )
     .await;
     let _ = fs::remove_file(&sql_path);
@@ -639,6 +640,7 @@ pub(super) async fn read(
     );
     let rows = workspace_d1_migration::execute_json_query_with_config_identity(
         &config.database_name,
+        &contract.database_binding,
         &config.path,
         &sql,
         Path::new(&contract.repository_root),
@@ -757,6 +759,7 @@ async fn verify_inner(
     );
     let rows = workspace_d1_migration::execute_json_query_with_config_identity(
         string(target, "database_name")?,
+        &contract.database_binding,
         string(target, "production_config")?,
         &sql,
         Path::new(&contract.repository_root),

@@ -394,6 +394,7 @@ pub(super) async fn execute(
         QUERY_TIMEOUT,
         &config.sha256,
         &contract.config_template_sha256,
+        &contract.database_binding,
     )
     .await
     .map_err(|error| {

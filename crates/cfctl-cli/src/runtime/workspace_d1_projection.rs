@@ -311,6 +311,7 @@ pub(super) async fn run(
         APPLY_TIMEOUT,
         config_sha256,
         &contract.config_template_sha256,
+        &contract.database_binding,
     )
     .await?;
     Ok(json!({
@@ -403,6 +404,7 @@ async fn verify_inner_with_authority(
     let count_sql = route_count_sql(contract, policy_sha)?;
     let count_rows = workspace_d1_migration::execute_json_query_with_config_identity(
         database_name,
+        &contract.database_binding,
         config,
         &count_sql,
         root,
@@ -431,6 +433,7 @@ async fn verify_inner_with_authority(
     );
     let state_rows = workspace_d1_migration::execute_json_query_with_config_identity(
         database_name,
+        &contract.database_binding,
         config,
         &state_sql,
         root,

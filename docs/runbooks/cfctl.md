@@ -546,7 +546,12 @@ All mutating repository operations bind an exact Wrangler version, the ignored p
 path and D1 binding, a fresh pre-change bookmark, and a separately approved
 exact-bookmark recovery capability. The production config must be a regular
 mode-restricted file and may differ from its tracked template only in the
-allowed Worker and D1 identity fields. A deployable production Worker binding
+closed private fields plus the operation's exact selected Worker/D1 identity.
+The planned database binding selects that one entry for both planning and
+launch: its production Worker name and `database_name` may differ from template
+sentinels, while its canonical `database_id` and optional equal
+`preview_database_id` remain the selected operational identity. Nonselected
+bindings and other selected-entry fields remain exact. A deployable production Worker binding
 may omit `preview_database_id`; an isolated preview database belongs in its own
 repository-declared Wrangler config and operation. If a production binding
 does declare `preview_database_id`, cfctl requires a canonical UUID equal to

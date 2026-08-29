@@ -18,8 +18,8 @@ use super::{
     },
     read_execution::credential_generation_for_read,
     support::cli_io,
-    worker_deployment::{self, validate_maildesk_verified_sender_domains},
-    workspace_d1_evidence, workspace_d1_projection, workspace_d1_reply_admission,
+    worker_deployment, workspace_d1_evidence, workspace_d1_projection,
+    workspace_d1_reply_admission,
 };
 
 const TARGET_KEY: &str = "workspace_d1_migration";
@@ -182,6 +182,7 @@ pub(super) async fn run(
 
     let before = read_ledger(
         database_name,
+        &contract.database_binding,
         config,
         Path::new(&contract.repository_root),
         credential,
@@ -222,6 +223,7 @@ pub(super) async fn run(
         APPLY_TIMEOUT,
         Some(config_sha256),
         Some(&contract.config_template_sha256),
+        Some(&contract.database_binding),
     )
     .await?;
     Ok(json!({
@@ -301,6 +303,7 @@ async fn verify_inner_with_authority(
     let root = Path::new(&contract.repository_root);
     let ledger = read_ledger(
         database_name,
+        &contract.database_binding,
         config,
         root,
         credential,
@@ -319,6 +322,7 @@ async fn verify_inner_with_authority(
     let assertion_sql = compile_assertion_sql(&contract.assertions)?;
     let assertion_rows = execute_json_query_with_expected_config(
         database_name,
+        Some(&contract.database_binding),
         config,
         &assertion_sql,
         root,
@@ -429,9 +433,14 @@ pub(super) fn validated_config(
             .map_err(|_| CliError::Input("tracked Wrangler config is not UTF-8".to_owned()))?,
     )
     .map_err(|error| CliError::Input(format!("tracked Wrangler config is invalid: {error}")))?;
+    let template = serde_json::to_value(template)
+        .map_err(|_| CliError::Input("tracked Wrangler config is invalid".to_owned()))?;
     let mut production = parse_private_production_config(&production_bytes)?;
-    let identity = production_identity(&production, &contract.database_binding)?;
-    normalize_production_identity(&mut production, &template, &contract.database_binding)?;
+    let identity = worker_deployment::normalize_workspace_d1_private_config(
+        &mut production,
+        &template,
+        &contract.database_binding,
+    )?;
     if production != template {
         return Err(CliError::Input(
             "production Wrangler config differs from the tracked template outside the closed private-config overlay"
@@ -443,7 +452,7 @@ pub(super) fn validated_config(
         .get("database_id")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("workspace D1 migration requires database_id".to_owned()))?;
-    if selected_database != identity.1 {
+    if selected_database != identity.database_id {
         return Err(CliError::Input(
             "workspace D1 migration database selector differs from production config".to_owned(),
         ));
@@ -451,249 +460,18 @@ pub(super) fn validated_config(
     Ok(ValidatedConfig {
         path: canonical.display().to_string(),
         sha256: sha256(&production_bytes),
-        database_name: identity.0,
-        database_id: identity.1,
+        database_name: identity.database_name,
+        database_id: identity.database_id,
     })
 }
 
-fn parse_private_production_config(bytes: &[u8]) -> Result<toml::Value> {
+fn parse_private_production_config(bytes: &[u8]) -> Result<Value> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| CliError::Input("production Wrangler config is not UTF-8".to_owned()))?;
-    toml::from_str(text)
+    let parsed: toml::Value = toml::from_str(text)
+        .map_err(|_| CliError::Input("production Wrangler config is invalid".to_owned()))?;
+    serde_json::to_value(parsed)
         .map_err(|_| CliError::Input("production Wrangler config is invalid".to_owned()))
-}
-
-fn production_identity(config: &toml::Value, binding: &str) -> Result<(String, String)> {
-    let databases = config
-        .get("d1_databases")
-        .and_then(toml::Value::as_array)
-        .ok_or_else(|| CliError::Input("production config has no D1 databases".to_owned()))?;
-    let matches = databases
-        .iter()
-        .filter(|entry| entry.get("binding").and_then(toml::Value::as_str) == Some(binding))
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(CliError::Input(
-            "production config must contain exactly one contract D1 binding".to_owned(),
-        ));
-    }
-    let name = matches[0]
-        .get("database_name")
-        .and_then(toml::Value::as_str)
-        .filter(|value| safe_name(value))
-        .ok_or_else(|| CliError::Input("production D1 database name is invalid".to_owned()))?;
-    let id = matches[0]
-        .get("database_id")
-        .and_then(toml::Value::as_str)
-        .filter(|value| canonical_uuid(value))
-        .ok_or_else(|| CliError::Input("production D1 database id is invalid".to_owned()))?;
-    if let Some(preview) = matches[0].get("preview_database_id") {
-        let preview = preview
-            .as_str()
-            .filter(|value| canonical_uuid(value))
-            .ok_or_else(|| {
-                CliError::Input("production preview D1 database id is invalid".to_owned())
-            })?;
-        if preview != id {
-            return Err(CliError::Input(
-                "a production config that declares preview_database_id must bind it to the same D1 database; use a separate governed preview config for an isolated preview database"
-                    .to_owned(),
-            ));
-        }
-    }
-    Ok((name.to_owned(), id.to_owned()))
-}
-
-fn normalize_production_identity(
-    production: &mut toml::Value,
-    template: &toml::Value,
-    binding: &str,
-) -> Result<()> {
-    let template_name = template
-        .get("name")
-        .cloned()
-        .ok_or_else(|| CliError::Input("tracked Wrangler Worker name is missing".to_owned()))?;
-    production["name"] = template_name;
-    let template_database = d1_entry(template, binding)?.clone();
-    *d1_entry_mut(production, binding)? = template_database;
-    normalize_sender_identity(production, template)?;
-    normalize_relay_activation(production, template)?;
-    normalize_verified_sender_domains(production, template)?;
-    Ok(())
-}
-
-fn normalize_verified_sender_domains(
-    production: &mut toml::Value,
-    template: &toml::Value,
-) -> Result<()> {
-    const KEY: &str = "MAILDESK_VERIFIED_SENDER_DOMAINS";
-    let template_value = template
-        .get("vars")
-        .and_then(toml::Value::as_table)
-        .and_then(|vars| vars.get(KEY))
-        .and_then(toml::Value::as_str)
-        .filter(|value| value.is_empty())
-        .ok_or_else(|| {
-            CliError::Input(
-                "tracked Wrangler template must declare the empty verified-sender domain sentinel"
-                    .to_owned(),
-            )
-        })?;
-    let production_vars = production
-        .get_mut("vars")
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| {
-            CliError::Input(
-                "production Wrangler config must materialize verified-sender domains".to_owned(),
-            )
-        })?;
-    let production_value = production_vars
-        .get(KEY)
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input(
-                "production Wrangler config must materialize verified-sender domains".to_owned(),
-            )
-        })?;
-    validate_maildesk_verified_sender_domains(production_value)?;
-    production_vars.insert(
-        KEY.to_owned(),
-        toml::Value::String(template_value.to_owned()),
-    );
-    Ok(())
-}
-
-fn normalize_relay_activation(production: &mut toml::Value, template: &toml::Value) -> Result<()> {
-    let Some(production_vars) = production
-        .get_mut("vars")
-        .and_then(toml::Value::as_table_mut)
-    else {
-        return Ok(());
-    };
-    let template_vars = template.get("vars").and_then(toml::Value::as_table);
-    for key in ["MAILDESK_INBOUND_RELAY_MODE", "MAILDESK_REPLY_RELAY_MODE"] {
-        let Some(production_mode) = production_vars.get(key) else {
-            continue;
-        };
-        let valid_mode =
-            |value: &toml::Value| matches!(value.as_str(), Some("disabled" | "enabled"));
-        if !valid_mode(production_mode) {
-            return Err(CliError::Input(format!(
-                "workspace D1 production {key} must be disabled or enabled"
-            )));
-        }
-        let template_mode = template_vars
-            .and_then(|values| values.get(key))
-            .filter(|value| valid_mode(value))
-            .ok_or_else(|| {
-                CliError::Input(format!(
-                    "workspace D1 production {key} has no canonical tracked-template authority"
-                ))
-            })?;
-        production_vars.insert(key.to_owned(), template_mode.clone());
-    }
-    Ok(())
-}
-
-fn normalize_sender_identity(production: &mut toml::Value, template: &toml::Value) -> Result<()> {
-    let Some(production_senders) = production
-        .get_mut("send_email")
-        .and_then(toml::Value::as_array_mut)
-    else {
-        return Ok(());
-    };
-    let Some(template_senders) = template.get("send_email").and_then(toml::Value::as_array) else {
-        return Ok(());
-    };
-    if production_senders.len() != template_senders.len() {
-        return Ok(());
-    }
-    for (production_sender, template_sender) in production_senders.iter_mut().zip(template_senders)
-    {
-        let Some(production_table) = production_sender.as_table_mut() else {
-            continue;
-        };
-        let Some(addresses) = production_table.get("allowed_sender_addresses") else {
-            continue;
-        };
-        validate_sender_addresses(addresses)?;
-        if let Some(template_addresses) = template_sender.get("allowed_sender_addresses") {
-            production_table.insert(
-                "allowed_sender_addresses".to_owned(),
-                template_addresses.clone(),
-            );
-        } else {
-            production_table.remove("allowed_sender_addresses");
-        }
-    }
-    Ok(())
-}
-
-fn validate_sender_addresses(value: &toml::Value) -> Result<()> {
-    let valid = value.as_array().is_some_and(|addresses| {
-        (1..=256).contains(&addresses.len())
-            && addresses.iter().all(|address| {
-                address.as_str().is_some_and(|address| {
-                    (3..=320).contains(&address.len())
-                        && !address
-                            .bytes()
-                            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-                        && address.split_once('@').is_some_and(|(local, domain)| {
-                            !local.is_empty()
-                                && !domain.is_empty()
-                                && !domain.contains('@')
-                                && !domain.starts_with('.')
-                                && !domain.ends_with('.')
-                        })
-                })
-            })
-    });
-    if valid {
-        Ok(())
-    } else {
-        Err(CliError::Input(
-            "workspace D1 production sender identity must be a bounded list of email addresses"
-                .to_owned(),
-        ))
-    }
-}
-
-fn d1_entry<'a>(config: &'a toml::Value, binding: &str) -> Result<&'a toml::Value> {
-    let databases = config
-        .get("d1_databases")
-        .and_then(toml::Value::as_array)
-        .ok_or_else(|| CliError::Input("Wrangler config has no D1 databases".to_owned()))?;
-    let matches = databases
-        .iter()
-        .filter(|entry| entry.get("binding").and_then(toml::Value::as_str) == Some(binding))
-        .collect::<Vec<_>>();
-    if matches.len() == 1 {
-        Ok(matches[0])
-    } else {
-        Err(CliError::Input(
-            "Wrangler config D1 binding is missing or ambiguous".to_owned(),
-        ))
-    }
-}
-
-fn d1_entry_mut<'a>(config: &'a mut toml::Value, binding: &str) -> Result<&'a mut toml::Value> {
-    let databases = config
-        .get_mut("d1_databases")
-        .and_then(toml::Value::as_array_mut)
-        .ok_or_else(|| CliError::Input("Wrangler config has no D1 databases".to_owned()))?;
-    let matching = databases
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.get("binding").and_then(toml::Value::as_str) == Some(binding))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    if matching.len() == 1 {
-        Ok(&mut databases[matching[0]])
-    } else {
-        Err(CliError::Input(
-            "Wrangler config D1 binding is missing or ambiguous".to_owned(),
-        ))
-    }
 }
 
 #[expect(
@@ -880,6 +658,7 @@ fn require_target_string(target: &Map<String, Value>, field: &str, expected: &st
 )]
 async fn read_ledger(
     database: &str,
+    database_binding: &str,
     config: &str,
     root: &Path,
     credential: &AuthCredential,
@@ -890,6 +669,7 @@ async fn read_ledger(
 ) -> Result<Vec<String>> {
     let existence = execute_json_query_with_expected_config(
         database,
+        Some(database_binding),
         config,
         "SELECT COUNT(*) AS present FROM sqlite_schema WHERE type = 'table' AND name = 'd1_migrations'",
         root,
@@ -910,6 +690,7 @@ async fn read_ledger(
     }
     let rows = execute_json_query_with_expected_config(
         database,
+        Some(database_binding),
         config,
         "SELECT name FROM d1_migrations ORDER BY id",
         root,
@@ -937,6 +718,7 @@ async fn read_ledger(
 )]
 pub(super) async fn execute_json_query_with_config_identity(
     database: &str,
+    database_binding: &str,
     config: &str,
     sql: &str,
     root: &Path,
@@ -948,6 +730,7 @@ pub(super) async fn execute_json_query_with_config_identity(
 ) -> Result<Vec<Map<String, Value>>> {
     execute_json_query_with_expected_config(
         database,
+        Some(database_binding),
         config,
         sql,
         root,
@@ -966,6 +749,7 @@ pub(super) async fn execute_json_query_with_config_identity(
 )]
 async fn execute_json_query_with_expected_config(
     database: &str,
+    database_binding: Option<&str>,
     config: &str,
     sql: &str,
     root: &Path,
@@ -995,6 +779,7 @@ async fn execute_json_query_with_expected_config(
         QUERY_TIMEOUT,
         expected_config_sha256,
         expected_template_sha256,
+        database_binding,
     )
     .await?;
     if output.success {
@@ -1045,7 +830,7 @@ pub(super) async fn run_wrangler(
     timeout: Duration,
 ) -> Result<WranglerOutput> {
     run_wrangler_with_expected_config(
-        arguments, root, credential, account_id, cache_dir, timeout, None, None,
+        arguments, root, credential, account_id, cache_dir, timeout, None, None, None,
     )
     .await
 }
@@ -1063,6 +848,7 @@ pub(super) async fn run_wrangler_with_config_identity(
     timeout: Duration,
     expected_config_sha256: &str,
     expected_template_sha256: &str,
+    database_binding: &str,
 ) -> Result<WranglerOutput> {
     run_wrangler_with_expected_config(
         arguments,
@@ -1073,6 +859,7 @@ pub(super) async fn run_wrangler_with_config_identity(
         timeout,
         Some(expected_config_sha256),
         Some(expected_template_sha256),
+        Some(database_binding),
     )
     .await
 }
@@ -1090,6 +877,7 @@ async fn run_wrangler_with_expected_config(
     timeout: Duration,
     expected_config_sha256: Option<&str>,
     expected_template_sha256: Option<&str>,
+    database_binding: Option<&str>,
 ) -> Result<WranglerOutput> {
     run_wrangler_program(
         Path::new("wrangler"),
@@ -1101,6 +889,7 @@ async fn run_wrangler_with_expected_config(
         timeout,
         expected_config_sha256,
         expected_template_sha256,
+        database_binding,
     )
     .await
 }
@@ -1119,12 +908,14 @@ async fn run_wrangler_program(
     timeout: Duration,
     expected_config_sha256: Option<&str>,
     expected_template_sha256: Option<&str>,
+    database_binding: Option<&str>,
 ) -> Result<WranglerOutput> {
     let mut execution_arguments = arguments.to_vec();
     let private_config = bind_private_config_from_arguments(
         &mut execution_arguments,
         expected_config_sha256,
         expected_template_sha256,
+        database_binding,
     )?;
     let token = credential.bearer_token().ok_or_else(|| {
         CliError::Input(
@@ -1204,6 +995,7 @@ fn bind_private_config_from_arguments(
     arguments: &mut [String],
     expected_config_sha256: Option<&str>,
     expected_template_sha256: Option<&str>,
+    database_binding: Option<&str>,
 ) -> Result<Option<worker_deployment::BoundPrivateConfig>> {
     if arguments
         .iter()
@@ -1247,11 +1039,17 @@ fn bind_private_config_from_arguments(
         })?
     };
     let bound = Some(
-        worker_deployment::bind_private_config_path_with_template_for_execution(
+        worker_deployment::bind_workspace_d1_private_config_for_execution(
             config,
             &template,
             expected_config_sha256,
             expected_template_sha256,
+            database_binding.ok_or_else(|| {
+                CliError::Input(
+                    "workspace D1 private execution requires the planned database binding"
+                        .to_owned(),
+                )
+            })?,
         )?,
     );
     if let Some(bound) = &bound {
@@ -1497,26 +1295,6 @@ pub(super) fn parse_wrangler_version(stdout: &str) -> Result<String> {
         })
         .map(str::to_owned)
         .ok_or_else(|| CliError::Input("Wrangler version output was invalid".to_owned()))
-}
-
-fn canonical_uuid(value: &str) -> bool {
-    value != "00000000-0000-0000-0000-000000000000"
-        && uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
-}
-
-fn safe_name(value: &str) -> bool {
-    (1..=63).contains(&value.len())
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && value
-            .bytes()
-            .last()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 pub(super) fn sha256(bytes: &[u8]) -> String {

@@ -1,7 +1,5 @@
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
-    fmt::Write as _,
     fs,
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
@@ -15,12 +13,18 @@ use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
 use cfctl_core::{
     CapabilityV1, PlanV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, hash_value, redact_json,
 };
-use cfctl_workspace::{WorkspaceGraph, load_wrangler_config, load_wrangler_config_snapshot};
+use cfctl_workspace::{WorkspaceGraph, load_wrangler_config_snapshot};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
-use super::CliError;
+use super::{
+    CliError,
+    worker_deployment_artifact::{
+        artifact_paths as deployment_artifact_paths, artifact_paths_from_document,
+        artifact_set_sha256, canonical_config, is_full_source_sha, repository_owning_path,
+        validate_artifact_tree_ownership,
+    },
+};
 
 pub(super) const STATE_PRECONDITION: &str = "worker_deployment_state";
 pub(super) const SETTINGS_CAPABILITY_ID: &str = "worker-script-get-settings";
@@ -68,49 +72,7 @@ pub(super) fn artifact_paths(
     if !binds_artifact(capability) {
         return Ok(Vec::new());
     }
-    let config = canonical_config(input)?;
-    let directory = config.parent().ok_or_else(|| {
-        CliError::Input("Wrangler configuration has no containing directory".to_owned())
-    })?;
-    let document = load_wrangler_config(&config)?;
-    artifact_paths_from_document(directory, &document, input)
-}
-
-fn artifact_paths_from_document(
-    directory: &Path,
-    document: &Value,
-    input: &CallInput,
-) -> Result<Vec<PathBuf>, CliError> {
-    let main = input
-        .query
-        .get("argument")
-        .and_then(Value::as_str)
-        .or_else(|| document.get("main").and_then(Value::as_str));
-    let assets = document
-        .pointer("/assets/directory")
-        .and_then(Value::as_str);
-    let mut roots = BTreeSet::new();
-    if let Some(main) = main.filter(|value| !value.trim().is_empty()) {
-        let path = canonical_artifact_path(directory, main)?;
-        roots.insert(if path.is_dir() {
-            path
-        } else {
-            path.parent()
-                .ok_or_else(|| {
-                    CliError::Input("Worker entry point has no containing directory".to_owned())
-                })?
-                .to_path_buf()
-        });
-    }
-    if let Some(assets) = assets.filter(|value| !value.trim().is_empty()) {
-        roots.insert(canonical_artifact_path(directory, assets)?);
-    }
-    if roots.is_empty() {
-        return Err(CliError::Input(
-            "Worker deployment configuration must declare `main` or `assets.directory`".to_owned(),
-        ));
-    }
-    Ok(roots.into_iter().collect())
+    deployment_artifact_paths(input)
 }
 
 #[expect(
@@ -800,15 +762,52 @@ pub(super) fn bind_planned_config_path_for_execution(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one binding transaction keeps no-follow capture, bounded bytes, production and template hashes, closed-overlay equality, immutable staging, and staged-byte readback under one private-config lifetime"
-)]
 pub(super) fn bind_private_config_path_with_template_for_execution(
     config: &Path,
     template_path: &Path,
     expected_sha256: Option<&str>,
     expected_template_sha256: Option<&str>,
+) -> Result<BoundPrivateConfig, CliError> {
+    bind_private_config_path_with_template_and_overlay_for_execution(
+        config,
+        template_path,
+        expected_sha256,
+        expected_template_sha256,
+        PrivateConfigOverlay::WorkerDeployment,
+    )
+}
+
+pub(super) fn bind_workspace_d1_private_config_for_execution(
+    config: &Path,
+    template_path: &Path,
+    expected_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+    database_binding: &str,
+) -> Result<BoundPrivateConfig, CliError> {
+    bind_private_config_path_with_template_and_overlay_for_execution(
+        config,
+        template_path,
+        expected_sha256,
+        expected_template_sha256,
+        PrivateConfigOverlay::WorkspaceD1 { database_binding },
+    )
+}
+
+enum PrivateConfigOverlay<'a> {
+    WorkerDeployment,
+    WorkspaceD1 { database_binding: &'a str },
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one binding transaction keeps no-follow capture, bounded bytes, production and template hashes, closed-overlay equality, immutable staging, and staged-byte readback under one private-config lifetime"
+)]
+fn bind_private_config_path_with_template_and_overlay_for_execution(
+    config: &Path,
+    template_path: &Path,
+    expected_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+    overlay: PrivateConfigOverlay<'_>,
 ) -> Result<BoundPrivateConfig, CliError> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -895,7 +894,14 @@ pub(super) fn bind_private_config_path_with_template_for_execution(
         .and_then(|value| serde_json::to_value(value).ok())
         .ok_or_else(|| CliError::Input("tracked Worker template is malformed".to_owned()))?;
     let mut normalized = production.clone();
-    normalize_private_d1_identity(&mut normalized, &template)?;
+    match overlay {
+        PrivateConfigOverlay::WorkerDeployment => {
+            normalize_private_d1_identity(&mut normalized, &template)?;
+        }
+        PrivateConfigOverlay::WorkspaceD1 { database_binding } => {
+            normalize_workspace_d1_private_config(&mut normalized, &template, database_binding)?;
+        }
+    }
     if normalized != template {
         return Err(CliError::Input(
             "private Worker production config differs from its tracked role template outside the closed private-config overlay"
@@ -1048,6 +1054,150 @@ fn normalize_private_d1_identity(production: &mut Value, template: &Value) -> Re
     normalize_private_relay_activation(production, template)?;
     normalize_private_verified_sender_domains(production, template)?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct WorkspaceD1PrivateIdentity {
+    pub(super) database_name: String,
+    pub(super) database_id: String,
+}
+
+pub(super) fn normalize_workspace_d1_private_config(
+    production: &mut Value,
+    template: &Value,
+    database_binding: &str,
+) -> Result<WorkspaceD1PrivateIdentity, CliError> {
+    if database_binding.is_empty() {
+        return Err(CliError::Input(
+            "workspace D1 private-config binding is missing".to_owned(),
+        ));
+    }
+    production
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| safe_workspace_d1_name(value))
+        .ok_or_else(|| CliError::Input("production Worker name is invalid".to_owned()))?;
+    let template_name = template
+        .get("name")
+        .cloned()
+        .ok_or_else(|| CliError::Input("tracked Wrangler Worker name is missing".to_owned()))?;
+    production["name"] = template_name;
+
+    let template_databases = template
+        .get("d1_databases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::Input("tracked Worker template has no D1 databases".to_owned()))?;
+    let template_index = unique_workspace_d1_binding_index(
+        template_databases,
+        database_binding,
+        "tracked Worker template",
+    )?;
+    let template_database = template_databases[template_index]
+        .as_object()
+        .ok_or_else(|| CliError::Input("tracked Worker D1 binding is not a table".to_owned()))?;
+
+    let production_databases = production
+        .get_mut("d1_databases")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            CliError::Input("private Worker production config has no D1 databases".to_owned())
+        })?;
+    let production_index = unique_workspace_d1_binding_index(
+        production_databases,
+        database_binding,
+        "private Worker production config",
+    )?;
+    let production_database = production_databases[production_index]
+        .as_object_mut()
+        .ok_or_else(|| CliError::Input("private Worker D1 binding is not a table".to_owned()))?;
+    let database_name = production_database
+        .get("database_name")
+        .and_then(Value::as_str)
+        .filter(|value| safe_workspace_d1_name(value))
+        .ok_or_else(|| CliError::Input("production D1 database name is invalid".to_owned()))?
+        .to_owned();
+    let database_id = production_database
+        .get("database_id")
+        .and_then(Value::as_str)
+        .filter(|value| canonical_workspace_d1_uuid(value))
+        .ok_or_else(|| CliError::Input("production D1 database id is invalid".to_owned()))?
+        .to_owned();
+    if let Some(preview) = production_database.get("preview_database_id") {
+        let preview = preview
+            .as_str()
+            .filter(|value| canonical_workspace_d1_uuid(value))
+            .ok_or_else(|| {
+                CliError::Input("production preview D1 database id is invalid".to_owned())
+            })?;
+        if preview != database_id.as_str() {
+            return Err(CliError::Input(
+                "a production config that declares preview_database_id must bind it to the same D1 database; use a separate governed preview config for an isolated preview database"
+                    .to_owned(),
+            ));
+        }
+    }
+    for field in ["database_name", "database_id"] {
+        let value = template_database
+            .get(field)
+            .cloned()
+            .ok_or_else(|| CliError::Input(format!("tracked Worker D1 {field} is missing")))?;
+        production_database.insert(field.to_owned(), value);
+    }
+    if let Some(preview) = template_database.get("preview_database_id") {
+        production_database.insert("preview_database_id".to_owned(), preview.clone());
+    } else {
+        production_database.remove("preview_database_id");
+    }
+
+    normalize_private_sender_identity(production, template)?;
+    normalize_private_relay_activation(production, template)?;
+    normalize_private_verified_sender_domains(production, template)?;
+    Ok(WorkspaceD1PrivateIdentity {
+        database_name,
+        database_id,
+    })
+}
+
+fn unique_workspace_d1_binding_index(
+    databases: &[Value],
+    database_binding: &str,
+    owner: &str,
+) -> Result<usize, CliError> {
+    let matches = databases
+        .iter()
+        .enumerate()
+        .filter(|(_, database)| {
+            database.get("binding").and_then(Value::as_str) == Some(database_binding)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Ok(matches[0])
+    } else {
+        Err(CliError::Input(format!(
+            "{owner} must contain exactly one selected D1 binding"
+        )))
+    }
+}
+
+fn canonical_workspace_d1_uuid(value: &str) -> bool {
+    value != "00000000-0000-0000-0000-000000000000"
+        && uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+}
+
+fn safe_workspace_d1_name(value: &str) -> bool {
+    (1..=63).contains(&value.len())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn normalize_private_verified_sender_domains(
@@ -1809,172 +1959,6 @@ pub(super) fn apply_plan_diff(diff: &mut Value, plan: &PlanV1, state: &Value) {
         });
         diff["planned_after"] = target.clone();
     }
-}
-
-fn canonical_config(input: &CallInput) -> Result<PathBuf, CliError> {
-    let raw = input
-        .query
-        .get("config")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("Worker deployment requires a config selector".to_owned())
-        })?;
-    let path = Path::new(raw);
-    if !path.is_absolute() {
-        return Err(CliError::Input(
-            "Worker deployment requires an absolute Wrangler config path".to_owned(),
-        ));
-    }
-    load_wrangler_config(path)?;
-    let canonical = fs::canonicalize(path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if !canonical.is_file() {
-        return Err(CliError::Input(format!(
-            "Wrangler configuration `{}` is not a file",
-            canonical.display()
-        )));
-    }
-    Ok(canonical)
-}
-
-fn canonical_artifact_path(directory: &Path, raw: &str) -> Result<PathBuf, CliError> {
-    let path = Path::new(raw);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        directory.join(path)
-    };
-    fs::canonicalize(&path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        source,
-    })
-}
-
-fn repository_owning_path<'a>(
-    graph: &'a WorkspaceGraph,
-    path: &Path,
-) -> Option<&'a cfctl_workspace::RepositoryNode> {
-    graph
-        .repositories
-        .iter()
-        .filter(|repository| path.starts_with(&repository.path))
-        .max_by_key(|repository| repository.path.components().count())
-}
-
-fn is_git_metadata_name(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|value| value.eq_ignore_ascii_case(".git"))
-}
-
-fn validate_artifact_tree_ownership(
-    graph: &WorkspaceGraph,
-    repository: &Path,
-    roots: &[PathBuf],
-) -> Result<(), CliError> {
-    for root in roots {
-        let mut entries = WalkDir::new(root).follow_links(false).into_iter();
-        while let Some(entry) = entries.next() {
-            let entry = entry.map_err(|error| {
-                CliError::Input(format!(
-                    "failed to inspect Worker deployment artifact `{}`: {error}",
-                    root.display()
-                ))
-            })?;
-            if is_git_metadata_name(entry.file_name()) {
-                if entry.path().parent() != Some(repository) {
-                    return Err(CliError::Input(format!(
-                        "Worker deployment artifact contains nested Git repository metadata `{}`",
-                        entry.path().display()
-                    )));
-                }
-                if entry.file_type().is_dir() {
-                    entries.skip_current_dir();
-                }
-                continue;
-            }
-            if repository_owning_path(graph, entry.path())
-                .is_none_or(|owner| owner.path != repository)
-            {
-                return Err(CliError::Input(format!(
-                    "Worker deployment artifact `{}` is not owned by config repository `{}`",
-                    entry.path().display(),
-                    repository.display()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn artifact_set_sha256(repository: &Path, roots: &[PathBuf]) -> Result<String, CliError> {
-    let mut entries = Vec::new();
-    for root in roots {
-        let mut walker = WalkDir::new(root).follow_links(false).into_iter();
-        while let Some(entry) = walker.next() {
-            let entry = entry.map_err(|error| {
-                CliError::Input(format!(
-                    "failed to inspect Worker deployment artifact `{}`: {error}",
-                    root.display()
-                ))
-            })?;
-            if is_git_metadata_name(entry.file_name()) {
-                if entry.path().parent() != Some(repository) {
-                    return Err(CliError::Input(format!(
-                        "Worker deployment artifact contains nested Git repository metadata `{}`",
-                        entry.path().display()
-                    )));
-                }
-                if entry.file_type().is_dir() {
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-            if entry.path() == root || entry.file_type().is_dir() {
-                continue;
-            }
-            if !entry.file_type().is_file() {
-                return Err(CliError::Input(format!(
-                    "Worker deployment artifact contains unsupported non-file entry `{}`",
-                    entry.path().display()
-                )));
-            }
-            let relative = entry.path().strip_prefix(repository).map_err(|_| {
-                CliError::Input(format!(
-                    "Worker deployment artifact `{}` escaped repository `{}`",
-                    entry.path().display(),
-                    repository.display()
-                ))
-            })?;
-            let bytes = fs::read(entry.path()).map_err(|source| CliError::Io {
-                path: entry.path().display().to_string(),
-                source,
-            })?;
-            entries.push((
-                relative.to_string_lossy().replace('\\', "/"),
-                hex::encode(Sha256::digest(bytes)),
-            ));
-        }
-    }
-    entries.sort();
-    entries.dedup();
-    let mut manifest = String::new();
-    for (path, digest) in entries {
-        writeln!(&mut manifest, "{digest}  {path}").map_err(|error| {
-            CliError::Input(format!(
-                "failed to construct deployment artifact manifest: {error}"
-            ))
-        })?;
-    }
-    Ok(hex::encode(Sha256::digest(manifest.as_bytes())))
-}
-
-fn is_full_source_sha(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

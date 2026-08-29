@@ -58,6 +58,7 @@ mod support;
 mod v1_migration;
 mod worker_custom_domain;
 mod worker_deployment;
+mod worker_deployment_artifact;
 mod workspace_commands;
 mod workspace_d1_evidence;
 mod workspace_d1_migration;
