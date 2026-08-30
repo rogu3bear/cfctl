@@ -54,6 +54,80 @@ pub(super) fn resolver_workflow_capability(id: &str, title: &str) -> CapabilityV
     capability
 }
 
+#[tokio::test]
+async fn registered_schema_v2_pack_does_not_block_cli_resolve_for_an_unrelated_intent() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let repository = tempfile::tempdir().expect("registered repository");
+    let git = |arguments: &[&str]| {
+        let output = StdCommand::new("git")
+            .current_dir(repository.path())
+            .args(arguments)
+            .output()
+            .expect("git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["remote", "add", "origin", "https://example.com/founder.git"]);
+    fs::create_dir_all(repository.path().join(".cfctl/operations")).expect("operation pack dir");
+    fs::write(
+        repository
+            .path()
+            .join(".cfctl/operations/d1-migrations.toml"),
+        r#"schema_version = 2
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+title = "Future manifest operation"
+manifest_path = ".control-plane/d1_migration_manifest.json"
+"#,
+    )
+    .expect("schema-v2 pack");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "schema-v2 fixture"]);
+
+    let store = StateStore::open(RuntimePaths::from_root(runtime.path())).expect("store opens");
+    store
+        .register_workspace(repository.path(), Some("account-a".to_owned()))
+        .expect("register exact repository");
+    let mut catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "test://resolver".to_owned(),
+        source_hash: "sha256:source".to_owned(),
+        schema_hash: String::new(),
+        capabilities: [(
+            "workers-scripts-list".to_owned(),
+            resolver_read_capability("workers-scripts-list", "List Workers", "Workers"),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    catalog.refresh_hash().expect("catalog hash");
+    store
+        .write_json(&store.paths().catalog_file(), &catalog)
+        .expect("store catalog");
+
+    let envelope = resolve_command(
+        &store,
+        ResolveArgs {
+            intent: "deploy JKCA workers".to_owned(),
+            account: None,
+            limit: 5,
+        },
+    )
+    .await
+    .expect("unrelated schema-v2 pack must not become a workspace resolver error");
+    assert_eq!(envelope.command, "resolve");
+    assert!(!envelope.performed);
+}
+
 #[test]
 pub(super) fn workflow_guide_replaces_generic_mutation_ceremony_with_preview_semantics() {
     let workflow = resolver_workflow_capability(
