@@ -20,8 +20,18 @@ const PACK_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Deserialize)]
 struct OperationPack {
-    schema_version: u8,
     operation: Vec<OperationDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationPackIndex {
+    schema_version: u8,
+    operation: Vec<OperationIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationIdentity {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,26 +113,39 @@ fn load_from_repository(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invariant("workspace operation repository has no origin"))?;
     let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH))?;
-    let pack: OperationPack = toml::from_str(
-        std::str::from_utf8(&pack_bytes)
-            .map_err(|_| invariant("workspace operation pack is not UTF-8"))?,
-    )
-    .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
-    if pack.schema_version != PACK_SCHEMA_VERSION {
-        return Err(invariant(
-            "workspace operation pack schema version is unsupported",
-        ));
-    }
-    let duplicate_ids = pack
+    let pack_text = std::str::from_utf8(&pack_bytes)
+        .map_err(|_| invariant("workspace operation pack is not UTF-8"))?;
+    let index: OperationPackIndex = toml::from_str(pack_text)
+        .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
+    let duplicate_ids = index
         .operation
         .iter()
         .map(|operation| operation.id.as_str())
         .collect::<BTreeSet<_>>()
         .len()
-        != pack.operation.len();
+        != index.operation.len();
     if duplicate_ids {
         return Err(invariant("workspace operation pack contains duplicate ids"));
     }
+    if index.schema_version == 2 {
+        if index
+            .operation
+            .iter()
+            .all(|operation| operation.id != capability_id)
+        {
+            return Ok(None);
+        }
+        return Err(invariant(
+            "workspace operation pack schema version is unsupported",
+        ));
+    }
+    if index.schema_version != PACK_SCHEMA_VERSION {
+        return Err(invariant(
+            "workspace operation pack schema version is unsupported",
+        ));
+    }
+    let pack: OperationPack = toml::from_str(pack_text)
+        .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
     let Some(operation) = pack
         .operation
         .iter()
@@ -656,5 +679,97 @@ kind = "foreign_key_check_empty"
                 .to_string()
                 .contains("exactly the declared migration files")
         );
+    }
+
+    #[test]
+    fn schema_v2_pack_is_irrelevant_to_an_unrelated_intent_but_matching_ids_stay_unsupported() {
+        let root = fixture();
+        fs::write(
+            root.path().join(PACK_RELATIVE_PATH),
+            r#"schema_version = 2
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+title = "Future manifest operation"
+manifest_path = ".control-plane/d1_migration_manifest.json"
+"#,
+        )
+        .expect("schema-v2 pack");
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "schema-v2 fixture"]);
+
+        assert!(
+            load_workspace_d1_migration_capability(
+                &[root.path().to_path_buf()],
+                "deploy JKCA workers",
+            )
+            .expect("unrelated intent is not blocked")
+            .is_none()
+        );
+        let error = load_workspace_d1_migration_capability(
+            &[root.path().to_path_buf()],
+            "mln-web.founder-d1-migration-apply",
+        )
+        .expect_err("matching schema-v2 capability remains unsupported");
+        assert!(error.to_string().contains("schema version is unsupported"));
+    }
+
+    #[test]
+    fn schema_v2_duplicate_ids_still_fail_closed_for_unrelated_intents() {
+        let root = fixture();
+        fs::write(
+            root.path().join(PACK_RELATIVE_PATH),
+            r#"schema_version = 2
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+"#,
+        )
+        .expect("duplicate schema-v2 pack");
+        git(root.path(), &["add", "."]);
+        git(
+            root.path(),
+            &["commit", "-qm", "duplicate schema-v2 fixture"],
+        );
+
+        let error = load_workspace_d1_migration_capability(
+            &[root.path().to_path_buf()],
+            "deploy JKCA workers",
+        )
+        .expect_err("duplicate authority is never ignored");
+        assert!(error.to_string().contains("duplicate ids"));
+    }
+
+    #[test]
+    fn non_v1_non_v2_schema_versions_stay_fail_closed_for_unrelated_intents() {
+        for schema_version in [0, 3] {
+            let root = fixture();
+            fs::write(
+                root.path().join(PACK_RELATIVE_PATH),
+                format!(
+                    r#"schema_version = {schema_version}
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+"#,
+                ),
+            )
+            .expect("unsupported-version pack");
+            git(root.path(), &["add", "."]);
+            git(
+                root.path(),
+                &["commit", "-qm", "unsupported-version fixture"],
+            );
+
+            let error = load_workspace_d1_migration_capability(
+                &[root.path().to_path_buf()],
+                "deploy JKCA workers",
+            )
+            .expect_err("only schema v2 has the unrelated-intent exception");
+            assert!(error.to_string().contains("schema version is unsupported"));
+        }
     }
 }
