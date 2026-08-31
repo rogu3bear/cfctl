@@ -10,11 +10,47 @@ pub(super) fn evidence_key_command(
 ) -> Result<ResultEnvelopeV2> {
     let manager = store.platform_evidence_key_manager()?;
     match command {
+        EvidenceKeyCommand::InitPreview => initialization_preview(store, &manager),
         EvidenceKeyCommand::Init => initialize(store, &manager),
         EvidenceKeyCommand::Status => status(store, &manager),
         EvidenceKeyCommand::Rotate => rotate(store, &manager),
         EvidenceKeyCommand::Retire(arguments) => retire(store, &manager, &arguments),
     }
+}
+
+fn initialization_preview(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+) -> Result<ResultEnvelopeV2> {
+    let _lifecycle = store.lock_evidence_lifecycle()?;
+    let marker = store.evidence_root_identity()?;
+    let status = manager.status(marker.as_deref())?;
+    let state = match (marker.is_some(), status.initialized) {
+        (false, false) => "ready",
+        (true, true) => "already_initialized",
+        _ => "split_authority_blocked",
+    };
+    Ok(ResultEnvelopeV2::success(
+        "auth evidence-key init-preview",
+        json!({
+            "performed": false,
+            "initialization_state": state,
+            "current_status": status,
+            "backend": "platform_keyring",
+            "generated_key_custody": "platform_keyring_only_non_exportable_through_cfctl",
+            "local_marker_custody": "canonical_state_root_non_secret_identity_marker",
+            "state_root_transition": "absent_to_random_content_addressed_identity",
+            "verification_generation_behavior": "initial_generation_signs_and_verifies; rotation makes older generations verification-only",
+            "recoverability": {
+                "before_marker_write": "a conclusively absent marker permits rollback of only the exact fresh platform authority",
+                "after_marker_write_or_uncertainty": "preserve both sides, inspect status, and never replay initialization blindly",
+                "split_authority": "blocked; initialization will not overwrite either side"
+            },
+            "secret_key_bytes_exposed": false,
+            "execution_command": "cfctl auth evidence-key init --json",
+            "message": "This preview is read-only. It creates no key or state-root marker and discloses no secret key material."
+        }),
+    ))
 }
 
 fn initialize(store: &StateStore, manager: &EvidenceKeyManager) -> Result<ResultEnvelopeV2> {
@@ -213,7 +249,10 @@ mod tests {
     };
     use cfctl_storage::{RuntimePaths, StorageError};
 
-    use super::{EvidenceKeyManager, StateStore, initialize, initialize_with_marker_write};
+    use super::{
+        EvidenceKeyManager, StateStore, initialization_preview, initialize,
+        initialize_with_marker_write,
+    };
 
     fn memory_manager(store: &StateStore) -> EvidenceKeyManager {
         EvidenceKeyManager::new(
@@ -222,6 +261,38 @@ mod tests {
             SecretBackend::Memory,
         )
         .expect("memory evidence manager")
+    }
+
+    #[test]
+    fn initialization_preview_discloses_custody_and_recovery_without_performing_transition() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        let envelope = initialization_preview(&store, &manager).expect("preview succeeds");
+
+        assert!(!envelope.performed);
+        assert_eq!(
+            envelope
+                .result
+                .get("initialization_state")
+                .and_then(serde_json::Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            envelope
+                .result
+                .get("secret_key_bytes_exposed")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            store
+                .evidence_root_identity()
+                .expect("marker reads")
+                .is_none()
+        );
+        assert!(!manager.status(None).expect("status reads").initialized);
     }
 
     #[derive(Default)]

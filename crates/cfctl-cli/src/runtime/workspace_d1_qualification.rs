@@ -11,6 +11,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod producer;
+
+pub(super) use producer::{CAPABILITY_ID as PRODUCER_CAPABILITY_ID, produce};
+
 use super::prelude::{CliError, PlanV1, Result, StateStore};
 
 pub(super) const ATOMICITY_QUALIFICATION_PRECONDITION: &str =
@@ -116,6 +120,7 @@ struct OwnedPlanExpectation {
     profile_id: String,
     account_id: String,
     credential_generation_id: String,
+    build_identity_hash: String,
     target_hash: String,
     expected_status: PlanStatus,
     expected_stage: TransactionStageV1,
@@ -801,6 +806,7 @@ fn resolve_plan_expectation(
         profile_id: plan.plan.profile_id.clone(),
         account_id: plan.plan.account_id.clone(),
         credential_generation_id: plan.pins.credential_generation_id.clone(),
+        build_identity_hash: plan.pins.build_identity_hash.clone(),
         target_hash: hash_value(&plan.plan.targets)?,
         expected_status,
         expected_stage,

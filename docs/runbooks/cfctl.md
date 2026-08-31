@@ -12,7 +12,7 @@ applies, and verification receipts separate.
 |---|---|---|
 | The installed command and the checkout behave differently | Run `cfctl version --json` and `cfctl doctor --json`; invoke each candidate executable directly and compare its self-reported path, version, commit, and identity source. Reinstall only from an exact release asset whose checksum matches `SHA256SUMS`. | Do not repair the mismatch with a symlink, PATH shim, unverified binary, or release override. Unknown or dirty identity remains unhealthy. |
 | No profile is selected, or the governed fallback store is active | Run `cfctl auth profiles --json`, select one existing account-pinned profile with `cfctl auth use <profile> --json`, then rerun `cfctl auth status --json`. An active fallback store is authoritative by design; use the explicit repair command only when the operator intentionally wants to test or restore the platform keyring. | Never ask the operator to paste a token, OAuth callback, global key, or fallback file. Do not broaden permissions merely to make the error disappear. |
-| Evidence qualification reports an uninitialized or split platform authority | Run `cfctl auth evidence-key status --json`. Initialize only when both the canonical state-root marker and direct platform registry are absent. Rotate explicitly; retire only an inactive generation after cfctl reports zero authenticated local artifacts. | Never use the credential fallback store for the evidence integrity key, recreate a missing half over existing state, or treat legacy unauthenticated proof rows as current qualification. |
+| Evidence qualification reports an uninitialized or split platform authority | Run `cfctl auth evidence-key status --json`, then `cfctl auth evidence-key init-preview --json` before any first initialization. Initialize only when both the canonical state-root marker and direct platform registry are absent. Rotate explicitly; retire only an inactive generation after cfctl reports zero authenticated local artifacts. | Never use the credential fallback store for the evidence integrity key, recreate a missing half over existing state, or treat legacy unauthenticated proof rows as current qualification. |
 | Catalog sync, coverage, or a stored catalog fails | Run `cfctl catalog sync --json`, then `cfctl catalog coverage --json`. Preserve `previous_catalog` and the returned error code; a discarded invalid current catalog is evidence of safe replacement, not evidence that earlier plans are valid. | Never edit a catalog body or content hash, restore a stale snapshot as current, or reuse a plan whose catalog pin drifted. |
 | A capability or write is blocked | Run `cfctl guide <capability-id> --json` and follow the exact `next_action`. Report the capability ID and `blocking_gaps` when the guide cannot close the contract. | Never route around `CFCTL_CAPABILITY_BLOCKED` with raw HTTP, Wrangler, dashboard changes, a broader token, or hand-edited plan JSON. |
 | A run crashed, timed out, or may have crossed the provider boundary | Run `cfctl plans status <operation-id> --json`. Use `cfctl plans rectify <operation-id> --json` when verification is unsupported or the boundary outcome is uncertain; review any derived compensation as a new transaction. | Do not replay `plans run`, approve a replacement operation speculatively, or call the provider directly. A consumed or uncertain plan remains non-replayable. |
@@ -1640,8 +1640,18 @@ preview, apply, and post-change verification evidence.
 
 ## Known limitations
 
-- **Manifest-selected workspace D1 migrations remain production-blocked.** The
-  catalog may expose their immutable source interface, but planning stops until
+- **Manifest-selected workspace D1 migrations remain fail-closed until
+  qualification is produced.** Every create, apply, restore, delete,
+  deployment, and other provider mutation remains its own immutable PlanV2:
+  generate it with `cfctl call`, show the exact operation to Prime, approve
+  only that reviewed ID, run it once, and retain its post-change evidence.
+  After the isolated success, declared DDL-failure, declared ledger-failure,
+  exact zero-delta reads, cleanup absence, fresh Worker
+  deployment/version/settings reads, and workspace-owned semantic canary have
+  authenticated child identities, call `workspace-d1-qualification-produce`
+  with those identities. The producer performs no Cloudflare or Wrangler
+  boundary, accepts no raw receipt body or SQL, and creates, approves, or runs
+  no provider plan. Production planning stops until
   one `workspace_d1_provider_atomicity_v1` PostChangeVerification receipt and
   one `workspace_d1_old_worker_canary_v1` workspace receipt pass the closed
   validators. The atomicity receipt binds an isolated database, exact cfctl and
@@ -1657,7 +1667,11 @@ preview, apply, and post-change verification evidence.
   plus deployment/version UUIDs. Exact index and trigger definitions are compared for equality;
   `schema_contains` is not accepted as migration verification. Provider proof,
   production planning, and automatic restore are not implied by the source
-  interface.
+  interface. Before any qualifying receipt is written, run
+  `cfctl auth evidence-key init-preview --json`; review its backend, generated
+  key and local marker custody classes, state-root transition,
+  verification-generation behavior, and recoverability. Only a separate
+  explicit `cfctl auth evidence-key init --json` performs initialization.
 
 - **Access application and identity-provider plan storage uses schema-aware
   redaction.** Secret-shaped JSON Schema property names such as

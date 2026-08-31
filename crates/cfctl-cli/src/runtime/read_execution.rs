@@ -568,6 +568,11 @@ pub(super) async fn execute_read(
     r2_credentials: Option<&R2LogRetrievalCredentials>,
     reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
+    if capability.id == super::workspace_d1_qualification::PRODUCER_CAPABILITY_ID {
+        return Ok(ExecutedRead::without_credential(
+            super::workspace_d1_qualification::produce(store, catalog, input)?,
+        ));
+    }
     if capability.workflow.is_some() {
         return Ok(ExecutedRead::without_credential(execute_native_workflow(
             store, catalog, capability,

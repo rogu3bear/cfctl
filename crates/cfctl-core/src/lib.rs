@@ -91,6 +91,7 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
                 name: "evidence-key",
                 subcommands: &[
                     CommandNodeV1::leaf("init"),
+                    CommandNodeV1::leaf("init-preview"),
                     CommandNodeV1::leaf("retire"),
                     CommandNodeV1::leaf("rotate"),
                     CommandNodeV1::leaf("status"),

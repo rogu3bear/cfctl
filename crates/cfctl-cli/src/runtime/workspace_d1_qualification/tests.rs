@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, fs};
 
+use cfctl_catalog::CatalogSnapshot;
 use cfctl_core::{
     CapabilityV1, D1FullExportGovernedExecutionBindingV1, EvidenceClass, EvidenceV1,
     OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanPinsV2, PlanStatus,
@@ -128,8 +129,22 @@ fn stored_plan(
         capability.workspace_d1_migration =
             Some(migration_contract(success_migration_sha256, false));
     }
-    let mut plan = PlanV1::draft(PROFILE, ACCOUNT, catalog_hash, capability, target.clone())
-        .expect("draft plan");
+    let plan_target = if role == "success_apply" {
+        let mut plan_target = target.clone();
+        plan_target["adapter"] =
+            json!({"workspace_d1_migration":{"wrangler_cli_sha256":digest("wrangler")}});
+        plan_target
+    } else {
+        target.clone()
+    };
+    let mut plan = PlanV1::draft(
+        PROFILE,
+        ACCOUNT,
+        catalog_hash,
+        capability,
+        plan_target.clone(),
+    )
+    .expect("draft plan");
     plan.input = serde_json::to_value(CallInput {
         selectors: target.clone(),
         ..CallInput::default()
@@ -186,7 +201,7 @@ fn stored_plan(
         pins_hash,
         capability_id: capability_id.to_owned(),
         catalog_hash: catalog_hash.to_owned(),
-        target_hash: hash_value(&target).expect("target hash"),
+        target_hash: hash_value(&plan_target).expect("target hash"),
         status,
         stage,
         evidence_hash: verification.content_hash,
@@ -368,11 +383,11 @@ fn fixture_with_migrations(
         )
     })
     .collect::<Vec<_>>();
-    let zero_delta_body = |observation: &str| {
+    let zero_delta_body = |role: &str, observation: &str| {
         let snapshot = store
             .write_evidence(
                 EvidenceClass::LiveRead,
-                &json!({"observation":observation,"rows":[]}),
+                &json!({"role":role,"observation":observation,"rows":[]}),
             )
             .expect("snapshot evidence");
         json!({
@@ -402,8 +417,8 @@ fn fixture_with_migrations(
         })
         .expect("D1 proof input");
         let body = match role {
-            "ddl_zero_schema" | "ledger_zero_schema" => zero_delta_body("schema"),
-            "ddl_zero_ledger" | "ledger_zero_ledger" => zero_delta_body("ledger"),
+            "ddl_zero_schema" | "ledger_zero_schema" => zero_delta_body(role, "schema"),
+            "ddl_zero_ledger" | "ledger_zero_ledger" => zero_delta_body(role, "ledger"),
             _ => json!({"status":200,"success":true,"result":{"id":DATABASE},"errors":[],"result_info":null,"etag":null,"cf_ray":null}),
         };
         stored_proof(
@@ -622,6 +637,74 @@ fn fixture_with_migrations(
         worker_plan,
         worker_proofs,
     }
+}
+
+pub(super) fn producer_fixture() -> (tempfile::TempDir, StateStore, CatalogSnapshot, CallInput) {
+    let (root, store) = store();
+    let fixture = fixture(&store);
+    let plan = |role: &str| {
+        fixture
+            .plans
+            .iter()
+            .find(|plan| plan.role == role)
+            .expect("plan role")
+    };
+    let proof = |role: &str| {
+        fixture
+            .proofs
+            .iter()
+            .find(|proof| proof.role == role)
+            .expect("proof role")
+    };
+    let worker_proof = |role: &str| {
+        fixture
+            .worker_proofs
+            .iter()
+            .find(|proof| proof.role == role)
+            .expect("Worker proof role")
+    };
+    let catalog = CatalogSnapshot {
+        schema_version: 2,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: digest("source"),
+        schema_hash: fixture.atomicity.catalog_hash.clone(),
+        capabilities: BTreeMap::new(),
+    };
+    let input = CallInput {
+        body: Some(json!({
+            "schema_version":1,
+            "atomicity":{
+                "create_database_operation_id":plan("create_database").operation_id,
+                "success_apply_operation_id":plan("success_apply").operation_id,
+                "ddl_failure_apply_operation_id":plan("ddl_failure_apply").operation_id,
+                "ledger_failure_apply_operation_id":plan("ledger_failure_apply").operation_id,
+                "restore_operation_id":plan("restore").operation_id,
+                "delete_database_operation_id":plan("delete_database").operation_id,
+                "get_database_proof_hash":proof("get_database").proof_hash,
+                "full_export_proof_hash":proof("full_export").proof_hash,
+                "bookmark_proof_hash":proof("bookmark").proof_hash,
+                "ddl_failure_zero_schema_proof_hash":proof("ddl_zero_schema").proof_hash,
+                "ddl_failure_zero_ledger_proof_hash":proof("ddl_zero_ledger").proof_hash,
+                "ledger_failure_zero_schema_proof_hash":proof("ledger_zero_schema").proof_hash,
+                "ledger_failure_zero_ledger_proof_hash":proof("ledger_zero_ledger").proof_hash,
+                "cleanup_proof_hash":proof("cleanup_absence").proof_hash,
+            },
+            "old_worker_canary":{
+                "worker_deployment_operation_id":fixture.worker_plan.operation_id,
+                "deployments_read_proof_hash":worker_proof("deployments").proof_hash,
+                "version_detail_proof_hash":worker_proof("version").proof_hash,
+                "settings_proof_hash":worker_proof("settings").proof_hash,
+                "request_sha256":fixture.canary.request_sha256,
+                "result_sha256":fixture.canary.result_sha256,
+                "semantic_assertions_sha256":fixture.canary.semantic_assertions_sha256,
+                "declared_evidence_hashes":fixture.canary.declared_evidence_hashes,
+                "disposition":"pass"
+            }
+        })),
+        ..CallInput::default()
+    };
+    (root, store, catalog, input)
 }
 
 fn atomicity_expected<'a>(

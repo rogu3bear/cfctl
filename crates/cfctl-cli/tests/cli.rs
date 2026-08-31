@@ -374,7 +374,7 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
 fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmation() {
     use cfctl_cli::{AuthCommand, Command, EvidenceKeyCommand};
 
-    for action in ["init", "status", "rotate"] {
+    for action in ["init-preview", "init", "status", "rotate"] {
         let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", action])
             .expect("evidence-key lifecycle action parses");
         let Some(Command::Auth(arguments)) = cli.command else {
@@ -384,6 +384,7 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             panic!("evidence-key command");
         };
         let parsed = match group.command {
+            EvidenceKeyCommand::InitPreview => "init-preview",
             EvidenceKeyCommand::Init => "init",
             EvidenceKeyCommand::Status => "status",
             EvidenceKeyCommand::Rotate => "rotate",

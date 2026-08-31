@@ -106,6 +106,8 @@ pub struct EvidenceKeyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EvidenceKeyCommand {
+    /// Preview the exact non-secret initialization transition without creating a key.
+    InitPreview,
     /// Initialize one platform-held evidence authority for this canonical state root.
     Init,
     /// Inspect the non-secret evidence-key lifecycle state without creating a key.

@@ -125,7 +125,7 @@ maintain a second command registry.
 
 Open-ended intent remains available as `cfctl "<natural-language request>"`.
 Existing v2 paths remain compatible; the command map includes newer paths such
-as `auth evidence-key status`, `auth repair-keychain-access`,
+as `auth evidence-key init-preview`, `auth repair-keychain-access`,
 `keys renew-analytics-profile`, and
 `plans bundle` that a hand-maintained list could omit.
 
@@ -149,10 +149,13 @@ Linux) and falls back to a mode-0600 file store when the keyring is
 unavailable; `cfctl doctor` reports which backend is active.
 
 Qualifying local evidence uses a separate platform-only integrity key. It
-never falls back to a file: initialize it explicitly with
-`cfctl auth evidence-key init --json`, inspect it with `status`, rotate to a
-new signing generation with `rotate`, and retire an inactive generation only
-when cfctl reports that no authenticated local artifact still depends on it.
+never falls back to a file: inspect the exact initialization transition with
+`cfctl auth evidence-key init-preview --json`, initialize it explicitly with
+`init`, inspect it with `status`, rotate to a new signing generation with
+`rotate`, and retire an inactive generation only when cfctl reports that no
+authenticated local artifact still depends on it. The preview discloses
+backend, custody, state-root transition, verification-generation behavior, and
+recovery semantics without creating a key or exposing key bytes.
 
 Two things that commonly bite:
 
