@@ -24,6 +24,28 @@ use crate::telemetry_product::execute_native_workflow;
 use cfctl_agent::build_ui_action;
 use cfctl_core::hash_value;
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct TestD1SchemaReadV1 {
+    pub response: cfctl_cloudflare::CloudflareResponseV1,
+    pub profile_id: String,
+    pub account_id: String,
+    pub credential_generation_id: String,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_D1_SCHEMA_READ: TestD1SchemaReadV1;
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_d1_schema_read<F: std::future::Future>(
+    fixture: TestD1SchemaReadV1,
+    future: F,
+) -> F::Output {
+    TEST_D1_SCHEMA_READ.scope(fixture, future).await
+}
+
 #[derive(Debug)]
 pub(super) struct ExecutedRead {
     pub(super) envelope: ResultEnvelopeV2,
@@ -577,6 +599,38 @@ pub(super) async fn execute_read(
         return Ok(ExecutedRead::without_credential(
             super::workspace_d1_qualification::produce(store, catalog, input)?,
         ));
+    }
+    #[cfg(test)]
+    if capability.id == "d1-schema-introspection"
+        && let Ok(fixture) = TEST_D1_SCHEMA_READ.try_with(Clone::clone)
+    {
+        let prepared =
+            cfctl_cloudflare::RequestBuilder::new(API_BASE_URL)?.build(capability, input)?;
+        let mut response = fixture.response;
+        response.result_info = Some(json!({
+            "query": prepared.query_receipt.ok_or_else(|| {
+                CliError::Input("test D1 schema read lacks its canonical query receipt".into())
+            })?,
+        }));
+        let mut sanitized =
+            redact_response_for_capability(capability, &serde_json::to_value(&response)?);
+        if let Some(object) = sanitized.as_object_mut() {
+            object.insert(
+                "availability".to_owned(),
+                live_read_availability(capability, &response),
+            );
+        }
+        let evidence = store.write_evidence(EvidenceClass::LiveRead, &sanitized)?;
+        let mut envelope = ResultEnvelopeV2::success("call", sanitized).with_evidence(evidence);
+        envelope.capability_id = Some(capability.id.clone());
+        envelope.profile_id = Some(fixture.profile_id);
+        envelope.account_id = Some(fixture.account_id);
+        envelope.ok = response.success;
+        envelope.performed = true;
+        return Ok(ExecutedRead {
+            envelope,
+            credential_generation_id: Some(fixture.credential_generation_id),
+        });
     }
     if capability.workflow.is_some() {
         return Ok(ExecutedRead::without_credential(execute_native_workflow(

@@ -147,10 +147,16 @@ pub(crate) fn observe(
         || query.get("caller_sql").and_then(Value::as_bool) != Some(false)
         || query.get("read_only").and_then(Value::as_bool) != Some(true)
         || (request.observation == "ledger"
-            && request.source_assertion.get("kind").and_then(Value::as_str)
+            && request
+                .source_assertion
+                .get("assertion")
+                .and_then(Value::as_str)
                 != Some("migration_ledger_equals"))
         || (request.observation == "schema"
-            && request.source_assertion.get("kind").and_then(Value::as_str)
+            && request
+                .source_assertion
+                .get("assertion")
+                .and_then(Value::as_str)
                 == Some("migration_ledger_equals"))
     {
         return Err(CliError::Input(
