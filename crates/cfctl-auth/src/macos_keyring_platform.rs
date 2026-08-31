@@ -4,7 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use directories::ProjectDirs;
+use cap_std::{ambient_authority, fs::Dir};
+use rustix::fs::{Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 
 use super::{MAX_LOGICAL_CREDENTIAL_BYTES, MacosKeychainAdapter, MutationGuard};
@@ -13,8 +14,29 @@ use crate::{AuthError, Result};
 pub(super) struct SecurityCommandAdapter;
 
 struct KeyringMutationLock {
-    _file: fs::File,
+    _parent: Dir,
+    _authority_lock: fs::File,
+    root: Dir,
+    file: fs::File,
+    parent_path: PathBuf,
+    parent_identity: FilesystemIdentity,
+    root_name: String,
+    root_path: PathBuf,
+    root_identity: FilesystemIdentity,
+    lock_name: String,
+    lock_identity: FilesystemIdentity,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilesystemIdentity {
+    device: u64,
+    inode: u64,
+    birth_seconds: i64,
+    birth_nanoseconds: i64,
+}
+
+const MUTATION_LOCK_ROOT_COMPONENT: &str = "io.cfctl.cfctl-keyring-mutations";
+const MAX_GETCONF_STDOUT_BYTES: usize = 4_096;
 
 impl MacosKeychainAdapter for SecurityCommandAdapter {
     fn put_raw(&self, service: &str, key: &str, value: &str) -> Result<()> {
@@ -39,10 +61,44 @@ impl MacosKeychainAdapter for SecurityCommandAdapter {
 }
 
 fn mutation_lock_root() -> Result<PathBuf> {
-    let project = ProjectDirs::from("io", "cfctl", "cfctl").ok_or_else(|| {
-        AuthError::SecretStore("platform keyring lock directory is unavailable".to_owned())
+    let output = std::process::Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if !output.status.success() {
+        return Err(AuthError::SecretStore(format!(
+            "platform user lock authority lookup failed with exit status {}",
+            output.status
+        )));
+    }
+    if output.stdout.is_empty() || output.stdout.len() > MAX_GETCONF_STDOUT_BYTES {
+        return Err(AuthError::SecretStore(
+            "platform user lock authority lookup returned an invalid byte length".to_owned(),
+        ));
+    }
+    let value = String::from_utf8(output.stdout).map_err(|_| {
+        AuthError::SecretStore("platform user lock authority is not valid UTF-8".to_owned())
     })?;
-    Ok(project.data_dir().join("locks").join("keyring-mutations"))
+    let Some(path) = value.strip_suffix('\n') else {
+        return Err(AuthError::SecretStore(
+            "platform user lock authority is missing its line terminator".to_owned(),
+        ));
+    };
+    if path.is_empty() || path.contains(['\0', '\n', '\r']) {
+        return Err(AuthError::SecretStore(
+            "platform user lock authority has invalid framing".to_owned(),
+        ));
+    }
+    let base = PathBuf::from(path);
+    if !base.is_absolute() {
+        return Err(AuthError::SecretStore(
+            "platform user lock authority must be absolute".to_owned(),
+        ));
+    }
+    Ok(base.join(MUTATION_LOCK_ROOT_COMPONENT))
 }
 
 fn mutation_lock_path(root: &Path, service: &str, key: &str) -> PathBuf {
@@ -52,54 +108,324 @@ fn mutation_lock_path(root: &Path, service: &str, key: &str) -> PathBuf {
     root.join(format!("{digest}.lock"))
 }
 
+#[cfg(test)]
 fn open_mutation_lock_file(root: &Path, service: &str, key: &str) -> Result<fs::File> {
-    fs::create_dir_all(root).map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    open_mutation_lock_file_with_hook(root, service, key, |_| Ok(())).map(|guard| guard.file)
+}
+
+fn open_mutation_lock_file_with_hook(
+    root: &Path,
+    service: &str,
+    key: &str,
+    after_open: impl FnOnce(&Path) -> Result<()>,
+) -> Result<KeyringMutationLock> {
+    let parent_path = root.parent().ok_or_else(|| {
+        AuthError::SecretStore("platform keyring mutation lock root has no parent".to_owned())
+    })?;
+    let root_name = root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            AuthError::SecretStore(
+                "platform keyring mutation lock root has an invalid name".to_owned(),
+            )
+        })?
+        .to_owned();
+    let parent_entry = fs::symlink_metadata(parent_path)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if parent_entry.file_type().is_symlink() || !parent_entry.is_dir() {
+        return Err(AuthError::SecretStore(
+            "platform keyring mutation lock parent must be a real directory".to_owned(),
+        ));
     }
-    let metadata =
-        fs::symlink_metadata(root).map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    let parent_identity = filesystem_identity_from_dir(&parent, parent_path)?;
+    if !standard_metadata_matches(&parent_entry, parent_identity) {
+        return Err(lock_identity_error(
+            "parent identity changed while opening authority",
+        ));
+    }
+    let authority_lock = parent
+        .try_clone()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?
+        .into_std_file();
+    authority_lock
+        .lock()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    require_parent_identity(parent_path, &parent, parent_identity)?;
+    match parent.create_dir(&root_name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(AuthError::SecretStore(error.to_string())),
+    }
+    let root_entry = parent
+        .symlink_metadata(&root_name)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if root_entry.file_type().is_symlink() || !root_entry.is_dir() {
         return Err(AuthError::SecretStore(
             "platform keyring mutation lock root must be a real directory".to_owned(),
         ));
     }
-    let path = mutation_lock_path(root, service, key);
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(&path)
+    let lock_root = parent
+        .open_dir(&root_name)
         .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    if !metadata.file_type().is_file() {
-        return Err(AuthError::SecretStore(
-            "platform keyring mutation lock must be a regular file".to_owned(),
+    let root_identity = filesystem_identity_from_dir(&lock_root, root)?;
+    if !capability_metadata_matches(&root_entry, root_identity) {
+        return Err(lock_identity_error(
+            "root identity changed while opening capability",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    }
-    Ok(file)
+    require_parent_identity(parent_path, &parent, parent_identity)?;
+    require_root_identity(&parent, &root_name, &lock_root, root_identity, root)?;
+    let root_file = lock_root
+        .try_clone()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?
+        .into_std_file();
+    set_handle_mode(&root_file, 0o700)?;
+    require_root_identity(&parent, &root_name, &lock_root, root_identity, root)?;
+
+    let lock_path = mutation_lock_path(root, service, key);
+    let lock_name = lock_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            AuthError::SecretStore(
+                "platform keyring mutation lock digest name is invalid".to_owned(),
+            )
+        })?
+        .to_owned();
+    reject_unsafe_lock_entry_if_present(&lock_root, &lock_name)?;
+    let file = open_lock_nofollow(&lock_root, &lock_name, true)?;
+    after_open(&lock_path)?;
+    let lock_identity = filesystem_identity_from_file(&file)?;
+    require_single_link_regular_file(&file)?;
+    require_lock_identity(&lock_root, &lock_name, lock_identity)?;
+    require_parent_identity(parent_path, &parent, parent_identity)?;
+    require_root_identity(&parent, &root_name, &lock_root, root_identity, root)?;
+    set_handle_mode(&file, 0o600)?;
+    require_lock_identity(&lock_root, &lock_name, lock_identity)?;
+    Ok(KeyringMutationLock {
+        _parent: parent,
+        _authority_lock: authority_lock,
+        root: lock_root,
+        file,
+        parent_path: parent_path.to_path_buf(),
+        parent_identity,
+        root_name,
+        root_path: root.to_path_buf(),
+        root_identity,
+        lock_name,
+        lock_identity,
+    })
 }
 
 fn acquire_mutation_lock(service: &str, key: &str) -> Result<KeyringMutationLock> {
-    let file = open_mutation_lock_file(&mutation_lock_root()?, service, key)?;
-    file.lock()
+    acquire_mutation_lock_at_with_hooks(
+        &mutation_lock_root()?,
+        service,
+        key,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+fn acquire_mutation_lock_at_with_hooks(
+    root: &Path,
+    service: &str,
+    key: &str,
+    after_open: impl FnOnce(&Path) -> Result<()>,
+    after_lock: impl FnOnce(&Path) -> Result<()>,
+) -> Result<KeyringMutationLock> {
+    let guard = open_mutation_lock_file_with_hook(root, service, key, after_open)?;
+    guard
+        .file
+        .lock()
         .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    Ok(KeyringMutationLock { _file: file })
+    after_lock(&mutation_lock_path(root, service, key))?;
+    guard.require_identity()?;
+    Ok(guard)
+}
+
+impl KeyringMutationLock {
+    fn require_identity(&self) -> Result<()> {
+        require_parent_identity(&self.parent_path, &self._parent, self.parent_identity)?;
+        require_root_identity(
+            &self._parent,
+            &self.root_name,
+            &self.root,
+            self.root_identity,
+            &self.root_path,
+        )?;
+        require_lock_identity(&self.root, &self.lock_name, self.lock_identity)
+    }
+}
+
+fn lock_identity_error(reason: &str) -> AuthError {
+    AuthError::SecretStore(format!(
+        "platform keyring mutation lock authority is unsafe: {reason}"
+    ))
+}
+
+fn filesystem_identity_from_file(file: &fs::File) -> Result<FilesystemIdentity> {
+    use std::os::{macos::fs::MetadataExt as _, unix::fs::MetadataExt as _};
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    Ok(FilesystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        birth_seconds: metadata.st_birthtime(),
+        birth_nanoseconds: metadata.st_birthtime_nsec(),
+    })
+}
+
+fn filesystem_identity_from_dir(
+    directory: &Dir,
+    display_path: &Path,
+) -> Result<FilesystemIdentity> {
+    let file = directory
+        .try_clone()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?
+        .into_std_file();
+    filesystem_identity_from_file(&file).map_err(|_| {
+        AuthError::SecretStore(format!(
+            "platform keyring mutation lock identity is unavailable for {}",
+            display_path.display()
+        ))
+    })
+}
+
+fn standard_metadata_matches(metadata: &fs::Metadata, identity: FilesystemIdentity) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.dev() == identity.device && metadata.ino() == identity.inode
+}
+
+fn capability_metadata_matches(
+    metadata: &cap_std::fs::Metadata,
+    identity: FilesystemIdentity,
+) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.dev() == identity.device && metadata.ino() == identity.inode
+}
+
+fn require_parent_identity(path: &Path, held: &Dir, identity: FilesystemIdentity) -> Result<()> {
+    let entry =
+        fs::symlink_metadata(path).map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if entry.file_type().is_symlink()
+        || !entry.is_dir()
+        || !standard_metadata_matches(&entry, identity)
+        || filesystem_identity_from_dir(held, path)? != identity
+    {
+        return Err(lock_identity_error("parent identity changed"));
+    }
+    let reopened = Dir::open_ambient_dir(path, ambient_authority())
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if filesystem_identity_from_dir(&reopened, path)? != identity {
+        return Err(lock_identity_error("parent replacement was detected"));
+    }
+    Ok(())
+}
+
+fn require_root_identity(
+    parent: &Dir,
+    name: &str,
+    held: &Dir,
+    identity: FilesystemIdentity,
+    display_path: &Path,
+) -> Result<()> {
+    let entry = parent
+        .symlink_metadata(name)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if entry.file_type().is_symlink()
+        || !entry.is_dir()
+        || !capability_metadata_matches(&entry, identity)
+        || filesystem_identity_from_dir(held, display_path)? != identity
+    {
+        return Err(lock_identity_error("root identity changed"));
+    }
+    let reopened = parent
+        .open_dir(name)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if filesystem_identity_from_dir(&reopened, display_path)? != identity {
+        return Err(lock_identity_error("root replacement was detected"));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_lock_entry_if_present(directory: &Dir, name: &str) -> Result<()> {
+    use cap_std::fs::MetadataExt as _;
+
+    let metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(AuthError::SecretStore(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(lock_identity_error("symbolic lock links are forbidden"));
+    }
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(lock_identity_error(
+            "lock entry must be one singly linked regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn open_lock_nofollow(directory: &Dir, name: &str, create: bool) -> Result<fs::File> {
+    let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if create {
+        flags |= OFlags::CREATE;
+    }
+    rustix::fs::openat(directory, name, flags, Mode::RUSR | Mode::WUSR)
+        .map(fs::File::from)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))
+}
+
+fn require_single_link_regular_file(file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(lock_identity_error(
+            "opened lock must be one singly linked regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn require_lock_identity(directory: &Dir, name: &str, identity: FilesystemIdentity) -> Result<()> {
+    use cap_std::fs::MetadataExt as _;
+
+    let entry = directory
+        .symlink_metadata(name)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if entry.file_type().is_symlink()
+        || !entry.is_file()
+        || entry.nlink() != 1
+        || !capability_metadata_matches(&entry, identity)
+    {
+        return Err(lock_identity_error("lock entry identity changed"));
+    }
+    let reopened = open_lock_nofollow(directory, name, false)?;
+    require_single_link_regular_file(&reopened)?;
+    if filesystem_identity_from_file(&reopened)? != identity {
+        return Err(lock_identity_error("lock handle identity changed"));
+    }
+    Ok(())
+}
+
+fn set_handle_mode(file: &fs::File, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|error| AuthError::SecretStore(error.to_string()))
 }
 
 pub(super) fn security_write_arguments(service: &str, key: &str) -> Vec<String> {
@@ -278,7 +604,10 @@ mod tests {
     use super::*;
 
     const LOCK_HELPER_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_HELPER";
+    const LOCK_HELPER_MODE_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_MODE";
     const LOCK_ROOT_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_ROOT";
+    const LOCK_SERVICE_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_SERVICE";
+    const LOCK_KEY_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_KEY";
     const READY_PATH_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_READY";
     const RELEASE_PATH_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_RELEASE";
 
@@ -295,10 +624,43 @@ mod tests {
         if std::env::var_os(LOCK_HELPER_ENV).is_none() {
             return;
         }
-        let root = PathBuf::from(std::env::var_os(LOCK_ROOT_ENV).expect("lock root"));
+        let mode = std::env::var(LOCK_HELPER_MODE_ENV).unwrap_or_else(|_| "explicit".to_owned());
         let ready = PathBuf::from(std::env::var_os(READY_PATH_ENV).expect("ready path"));
         let release = PathBuf::from(std::env::var_os(RELEASE_PATH_ENV).expect("release path"));
-        let file = open_mutation_lock_file(&root, "service", "credential").expect("open lock");
+        let service = std::env::var(LOCK_SERVICE_ENV).unwrap_or_else(|_| "service".to_owned());
+        let key = std::env::var(LOCK_KEY_ENV).unwrap_or_else(|_| "credential".to_owned());
+        if mode == "holder" || mode == "explicit-guard-holder" {
+            let guard = if mode == "holder" {
+                acquire_mutation_lock(&service, &key).expect("acquire production lock")
+            } else {
+                let root = PathBuf::from(std::env::var_os(LOCK_ROOT_ENV).expect("lock root"));
+                acquire_mutation_lock_at_with_hooks(&root, &service, &key, |_| Ok(()), |_| Ok(()))
+                    .expect("acquire explicit production lock")
+            };
+            fs::write(&ready, b"ready").expect("publish ready signal");
+            wait_for_path(&release, "release signal");
+            drop(guard);
+            return;
+        }
+        let root = if mode == "explicit" {
+            PathBuf::from(std::env::var_os(LOCK_ROOT_ENV).expect("lock root"))
+        } else {
+            mutation_lock_root().expect("production lock root")
+        };
+        if mode == "contender" {
+            let parent = Dir::open_ambient_dir(
+                root.parent().expect("production lock parent"),
+                ambient_authority(),
+            )
+            .expect("open production authority");
+            let authority = parent.into_std_file();
+            assert!(matches!(
+                authority.try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            ));
+            return;
+        }
+        let file = open_mutation_lock_file(&root, &service, &key).expect("open lock");
         file.lock().expect("acquire child lock");
         fs::write(&ready, b"ready").expect("publish ready signal");
         wait_for_path(&release, "release signal");
@@ -335,6 +697,238 @@ mod tests {
         fs::write(&release, b"release").expect("publish release signal");
         assert!(child.wait().expect("wait for lock holder").success());
         contender.lock().expect("acquire released lock");
+    }
+
+    #[test]
+    fn production_lock_serializes_across_distinct_home_and_cfctl_home() {
+        let temp = tempfile::tempdir().expect("temporary signals");
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let first_home = temp.path().join("first-home");
+        let second_home = temp.path().join("second-home");
+        fs::create_dir_all(&first_home).expect("first home");
+        fs::create_dir_all(&second_home).expect("second home");
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let helper_name = "macos_keyring::platform::tests::cross_process_lock_helper";
+        let service = format!("io.cfctl.test.{}", std::process::id());
+        let key = "environment-independent-lock";
+        let mut holder = Command::new(&current_exe)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env(LOCK_HELPER_ENV, "1")
+            .env(LOCK_HELPER_MODE_ENV, "holder")
+            .env(LOCK_SERVICE_ENV, &service)
+            .env(LOCK_KEY_ENV, key)
+            .env("HOME", &first_home)
+            .env("CFCTL_HOME", first_home.join("cfctl"))
+            .env(READY_PATH_ENV, &ready)
+            .env(RELEASE_PATH_ENV, &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn production lock holder");
+
+        wait_for_path(&ready, "production lock holder");
+        let contender = Command::new(current_exe)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env(LOCK_HELPER_ENV, "1")
+            .env(LOCK_HELPER_MODE_ENV, "contender")
+            .env(LOCK_SERVICE_ENV, &service)
+            .env(LOCK_KEY_ENV, key)
+            .env("HOME", &second_home)
+            .env("CFCTL_HOME", second_home.join("cfctl"))
+            .env(READY_PATH_ENV, &ready)
+            .env(RELEASE_PATH_ENV, &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run production lock contender");
+        fs::write(&release, b"release").expect("release production lock holder");
+        assert!(
+            holder
+                .wait()
+                .expect("wait for production lock holder")
+                .success()
+        );
+        assert!(contender.success());
+    }
+
+    #[test]
+    fn root_symlink_is_rejected_before_permission_side_effect() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().expect("temporary root");
+        let target = temp.path().join("target");
+        let root = temp.path().join("locks");
+        fs::create_dir(&target).expect("target directory");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("target mode");
+        symlink(&target, &root).expect("root symlink");
+
+        assert!(open_mutation_lock_file(&root, "service", "credential").is_err());
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(
+            fs::read_dir(&target)
+                .expect("target entries")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lock_file_symlink_and_hard_link_are_rejected_without_target_side_effects() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().expect("temporary root");
+        let root = temp.path().join("locks");
+        fs::create_dir(&root).expect("lock root");
+        let target = temp.path().join("target");
+        fs::write(&target, b"unchanged").expect("target contents");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("target mode");
+        let lock_path = mutation_lock_path(&root, "service", "credential");
+        symlink(&target, &lock_path).expect("lock symlink");
+        assert!(open_mutation_lock_file(&root, "service", "credential").is_err());
+        assert_eq!(fs::read(&target).expect("target read"), b"unchanged");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+
+        fs::remove_file(&lock_path).expect("remove test symlink");
+        fs::hard_link(&target, &lock_path).expect("hard-linked lock");
+        assert!(open_mutation_lock_file(&root, "service", "credential").is_err());
+        assert_eq!(fs::read(&target).expect("target reread"), b"unchanged");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn lock_path_replacement_is_rejected_before_permission_or_lock_side_effect() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary root");
+        let root = temp.path().join("locks");
+        fs::create_dir(&root).expect("lock root");
+        let lock_path = mutation_lock_path(&root, "service", "credential");
+        fs::write(&lock_path, b"opened").expect("seed lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).expect("seed mode");
+        let displaced = root.join("displaced.lock");
+        let error =
+            open_mutation_lock_file_with_hook(&root, "service", "credential", |opened_path| {
+                fs::rename(opened_path, &displaced)
+                    .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+                fs::write(opened_path, b"replacement")
+                    .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+                Ok(())
+            });
+        assert!(error.is_err());
+        for path in [&displaced, &lock_path] {
+            assert_eq!(
+                fs::metadata(path)
+                    .expect("lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+        let displaced_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&displaced)
+            .expect("open displaced lock");
+        displaced_file
+            .lock()
+            .expect("displaced file was not locked");
+    }
+
+    #[test]
+    fn post_lock_path_replacement_is_rejected_before_mutation_authority_returns() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let root = temp.path().join("locks");
+        let displaced = root.join("displaced.lock");
+        let result = acquire_mutation_lock_at_with_hooks(
+            &root,
+            "service",
+            "credential-post-lock",
+            |_| Ok(()),
+            |locked_path| {
+                fs::rename(locked_path, &displaced)
+                    .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+                fs::write(locked_path, b"replacement")
+                    .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        let replacement = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mutation_lock_path(&root, "service", "credential-post-lock"))
+            .expect("open replacement");
+        replacement
+            .lock()
+            .expect("replacement did not inherit displaced lock authority");
+    }
+
+    #[test]
+    fn retained_os_authority_serializes_after_root_replacement() {
+        let temp = tempfile::tempdir().expect("temporary authority");
+        let root = temp.path().join("locks");
+        let displaced = temp.path().join("displaced-locks");
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let service = "service";
+        let key = "credential-root-replacement";
+        let first =
+            acquire_mutation_lock_at_with_hooks(&root, service, key, |_| Ok(()), |_| Ok(()))
+                .expect("acquire first mutation authority");
+        fs::rename(&root, &displaced).expect("displace locked root");
+        fs::create_dir(&root).expect("create replacement root");
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let helper_name = "macos_keyring::platform::tests::cross_process_lock_helper";
+        let mut contender = Command::new(current_exe)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env(LOCK_HELPER_ENV, "1")
+            .env(LOCK_HELPER_MODE_ENV, "explicit-guard-holder")
+            .env(LOCK_ROOT_ENV, &root)
+            .env(LOCK_SERVICE_ENV, service)
+            .env(LOCK_KEY_ENV, key)
+            .env(READY_PATH_ENV, &ready)
+            .env(RELEASE_PATH_ENV, &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn replacement-root contender");
+
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !ready.exists(),
+            "replacement root admitted overlapping mutation authority"
+        );
+        drop(first);
+        wait_for_path(&ready, "replacement-root contender");
+        fs::write(&release, b"release").expect("release replacement-root contender");
+        assert!(contender.wait().expect("wait for contender").success());
     }
 
     #[test]
