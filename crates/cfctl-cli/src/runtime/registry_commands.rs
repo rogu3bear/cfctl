@@ -8,7 +8,9 @@ use super::prelude::{
 };
 use super::support::cli_io;
 use super::workspace_state::discover_registered;
-use crate::telemetry_product::OPERATIONAL_PROOF_PROJECTION_LIMIT;
+use crate::telemetry_product::{
+    OPERATIONAL_PROOF_PROJECTION_LIMIT, ensure_operational_proof_projection_valid,
+};
 
 #[expect(
     clippy::too_many_lines,
@@ -356,6 +358,7 @@ pub(super) fn registry_sync_result(store: &StateStore, registry: &mut Registry) 
         })?;
     }
     let proof_page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
+    ensure_operational_proof_projection_valid(&proof_page)?;
     for proof in &proof_page.proofs {
         registry.record_unindexable_evidence(
             &proof.evidence.content_hash,

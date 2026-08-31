@@ -13,6 +13,7 @@ applies, and verification receipts separate.
 | The installed command and the checkout behave differently | Run `cfctl version --json` and `cfctl doctor --json`; invoke each candidate executable directly and compare its self-reported path, version, commit, and identity source. Reinstall only from an exact release asset whose checksum matches `SHA256SUMS`. | Do not repair the mismatch with a symlink, PATH shim, unverified binary, or release override. Unknown or dirty identity remains unhealthy. |
 | No profile is selected, or the governed fallback store is active | Run `cfctl auth profiles --json`, select one existing account-pinned profile with `cfctl auth use <profile> --json`, then rerun `cfctl auth status --json`. An active fallback store is authoritative by design; use the explicit repair command only when the operator intentionally wants to test or restore the platform keyring. | Never ask the operator to paste a token, OAuth callback, global key, or fallback file. Do not broaden permissions merely to make the error disappear. |
 | Evidence qualification reports an uninitialized or split platform authority | Run `cfctl auth evidence-key status --json`, then `cfctl auth evidence-key init-preview --json` before any first initialization. Initialize only when both the canonical state-root marker and direct platform registry are absent. Rotate explicitly; retire only an inactive generation after cfctl reports zero authenticated local artifacts. | Never use the credential fallback store for the evidence integrity key, recreate a missing half over existing state, or treat legacy unauthenticated proof rows as current qualification. |
+| The sole canonical evidence registry is malformed while the marker is absent | Run `cfctl auth evidence-key recover-preview --json`. Recovery is admissible only when the direct platform backend has no managed transition and local storage has zero authenticated descriptors or proofs. The preview is classification-only and read-only: it returns a byte count but no raw value, digest, secret-derived identity, quarantine identity, or execution handle. Create the protected private intent with `cfctl auth evidence-key recover-plan create --json`; inspect or revoke its random opaque ID with `recover-plan status|revoke` without another confirmation prompt. Only the protected quarantine-and-replacement transition requires `cfctl auth evidence-key recover <plan-id> --yes --json`. | Never print or export the registry, hand-edit Keychain, initialize over it, derive an execution identity from secret material, retire quarantine in the same transaction, restore malformed bytes after quarantine begins, or delete historical V1 evidence. A marker, authenticated artifact, unmanaged custody drift, or conflicting readback remains a hold; after a crossed quarantine transition, resume only the same private plan forward. |
 | Catalog sync, coverage, or a stored catalog fails | Run `cfctl catalog sync --json`, then `cfctl catalog coverage --json`. Preserve `previous_catalog` and the returned error code; a discarded invalid current catalog is evidence of safe replacement, not evidence that earlier plans are valid. | Never edit a catalog body or content hash, restore a stale snapshot as current, or reuse a plan whose catalog pin drifted. |
 | A capability or write is blocked | Run `cfctl guide <capability-id> --json` and follow the exact `next_action`. Report the capability ID and `blocking_gaps` when the guide cannot close the contract. | Never route around `CFCTL_CAPABILITY_BLOCKED` with raw HTTP, Wrangler, dashboard changes, a broader token, or hand-edited plan JSON. |
 | A run crashed, timed out, or may have crossed the provider boundary | Run `cfctl plans status <operation-id> --json`. Use `cfctl plans rectify <operation-id> --json` when verification is unsupported or the boundary outcome is uncertain; review any derived compensation as a new transaction. | Do not replay `plans run`, approve a replacement operation speculatively, or call the provider directly. A consumed or uncertain plan remains non-replayable. |
@@ -1679,6 +1680,19 @@ preview, apply, and post-change verification evidence.
   key and local marker custody classes, state-root transition,
   verification-generation behavior, and recoverability. Only a separate
   explicit `cfctl auth evidence-key init --json` performs initialization.
+  A malformed sole canonical platform registry is not an initialization case:
+  `cfctl auth evidence-key recover-preview --json` only classifies the state and
+  reports its byte count and local artifact counts. It writes nothing and
+  exposes no registry bytes, digest, secret-derived identity, or execution
+  handle. `cfctl auth evidence-key recover-plan create --json` separately
+  writes a short-lived private Keychain intent bound to the exact bytes,
+  classification, artifact inventory, fresh replacement, root, expiry, and
+  lifecycle, while returning a random opaque plan ID. The confirmed `recover
+  <plan-id> --yes` copies the original bytes to private quarantine, verifies
+  them, publishes a fresh chunked authority, writes the marker, and records
+  single-use completion. An interrupted plan resumes forward from private
+  custody and never restores malformed bytes to the canonical identity. It
+  never upgrades legacy proof rows or exposes registry bytes.
 
 - **Access application and identity-provider plan storage uses schema-aware
   redaction.** Secret-shaped JSON Schema property names such as

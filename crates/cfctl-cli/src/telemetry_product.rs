@@ -35,6 +35,7 @@ pub(crate) fn operational_proof_coverage(
     catalog: &CatalogSnapshot,
 ) -> Result<Value> {
     let proof_page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
+    ensure_operational_proof_projection_valid(&proof_page)?;
     let proofs = &proof_page.proofs;
     let profiles = ProfilesConfig::load(store)?;
     let targeted_mutations = catalog
@@ -169,10 +170,24 @@ pub(crate) fn operational_proof_projection_json(page: &OperationalProofPageV1) -
     json!({
         "retained_count": page.proofs.len(),
         "total_index_rows": page.total_count,
+        "legacy_nonqualifying_count": page.legacy_nonqualifying_count,
+        "candidate_failure_count": page.failures.len(),
         "limit": OPERATIONAL_PROOF_PROJECTION_LIMIT,
         "truncated": page.truncated,
-        "boundary": "Counts and observations cover only the bounded most-recently-indexed projection when truncated is true."
+        "boundary": "Qualifying observations cover only the bounded newest authenticated projection when truncated is true. Legacy rows remain immutable and nonqualifying and are reported only as classification counts."
     })
+}
+
+pub(crate) fn ensure_operational_proof_projection_valid(
+    page: &OperationalProofPageV1,
+) -> Result<()> {
+    if let Some(failure) = page.failures.first() {
+        return Err(CliError::Input(format!(
+            "candidate operational proof {} is invalid: {}",
+            failure.proof_identity, failure.reason
+        )));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -447,6 +462,7 @@ pub(crate) fn execute_native_workflow(
         CliError::Input("native workflow capability is missing its recipe".to_owned())
     })?;
     let proof_page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
+    ensure_operational_proof_projection_valid(&proof_page)?;
     let proofs = &proof_page.proofs;
     let profiles = ProfilesConfig::load(store)?;
     let now = Utc::now();

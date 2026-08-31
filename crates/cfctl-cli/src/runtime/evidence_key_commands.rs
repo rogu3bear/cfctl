@@ -1,6 +1,8 @@
 use super::prelude::{
-    CliError, EvidenceKeyCommand, EvidenceKeyManager, EvidenceKeyRetireArgs, EvidenceKeyStatusV1,
-    EvidenceMacProvider as _, Result, ResultEnvelopeV2, Sha256, StateStore, Uuid, json,
+    CliError, EvidenceKeyCommand, EvidenceKeyManager, EvidenceKeyRecoverArgs,
+    EvidenceKeyRecoverPlanCommand, EvidenceKeyRecoverPlanSelector, EvidenceKeyRetireArgs,
+    EvidenceKeyStatusV1, EvidenceMacProvider as _, Result, ResultEnvelopeV2, Sha256, StateStore,
+    Uuid, json,
 };
 use sha2::Digest as _;
 
@@ -15,7 +17,166 @@ pub(super) fn evidence_key_command(
         EvidenceKeyCommand::Status => status(store, &manager),
         EvidenceKeyCommand::Rotate => rotate(store, &manager),
         EvidenceKeyCommand::Retire(arguments) => retire(store, &manager, &arguments),
+        EvidenceKeyCommand::RecoverPreview => recovery_preview(store, &manager),
+        EvidenceKeyCommand::RecoverPlan(arguments) => match arguments.command {
+            EvidenceKeyRecoverPlanCommand::Create => recovery_plan_create(store, &manager),
+            EvidenceKeyRecoverPlanCommand::Status(selector) => {
+                recovery_plan_status(&manager, &selector)
+            }
+            EvidenceKeyRecoverPlanCommand::Revoke(arguments) => {
+                recovery_plan_revoke(store, &manager, &arguments)
+            }
+        },
+        EvidenceKeyCommand::Recover(arguments) => recover(store, &manager, &arguments),
     }
+}
+
+fn recovery_preview(store: &StateStore, manager: &EvidenceKeyManager) -> Result<ResultEnvelopeV2> {
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    let marker_present = store.evidence_root_identity()?.is_some();
+    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+    let preview =
+        manager.recover_preview(marker_present, counts.descriptor_count, counts.proof_count)?;
+    Ok(ResultEnvelopeV2::success(
+        "auth evidence-key recover-preview",
+        json!({
+            "performed": false,
+            "preview": preview,
+            "historical_legacy_evidence": "preserved_and_nonqualifying",
+            "quarantine_custody": "platform_keyring_only_byte_exact_readback_required",
+            "recovery_direction": "after quarantine custody begins, resume forward; never restore malformed bytes to the canonical identity",
+            "secret_key_bytes_exposed": false,
+            "next_action": "Run `cfctl auth evidence-key recover-plan create --json` to create a short-lived private intent with a random opaque public identity.",
+        }),
+    ))
+}
+
+fn recovery_plan_create(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+) -> Result<ResultEnvelopeV2> {
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    let marker_present = store.evidence_root_identity()?.is_some();
+    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+    let plan = manager.create_recovery_plan(
+        marker_present,
+        counts.descriptor_count,
+        counts.proof_count,
+    )?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "auth evidence-key recover-plan create",
+        json!({
+            "plan": plan,
+            "private_binding": "platform_keyring_only_non_exportable_through_cfctl",
+            "secret_or_secret_derived_values_exposed": false,
+            "execution_command": format!(
+                "cfctl auth evidence-key recover {} --yes --json",
+                plan.plan_id
+            ),
+        }),
+    );
+    envelope.performed = true;
+    Ok(envelope)
+}
+
+fn recovery_plan_status(
+    manager: &EvidenceKeyManager,
+    selector: &EvidenceKeyRecoverPlanSelector,
+) -> Result<ResultEnvelopeV2> {
+    let status = manager.recovery_plan_status(&selector.plan_id)?;
+    Ok(ResultEnvelopeV2::success(
+        "auth evidence-key recover-plan status",
+        json!({
+            "status": status,
+            "performed": false,
+            "secret_or_secret_derived_values_exposed": false,
+        }),
+    ))
+}
+
+fn recovery_plan_revoke(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    arguments: &EvidenceKeyRecoverPlanSelector,
+) -> Result<ResultEnvelopeV2> {
+    let _lifecycle = store.lock_evidence_lifecycle()?;
+    let status = manager.revoke_recovery_plan(&arguments.plan_id)?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "auth evidence-key recover-plan revoke",
+        json!({
+            "status": status,
+            "secret_or_secret_derived_values_exposed": false,
+        }),
+    );
+    envelope.performed = true;
+    Ok(envelope)
+}
+
+fn recover(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    arguments: &EvidenceKeyRecoverArgs,
+) -> Result<ResultEnvelopeV2> {
+    if !arguments.yes {
+        return Err(CliError::Input(
+            "evidence-key recovery requires --yes for the exact opaque plan identity".to_owned(),
+        ));
+    }
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    let marker = store.evidence_root_identity()?;
+    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+    let status = manager.resume_malformed_registry(
+        &arguments.plan_id,
+        marker.as_deref(),
+        counts.descriptor_count,
+        counts.proof_count,
+    )?;
+    let state_root_identity = status.state_root_identity.as_deref().ok_or_else(|| {
+        CliError::Input("recovered evidence authority omitted its private root binding".to_owned())
+    })?;
+    if marker.is_none()
+        && let Err(marker_error) = store.initialize_evidence_root_identity(state_root_identity)
+    {
+        match store.evidence_root_identity() {
+            Ok(Some(readback)) if readback == state_root_identity => {}
+            Ok(None) => {
+                return Err(CliError::Input(format!(
+                    "recovered platform authority is published, but local marker creation did not cross; rerun the same recovery plan to resume forward: {marker_error}"
+                )));
+            }
+            Ok(Some(_)) => {
+                return Err(CliError::Input(format!(
+                    "recovered platform authority is published, but marker readback conflicts; preserve private custody and stop: {marker_error}"
+                )));
+            }
+            Err(readback_error) => {
+                return Err(CliError::Input(format!(
+                    "recovered platform authority is published and marker state is indeterminate; preserve private custody and inspect before resuming: write={marker_error}; readback={readback_error}"
+                )));
+            }
+        }
+    }
+    let readback = manager.status(Some(state_root_identity))?;
+    if readback != status {
+        return Err(CliError::Input(
+            "malformed registry recovery final status drifted; preserve authority and quarantine and do not replay"
+                .to_owned(),
+        ));
+    }
+    let recovery = manager.complete_recovery_plan(&arguments.plan_id, state_root_identity)?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "auth evidence-key recover",
+        json!({
+            "recovery_performed": true,
+            "recovery_plan": recovery,
+            "status": status,
+            "historical_legacy_evidence": "preserved_and_nonqualifying",
+            "secret_or_secret_derived_values_exposed": false,
+            "quarantine_retirement": "separate_explicit_lifecycle",
+        }),
+    );
+    envelope.performed = true;
+    Ok(envelope)
 }
 
 fn initialization_preview(
@@ -248,11 +409,14 @@ mod tests {
         AuthError, EvidenceMacProvider as _, MemorySecretStore, SecretBackend, SecretStore,
     };
     use cfctl_storage::{RuntimePaths, StorageError};
+    use sha2::{Digest as _, Sha256};
 
     use super::{
         EvidenceKeyManager, StateStore, initialization_preview, initialize,
-        initialize_with_marker_write,
+        initialize_with_marker_write, recover, recovery_plan_create, recovery_plan_status,
+        recovery_preview,
     };
+    use crate::{EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanSelector};
 
     fn memory_manager(store: &StateStore) -> EvidenceKeyManager {
         EvidenceKeyManager::new(
@@ -261,6 +425,29 @@ mod tests {
             SecretBackend::Memory,
         )
         .expect("memory evidence manager")
+    }
+
+    #[derive(Default)]
+    struct PlatformMemorySecretStore {
+        inner: MemorySecretStore,
+    }
+
+    impl SecretStore for PlatformMemorySecretStore {
+        fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> cfctl_auth::Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> cfctl_auth::Result<()> {
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> cfctl_auth::Result<Option<SecretBackend>> {
+            Ok(self.inner.get(key)?.map(|_| SecretBackend::PlatformKeyring))
+        }
     }
 
     #[test]
@@ -293,6 +480,87 @@ mod tests {
                 .is_none()
         );
         assert!(!manager.status(None).expect("status reads").initialized);
+    }
+
+    #[test]
+    fn recovery_plan_keeps_preview_read_only_and_finalizes_marker_once() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let secrets = Arc::new(PlatformMemorySecretStore::default());
+        let manager = EvidenceKeyManager::new(
+            secrets.clone(),
+            store.evidence_location_identity(),
+            SecretBackend::PlatformKeyring,
+        )
+        .expect("platform-memory evidence manager");
+        let registry_key = format!(
+            "evidence-integrity/location/{}/registry-v1",
+            store.evidence_location_identity()
+        );
+        let malformed = "{".repeat(128);
+        secrets
+            .inner
+            .put(&registry_key, &malformed)
+            .expect("malformed registry seeds");
+
+        let preview = recovery_preview(&store, &manager).expect("preview succeeds");
+        assert!(!preview.performed);
+        let preview_json = preview.result.to_string();
+        let malformed_digest = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(malformed.as_bytes()))
+        );
+        assert!(!preview_json.contains(&malformed));
+        assert!(!preview_json.contains(&malformed_digest));
+        assert!(
+            store
+                .evidence_root_identity()
+                .expect("marker reads")
+                .is_none()
+        );
+
+        let plan = recovery_plan_create(&store, &manager).expect("private plan creates");
+        assert!(plan.performed);
+        let plan_id = plan.result["plan"]["plan_id"]
+            .as_str()
+            .expect("opaque plan id")
+            .to_owned();
+        let status = recovery_plan_status(
+            &manager,
+            &EvidenceKeyRecoverPlanSelector {
+                plan_id: plan_id.clone(),
+            },
+        )
+        .expect("plan status reads");
+        assert_eq!(status.result["status"]["state"], "prepared");
+
+        let recovered = recover(
+            &store,
+            &manager,
+            &EvidenceKeyRecoverArgs {
+                plan_id: plan_id.clone(),
+                yes: true,
+            },
+        )
+        .expect("plan recovers and finalizes marker");
+        assert!(recovered.performed);
+        assert_eq!(recovered.result["recovery_plan"]["state"], "completed");
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker reads")
+            .expect("marker finalized");
+        manager
+            .status(Some(&marker))
+            .expect("marker and replacement authority agree");
+        assert!(
+            recover(
+                &store,
+                &manager,
+                &EvidenceKeyRecoverArgs { plan_id, yes: true },
+            )
+            .is_err(),
+            "completed plan is single-use"
+        );
     }
 
     #[derive(Default)]

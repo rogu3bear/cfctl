@@ -638,7 +638,12 @@ fn coordinated_descriptor_and_proof_rewrite_cannot_manufacture_live_read_authori
     .expect("attacker writes a recomputed content-addressed proof row");
     assert!(store.load_operational_proof(&proof_hash(&forged)).is_err());
     assert!(store.list_operational_proofs().is_err());
-    assert!(store.list_recent_operational_proofs(10).is_err());
+    let page = store
+        .list_recent_operational_proofs(10)
+        .expect("recent projection preserves raw V1 classification");
+    assert!(page.proofs.is_empty());
+    assert_eq!(page.legacy_nonqualifying_count, 1);
+    assert!(page.failures.is_empty());
 }
 
 #[test]
@@ -670,7 +675,14 @@ fn proof_envelope_rejects_rehashed_authority_substitution() {
 
     assert!(store.load_operational_proof(&proof_hash(&forged)).is_err());
     assert!(store.list_operational_proofs().is_err());
-    assert!(store.list_recent_operational_proofs(10).is_err());
+    let page = store
+        .list_recent_operational_proofs(10)
+        .expect("recent projection classifies candidate failure");
+    assert_eq!(page.proofs.len(), 1);
+    assert_eq!(page.proofs[0], original);
+    assert_eq!(page.legacy_nonqualifying_count, 0);
+    assert_eq!(page.failures.len(), 1);
+    assert_eq!(page.failures[0].account_id.as_deref(), Some("account-a"));
 }
 
 #[test]
@@ -775,7 +787,12 @@ fn legacy_body_and_plain_proof_remain_readable_only_at_the_body_audit_boundary()
             .is_err()
     );
     assert!(store.list_operational_proofs().is_err());
-    assert!(store.list_recent_operational_proofs(10).is_err());
+    let page = store
+        .list_recent_operational_proofs(10)
+        .expect("recent projection preserves raw V1 classification");
+    assert!(page.proofs.is_empty());
+    assert_eq!(page.legacy_nonqualifying_count, 1);
+    assert!(page.failures.is_empty());
 }
 
 #[test]

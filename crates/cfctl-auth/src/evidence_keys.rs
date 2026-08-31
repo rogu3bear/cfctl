@@ -1,15 +1,18 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac as _};
 use serde::{Deserialize, Serialize};
-use sha2_compat::Sha256;
+use sha2_compat::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{AuthError, KeyringSecretStore, Result, SecretBackend, SecretStore};
 
 pub const EVIDENCE_HMAC_ALGORITHM: &str = "hmac-sha256";
 const REGISTRY_SCHEMA_VERSION: u8 = 1;
+const RECOVERY_INTENT_SCHEMA_VERSION: u8 = 1;
+const RECOVERY_PLAN_TTL_MINUTES: i64 = 15;
 const REGISTRY_KEY_PREFIX: &str = "evidence-integrity/location";
 const MAC_DOMAIN_PREFIX: &[u8] = b"cfctl-evidence-authentication-v1\0";
 
@@ -45,6 +48,44 @@ pub struct EvidenceKeyStatusV1 {
     pub active_generation_id: Option<String>,
     pub verification_generation_ids: Vec<String>,
     pub backend: Option<SecretBackend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceKeyRecoveryPreviewV1 {
+    pub location_identity: String,
+    pub registry_byte_count: usize,
+    pub malformed_class: String,
+    pub authenticated_descriptor_count: usize,
+    pub authenticated_proof_count: usize,
+    pub backend: SecretBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceKeyRecoveryPlanV1 {
+    pub plan_id: String,
+    pub location_identity: String,
+    pub registry_byte_count: usize,
+    pub malformed_class: String,
+    pub authenticated_descriptor_count: usize,
+    pub authenticated_proof_count: usize,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub state: String,
+    pub backend: SecretBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceKeyRecoveryPlanStatusV1 {
+    pub plan_id: String,
+    pub location_identity: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub state: String,
+    pub next_action: String,
+    pub backend: SecretBackend,
 }
 
 pub trait EvidenceMacProvider: Send + Sync {
@@ -90,6 +131,54 @@ struct EvidenceKeyRegistryV1 {
     state_root_identity: String,
     active_generation_id: String,
     generations: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryIntentStateV1 {
+    Prepared,
+    ReplacementPublished,
+    Completed,
+    Revoked,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceKeyRecoveryIntentV1 {
+    schema_version: u8,
+    plan_id: String,
+    location_identity: String,
+    registry_byte_count: usize,
+    registry_sha256: String,
+    malformed_class: String,
+    authenticated_descriptor_count: usize,
+    authenticated_proof_count: usize,
+    quarantine_identity: String,
+    replacement_registry: String,
+    state_root_identity: String,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    state: RecoveryIntentStateV1,
+}
+
+impl fmt::Debug for EvidenceKeyRecoveryIntentV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EvidenceKeyRecoveryIntentV1")
+            .field("plan_id", &self.plan_id)
+            .field("location_identity", &self.location_identity)
+            .field("registry_byte_count", &self.registry_byte_count)
+            .field("malformed_class", &self.malformed_class)
+            .field(
+                "authenticated_descriptor_count",
+                &self.authenticated_descriptor_count,
+            )
+            .field("authenticated_proof_count", &self.authenticated_proof_count)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for EvidenceKeyRegistryV1 {
@@ -148,6 +237,274 @@ impl EvidenceKeyManager {
         };
         self.save_registry(&registry)?;
         self.status(Some(state_root_identity))
+    }
+
+    pub fn recover_preview(
+        &self,
+        marker_present: bool,
+        authenticated_descriptor_count: usize,
+        authenticated_proof_count: usize,
+    ) -> Result<EvidenceKeyRecoveryPreviewV1> {
+        if marker_present {
+            return Err(AuthError::SecretStore(
+                "malformed-registry recovery requires the evidence-root marker to be absent"
+                    .to_owned(),
+            ));
+        }
+        if authenticated_descriptor_count != 0 || authenticated_proof_count != 0 {
+            return Err(AuthError::SecretStore(
+                "malformed-registry recovery requires zero authenticated local artifacts"
+                    .to_owned(),
+            ));
+        }
+        let registry_key = self.registry_key();
+        let encoded = self
+            .store
+            .recoverable_unmanaged_value(&registry_key)?
+            .ok_or_else(|| {
+                AuthError::SecretStore(
+                    "malformed-registry recovery requires exactly one canonical registry item"
+                        .to_owned(),
+                )
+            })?;
+        if self.store.locate(&registry_key)? != Some(self.required_backend)
+            || self.required_backend != SecretBackend::PlatformKeyring
+        {
+            return Err(AuthError::SecretStore(
+                "malformed-registry recovery is restricted to the direct platform keyring"
+                    .to_owned(),
+            ));
+        }
+        let malformed_class = classify_malformed_registry(&encoded)?;
+        Ok(EvidenceKeyRecoveryPreviewV1 {
+            location_identity: self.location_identity.clone(),
+            registry_byte_count: encoded.len(),
+            malformed_class: malformed_class.to_owned(),
+            authenticated_descriptor_count,
+            authenticated_proof_count,
+            backend: self.required_backend,
+        })
+    }
+
+    pub fn create_recovery_plan(
+        &self,
+        marker_present: bool,
+        authenticated_descriptor_count: usize,
+        authenticated_proof_count: usize,
+    ) -> Result<EvidenceKeyRecoveryPlanV1> {
+        self.create_recovery_plan_at(
+            marker_present,
+            authenticated_descriptor_count,
+            authenticated_proof_count,
+            Utc::now(),
+        )
+    }
+
+    fn create_recovery_plan_at(
+        &self,
+        marker_present: bool,
+        authenticated_descriptor_count: usize,
+        authenticated_proof_count: usize,
+        now: DateTime<Utc>,
+    ) -> Result<EvidenceKeyRecoveryPlanV1> {
+        let preview = self.recover_preview(
+            marker_present,
+            authenticated_descriptor_count,
+            authenticated_proof_count,
+        )?;
+        let registry_key = self.registry_key();
+        let encoded = self
+            .store
+            .recoverable_unmanaged_value(&registry_key)?
+            .ok_or_else(|| {
+                AuthError::SecretStore(
+                    "malformed-registry recovery plan requires the previewed registry".to_owned(),
+                )
+            })?;
+        if encoded.len() != preview.registry_byte_count
+            || classify_malformed_registry(&encoded)? != preview.malformed_class
+        {
+            return Err(AuthError::SecretStore(
+                "malformed registry drifted while the private recovery plan was created".to_owned(),
+            ));
+        }
+        let plan_id = Uuid::new_v4().to_string();
+        let intent_key = self.recovery_intent_key(&plan_id)?;
+        if self.store.get(&intent_key)?.is_some() {
+            return Err(AuthError::SecretStore(
+                "opaque recovery plan identity already exists".to_owned(),
+            ));
+        }
+        let state_root_identity = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()))
+        );
+        let generation_id = Uuid::new_v4().to_string();
+        let mut key = [0_u8; 32];
+        rand::fill(&mut key);
+        let replacement = EvidenceKeyRegistryV1 {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            state_root_identity: state_root_identity.clone(),
+            active_generation_id: generation_id.clone(),
+            generations: BTreeMap::from([(generation_id, URL_SAFE_NO_PAD.encode(key))]),
+        };
+        let expires_at = now + Duration::minutes(RECOVERY_PLAN_TTL_MINUTES);
+        let intent = EvidenceKeyRecoveryIntentV1 {
+            schema_version: RECOVERY_INTENT_SCHEMA_VERSION,
+            plan_id: plan_id.clone(),
+            location_identity: self.location_identity.clone(),
+            registry_byte_count: encoded.len(),
+            registry_sha256: format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes()))),
+            malformed_class: preview.malformed_class.clone(),
+            authenticated_descriptor_count,
+            authenticated_proof_count,
+            quarantine_identity: format!(
+                "{REGISTRY_KEY_PREFIX}/{}/recovery-quarantine/{plan_id}",
+                self.location_identity
+            ),
+            replacement_registry: serde_json::to_string(&replacement)?,
+            state_root_identity,
+            created_at: now,
+            expires_at,
+            state: RecoveryIntentStateV1::Prepared,
+        };
+        self.save_recovery_intent(&intent)?;
+        Ok(self.public_recovery_plan(&intent))
+    }
+
+    pub fn recovery_plan_status(&self, plan_id: &str) -> Result<EvidenceKeyRecoveryPlanStatusV1> {
+        let intent = self.load_recovery_intent(plan_id)?;
+        Ok(self.public_recovery_plan_status(&intent))
+    }
+
+    pub fn revoke_recovery_plan(&self, plan_id: &str) -> Result<EvidenceKeyRecoveryPlanStatusV1> {
+        let mut intent = self.load_recovery_intent(plan_id)?;
+        if intent.state != RecoveryIntentStateV1::Prepared {
+            return Err(AuthError::SecretStore(
+                "only an unused prepared recovery plan can be revoked".to_owned(),
+            ));
+        }
+        if self.store.get(&intent.quarantine_identity)?.is_some() {
+            return Err(AuthError::SecretStore(
+                "recovery already crossed into quarantine custody and must be resumed, not revoked"
+                    .to_owned(),
+            ));
+        }
+        intent.state = RecoveryIntentStateV1::Revoked;
+        self.save_recovery_intent(&intent)?;
+        Ok(self.public_recovery_plan_status(&intent))
+    }
+
+    pub fn resume_malformed_registry(
+        &self,
+        plan_id: &str,
+        marker_identity: Option<&str>,
+        authenticated_descriptor_count: usize,
+        authenticated_proof_count: usize,
+    ) -> Result<EvidenceKeyStatusV1> {
+        let mut intent = self.load_recovery_intent(plan_id)?;
+        match intent.state {
+            RecoveryIntentStateV1::Completed => {
+                return Err(AuthError::SecretStore(
+                    "recovery plan is already completed and cannot be replayed".to_owned(),
+                ));
+            }
+            RecoveryIntentStateV1::Revoked => {
+                return Err(AuthError::SecretStore(
+                    "recovery plan is revoked".to_owned(),
+                ));
+            }
+            RecoveryIntentStateV1::Prepared | RecoveryIntentStateV1::ReplacementPublished => {}
+        }
+        if authenticated_descriptor_count != intent.authenticated_descriptor_count
+            || authenticated_proof_count != intent.authenticated_proof_count
+            || authenticated_descriptor_count != 0
+            || authenticated_proof_count != 0
+        {
+            return Err(AuthError::SecretStore(
+                "authenticated local artifact custody drifted after recovery planning".to_owned(),
+            ));
+        }
+        if marker_identity.is_some_and(|marker| marker != intent.state_root_identity) {
+            return Err(AuthError::SecretStore(
+                "evidence-root marker conflicts with the private recovery intent".to_owned(),
+            ));
+        }
+        let quarantine = self.store.get(&intent.quarantine_identity)?;
+        if quarantine.is_none() && Utc::now() >= intent.expires_at {
+            return Err(AuthError::SecretStore(
+                "unused recovery plan expired before any protected transition".to_owned(),
+            ));
+        }
+        let registry_key = self.registry_key();
+        let current = self.store.get(&registry_key)?;
+        let original = match quarantine.as_deref() {
+            Some(value) => value.to_owned(),
+            None => current.clone().ok_or_else(|| {
+                AuthError::SecretStore(
+                    "planned malformed registry disappeared before quarantine".to_owned(),
+                )
+            })?,
+        };
+        if original.len() != intent.registry_byte_count
+            || format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(original.as_bytes()))
+            ) != intent.registry_sha256
+            || classify_malformed_registry(&original)? != intent.malformed_class
+        {
+            return Err(AuthError::SecretStore(
+                "private recovery binding does not match the current or quarantined registry"
+                    .to_owned(),
+            ));
+        }
+        if current.as_deref() != Some(intent.replacement_registry.as_str()) {
+            self.store.recover_malformed_value(
+                &registry_key,
+                &original,
+                &intent.quarantine_identity,
+                &intent.replacement_registry,
+            )?;
+        }
+        let status = self.status(Some(&intent.state_root_identity))?;
+        intent.state = RecoveryIntentStateV1::ReplacementPublished;
+        self.save_recovery_intent(&intent)?;
+        Ok(status)
+    }
+
+    pub fn complete_recovery_plan(
+        &self,
+        plan_id: &str,
+        marker_identity: &str,
+    ) -> Result<EvidenceKeyRecoveryPlanStatusV1> {
+        let mut intent = self.load_recovery_intent(plan_id)?;
+        if marker_identity != intent.state_root_identity {
+            return Err(AuthError::SecretStore(
+                "recovery completion marker does not match the private recovery intent".to_owned(),
+            ));
+        }
+        match intent.state {
+            RecoveryIntentStateV1::ReplacementPublished => {}
+            RecoveryIntentStateV1::Prepared => {
+                return Err(AuthError::SecretStore(
+                    "recovery plan has not published its replacement authority".to_owned(),
+                ));
+            }
+            RecoveryIntentStateV1::Completed => {
+                return Err(AuthError::SecretStore(
+                    "recovery plan is already completed and cannot be replayed".to_owned(),
+                ));
+            }
+            RecoveryIntentStateV1::Revoked => {
+                return Err(AuthError::SecretStore(
+                    "revoked recovery plan cannot be completed".to_owned(),
+                ));
+            }
+        }
+        self.status(Some(marker_identity))?;
+        intent.state = RecoveryIntentStateV1::Completed;
+        self.save_recovery_intent(&intent)?;
+        Ok(self.public_recovery_plan_status(&intent))
     }
 
     pub fn rotate(&self, state_root_identity: &str) -> Result<EvidenceKeyStatusV1> {
@@ -213,6 +570,150 @@ impl EvidenceKeyManager {
             "{REGISTRY_KEY_PREFIX}/{}/registry-v1",
             self.location_identity
         )
+    }
+
+    fn recovery_intent_key(&self, plan_id: &str) -> Result<String> {
+        let canonical = Uuid::parse_str(plan_id)
+            .ok()
+            .filter(|candidate| candidate.to_string() == plan_id)
+            .ok_or_else(|| {
+                AuthError::SecretStore(
+                    "recovery plan identity must be one canonical lowercase hyphenated UUID"
+                        .to_owned(),
+                )
+            })?;
+        Ok(format!(
+            "{REGISTRY_KEY_PREFIX}/{}/recovery-intent-v1/{canonical}",
+            self.location_identity
+        ))
+    }
+
+    fn load_recovery_intent(&self, plan_id: &str) -> Result<EvidenceKeyRecoveryIntentV1> {
+        let key = self.recovery_intent_key(plan_id)?;
+        let encoded = self.store.get(&key)?.ok_or_else(|| {
+            AuthError::SecretStore("recovery plan does not exist in private custody".to_owned())
+        })?;
+        if self.store.locate(&key)? != Some(self.required_backend)
+            || self.required_backend != SecretBackend::PlatformKeyring
+        {
+            return Err(AuthError::SecretStore(
+                "recovery plan must remain in the direct platform keyring".to_owned(),
+            ));
+        }
+        let intent: EvidenceKeyRecoveryIntentV1 = serde_json::from_str(&encoded)?;
+        self.validate_recovery_intent(&intent)?;
+        if intent.plan_id != plan_id {
+            return Err(AuthError::SecretStore(
+                "private recovery intent identity differs from its lookup identity".to_owned(),
+            ));
+        }
+        Ok(intent)
+    }
+
+    fn save_recovery_intent(&self, intent: &EvidenceKeyRecoveryIntentV1) -> Result<()> {
+        self.validate_recovery_intent(intent)?;
+        let key = self.recovery_intent_key(&intent.plan_id)?;
+        let encoded = serde_json::to_string(intent)?;
+        self.store.put(&key, &encoded)?;
+        if self.store.locate(&key)? != Some(self.required_backend) {
+            return Err(AuthError::SecretStore(
+                "private recovery intent was not stored in the required backend".to_owned(),
+            ));
+        }
+        let readback = self.store.get(&key)?.ok_or_else(|| {
+            AuthError::SecretStore("private recovery intent readback is missing".to_owned())
+        })?;
+        let readback: EvidenceKeyRecoveryIntentV1 = serde_json::from_str(&readback)?;
+        if readback != *intent {
+            return Err(AuthError::SecretStore(
+                "private recovery intent readback differs from the intended state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_intent(&self, intent: &EvidenceKeyRecoveryIntentV1) -> Result<()> {
+        let canonical_plan_id = Uuid::parse_str(&intent.plan_id)
+            .ok()
+            .filter(|candidate| candidate.to_string() == intent.plan_id)
+            .is_some();
+        let digest_is_canonical =
+            intent
+                .registry_sha256
+                .strip_prefix("sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                });
+        let expected_quarantine = format!(
+            "{REGISTRY_KEY_PREFIX}/{}/recovery-quarantine/{}",
+            self.location_identity, intent.plan_id
+        );
+        let replacement: EvidenceKeyRegistryV1 =
+            serde_json::from_str(&intent.replacement_registry)?;
+        validate_registry(&replacement)?;
+        if intent.schema_version != RECOVERY_INTENT_SCHEMA_VERSION
+            || !canonical_plan_id
+            || intent.location_identity != self.location_identity
+            || !digest_is_canonical
+            || !matches!(
+                intent.malformed_class.as_str(),
+                "invalid_json_registry" | "invalid_registry_contract"
+            )
+            || intent.authenticated_descriptor_count != 0
+            || intent.authenticated_proof_count != 0
+            || intent.quarantine_identity != expected_quarantine
+            || replacement.state_root_identity != intent.state_root_identity
+            || intent.created_at >= intent.expires_at
+        {
+            return Err(AuthError::SecretStore(
+                "private recovery intent is malformed or bound to another authority".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn public_recovery_plan(
+        &self,
+        intent: &EvidenceKeyRecoveryIntentV1,
+    ) -> EvidenceKeyRecoveryPlanV1 {
+        EvidenceKeyRecoveryPlanV1 {
+            plan_id: intent.plan_id.clone(),
+            location_identity: intent.location_identity.clone(),
+            registry_byte_count: intent.registry_byte_count,
+            malformed_class: intent.malformed_class.clone(),
+            authenticated_descriptor_count: intent.authenticated_descriptor_count,
+            authenticated_proof_count: intent.authenticated_proof_count,
+            created_at: intent.created_at,
+            expires_at: intent.expires_at,
+            state: recovery_intent_state_name(intent.state).to_owned(),
+            backend: self.required_backend,
+        }
+    }
+
+    fn public_recovery_plan_status(
+        &self,
+        intent: &EvidenceKeyRecoveryIntentV1,
+    ) -> EvidenceKeyRecoveryPlanStatusV1 {
+        let next_action = match intent.state {
+            RecoveryIntentStateV1::Prepared => "recover_with_confirmation_before_expiry",
+            RecoveryIntentStateV1::ReplacementPublished => {
+                "resume_recovery_to_finalize_local_marker"
+            }
+            RecoveryIntentStateV1::Completed => "none_completed_single_use",
+            RecoveryIntentStateV1::Revoked => "none_revoked",
+        };
+        EvidenceKeyRecoveryPlanStatusV1 {
+            plan_id: intent.plan_id.clone(),
+            location_identity: intent.location_identity.clone(),
+            created_at: intent.created_at,
+            expires_at: intent.expires_at,
+            state: recovery_intent_state_name(intent.state).to_owned(),
+            next_action: next_action.to_owned(),
+            backend: self.required_backend,
+        }
     }
 
     fn load_registry(&self) -> Result<Option<EvidenceKeyRegistryV1>> {
@@ -438,6 +939,30 @@ fn validate_registry(registry: &EvidenceKeyRegistryV1) -> Result<()> {
     Ok(())
 }
 
+fn classify_malformed_registry(encoded: &str) -> Result<&'static str> {
+    if let Ok(registry) = serde_json::from_str::<EvidenceKeyRegistryV1>(encoded)
+        && validate_registry(&registry).is_ok()
+    {
+        return Err(AuthError::SecretStore(
+            "canonical evidence registry is valid; malformed recovery is not applicable".to_owned(),
+        ));
+    }
+    if serde_json::from_str::<serde_json::Value>(encoded).is_ok() {
+        Ok("invalid_registry_contract")
+    } else {
+        Ok("invalid_json_registry")
+    }
+}
+
+fn recovery_intent_state_name(state: RecoveryIntentStateV1) -> &'static str {
+    match state {
+        RecoveryIntentStateV1::Prepared => "prepared",
+        RecoveryIntentStateV1::ReplacementPublished => "replacement_published",
+        RecoveryIntentStateV1::Completed => "completed",
+        RecoveryIntentStateV1::Revoked => "revoked",
+    }
+}
+
 fn validate_identity(label: &str, value: &str) -> Result<()> {
     let valid = value.strip_prefix("sha256:").is_some_and(|digest| {
         digest.len() == 64
@@ -518,6 +1043,33 @@ mod tests {
 
     use super::*;
     use crate::MemorySecretStore;
+
+    #[derive(Default)]
+    struct PlatformMemorySecretStore {
+        inner: MemorySecretStore,
+        put_attempts: AtomicUsize,
+        delete_attempts: AtomicUsize,
+    }
+
+    impl SecretStore for PlatformMemorySecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.put_attempts.fetch_add(1, Ordering::AcqRel);
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.delete_attempts.fetch_add(1, Ordering::AcqRel);
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            Ok(self.inner.get(key)?.map(|_| SecretBackend::PlatformKeyring))
+        }
+    }
 
     fn identity(label: &str) -> String {
         format!(
@@ -669,6 +1221,181 @@ mod tests {
         assert!(
             manager
                 .verify(&root, "descriptor-v2", b"payload", &old_tag)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_registry_recovery_is_plan_bound_quarantined_and_non_disclosing() {
+        let store = Arc::new(PlatformMemorySecretStore::default());
+        let manager = EvidenceKeyManager::new(
+            store.clone(),
+            identity("recovery-location"),
+            SecretBackend::PlatformKeyring,
+        )
+        .expect("manager");
+        let malformed = "{".repeat(128);
+        store
+            .inner
+            .put(&manager.registry_key(), &malformed)
+            .expect("malformed registry seeds");
+
+        let preview = manager
+            .recover_preview(false, 0, 0)
+            .expect("exact malformed state previews");
+        assert_eq!(preview.registry_byte_count, 128);
+        assert_eq!(preview.malformed_class, "invalid_json_registry");
+        let serialized = serde_json::to_string(&preview).expect("preview serializes");
+        let secret_digest = format!(
+            "sha256:{}",
+            hex::encode(Sha256V11::digest(malformed.as_bytes()))
+        );
+        assert!(!serialized.contains(&malformed));
+        assert!(
+            !serialized.contains(&secret_digest),
+            "public recovery preview must not expose a secret-derived digest oracle"
+        );
+        assert_eq!(
+            store.put_attempts.load(Ordering::Acquire),
+            0,
+            "recovery preview must remain strictly read-only"
+        );
+        assert_eq!(
+            store.delete_attempts.load(Ordering::Acquire),
+            0,
+            "recovery preview must not delete platform state"
+        );
+        assert!(manager.recover_preview(true, 0, 0).is_err());
+        assert!(manager.recover_preview(false, 1, 0).is_err());
+        assert!(manager.recover_preview(false, 0, 1).is_err());
+
+        let plan = manager
+            .create_recovery_plan(false, 0, 0)
+            .expect("private recovery plan creates");
+        assert!(Uuid::parse_str(&plan.plan_id).is_ok());
+        assert_eq!(plan.state, "prepared");
+        let public_plan = serde_json::to_string(&plan).expect("public plan serializes");
+        assert!(!public_plan.contains(&malformed));
+        assert!(!public_plan.contains(&secret_digest));
+        let intent = manager
+            .load_recovery_intent(&plan.plan_id)
+            .expect("private intent reads");
+        assert!(intent.registry_sha256.contains(&secret_digest));
+        assert!(!public_plan.contains(&intent.quarantine_identity));
+        assert!(!public_plan.contains(&intent.state_root_identity));
+        let private_debug = format!("{intent:?}");
+        assert!(!private_debug.contains(&malformed));
+        assert!(!private_debug.contains(&secret_digest));
+        assert!(!private_debug.contains(&intent.quarantine_identity));
+        assert!(!private_debug.contains(&intent.replacement_registry));
+        assert!(!private_debug.contains(&intent.state_root_identity));
+
+        let status = manager
+            .resume_malformed_registry(&plan.plan_id, None, 0, 0)
+            .expect("exact private plan recovers");
+        let root = status
+            .state_root_identity
+            .as_deref()
+            .expect("recovery publishes bound root");
+        assert_eq!(root, intent.state_root_identity);
+        assert_eq!(
+            store
+                .get(&intent.quarantine_identity)
+                .expect("quarantine reads")
+                .as_deref(),
+            Some(malformed.as_str())
+        );
+        let completed = manager
+            .complete_recovery_plan(&plan.plan_id, root)
+            .expect("marker-bound recovery completes");
+        assert_eq!(completed.state, "completed");
+        assert!(
+            manager
+                .resume_malformed_registry(&plan.plan_id, Some(root), 0, 0)
+                .is_err(),
+            "consumed recovery cannot replay"
+        );
+    }
+
+    #[test]
+    fn recovery_plan_expiry_revocation_and_custody_drift_fail_closed() {
+        let expired_store = Arc::new(PlatformMemorySecretStore::default());
+        let expired_manager = EvidenceKeyManager::new(
+            expired_store.clone(),
+            identity("expired-recovery-location"),
+            SecretBackend::PlatformKeyring,
+        )
+        .expect("expired manager");
+        let malformed = "{".repeat(64);
+        expired_store
+            .inner
+            .put(&expired_manager.registry_key(), &malformed)
+            .expect("expired malformed registry seeds");
+        let old_now = Utc::now() - Duration::minutes(RECOVERY_PLAN_TTL_MINUTES + 1);
+        let expired = expired_manager
+            .create_recovery_plan_at(false, 0, 0, old_now)
+            .expect("expired plan creates at controlled clock");
+        assert!(
+            expired_manager
+                .resume_malformed_registry(&expired.plan_id, None, 0, 0)
+                .is_err()
+        );
+        assert_eq!(
+            expired_store
+                .get(&expired_manager.registry_key())
+                .expect("expired canonical reads")
+                .as_deref(),
+            Some(malformed.as_str())
+        );
+
+        let revoked_store = Arc::new(PlatformMemorySecretStore::default());
+        let revoked_manager = EvidenceKeyManager::new(
+            revoked_store.clone(),
+            identity("revoked-recovery-location"),
+            SecretBackend::PlatformKeyring,
+        )
+        .expect("revoked manager");
+        revoked_store
+            .inner
+            .put(&revoked_manager.registry_key(), &malformed)
+            .expect("revoked malformed registry seeds");
+        let revoked = revoked_manager
+            .create_recovery_plan(false, 0, 0)
+            .expect("revocable plan creates");
+        assert_eq!(
+            revoked_manager
+                .revoke_recovery_plan(&revoked.plan_id)
+                .expect("unused plan revokes")
+                .state,
+            "revoked"
+        );
+        assert!(
+            revoked_manager
+                .resume_malformed_registry(&revoked.plan_id, None, 0, 0)
+                .is_err()
+        );
+
+        let drift_store = Arc::new(PlatformMemorySecretStore::default());
+        let drift_manager = EvidenceKeyManager::new(
+            drift_store.clone(),
+            identity("drift-recovery-location"),
+            SecretBackend::PlatformKeyring,
+        )
+        .expect("drift manager");
+        drift_store
+            .inner
+            .put(&drift_manager.registry_key(), &malformed)
+            .expect("drift malformed registry seeds");
+        let drift = drift_manager
+            .create_recovery_plan(false, 0, 0)
+            .expect("drift-bound plan creates");
+        drift_store
+            .inner
+            .put(&drift_manager.registry_key(), &format!("{malformed}x"))
+            .expect("canonical state drifts");
+        assert!(
+            drift_manager
+                .resume_malformed_registry(&drift.plan_id, None, 0, 0)
                 .is_err()
         );
     }

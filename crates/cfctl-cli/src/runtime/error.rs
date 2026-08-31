@@ -366,11 +366,18 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
                     .to_owned(),
             ));
         }
-        E::EvidenceKeyLifecycle(cfctl_auth::EvidenceKeyLifecycleError::Indeterminate { .. }) => {
+        E::EvidenceKeyLifecycle(cfctl_auth::EvidenceKeyLifecycleError::Indeterminate {
+            action,
+            ..
+        }) => {
+            let next_step = if action == "malformed-registry recovery" {
+                "Do not initialize or create a replacement plan. Preserve private quarantine, inspect the same opaque plan with `cfctl auth evidence-key recover-plan status <plan-id> --json`, reconcile the marker readback, and resume only that same plan forward with `cfctl auth evidence-key recover <plan-id> --yes --json`."
+            } else {
+                "Do not replay rotate or retire. Run `cfctl auth evidence-key status --json` and reconcile the exact platform registry before any further evidence-key mutation."
+            };
             return Some((
                 "CFCTL_EVIDENCE_KEY_INDETERMINATE",
-                "Do not replay rotate or retire. Run `cfctl auth evidence-key status --json` and reconcile the exact platform registry before any further evidence-key mutation."
-                    .to_owned(),
+                next_step.to_owned(),
             ));
         }
         E::SecretStore(_) => {

@@ -125,7 +125,9 @@ maintain a second command registry.
 
 Open-ended intent remains available as `cfctl "<natural-language request>"`.
 Existing v2 paths remain compatible; the command map includes newer paths such
-as `auth evidence-key init-preview`, `auth repair-keychain-access`,
+as `auth evidence-key init-preview`, `auth evidence-key recover-preview`,
+`auth evidence-key recover-plan create`,
+`auth repair-keychain-access`,
 `keys renew-analytics-profile`, and
 `plans bundle` that a hand-maintained list could omit.
 
@@ -156,6 +158,19 @@ never falls back to a file: inspect the exact initialization transition with
 authenticated local artifact still depends on it. The preview discloses
 backend, custody, state-root transition, verification-generation behavior, and
 recovery semantics without creating a key or exposing key bytes.
+If the sole canonical platform registry is malformed while the filesystem
+marker and authenticated storage-v2 artifacts are absent, use
+`recover-preview` for a strictly read-only classification and byte count. It
+does not disclose raw registry material, a digest, a secret-derived identity,
+or a deterministic execution handle. A separate `recover-plan create` writes
+a short-lived private intent to the platform keyring and returns only a random
+opaque plan ID; inspect or revoke that plan with `recover-plan status|revoke`,
+without another confirmation prompt. Only the transition that quarantines and
+replaces the protected registry requires `recover <plan-id> --yes`. Recovery preserves the original
+bytes in private quarantine before publishing a fresh chunked authority and
+resumes the same plan forward after an interrupted transition. Quarantine
+retirement is a separate lifecycle and legacy evidence remains historical and
+nonqualifying.
 
 Two things that commonly bite:
 

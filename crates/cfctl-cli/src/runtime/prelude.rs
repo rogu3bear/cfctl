@@ -58,6 +58,7 @@ pub(super) use crate::{
     AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand,
     Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
     EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, EvidenceKeyCommand,
+    EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanCommand, EvidenceKeyRecoverPlanSelector,
     EvidenceKeyRetireArgs, GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs,
     KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand,
     KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs, KeyRevokeArgs,

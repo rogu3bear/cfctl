@@ -1042,10 +1042,11 @@ pub(super) fn workspace_proof_posture_requires_an_account_pin_and_keeps_catalog_
     profile.credential_generation_id = Some("11111111-1111-4111-8111-111111111111".to_owned());
     profiles.profiles.insert("default".to_owned(), profile);
 
-    let unscoped = workspace_operational_proof_posture(&proofs, &profiles, None, None);
+    let unscoped = workspace_operational_proof_posture(&proofs, &[], &profiles, None, None);
     assert_eq!(unscoped["state"], "unscoped");
     let account = workspace_operational_proof_posture(
         &proofs,
+        &[],
         &profiles,
         Some("account-a"),
         Some("sha256:current"),
@@ -1053,6 +1054,28 @@ pub(super) fn workspace_proof_posture_requires_an_account_pin_and_keeps_catalog_
     assert_eq!(account["proof_count"], 1);
     assert_eq!(account["current_catalog_successes"], 1);
     assert_eq!(account["catalog_drifted_or_unclassified"], 0);
+    let failures = vec![cfctl_storage::OperationalProofFailureV1 {
+        account_id: Some("account-b".to_owned()),
+        proof_identity: format!("sha256:{}", "f".repeat(64)),
+        reason: "authentication failed".to_owned(),
+    }];
+    let unaffected = workspace_operational_proof_posture(
+        &proofs,
+        &failures,
+        &profiles,
+        Some("account-a"),
+        Some("sha256:current"),
+    );
+    assert_eq!(unaffected["state"], "recorded");
+    let affected = workspace_operational_proof_posture(
+        &proofs,
+        &failures,
+        &profiles,
+        Some("account-b"),
+        Some("sha256:current"),
+    );
+    assert_eq!(affected["state"], "invalid");
+    assert_eq!(affected["proof_failures"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]

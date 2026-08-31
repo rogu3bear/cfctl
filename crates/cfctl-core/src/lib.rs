@@ -94,6 +94,16 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
                 subcommands: &[
                     CommandNodeV1::leaf("init"),
                     CommandNodeV1::leaf("init-preview"),
+                    CommandNodeV1::leaf("recover"),
+                    CommandNodeV1 {
+                        name: "recover-plan",
+                        subcommands: &[
+                            CommandNodeV1::leaf("create"),
+                            CommandNodeV1::leaf("revoke"),
+                            CommandNodeV1::leaf("status"),
+                        ],
+                    },
+                    CommandNodeV1::leaf("recover-preview"),
                     CommandNodeV1::leaf("retire"),
                     CommandNodeV1::leaf("rotate"),
                     CommandNodeV1::leaf("status"),

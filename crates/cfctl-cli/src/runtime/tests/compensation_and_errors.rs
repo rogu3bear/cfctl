@@ -684,6 +684,18 @@ pub(super) fn evidence_key_transition_guidance_distinguishes_unchanged_and_indet
     let indeterminate_step = indeterminate.next_step().expect("indeterminate guidance");
     assert!(indeterminate_step.contains("Do not replay"));
     assert!(indeterminate_step.contains("evidence-key status"));
+
+    let recovery = super::CliError::Auth(cfctl_auth::AuthError::EvidenceKeyLifecycle(
+        cfctl_auth::EvidenceKeyLifecycleError::Indeterminate {
+            action: "malformed-registry recovery".to_owned(),
+            cause: "replacement crossed".to_owned(),
+            readback: "restoration unknown".to_owned(),
+        },
+    ));
+    let recovery_step = recovery.next_step().expect("recovery guidance");
+    assert!(recovery_step.contains("same opaque plan"));
+    assert!(recovery_step.contains("recover-plan status"));
+    assert!(recovery_step.contains("resume only that same plan forward"));
 }
 
 #[test]

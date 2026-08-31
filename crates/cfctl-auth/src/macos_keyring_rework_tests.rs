@@ -80,6 +80,96 @@ fn canonical_v1_root_without_chunks_is_ambiguous_not_raw() {
 }
 
 #[test]
+fn malformed_recovery_quarantines_exact_bytes_and_publishes_managed_replacement() {
+    let adapter = MapAdapter::default();
+    let malformed = "{".repeat(128);
+    adapter
+        .put_raw("service", "registry", &malformed)
+        .expect("malformed registry seeds");
+
+    recover_malformed_with(
+        &adapter,
+        "service",
+        "registry",
+        &malformed,
+        "registry-quarantine",
+        r#"{"schema_version":1}"#,
+    )
+    .expect("recovery succeeds");
+
+    assert_eq!(
+        get_with(&adapter, "service", "registry-quarantine")
+            .expect("quarantine reads")
+            .as_deref(),
+        Some(malformed.as_str())
+    );
+    assert_eq!(
+        get_with(&adapter, "service", "registry")
+            .expect("replacement reads")
+            .as_deref(),
+        Some(r#"{"schema_version":1}"#)
+    );
+    assert_eq!(
+        adapter
+            .get_raw("service", "registry")
+            .expect("managed root reads")
+            .as_deref(),
+        Some(ROOT_MARKER)
+    );
+    assert!(
+        recover_malformed_with(
+            &adapter,
+            "service",
+            "registry",
+            &malformed,
+            "registry-quarantine",
+            "replacement",
+        )
+        .is_err(),
+        "recovery refuses managed inventory and quarantine collision"
+    );
+}
+
+#[test]
+fn recovery_preview_rejects_v2_inventory_and_recovery_rejects_quarantine_collision() {
+    let managed = MapAdapter::default();
+    put_with(&managed, "service", "registry", r#"{"valid":true}"#)
+        .expect("managed registry writes");
+    assert!(
+        get_recoverable_unmanaged_with(&managed, "service", "registry").is_err(),
+        "managed v2 inventory is never a malformed raw recovery source"
+    );
+
+    let collision = MapAdapter::default();
+    let malformed = "{".repeat(128);
+    collision
+        .put_raw("service", "registry", &malformed)
+        .expect("malformed registry seeds");
+    collision
+        .put_raw("service", "registry-quarantine", "occupied")
+        .expect("quarantine collision seeds");
+    assert!(
+        recover_malformed_with(
+            &collision,
+            "service",
+            "registry",
+            &malformed,
+            "registry-quarantine",
+            r#"{"schema_version":1}"#,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        collision
+            .get_raw("service", "registry")
+            .expect("source reads")
+            .as_deref(),
+        Some(malformed.as_str()),
+        "collision rejection preserves the exact source"
+    );
+}
+
+#[test]
 fn security_stdout_accepts_exact_maximum_with_lf_frame() {
     let mut output = vec![b'x'; MAX_LOGICAL_CREDENTIAL_BYTES];
     output.push(b'\n');

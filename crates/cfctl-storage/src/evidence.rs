@@ -21,10 +21,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    EvidenceDirectoryCapabilities, EvidenceLifecycleLock, OperationalProofPageV1, Result,
-    RuntimePaths, StateStore, StorageError, io_error, same_filesystem_identity,
-    set_private_file_permissions, sync_capability_directory, unsafe_managed_document,
-    write_durability_unknown,
+    AuthenticatedEvidenceArtifactCountsV1, EvidenceDirectoryCapabilities, EvidenceLifecycleLock,
+    OperationalProofFailureV1, OperationalProofPageV1, Result, RuntimePaths, StateStore,
+    StorageError, io_error, same_filesystem_identity, set_private_file_permissions,
+    sync_capability_directory, unsafe_managed_document, write_durability_unknown,
 };
 
 const DESCRIPTOR_MAC_DOMAIN: &str = "evidence-descriptor-v2";
@@ -412,12 +412,16 @@ impl StateStore {
         Ok(proofs)
     }
 
-    /// Preserves bounded historical audit visibility. Legacy rows are body- and
-    /// index-validated but remain ineligible for qualification APIs above.
+    /// Preserves historical classification while retaining only the newest
+    /// qualifying storage-v2 proofs. Exact raw V1 rows remain immutable and
+    /// nonqualifying; candidate-envelope failures retain account scope so one
+    /// unrelated account cannot poison every registered workspace.
     pub fn list_recent_operational_proofs(&self, limit: usize) -> Result<OperationalProofPageV1> {
         let directory = self.paths.data_dir.join("evidence-index");
         let mut newest = BinaryHeap::<Reverse<(SystemTime, String)>>::new();
         let mut total_count = 0_usize;
+        let mut legacy_nonqualifying_count = 0_usize;
+        let mut failures = Vec::new();
         for entry in self
             .evidence_directories
             .proofs
@@ -435,9 +439,6 @@ impl StateStore {
             }
             validate_proof_index_filename(&PathBuf::from(&name))?;
             total_count = total_count.saturating_add(1);
-            if limit == 0 {
-                continue;
-            }
             let metadata = self
                 .evidence_directories
                 .proofs
@@ -452,6 +453,40 @@ impl StateStore {
             let modified = metadata
                 .modified()
                 .map_err(|source| io_error(&directory.join(&name), source))?;
+            let path = directory.join(&name);
+            let encoded =
+                read_required_capability_file(&self.evidence_directories.proofs, &name, &path)?;
+            if serde_json::from_slice::<OperationalProofV1>(&encoded)
+                .is_ok_and(|proof| proof.schema_version == 1)
+            {
+                legacy_nonqualifying_count = legacy_nonqualifying_count.saturating_add(1);
+                continue;
+            }
+            let untrusted = serde_json::from_slice::<Value>(&encoded).map_err(|_| {
+                StorageError::InvalidOperationalProof(
+                    "malformed operational-proof document is nonqualifying".to_owned(),
+                )
+            })?;
+            let account_id = untrusted
+                .pointer("/payload/account_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Err(error) = read_operational_proof_index(self, &name) {
+                failures.push(OperationalProofFailureV1 {
+                    account_id,
+                    proof_identity: format!(
+                        "sha256:{}",
+                        path.file_stem()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .unwrap_or_default()
+                    ),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            if limit == 0 {
+                continue;
+            }
             newest.push(Reverse((modified, name)));
             if newest.len() > limit {
                 newest.pop();
@@ -463,8 +498,10 @@ impl StateStore {
             .collect::<Result<Vec<_>>>()?;
         proofs.sort_by_key(|proof| proof.observed_at);
         Ok(OperationalProofPageV1 {
-            truncated: total_count > proofs.len(),
+            truncated: total_count > proofs.len() + legacy_nonqualifying_count + failures.len(),
             total_count,
+            legacy_nonqualifying_count,
+            failures,
             proofs,
         })
     }
@@ -510,6 +547,26 @@ impl StateStore {
         Ok(count)
     }
 
+    /// Counts storage-v2 candidates without requiring the unavailable key.
+    /// Recovery treats any candidate envelope as dependent authority and holds.
+    pub fn authenticated_evidence_artifact_counts(
+        &self,
+        _lifecycle: &EvidenceLifecycleLock,
+    ) -> Result<AuthenticatedEvidenceArtifactCountsV1> {
+        let descriptor_count = count_authenticated_candidates(
+            &self.evidence_directories.descriptors,
+            &self.paths.data_dir.join("evidence-descriptors"),
+        )?;
+        let proof_count = count_authenticated_candidates(
+            &self.evidence_directories.proofs,
+            &self.paths.data_dir.join("evidence-index"),
+        )?;
+        Ok(AuthenticatedEvidenceArtifactCountsV1 {
+            descriptor_count,
+            proof_count,
+        })
+    }
+
     fn require_evidence_authenticator(&self) -> Result<&dyn cfctl_auth::EvidenceMacProvider> {
         self.evidence_authenticator.as_deref().ok_or_else(|| {
             StorageError::EvidenceAuthentication(
@@ -526,6 +583,28 @@ impl StateStore {
             )
         })
     }
+}
+
+fn count_authenticated_candidates(directory: &Dir, display: &Path) -> Result<usize> {
+    let mut count = 0_usize;
+    for entry in directory
+        .entries()
+        .map_err(|source| io_error(display, source))?
+    {
+        let entry = entry.map_err(|source| io_error(display, source))?;
+        let name = strict_managed_entry_name(entry.file_name(), display)?;
+        let path = display.join(&name);
+        let bytes = read_required_capability_file(directory, &name, &path)?;
+        let value = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+            StorageError::InvalidOperationalProof(format!(
+                "managed evidence artifact `{name}` is malformed"
+            ))
+        })?;
+        if value.get("storage_schema_version").is_some() || value.get("authentication").is_some() {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
 }
 
 pub(super) fn open_evidence_directories(

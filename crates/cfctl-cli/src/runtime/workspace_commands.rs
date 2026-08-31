@@ -87,6 +87,7 @@ pub(super) fn workspace_command(
                     "account_id": account_id,
                     "operational_proof": workspace_operational_proof_posture(
                         proofs,
+                        &proof_page.failures,
                         &profiles,
                         account_id,
                         current_catalog_hash.as_deref(),
@@ -108,6 +109,7 @@ pub(super) fn workspace_command(
 
 pub(super) fn workspace_operational_proof_posture(
     proofs: &[OperationalProofV1],
+    failures: &[cfctl_storage::OperationalProofFailureV1],
     profiles: &ProfilesConfig,
     account_id: Option<&str>,
     current_catalog_hash: Option<&str>,
@@ -122,6 +124,13 @@ pub(super) fn workspace_operational_proof_posture(
     let scoped = proofs
         .iter()
         .filter(|proof| proof.account_id.as_deref() == Some(account_id))
+        .collect::<Vec<_>>();
+    let scoped_failures = failures
+        .iter()
+        .filter(|failure| {
+            failure.account_id.as_deref().is_none()
+                || failure.account_id.as_deref() == Some(account_id)
+        })
         .collect::<Vec<_>>();
     let capabilities = scoped
         .iter()
@@ -160,7 +169,7 @@ pub(super) fn workspace_operational_proof_posture(
             .count()
     });
     json!({
-        "state": if scoped.is_empty() { "not_recorded" } else { "recorded" },
+        "state": if !scoped_failures.is_empty() { "invalid" } else if scoped.is_empty() { "not_recorded" } else { "recorded" },
         "account_id": account_id,
         "proof_count": scoped.len(),
         "capabilities_observed": capabilities,
@@ -176,6 +185,7 @@ pub(super) fn workspace_operational_proof_posture(
                     .and_then(|profile| profile.credential_generation_id.as_deref())
                     != proof.credential_generation_id.as_deref()
         }).count(),
+        "proof_failures": scoped_failures,
         "freshness_policy": "Select a governed workflow to evaluate time freshness; workspace audit does not invent a universal window."
     })
 }

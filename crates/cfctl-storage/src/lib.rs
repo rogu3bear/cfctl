@@ -241,14 +241,34 @@ struct EvidenceRootMarkerV1 {
     state_root_identity: String,
 }
 
-/// A bounded projection of the most recently indexed durable proof rows.
-/// `total_count` describes valid index filenames encountered; callers must
-/// preserve `truncated` so a projection is never presented as full history.
+/// A bounded projection of the most recently indexed qualifying proof rows,
+/// plus complete classification counts for immutable legacy history and
+/// candidate-envelope failures. `total_count` describes valid index filenames
+/// encountered; callers must preserve `truncated` so retained qualifying rows
+/// are never presented as full qualifying history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperationalProofPageV1 {
     pub proofs: Vec<OperationalProofV1>,
+    pub failures: Vec<OperationalProofFailureV1>,
     pub total_count: usize,
+    pub legacy_nonqualifying_count: usize,
     pub truncated: bool,
+}
+
+/// One candidate qualifying proof that could not be authenticated. An account
+/// is retained only when it can be read from the untrusted public payload; an
+/// unscoped failure must be treated as relevant to every consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationalProofFailureV1 {
+    pub account_id: Option<String>,
+    pub proof_identity: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AuthenticatedEvidenceArtifactCountsV1 {
+    pub descriptor_count: usize,
+    pub proof_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

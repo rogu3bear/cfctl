@@ -395,6 +395,95 @@ pub trait SecretStore: Send + Sync {
     /// Report which backend currently holds `key`, if any.
     fn locate(&self, key: &str) -> Result<Option<SecretBackend>>;
 
+    /// Return a value only when it has no managed platform transition state.
+    /// Platform implementations override this to reject inventory siblings.
+    fn recoverable_unmanaged_value(&self, key: &str) -> Result<Option<String>> {
+        self.get(key)
+    }
+
+    /// Replace one exact malformed platform value only after preserving an
+    /// independently addressed byte-exact quarantine copy. Implementations
+    /// must fail when either source or quarantine identity has drifted.
+    fn recover_malformed_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        quarantine_key: &str,
+        replacement_value: &str,
+    ) -> Result<()> {
+        match self.get(quarantine_key)? {
+            Some(quarantine) if quarantine != expected_value => {
+                return Err(AuthError::SecretStore(
+                    "malformed-value recovery quarantine differs from the private binding"
+                        .to_owned(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                if self.get(key)?.as_deref() != Some(expected_value) {
+                    return Err(AuthError::SecretStore(
+                        "malformed-value recovery source drifted before quarantine".to_owned(),
+                    ));
+                }
+                self.put(quarantine_key, expected_value)?;
+            }
+        }
+        if self.get(quarantine_key)?.as_deref() != Some(expected_value) {
+            return Err(AuthError::SecretStore(
+                "malformed-value recovery quarantine failed exact readback".to_owned(),
+            ));
+        }
+        match self.get(key)? {
+            Some(current) if current == replacement_value => return Ok(()),
+            Some(current) if current == expected_value => {
+                self.delete(key)?;
+                if self.get(key)?.is_some() {
+                    return Err(AuthError::SecretStore(
+                        "malformed-value recovery source deletion did not cross".to_owned(),
+                    ));
+                }
+            }
+            None => {}
+            Some(_) => {
+                return Err(AuthError::SecretStore(
+                    "malformed-value recovery canonical identity contains a third state".to_owned(),
+                ));
+            }
+        }
+        if let Err(error) = self.put(key, replacement_value) {
+            return match self.get(key) {
+                Ok(Some(readback)) if readback == replacement_value => Ok(()),
+                Ok(readback) => Err(EvidenceKeyLifecycleError::Indeterminate {
+                    action: "malformed-registry recovery".to_owned(),
+                    cause: error.to_string(),
+                    readback: if readback.is_some() {
+                        "an unexpected value is present; original bytes remain in private quarantine for forward recovery"
+                            .to_owned()
+                    } else {
+                        "the canonical value is absent; original bytes remain in private quarantine for forward recovery"
+                            .to_owned()
+                    },
+                }
+                .into()),
+                Err(readback_error) => Err(EvidenceKeyLifecycleError::Indeterminate {
+                    action: "malformed-registry recovery".to_owned(),
+                    cause: error.to_string(),
+                    readback: readback_error.to_string(),
+                }
+                .into()),
+            };
+        }
+        if self.get(key)?.as_deref() != Some(replacement_value) {
+            return Err(EvidenceKeyLifecycleError::Indeterminate {
+                action: "malformed-registry recovery".to_owned(),
+                cause: "replacement write lacked byte-exact readback".to_owned(),
+                readback: "preserve the quarantine and inspect both identities".to_owned(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn locate_api_token(&self, profile_id: &str) -> Result<Option<SecretBackend>> {
         self.locate(&api_token_key(profile_id))
     }
@@ -609,6 +698,48 @@ impl SecretStore for KeyringSecretStore {
 
     fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
         Ok(self.get(key)?.map(|_| SecretBackend::PlatformKeyring))
+    }
+
+    fn recoverable_unmanaged_value(&self, key: &str) -> Result<Option<String>> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_keyring::get_recoverable_unmanaged(KEYRING_SERVICE, key)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = key;
+            Err(AuthError::SecretStore(
+                "malformed evidence-registry recovery preview is not implemented for this platform keyring"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    fn recover_malformed_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        quarantine_key: &str,
+        replacement_value: &str,
+    ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_keyring::recover_malformed(
+                KEYRING_SERVICE,
+                key,
+                expected_value,
+                quarantine_key,
+                replacement_value,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (key, expected_value, quarantine_key, replacement_value);
+            Err(AuthError::SecretStore(
+                "malformed evidence-registry recovery is not yet implemented for this platform keyring"
+                    .to_owned(),
+            ))
+        }
     }
 }
 

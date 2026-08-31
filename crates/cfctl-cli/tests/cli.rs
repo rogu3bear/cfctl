@@ -374,7 +374,13 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
 fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmation() {
     use cfctl_cli::{AuthCommand, Command, EvidenceKeyCommand};
 
-    for action in ["init-preview", "init", "status", "rotate"] {
+    for action in [
+        "init-preview",
+        "init",
+        "status",
+        "rotate",
+        "recover-preview",
+    ] {
         let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", action])
             .expect("evidence-key lifecycle action parses");
         let Some(Command::Auth(arguments)) = cli.command else {
@@ -389,6 +395,9 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             EvidenceKeyCommand::Status => "status",
             EvidenceKeyCommand::Rotate => "rotate",
             EvidenceKeyCommand::Retire(_) => "retire",
+            EvidenceKeyCommand::RecoverPreview => "recover-preview",
+            EvidenceKeyCommand::RecoverPlan(_) => "recover-plan",
+            EvidenceKeyCommand::Recover(_) => "recover",
         };
         assert_eq!(parsed, action);
     }
@@ -412,6 +421,34 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         panic!("retire command");
     };
     assert!(retire.yes);
+
+    let plan_id = "7ff2b63e-f412-4a73-978a-e88b86ef5327";
+    for action in ["status", "revoke"] {
+        let arguments = vec![
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "recover-plan",
+            action,
+            plan_id,
+        ];
+        Cli::try_parse_from(arguments).expect("recovery-plan lifecycle action parses");
+    }
+    Cli::try_parse_from(["cfctl", "auth", "evidence-key", "recover-plan", "create"])
+        .expect("recovery-plan creation parses");
+
+    let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", "recover", plan_id, "--yes"])
+        .expect("evidence-key recover parses");
+    let Some(Command::Auth(arguments)) = cli.command else {
+        panic!("auth command");
+    };
+    let AuthCommand::EvidenceKey(group) = arguments.command else {
+        panic!("evidence-key command");
+    };
+    let EvidenceKeyCommand::Recover(recover) = group.command else {
+        panic!("recover command");
+    };
+    assert!(recover.yes);
 }
 
 #[test]

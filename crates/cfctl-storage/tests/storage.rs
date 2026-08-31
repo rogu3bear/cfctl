@@ -776,7 +776,13 @@ fn legacy_unbound_operational_proof_is_body_readable_but_nonqualifying() {
     .expect("legacy index row writes");
 
     assert!(store.list_operational_proofs().is_err());
-    assert!(store.list_recent_operational_proofs(10).is_err());
+    let page = store
+        .list_recent_operational_proofs(10)
+        .expect("legacy history is classified without qualifying");
+    assert!(page.proofs.is_empty());
+    assert!(page.failures.is_empty());
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.legacy_nonqualifying_count, 1);
     assert_eq!(
         store
             .read_audit_evidence_value(&legacy.evidence.content_hash)
@@ -788,6 +794,129 @@ fn legacy_unbound_operational_proof_is_body_readable_but_nonqualifying() {
         Err(StorageError::InvalidOperationalProof(message))
             if message.contains("credential-generation")
     ));
+}
+
+#[test]
+fn recent_projection_skips_more_than_512_legacy_rows_and_retains_authenticated_rows() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = authenticated_store(paths.clone());
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("authenticated evidence writes");
+    for index in 0..513_u16 {
+        let capability_id = format!("legacy-{index}");
+        let input_hash = format!("sha256:{index:064x}");
+        let legacy = OperationalProofV1::new(
+            Utc::now() - Duration::minutes(i64::from(index) + 1),
+            &capability_id,
+            &sha256('a'),
+            &input_hash,
+            OperationalProofScopeV1::new(
+                Some("legacy-profile"),
+                Some("unrelated-account"),
+                Some(GENERATION_A),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        let encoded = serde_json::to_vec_pretty(&legacy).expect("legacy row encodes");
+        let digest = hex::encode(Sha256::digest(&encoded));
+        std::fs::write(
+            paths
+                .data_dir
+                .join("evidence-index")
+                .join(format!("{digest}.json")),
+            encoded,
+        )
+        .expect("legacy row writes");
+    }
+    let current = OperationalProofV1::new(
+        Utc::now(),
+        "graphql-analytics-account-rum-pageload-visits",
+        &sha256('b'),
+        &sha256('c'),
+        OperationalProofScopeV1::new(
+            Some("jkca-public-activity-read"),
+            Some("jkca-account"),
+            Some(GENERATION_A),
+        ),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    store
+        .record_operational_proof(&current)
+        .expect("current proof writes");
+
+    let page = store
+        .list_recent_operational_proofs(512)
+        .expect("mixed projection classifies");
+    assert_eq!(page.proofs, [current]);
+    assert_eq!(page.legacy_nonqualifying_count, 513);
+    assert!(page.failures.is_empty());
+    assert_eq!(page.total_count, 514);
+    assert!(!page.truncated);
+}
+
+#[test]
+fn malformed_v2_is_account_scoped_while_unclassifiable_bytes_fail_closed() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = authenticated_store(paths.clone());
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("authenticated evidence writes");
+    for (account, input) in [("account-a", 'a'), ("account-b", 'b')] {
+        let proof = OperationalProofV1::new(
+            Utc::now(),
+            "zones-list",
+            &sha256('c'),
+            &sha256(input),
+            OperationalProofScopeV1::new(Some("profile-a"), Some(account), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        store
+            .record_operational_proof(&proof)
+            .expect("proof writes");
+    }
+    let proof_directory = paths.data_dir.join("evidence-index");
+    let account_b_path = std::fs::read_dir(&proof_directory)
+        .expect("proof directory reads")
+        .map(|entry| entry.expect("proof entry").path())
+        .find(|path| {
+            serde_json::from_slice::<Value>(&std::fs::read(path).expect("proof candidate reads"))
+                .expect("proof candidate parses")
+                .pointer("/payload/account_id")
+                .and_then(Value::as_str)
+                == Some("account-b")
+        })
+        .expect("account-b proof exists");
+    let mut malformed = serde_json::from_slice::<Value>(
+        &std::fs::read(&account_b_path).expect("account-b proof reads"),
+    )
+    .expect("account-b envelope parses");
+    malformed["authentication"]["tag"] = Value::String("00".repeat(32));
+    std::fs::write(
+        &account_b_path,
+        serde_json::to_vec_pretty(&malformed).expect("malformed envelope encodes"),
+    )
+    .expect("account-b envelope tampers");
+
+    let page = store
+        .list_recent_operational_proofs(512)
+        .expect("account-scoped failure does not abort projection");
+    assert_eq!(page.proofs.len(), 1);
+    assert_eq!(page.proofs[0].account_id.as_deref(), Some("account-a"));
+    assert_eq!(page.failures.len(), 1);
+    assert_eq!(page.failures[0].account_id.as_deref(), Some("account-b"));
+
+    let opaque_path = proof_directory.join(format!("{}.json", "f".repeat(64)));
+    std::fs::write(&opaque_path, b"not-json").expect("opaque corruption writes");
+    assert!(
+        store.list_recent_operational_proofs(512).is_err(),
+        "unclassifiable candidate bytes remain a global fail-closed error"
+    );
 }
 
 #[test]

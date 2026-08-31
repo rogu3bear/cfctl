@@ -116,6 +116,42 @@ pub enum EvidenceKeyCommand {
     Rotate,
     /// Delete one inactive key only when no local authenticated artifact uses it.
     Retire(EvidenceKeyRetireArgs),
+    /// Preview recovery of one exact malformed canonical platform registry.
+    RecoverPreview,
+    /// Create, inspect, or revoke a private malformed-registry recovery plan.
+    RecoverPlan(EvidenceKeyRecoverPlanArgs),
+    /// Execute or resume one exact private malformed-registry recovery plan.
+    Recover(EvidenceKeyRecoverArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyRecoverArgs {
+    /// Opaque random identity returned by recover-plan create.
+    pub plan_id: String,
+    /// Confirm the protected quarantine and replacement transition.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyRecoverPlanArgs {
+    #[command(subcommand)]
+    pub command: EvidenceKeyRecoverPlanCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvidenceKeyRecoverPlanCommand {
+    /// Create a short-lived private plan from the currently admissible malformed registry.
+    Create,
+    /// Inspect public lifecycle state for one opaque recovery plan.
+    Status(EvidenceKeyRecoverPlanSelector),
+    /// Immediately revoke one unused recovery plan before quarantine custody begins.
+    Revoke(EvidenceKeyRecoverPlanSelector),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyRecoverPlanSelector {
+    pub plan_id: String,
 }
 
 #[derive(Debug, Args)]

@@ -9,6 +9,9 @@ mod platform;
 use platform::SecurityCommandAdapter;
 #[cfg(test)]
 use platform::security_write_arguments;
+#[path = "macos_keyring_recovery.rs"]
+mod macos_keyring_recovery;
+use macos_keyring_recovery::recover_malformed_with;
 
 const PROMPT_SAFE_VALUE_BYTES: usize = 96;
 const PROMPT_MAX_VALUE_BYTES: usize = 127;
@@ -45,6 +48,27 @@ pub(super) fn get(service: &str, key: &str) -> Result<Option<String>> {
 
 pub(super) fn delete(service: &str, key: &str) -> Result<()> {
     delete_with(&SecurityCommandAdapter, service, key)
+}
+
+pub(super) fn get_recoverable_unmanaged(service: &str, key: &str) -> Result<Option<String>> {
+    get_recoverable_unmanaged_with(&SecurityCommandAdapter, service, key)
+}
+
+pub(super) fn recover_malformed(
+    service: &str,
+    key: &str,
+    expected_value: &str,
+    quarantine_key: &str,
+    replacement_value: &str,
+) -> Result<()> {
+    recover_malformed_with(
+        &SecurityCommandAdapter,
+        service,
+        key,
+        expected_value,
+        quarantine_key,
+        replacement_value,
+    )
 }
 
 trait MacosKeychainAdapter {
@@ -139,6 +163,25 @@ fn get_with(
             read_generation(adapter, service, key, &inventory.primary).map(Some)
         }
     }
+}
+
+fn get_recoverable_unmanaged_with(
+    adapter: &dyn MacosKeychainAdapter,
+    service: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    if read_inventory(adapter, service, key)?.is_some()
+        || !matches!(
+            classify_legacy_v1(adapter, service, key)?,
+            LegacyV1State::Unmanaged
+        )
+    {
+        return Err(AuthError::SecretStore(
+            "malformed registry recovery requires no v2 inventory or legacy chunk manifest"
+                .to_owned(),
+        ));
+    }
+    get_unmanaged(adapter, service, key)
 }
 
 fn delete_with(adapter: &dyn MacosKeychainAdapter, service: &str, key: &str) -> Result<()> {
