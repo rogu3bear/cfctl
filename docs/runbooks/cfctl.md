@@ -12,6 +12,7 @@ applies, and verification receipts separate.
 |---|---|---|
 | The installed command and the checkout behave differently | Run `cfctl version --json` and `cfctl doctor --json`; invoke each candidate executable directly and compare its self-reported path, version, commit, and identity source. Reinstall only from an exact release asset whose checksum matches `SHA256SUMS`. | Do not repair the mismatch with a symlink, PATH shim, unverified binary, or release override. Unknown or dirty identity remains unhealthy. |
 | No profile is selected, or the governed fallback store is active | Run `cfctl auth profiles --json`, select one existing account-pinned profile with `cfctl auth use <profile> --json`, then rerun `cfctl auth status --json`. An active fallback store is authoritative by design; use the explicit repair command only when the operator intentionally wants to test or restore the platform keyring. | Never ask the operator to paste a token, OAuth callback, global key, or fallback file. Do not broaden permissions merely to make the error disappear. |
+| Evidence qualification reports an uninitialized or split platform authority | Run `cfctl auth evidence-key status --json`. Initialize only when both the canonical state-root marker and direct platform registry are absent. Rotate explicitly; retire only an inactive generation after cfctl reports zero authenticated local artifacts. | Never use the credential fallback store for the evidence integrity key, recreate a missing half over existing state, or treat legacy unauthenticated proof rows as current qualification. |
 | Catalog sync, coverage, or a stored catalog fails | Run `cfctl catalog sync --json`, then `cfctl catalog coverage --json`. Preserve `previous_catalog` and the returned error code; a discarded invalid current catalog is evidence of safe replacement, not evidence that earlier plans are valid. | Never edit a catalog body or content hash, restore a stale snapshot as current, or reuse a plan whose catalog pin drifted. |
 | A capability or write is blocked | Run `cfctl guide <capability-id> --json` and follow the exact `next_action`. Report the capability ID and `blocking_gaps` when the guide cannot close the contract. | Never route around `CFCTL_CAPABILITY_BLOCKED` with raw HTTP, Wrangler, dashboard changes, a broader token, or hand-edited plan JSON. |
 | A run crashed, timed out, or may have crossed the provider boundary | Run `cfctl plans status <operation-id> --json`. Use `cfctl plans rectify <operation-id> --json` when verification is unsupported or the boundary outcome is uncertain; review any derived compensation as a new transaction. | Do not replay `plans run`, approve a replacement operation speculatively, or call the provider directly. A consumed or uncertain plan remains non-replayable. |
@@ -450,10 +451,12 @@ printf '%s' '{"migration_id":"0143","phase":"pre_import"}' |
 ```
 
 The allowed assertions are `table_exists`, `column_exists`, `index_exists`,
-`trigger_exists`, `schema_contains`, and `foreign_key_check_empty`. Caller SQL,
-parameters, arbitrary PRAGMAs, multiple statements, and database retargeting
-are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
-`wrangler.d1` capabilities remain blocked.
+`trigger_exists`, `schema_contains`, `foreign_key_check_empty`, and the bounded
+ordered `migration_ledger_equals`. Caller SQL, arbitrary PRAGMAs, multiple
+statements, and database retargeting are not inputs; parameters exist only in
+the closed ledger contract, never as caller-selected SQL controls. The generic
+`d1-query-database`, `d1-raw-database-query`, and `wrangler.d1` capabilities
+remain blocked.
 
 ### Repository-bound D1 changes
 
@@ -1636,6 +1639,25 @@ Do not report completion without the applicable source-config, live-read,
 preview, apply, and post-change verification evidence.
 
 ## Known limitations
+
+- **Manifest-selected workspace D1 migrations remain production-blocked.** The
+  catalog may expose their immutable source interface, but planning stops until
+  one `workspace_d1_provider_atomicity_v1` PostChangeVerification receipt and
+  one `workspace_d1_old_worker_canary_v1` workspace receipt pass the closed
+  validators. The atomicity receipt binds an isolated database, exact cfctl and
+  Wrangler identities, child PlanV2 hashes, success and both failure paths,
+  zero schema/ledger deltas, and cleanup. The canary binds the existing Worker
+  deployment/version/settings operational-proof envelopes and keeps workspace
+  semantics opaque behind one digest without retaining the semantic body. Both
+  receipt hashes, the three Worker live-read
+  hashes, and the Worker deployment-plan hash become PlanV2 resource
+  observations. The canary self-hash is the canonical JSON receipt hash with
+  `canary_receipt_sha256` set to the empty string; the Worker-identity join is a
+  separate canonical hash over the deployment-plan and three live-read hashes
+  plus deployment/version UUIDs. Exact index and trigger definitions are compared for equality;
+  `schema_contains` is not accepted as migration verification. Provider proof,
+  production planning, and automatic restore are not implied by the source
+  interface.
 
 - **Access application and identity-provider plan storage uses schema-aware
   redaction.** Secret-shaped JSON Schema property names such as

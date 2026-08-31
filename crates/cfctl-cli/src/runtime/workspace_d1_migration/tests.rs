@@ -234,7 +234,7 @@ fn assertion_readback_requires_the_exact_unique_label_set() {
 #[test]
 fn rectification_preserves_recovery_identity_without_weakening_fresh_plan_admission() {
     let root = tempfile::tempdir().expect("runtime root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+    let store = super::super::tests::authenticated_test_store(RuntimePaths::from_root(root.path()));
     let evidence = json!({
         "status":200,
         "success":true,
@@ -665,12 +665,14 @@ fn assertion_compiler_accepts_only_closed_identifiers() {
             table: Some("todos".to_owned()),
             column: Some("session_id".to_owned()),
             index: None,
+            exact_object: None,
         },
         WorkspaceD1SchemaAssertionV1 {
             kind: "foreign_key_check_empty".to_owned(),
             table: None,
             column: None,
             index: None,
+            exact_object: None,
         },
     ])
     .expect("SQL");
@@ -680,6 +682,50 @@ fn assertion_compiler_accepts_only_closed_identifiers() {
     assert!(!sql.contains("UNION ALL"));
     assert!(!sql.contains(';'));
     assert!(identifier(Some("todos'; DROP TABLE todos;--")).is_err());
+}
+
+#[test]
+fn assertion_compiler_requires_the_exact_trigger_definition() {
+    let definition =
+        "CREATE TRIGGER users_guard BEFORE INSERT ON users BEGIN SELECT RAISE(ABORT, 'guard'); END";
+    let assertion = WorkspaceD1SchemaAssertionV1 {
+        kind: "object_definition_equals".to_owned(),
+        table: None,
+        column: None,
+        index: None,
+        exact_object: Some(cfctl_core::WorkspaceD1ExactObjectAssertionV1 {
+            object_type: "trigger".to_owned(),
+            name: "users_guard".to_owned(),
+            table: Some("users".to_owned()),
+            definition: definition.to_owned(),
+            definition_sha256: sha256(definition.as_bytes()),
+        }),
+    };
+    let sql = compile_assertion_sql(std::slice::from_ref(&assertion)).expect("exact assertion SQL");
+    assert!(sql.contains("sql = 'CREATE TRIGGER users_guard"));
+    assert!(!sql.contains("instr("));
+
+    let database = rusqlite::Connection::open_in_memory().expect("database");
+    database
+        .execute_batch(
+            "CREATE TABLE users(id INTEGER); CREATE TRIGGER users_guard BEFORE INSERT ON users BEGIN SELECT RAISE(ABORT, 'guard'); END;",
+        )
+        .expect("schema");
+    assert_eq!(
+        database
+            .query_row(&sql, [], |row| row.get::<_, i64>(1))
+            .expect("assertion result"),
+        1
+    );
+
+    let mut drifted = assertion;
+    drifted
+        .exact_object
+        .as_mut()
+        .expect("exact object")
+        .definition
+        .push_str(" -- drift");
+    assert!(compile_assertion_sql(&[drifted]).is_err());
 }
 
 #[test]
@@ -703,6 +749,7 @@ fn assertion_compiler_executes_eleven_checks_without_compound_selects() {
             table: Some((*table).to_owned()),
             column: None,
             index: None,
+            exact_object: None,
         })
         .collect::<Vec<_>>();
     assertions.push(WorkspaceD1SchemaAssertionV1 {
@@ -710,6 +757,7 @@ fn assertion_compiler_executes_eleven_checks_without_compound_selects() {
         table: None,
         column: None,
         index: None,
+        exact_object: None,
     });
     let sql = compile_assertion_sql(&assertions).expect("SQL");
     assert!(!sql.contains("UNION ALL"));
@@ -778,11 +826,282 @@ fn migration_names_are_filename_only() {
         recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
         recovery_max_age_seconds: 600,
         rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        manifest_migration: None,
     };
     assert_eq!(
         declared_migration_names(&contract).expect("names"),
         ["0001_init.sql"]
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn manifest_migration_distinguishes_remote_baseline_from_the_sole_local_target() {
+    let baseline = (116_u64..=171)
+        .map(|sequence| cfctl_core::WorkspaceD1MigrationLedgerEntryV1 {
+            sequence,
+            name: format!("{sequence:04}_baseline.sql"),
+            sha256: format!("sha256:{}", "a".repeat(64)),
+        })
+        .collect::<Vec<_>>();
+    let contract = cfctl_core::WorkspaceD1MigrationContractV1 {
+        repository_root: "/repo".to_owned(),
+        repository_head: "a".repeat(40),
+        repository_origin: "https://example.com/mln-web.git".to_owned(),
+        operation_pack_path: ".cfctl/operations/d1-migrations.toml".to_owned(),
+        operation_pack_sha256: format!("sha256:{}", "a".repeat(64)),
+        config_template_path: "workers/founder/wrangler.toml".to_owned(),
+        config_template_sha256: format!("sha256:{}", "b".repeat(64)),
+        production_config_path: "workers/founder/wrangler.production.toml".to_owned(),
+        migrations_dir: "crates/founder/migrations/d1".to_owned(),
+        database_binding: "FOUNDER_DB".to_owned(),
+        wrangler_version: "4.100.0".to_owned(),
+        migrations: vec![WorkspaceD1MigrationFileV1 {
+            path: "crates/founder/migrations/d1/0172_target.sql".to_owned(),
+            sha256: format!("sha256:{}", "c".repeat(64)),
+        }],
+        assertions: Vec::new(),
+        recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
+        recovery_max_age_seconds: 600,
+        rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        manifest_migration: Some(cfctl_core::WorkspaceD1ManifestMigrationContractV1 {
+            manifest_path: ".control-plane/d1_migration_manifest.json".to_owned(),
+            manifest_sha256: format!("sha256:{}", "d".repeat(64)),
+            account_id: "account".to_owned(),
+            profile_id: "profile".to_owned(),
+            database_name: "founder".to_owned(),
+            database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
+            baseline_start_sequence: 116,
+            baseline_end_sequence: 171,
+            baseline,
+            baseline_digest: format!("sha256:{}", "e".repeat(64)),
+            target_sequence: 172,
+            target_git_blob_oid: "1".repeat(40),
+            migrations_pattern: "crates/founder/migrations/d1/0172_target.sql".to_owned(),
+            ledger_table: "d1_migrations".to_owned(),
+            ledger_name: "0172_target.sql".to_owned(),
+            wrangler_cli_sha256: format!("sha256:{}", "f".repeat(64)),
+            full_export_capability_id: "d1-full-export".to_owned(),
+            require_exact_post_ledger: true,
+            forbidden_future_sequences: vec![173, 174],
+            require_exact_schema_sql: true,
+            require_foreign_key_check_empty: true,
+            require_integrity_check_ok: true,
+            require_unchanged_worker_identity: true,
+            require_old_worker_compatibility: true,
+        }),
+    };
+    let before = expected_ledger_before(&contract).expect("baseline");
+    let after = declared_migration_names(&contract).expect("post ledger");
+    assert_eq!(before.len(), 56);
+    assert_eq!(after.len(), 57);
+    assert_eq!(after.last().map(String::as_str), Some("0172_target.sql"));
+    assert!(!before.contains(&"0172_target.sql".to_owned()));
+    let blocked = require_manifest_production_eligibility(&contract, None)
+        .expect_err("manifest migration is blocked before canonical evidence joins exist");
+    assert!(blocked.to_string().contains("provider-isolated atomicity"));
+    assert!(blocked.to_string().contains("old-Worker compatibility"));
+
+    let joins = cfctl_core::WorkspaceD1EvidenceJoinsV1 {
+        atomicity_qualification_evidence_hash: format!("sha256:{}", "1".repeat(64)),
+        old_worker_canary_evidence_hash: format!("sha256:{}", "2".repeat(64)),
+        worker_deployments_evidence_hash: format!("sha256:{}", "3".repeat(64)),
+        worker_version_evidence_hash: format!("sha256:{}", "4".repeat(64)),
+        worker_settings_evidence_hash: format!("sha256:{}", "5".repeat(64)),
+        worker_deployment_plan_hash: format!("sha256:{}", "6".repeat(64)),
+    };
+    require_manifest_production_eligibility(&contract, Some(&joins))
+        .expect("closed manifest and six distinct joins are production eligible");
+
+    let mut duplicate = joins.clone();
+    duplicate.worker_settings_evidence_hash = duplicate.worker_version_evidence_hash.clone();
+    assert!(
+        require_manifest_production_eligibility(&contract, Some(&duplicate))
+            .expect_err("duplicate joins are rejected")
+            .to_string()
+            .contains("six distinct canonical SHA-256")
+    );
+
+    for requirement in [
+        "post_ledger",
+        "schema_sql",
+        "foreign_keys",
+        "integrity",
+        "worker_identity",
+        "old_worker",
+    ] {
+        let mut incomplete = contract.clone();
+        let manifest = incomplete.manifest_migration.as_mut().expect("manifest");
+        match requirement {
+            "post_ledger" => manifest.require_exact_post_ledger = false,
+            "schema_sql" => manifest.require_exact_schema_sql = false,
+            "foreign_keys" => manifest.require_foreign_key_check_empty = false,
+            "integrity" => manifest.require_integrity_check_ok = false,
+            "worker_identity" => manifest.require_unchanged_worker_identity = false,
+            "old_worker" => manifest.require_old_worker_compatibility = false,
+            _ => unreachable!(),
+        }
+        assert!(
+            require_manifest_production_eligibility(&incomplete, Some(&joins)).is_err(),
+            "the `{requirement}` production requirement is mandatory"
+        );
+    }
+
+    for malformed in [
+        "sha256:ABCDEF",
+        "sha256:1234",
+        "not-sha256",
+        "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+    ] {
+        let mut invalid = joins.clone();
+        invalid.worker_settings_evidence_hash = malformed.to_owned();
+        assert!(require_manifest_production_eligibility(&contract, Some(&invalid)).is_err());
+    }
+}
+
+#[test]
+fn staged_manifest_execution_config_selects_exactly_one_migration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("fixture");
+    let template = root.path().join("wrangler.founder.toml");
+    let production = root.path().join("wrangler.founder.production.toml");
+    let template_source = r#"name = "founder"
+[vars]
+MAILDESK_VERIFIED_SENDER_DOMAINS = ""
+[[d1_databases]]
+binding = "FOUNDER_DB"
+database_name = "founder"
+database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65"
+"#;
+    let production_source = template_source.replace(
+        "MAILDESK_VERIFIED_SENDER_DOMAINS = \"\"",
+        "MAILDESK_VERIFIED_SENDER_DOMAINS = \"sender.example.com\"",
+    );
+    fs::write(&template, template_source).expect("template");
+    fs::write(&production, &production_source).expect("production");
+    fs::set_permissions(&production, fs::Permissions::from_mode(0o600)).expect("private mode");
+    let mut bound = worker_deployment::bind_workspace_d1_private_config_for_execution(
+        &production,
+        &template,
+        Some(&sha256(production_source.as_bytes())),
+        Some(&sha256(template_source.as_bytes())),
+        "FOUNDER_DB",
+    )
+    .expect("bound migration config");
+    stage_migration_selection(
+        &mut bound,
+        "FOUNDER_DB",
+        &MigrationSelection {
+            dir: "/repo/crates/founder/migrations/d1".to_owned(),
+            pattern: "/repo/crates/founder/migrations/d1/0172_target.sql".to_owned(),
+            table: "d1_migrations".to_owned(),
+        },
+    )
+    .expect("stage selection");
+    let staged = fs::read_to_string(bound.path()).expect("staged config");
+    let staged: toml::Value = toml::from_str(&staged).expect("staged TOML");
+    let database = &staged["d1_databases"][0];
+    assert_eq!(
+        database["migrations_dir"].as_str(),
+        Some("/repo/crates/founder/migrations/d1")
+    );
+    assert_eq!(
+        database["migrations_pattern"].as_str(),
+        Some("/repo/crates/founder/migrations/d1/0172_target.sql")
+    );
+    assert_eq!(database["migrations_table"].as_str(), Some("d1_migrations"));
+    assert_eq!(
+        bound.content_sha256(),
+        sha256(production_source.as_bytes()).trim_start_matches("sha256:")
+    );
+}
+
+#[test]
+fn atomic_migration_model_rolls_back_ddl_and_ledger_failures() {
+    let mut success = rusqlite::Connection::open_in_memory().expect("success database");
+    success
+        .execute(
+            "CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            [],
+        )
+        .expect("ledger");
+    {
+        let transaction = success.transaction().expect("transaction");
+        transaction
+            .execute_batch("CREATE TABLE governed(id INTEGER PRIMARY KEY);")
+            .expect("DDL");
+        transaction
+            .execute(
+                "INSERT INTO d1_migrations(name) VALUES (?1)",
+                ["0172_target.sql"],
+            )
+            .expect("ledger insert");
+        transaction.commit().expect("commit");
+    }
+    assert_eq!(
+        success
+            .query_row("SELECT COUNT(*) FROM governed", [], |row| row
+                .get::<_, i64>(0))
+            .expect("schema"),
+        0
+    );
+    assert_eq!(
+        success
+            .query_row("SELECT COUNT(*) FROM d1_migrations", [], |row| row
+                .get::<_, i64>(0))
+            .expect("ledger count"),
+        1
+    );
+
+    for ledger_failure in [false, true] {
+        let mut database = rusqlite::Connection::open_in_memory().expect("failure database");
+        database
+            .execute(
+                "CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                [],
+            )
+            .expect("ledger");
+        if ledger_failure {
+            database
+                .execute_batch("CREATE TRIGGER reject_ledger BEFORE INSERT ON d1_migrations BEGIN SELECT RAISE(ABORT, 'reject'); END;")
+                .expect("ledger failure trigger");
+        }
+        let transaction = database.transaction().expect("transaction");
+        let result = if ledger_failure {
+            transaction
+                .execute_batch("CREATE TABLE governed(id INTEGER PRIMARY KEY);")
+                .and_then(|()| {
+                    transaction
+                        .execute(
+                            "INSERT INTO d1_migrations(name) VALUES (?1)",
+                            ["0172_target.sql"],
+                        )
+                        .map(|_| ())
+                })
+        } else {
+            transaction.execute_batch("CREATE TABLE governed(id INTEGER PRIMARY KEY); INVALID SQL;")
+        };
+        assert!(result.is_err());
+        drop(transaction);
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='governed'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("schema count"),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM d1_migrations", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("ledger count"),
+            0
+        );
+    }
 }
 
 #[test]
@@ -922,6 +1241,49 @@ fn workspace_d1_shared_overlay_preserves_closed_private_field_rules() {
     assert_eq!(identity.database_name, "production-db");
     assert_eq!(identity.database_id, "11111111-1111-4111-8111-111111111111");
     assert_eq!(allowed, template);
+
+    let mut absent_template = template.clone();
+    absent_template["vars"]
+        .as_object_mut()
+        .expect("template vars")
+        .remove("MAILDESK_VERIFIED_SENDER_DOMAINS");
+    let mut absent_production = production.clone();
+    absent_production["vars"]
+        .as_object_mut()
+        .expect("production vars")
+        .remove("MAILDESK_VERIFIED_SENDER_DOMAINS");
+    assert!(
+        worker_deployment::normalize_workspace_d1_private_config(
+            &mut absent_production,
+            &absent_template,
+            "DB",
+        )
+        .is_err()
+    );
+
+    let mut template_only_production = production.clone();
+    template_only_production["vars"]
+        .as_object_mut()
+        .expect("production vars")
+        .remove("MAILDESK_VERIFIED_SENDER_DOMAINS");
+    assert!(
+        worker_deployment::normalize_workspace_d1_private_config(
+            &mut template_only_production,
+            &template,
+            "DB"
+        )
+        .is_err()
+    );
+
+    let mut production_only = production.clone();
+    assert!(
+        worker_deployment::normalize_workspace_d1_private_config(
+            &mut production_only,
+            &absent_template,
+            "DB"
+        )
+        .is_err()
+    );
 
     for invalid in [json!("preview"), json!(true), Value::Null] {
         let mut rejected = production.clone();

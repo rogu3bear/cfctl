@@ -3,6 +3,7 @@ use super::credential_resolution::describe_secret_backend;
 use super::credential_resolution::oauth_scope_inventory_hash;
 use super::credential_resolution::platform_secrets;
 use super::credential_resolution::resolve_login_scopes;
+use super::evidence_key_commands::evidence_key_command;
 use super::prelude::{
     AuthCommand, AuthLoginArgs, CliError, ImportApiTokenArgs, ImportGlobalKeyArgs,
     OAuthClientConfig, PendingLogin, PkceSession, ProfileKind, ProfileMetadata, ProfileSelector,
@@ -18,6 +19,12 @@ pub(super) async fn auth_command(
     store: &StateStore,
     command: AuthCommand,
 ) -> Result<ResultEnvelopeV2> {
+    let command = match command {
+        AuthCommand::EvidenceKey(arguments) => {
+            return evidence_key_command(store, arguments.command);
+        }
+        command => command,
+    };
     let secrets = platform_secrets(store);
     let mut profiles = ProfilesConfig::load(store)?;
     match command {
@@ -45,6 +52,7 @@ pub(super) async fn auth_command(
         AuthCommand::ImportGlobalKey(arguments) => {
             import_global_key(store, &mut profiles, &secrets, &arguments)
         }
+        AuthCommand::EvidenceKey(_) => unreachable!("matched before profile loading"),
     }
 }
 

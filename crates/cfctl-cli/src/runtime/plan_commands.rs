@@ -361,7 +361,8 @@ pub(super) fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result
     })?;
     plan.cancel()?;
     store.save_plan(&plan)?;
-    let evidence = store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
+    let evidence =
+        store.write_audit_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
     let mut envelope = ResultEnvelopeV2::success(
         "plans cancel",
         json!({
@@ -387,6 +388,7 @@ pub(super) async fn run_plan(
     selector: &PlanSelector,
 ) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&selector.operation_id)?;
+    store.require_qualifying_evidence_authority()?;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
     ensure_plan_execution_contract(store, &plan)?;
@@ -537,6 +539,7 @@ pub(super) async fn run_plan_under_standing_authority(
     // preflight; the authority lock is acquired only for the synchronous
     // admission critical section below and is released before network I/O.
     let _plan_lock = store.lock_plan(operation_id)?;
+    store.require_qualifying_evidence_authority()?;
     let authority_snapshot = store.load_authority(authority_id)?;
     store.bind_plan_authority_hash(operation_id, &authority_snapshot.content_hash)?;
     let catalog = ensure_catalog(store).await?;
@@ -981,106 +984,109 @@ pub(super) struct LivePreconditionEvidence {
     pub(super) r2_parent_token: Option<EvidenceV1>,
 }
 
-pub(super) async fn validate_live_plan_precondition_evidence(
-    store: &StateStore,
-    catalog: &CatalogSnapshot,
-    plan: &PlanV1,
-    input: &CallInput,
-    credential: &AuthCredential,
-    standing_authority: Option<&StandingAuthorityV1>,
-) -> Result<LivePreconditionEvidence> {
-    Ok(LivePreconditionEvidence {
-        zone_account: validate_live_zone_account_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        entitlement: validate_live_entitlement_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        pages_project_absence: validate_live_pages_project_absence_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        pages_deployment_project_state: validate_live_pages_deployment_project_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        permission_inventory: validate_live_permission_inventory_precondition(
-            store,
-            catalog,
-            plan,
-            credential,
-            standing_authority,
-        )
-        .await?,
-        global_warp_override_state: validate_live_global_warp_override_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        d1_read_replication_state: validate_live_d1_read_replication_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        kv_empty_namespace_state: validate_live_kv_empty_namespace_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        d1_empty_database_state: validate_live_d1_empty_database_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        cloudflare_tunnel_configuration_state:
-            validate_live_cloudflare_tunnel_configuration_state_precondition(
+pub(super) fn validate_live_plan_precondition_evidence<'a>(
+    store: &'a StateStore,
+    catalog: &'a CatalogSnapshot,
+    plan: &'a PlanV1,
+    input: &'a CallInput,
+    credential: &'a AuthCredential,
+    standing_authority: Option<&'a StandingAuthorityV1>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LivePreconditionEvidence>> + 'a>> {
+    Box::pin(async move {
+        Ok(LivePreconditionEvidence {
+            zone_account: validate_live_zone_account_precondition(
                 store, catalog, plan, input, credential,
             )
             .await?,
-        warp_connector_configuration_state:
-            validate_live_warp_connector_configuration_state_precondition(
+            entitlement: validate_live_entitlement_precondition(
                 store, catalog, plan, input, credential,
             )
             .await?,
-        web_analytics_rum_state: validate_live_web_analytics_rum_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        dns_record_state: validate_live_dns_record_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        same_path_prior_state: validate_live_same_path_prior_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        access_operator_group_policy_ownership:
-            validate_live_access_operator_group_policy_ownership_precondition(
+            pages_project_absence: validate_live_pages_project_absence_precondition(
                 store, catalog, plan, input, credential,
             )
             .await?,
-        security_action_state: validate_live_security_action_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        oauth_client_secret_state: validate_live_oauth_client_secret_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        oauth_client_update_state: validate_live_oauth_client_update_state_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        worker_custom_domain_state: worker_custom_domain::validate_live_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
-        worker_deployment_state: validate_live_worker_deployment_state_precondition(
-            store, catalog, plan, credential,
-        )
-        .await?,
-        r2_parent_token: validate_live_r2_parent_token_precondition(
-            store, catalog, plan, input, credential,
-        )
-        .await?,
+            pages_deployment_project_state:
+                validate_live_pages_deployment_project_state_precondition(
+                    store, catalog, plan, input, credential,
+                )
+                .await?,
+            permission_inventory: validate_live_permission_inventory_precondition(
+                store,
+                catalog,
+                plan,
+                credential,
+                standing_authority,
+            )
+            .await?,
+            global_warp_override_state: validate_live_global_warp_override_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            d1_read_replication_state: validate_live_d1_read_replication_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            kv_empty_namespace_state: validate_live_kv_empty_namespace_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            d1_empty_database_state: validate_live_d1_empty_database_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            cloudflare_tunnel_configuration_state:
+                validate_live_cloudflare_tunnel_configuration_state_precondition(
+                    store, catalog, plan, input, credential,
+                )
+                .await?,
+            warp_connector_configuration_state:
+                validate_live_warp_connector_configuration_state_precondition(
+                    store, catalog, plan, input, credential,
+                )
+                .await?,
+            web_analytics_rum_state: validate_live_web_analytics_rum_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            dns_record_state: validate_live_dns_record_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            same_path_prior_state: validate_live_same_path_prior_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            access_operator_group_policy_ownership:
+                validate_live_access_operator_group_policy_ownership_precondition(
+                    store, catalog, plan, input, credential,
+                )
+                .await?,
+            security_action_state: validate_live_security_action_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            oauth_client_secret_state: validate_live_oauth_client_secret_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            oauth_client_update_state: validate_live_oauth_client_update_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            worker_custom_domain_state: worker_custom_domain::validate_live_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            worker_deployment_state: validate_live_worker_deployment_state_precondition(
+                store, catalog, plan, credential,
+            )
+            .await?,
+            r2_parent_token: validate_live_r2_parent_token_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+        })
     })
 }
 

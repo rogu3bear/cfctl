@@ -54,6 +54,125 @@ pub(super) fn resolver_workflow_capability(id: &str, title: &str) -> CapabilityV
     capability
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn registered_schema_v2_pack_does_not_block_cli_resolve_for_an_unrelated_intent() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let repository = tempfile::tempdir().expect("registered repository");
+    let git = |arguments: &[&str]| {
+        let output = StdCommand::new("git")
+            .current_dir(repository.path())
+            .args(arguments)
+            .output()
+            .expect("git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["remote", "add", "origin", "https://example.com/founder.git"]);
+    fs::create_dir_all(repository.path().join(".cfctl/operations")).expect("operation pack dir");
+    fs::write(
+        repository
+            .path()
+            .join(".cfctl/operations/d1-migrations.toml"),
+        r#"schema_version = 2
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+title = "Future manifest operation"
+description = "Apply one exact target after an exact remote baseline."
+authority = "cfctl_native_workspace_operation"
+manifest_path = ".control-plane/d1_migration_manifest.json"
+config_template = "workers/founder/wrangler.toml"
+account_id = "ca30e922fda7f5578e49873542e4aaca"
+profile_id = "mln-founder-d1"
+database_name = "founder"
+database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65"
+database_binding = "FOUNDER_DB"
+baseline_start_sequence = 116
+baseline_end_sequence = 171
+target_sequence = 172
+migrations_dir = "crates/founder/migrations/d1"
+migrations_pattern = "{target_path}"
+ledger_table = "d1_migrations"
+ledger_name = "{target_name}"
+wrangler_version = "4.100.0"
+wrangler_cli_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[operation.recovery]
+full_export_capability_id = "d1-full-export"
+bookmark_capability_id = "d1-time-travel-get-bookmark"
+rollback_capability_id = "d1-restore-exact-bookmark"
+requires_fresh_full_export = true
+requires_fresh_bookmark = true
+existing_anchor_reusable = false
+
+[operation.atomicity]
+local_ddl_failure_zero_schema_delta = true
+local_ddl_failure_zero_ledger_delta = true
+local_ledger_failure_zero_schema_delta = true
+local_ledger_failure_zero_ledger_delta = true
+remote_ddl_failure_zero_schema_delta = true
+remote_ddl_failure_zero_ledger_delta = true
+remote_ledger_failure_zero_schema_delta = true
+remote_ledger_failure_zero_ledger_delta = true
+
+[operation.verification]
+require_exact_post_ledger = true
+forbidden_future_sequences = [173, 174]
+require_exact_schema_sql = true
+require_foreign_key_check_empty = true
+require_integrity_check_ok = true
+require_unchanged_worker_identity = true
+require_old_worker_compatibility = true
+"#,
+    )
+    .expect("schema-v2 pack");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "schema-v2 fixture"]);
+
+    let store = StateStore::open(RuntimePaths::from_root(runtime.path())).expect("store opens");
+    store
+        .register_workspace(repository.path(), Some("account-a".to_owned()))
+        .expect("register exact repository");
+    let mut catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "test://resolver".to_owned(),
+        source_hash: "sha256:source".to_owned(),
+        schema_hash: String::new(),
+        capabilities: [(
+            "workers-scripts-list".to_owned(),
+            resolver_read_capability("workers-scripts-list", "List Workers", "Workers"),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    catalog.refresh_hash().expect("catalog hash");
+    store
+        .write_json(&store.paths().catalog_file(), &catalog)
+        .expect("store catalog");
+
+    let envelope = resolve_command(
+        &store,
+        ResolveArgs {
+            intent: "deploy JKCA workers".to_owned(),
+            account: None,
+            limit: 5,
+        },
+    )
+    .await
+    .expect("unrelated schema-v2 pack must not become a workspace resolver error");
+    assert_eq!(envelope.command, "resolve");
+    assert!(!envelope.performed);
+}
+
 #[test]
 pub(super) fn workflow_guide_replaces_generic_mutation_ceremony_with_preview_semantics() {
     let workflow = resolver_workflow_capability(
@@ -89,7 +208,7 @@ pub(super) fn workflow_guide_replaces_generic_mutation_ceremony_with_preview_sem
 )]
 pub(super) fn workflow_preview_joins_scoped_proof_without_crossing_the_cloudflare_boundary() {
     let root = tempfile::tempdir().expect("runtime root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store opens");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
     let read_capability = resolver_read_capability(
         "graphql-analytics-zone-http-requests",
         "Query zone HTTP analytics",

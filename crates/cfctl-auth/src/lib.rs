@@ -1,6 +1,8 @@
 //! OAuth, profile, account selection, and secret-store contracts.
 
+mod evidence_keys;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+pub use evidence_keys::*;
 use rand::{RngExt as _, distr::Alphanumeric};
 #[cfg(target_os = "macos")]
 use std::io::Read as _;
@@ -42,6 +44,8 @@ pub enum AuthError {
     Json(#[from] serde_json::Error),
     #[error("secret store failed: {0}")]
     SecretStore(String),
+    #[error(transparent)]
+    EvidenceKeyLifecycle(#[from] EvidenceKeyLifecycleError),
     #[error("profile `{0}` has no stored credential")]
     MissingCredential(String),
     #[error("credential unavailable for profile `{profile_id}`: {reason}")]
@@ -518,30 +522,28 @@ pub trait SecretStore: Send + Sync {
 pub struct MemorySecretStore {
     values: Mutex<BTreeMap<String, String>>,
 }
+const MEMORY_STORE_POISONED: &str = "memory secret store lock is poisoned";
+
+impl MemorySecretStore {
+    fn values(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, String>>> {
+        self.values
+            .lock()
+            .map_err(|_| AuthError::SecretStore(MEMORY_STORE_POISONED.into()))
+    }
+}
 
 impl SecretStore for MemorySecretStore {
     fn put(&self, key: &str, value: &str) -> Result<()> {
-        self.values
-            .lock()
-            .map_err(|_| AuthError::SecretStore("memory secret store lock is poisoned".to_owned()))?
-            .insert(key.to_owned(), value.to_owned());
+        self.values()?.insert(key.to_owned(), value.to_owned());
         Ok(())
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .values
-            .lock()
-            .map_err(|_| AuthError::SecretStore("memory secret store lock is poisoned".to_owned()))?
-            .get(key)
-            .cloned())
+        Ok(self.values()?.get(key).cloned())
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        self.values
-            .lock()
-            .map_err(|_| AuthError::SecretStore("memory secret store lock is poisoned".to_owned()))?
-            .remove(key);
+        self.values()?.remove(key);
         Ok(())
     }
 

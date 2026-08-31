@@ -1153,6 +1153,7 @@ fn config_contract(contract: &WorkspaceD1EvidenceContractV1) -> WorkspaceD1Migra
         recovery_capability_id: String::new(),
         recovery_max_age_seconds: 0,
         rollback_capability_id: String::new(),
+        manifest_migration: None,
     }
 }
 

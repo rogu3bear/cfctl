@@ -94,6 +94,34 @@ pub enum AuthCommand {
     ImportApiToken(ImportApiTokenArgs),
     /// Import an emergency global API key from protected input.
     ImportGlobalKey(ImportGlobalKeyArgs),
+    /// Manage the platform-held key that authenticates local evidence and proofs.
+    EvidenceKey(EvidenceKeyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyArgs {
+    #[command(subcommand)]
+    pub command: EvidenceKeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvidenceKeyCommand {
+    /// Initialize one platform-held evidence authority for this canonical state root.
+    Init,
+    /// Inspect the non-secret evidence-key lifecycle state without creating a key.
+    Status,
+    /// Generate a new active signing key and retain older keys for verification.
+    Rotate,
+    /// Delete one inactive key only when no local authenticated artifact uses it.
+    Retire(EvidenceKeyRetireArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyRetireArgs {
+    pub generation_id: String,
+    /// Confirm deletion after the local authenticated-artifact impact count is zero.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

@@ -17,14 +17,14 @@ use super::plan_secret::WEB_ANALYTICS_RUM_STATE_PRECONDITION;
 use super::prelude::fs;
 use super::prelude::{
     BTreeMap, BTreeSet, CallInput, CliError, Digest, Path, PathBuf, PlanV1, RegisteredRoot, Result,
-    Sha256, StateStore, Value, WalkDir, WorkspaceGraph, json,
+    Sha256, StateStore, Utc, Value, WalkDir, WorkspaceGraph, json,
 };
 use super::r2_credentials::R2_PARENT_TOKEN_PRECONDITION;
 use super::support::cli_io;
 use super::{
     pages_deployment, r2_private_upload, worker_custom_domain, worker_deployment,
-    workspace_d1_migration, workspace_d1_projection, workspace_d1_reply_admission,
-    workspace_reply_subdomain_ingress,
+    workspace_d1_migration, workspace_d1_projection, workspace_d1_qualification,
+    workspace_d1_reply_admission, workspace_reply_subdomain_ingress,
 };
 use cfctl_core::hash_value;
 
@@ -247,6 +247,11 @@ pub(super) fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> 
     if let Some(source_remote) = current_pages_source_remote_precondition(store, plan)? {
         current.insert(SOURCE_REMOTE_PRECONDITION.to_owned(), source_remote);
     }
+    current.extend(workspace_d1_qualification::current_plan_evidence_hashes(
+        store,
+        plan,
+        Utc::now(),
+    )?);
     for (name, expected) in &plan.precondition_hashes {
         if is_live_plan_precondition_hash(name) {
             continue;

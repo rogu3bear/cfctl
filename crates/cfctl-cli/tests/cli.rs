@@ -371,6 +371,49 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
 }
 
 #[test]
+fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmation() {
+    use cfctl_cli::{AuthCommand, Command, EvidenceKeyCommand};
+
+    for action in ["init", "status", "rotate"] {
+        let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", action])
+            .expect("evidence-key lifecycle action parses");
+        let Some(Command::Auth(arguments)) = cli.command else {
+            panic!("auth command");
+        };
+        let AuthCommand::EvidenceKey(group) = arguments.command else {
+            panic!("evidence-key command");
+        };
+        let parsed = match group.command {
+            EvidenceKeyCommand::Init => "init",
+            EvidenceKeyCommand::Status => "status",
+            EvidenceKeyCommand::Rotate => "rotate",
+            EvidenceKeyCommand::Retire(_) => "retire",
+        };
+        assert_eq!(parsed, action);
+    }
+
+    let cli = Cli::try_parse_from([
+        "cfctl",
+        "auth",
+        "evidence-key",
+        "retire",
+        "7ff2b63e-f412-4a73-978a-e88b86ef5327",
+        "--yes",
+    ])
+    .expect("evidence-key retire parses");
+    let Some(Command::Auth(arguments)) = cli.command else {
+        panic!("auth command");
+    };
+    let AuthCommand::EvidenceKey(group) = arguments.command else {
+        panic!("evidence-key command");
+    };
+    let EvidenceKeyCommand::Retire(retire) = group.command else {
+        panic!("retire command");
+    };
+    assert!(retire.yes);
+}
+
+#[test]
 fn guide_topics_are_additive_and_capability_guides_remain_compatible() {
     let capability = Cli::try_parse_from(["cfctl", "guide", "dns-records-list"])
         .expect("existing capability guide parses");

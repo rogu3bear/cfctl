@@ -1,5 +1,14 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
+mod workspace_d1;
+pub use workspace_d1::{
+    WorkspaceD1AtomicityQualificationV1, WorkspaceD1EvidenceContractV1, WorkspaceD1EvidenceJoinsV1,
+    WorkspaceD1ExactObjectAssertionV1, WorkspaceD1ManifestMigrationContractV1,
+    WorkspaceD1MigrationContractV1, WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1,
+    WorkspaceD1OldWorkerCanaryV1, WorkspaceD1PolicyProjectionContractV1,
+    WorkspaceD1ReplyAdmissionContractV1, WorkspaceD1SchemaAssertionV1,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
@@ -78,6 +87,15 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
     CommandNodeV1 {
         name: "auth",
         subcommands: &[
+            CommandNodeV1 {
+                name: "evidence-key",
+                subcommands: &[
+                    CommandNodeV1::leaf("init"),
+                    CommandNodeV1::leaf("retire"),
+                    CommandNodeV1::leaf("rotate"),
+                    CommandNodeV1::leaf("status"),
+                ],
+            },
             CommandNodeV1::leaf("import-api-token"),
             CommandNodeV1::leaf("import-global-key"),
             CommandNodeV1::leaf("login"),
@@ -1947,110 +1965,6 @@ pub struct RollbackSpecV1 {
     pub warning: Option<String>,
 }
 
-/// One append-only migration file bound by a workspace-owned D1 operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceD1MigrationFileV1 {
-    pub path: String,
-    pub sha256: String,
-}
-
-/// A compiler-owned post-migration assertion. Optional fields are validated
-/// against `kind`; callers cannot supply SQL.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceD1SchemaAssertionV1 {
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub table: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub column: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index: Option<String>,
-}
-
-/// Exact repository authority serialized into a workspace-owned D1 migration
-/// plan. Provider identity and the fresh recovery proof are bound separately
-/// in the plan adapter target because they are just-in-time inputs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceD1MigrationContractV1 {
-    pub repository_root: String,
-    pub repository_head: String,
-    pub repository_origin: String,
-    pub operation_pack_path: String,
-    pub operation_pack_sha256: String,
-    pub config_template_path: String,
-    pub config_template_sha256: String,
-    pub production_config_path: String,
-    pub migrations_dir: String,
-    pub database_binding: String,
-    pub wrangler_version: String,
-    pub migrations: Vec<WorkspaceD1MigrationFileV1>,
-    pub assertions: Vec<WorkspaceD1SchemaAssertionV1>,
-    pub recovery_capability_id: String,
-    pub recovery_max_age_seconds: u64,
-    pub rollback_capability_id: String,
-}
-
-/// A workspace-owned D1 policy projection. The private SQL projection is
-/// staged out of band; this contract contains only repository authority,
-/// compiler-owned readback identifiers, and recovery requirements.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceD1PolicyProjectionContractV1 {
-    pub repository_root: String,
-    pub repository_head: String,
-    pub repository_origin: String,
-    pub operation_pack_path: String,
-    pub operation_pack_sha256: String,
-    pub config_template_path: String,
-    pub config_template_sha256: String,
-    pub production_config_path: String,
-    pub database_binding: String,
-    pub wrangler_version: String,
-    pub route_table: String,
-    pub route_policy_sha_column: String,
-    pub runtime_state_table: String,
-    pub runtime_state_key_column: String,
-    pub runtime_state_value_column: String,
-    pub active_policy_key: String,
-    pub desired_state_digest_key: String,
-    pub projection_digest_key: String,
-    pub recovery_capability_id: String,
-    pub recovery_max_age_seconds: u64,
-    pub rollback_capability_id: String,
-}
-
-/// Repository-owned contract for activating one compiler-produced Maildesk
-/// reply admission. Candidate bytes remain in a private staged file; plans
-/// carry only immutable digests and the distinct logical activation identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceD1ReplyAdmissionContractV1 {
-    pub operation_kind: String,
-    pub repository_root: String,
-    pub repository_head: String,
-    pub repository_origin: String,
-    pub operation_pack_path: String,
-    pub operation_pack_sha256: String,
-    pub compiler_path: String,
-    pub compiler_sha256: String,
-    pub compiler_runtime: String,
-    pub compiler_runtime_version: String,
-    pub compiler_runtime_sha256: String,
-    pub config_template_path: String,
-    pub config_template_sha256: String,
-    pub production_config_path: String,
-    pub database_binding: String,
-    pub wrangler_version: String,
-    pub admission_table: String,
-    pub input_contract: String,
-    pub mutation_projection: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_projection: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub read_parameters: Vec<String>,
-    pub recovery_capability_id: String,
-    pub recovery_max_age_seconds: u64,
-    pub rollback_capability_id: String,
-}
-
 /// Repository-owned contract for proving one exact Maildesk reply subdomain
 /// ingress configuration. Provider zone, DNS, and routing-rule values are
 /// reduced inside cfctl and never become part of the public projection.
@@ -2065,25 +1979,6 @@ pub struct WorkspaceReplySubdomainIngressContractV1 {
     pub consumer_contract_path: String,
     pub consumer_contract_sha256: String,
     pub projection: String,
-}
-
-/// Repository-bound, caller-invariant D1 evidence projection. The committed
-/// query is executed only inside cfctl and its rows are reduced to the typed,
-/// body-free `MaildeskD1EvidenceV1` result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceD1EvidenceContractV1 {
-    pub repository_root: String,
-    pub repository_head: String,
-    pub repository_origin: String,
-    pub operation_pack_path: String,
-    pub operation_pack_sha256: String,
-    pub config_template_path: String,
-    pub config_template_sha256: String,
-    pub production_config_path: String,
-    pub database_binding: String,
-    pub wrangler_version: String,
-    pub projection: String,
-    pub query_sha256: String,
 }
 
 /// Body-free operational evidence emitted by a workspace-owned Maildesk D1
@@ -2797,6 +2692,31 @@ impl CapabilityV1 {
                         .workspace_d1_migration
                         .as_ref()
                         .is_some_and(|contract| {
+                            let manifest_valid = contract.manifest_migration.as_ref().is_none_or(|manifest| {
+                                !manifest.manifest_path.is_empty()
+                                    && !manifest.manifest_sha256.is_empty()
+                                    && !manifest.account_id.is_empty()
+                                    && !manifest.profile_id.is_empty()
+                                    && !manifest.database_name.is_empty()
+                                    && !manifest.database_id.is_empty()
+                                    && (1..=64).contains(&manifest.baseline.len())
+                                    && manifest.baseline_start_sequence <= manifest.baseline_end_sequence
+                                    && manifest.target_sequence == manifest.baseline_end_sequence + 1
+                                    && !manifest.target_git_blob_oid.is_empty()
+                                    && contract.migrations.len() == 1
+                                    && !manifest.baseline_digest.is_empty()
+                                    && !manifest.migrations_pattern.is_empty()
+                                    && !manifest.ledger_table.is_empty()
+                                    && !manifest.ledger_name.is_empty()
+                                    && !manifest.wrangler_cli_sha256.is_empty()
+                                    && manifest.full_export_capability_id == "d1-full-export"
+                                    && manifest.require_exact_post_ledger
+                                    && manifest.require_exact_schema_sql
+                                    && manifest.require_foreign_key_check_empty
+                                    && manifest.require_integrity_check_ok
+                                    && manifest.require_unchanged_worker_identity
+                                    && manifest.require_old_worker_compatibility
+                            });
                             !contract.repository_root.is_empty()
                                 && !contract.repository_head.is_empty()
                                 && !contract.operation_pack_sha256.is_empty()
@@ -2804,6 +2724,7 @@ impl CapabilityV1 {
                                 && !contract.wrangler_version.is_empty()
                                 && !contract.migrations.is_empty()
                                 && !contract.assertions.is_empty()
+                                && manifest_valid
                                 && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
                                 && contract.recovery_max_age_seconds > 0
                                 && contract.recovery_max_age_seconds <= 600
@@ -7551,6 +7472,7 @@ pub enum EvidenceClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceV1 {
     pub schema_version: u8,
     pub generated_at: DateTime<Utc>,
@@ -7614,12 +7536,15 @@ impl OperationalProofScopeV1 {
 /// Durable index row binding a live-read receipt to the exact public contract,
 /// account context, and redacted input identity that produced it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationalProofV1 {
     pub schema_version: u8,
     pub observed_at: DateTime<Utc>,
     pub capability_id: String,
     pub catalog_hash: String,
     pub input_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity_hash: Option<String>,
     pub profile_id: Option<String>,
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7635,6 +7560,7 @@ pub struct OperationalProofV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct D1FullExportGovernedExecutionBindingV1 {
     pub schema_version: u8,
     pub operation_id: String,
@@ -7652,6 +7578,7 @@ pub struct D1FullExportGovernedExecutionBindingV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mln0142GovernedExecutionBindingV1 {
     pub schema_version: u8,
     pub operation_id: String,
@@ -7674,6 +7601,7 @@ pub struct Mln0142GovernedExecutionBindingV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mln0143GovernedExecutionBindingV1 {
     pub schema_version: u8,
     pub operation_id: String,
@@ -7711,6 +7639,7 @@ impl OperationalProofV1 {
             capability_id: capability_id.to_owned(),
             catalog_hash: catalog_hash.to_owned(),
             input_hash: input_hash.to_owned(),
+            build_identity_hash: None,
             profile_id: scope.profile_id,
             account_id: scope.account_id,
             credential_generation_id: scope.credential_generation_id,
@@ -7720,6 +7649,16 @@ impl OperationalProofV1 {
             mln_0142_execution: None,
             d1_full_export_execution: None,
         }
+    }
+
+    pub fn bind_build_identity_hash(&mut self, build_identity_hash: &str) -> Result<()> {
+        if !valid_sha256_identity(build_identity_hash) || self.build_identity_hash.is_some() {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "build identity must be one immutable canonical SHA-256".to_owned(),
+            ));
+        }
+        self.build_identity_hash = Some(build_identity_hash.to_owned());
+        Ok(())
     }
 
     pub fn bind_d1_full_export_governed_execution(

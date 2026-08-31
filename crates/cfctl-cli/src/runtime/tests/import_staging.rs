@@ -3,7 +3,7 @@ use super::*;
 #[test]
 pub(super) fn d1_full_export_runtime_records_the_exact_bookmark_anchor_receipt() {
     let root = tempfile::tempdir().expect("runtime root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
     let mut catalog = CatalogSnapshot {
         schema_version: 1,
         generated_at: Utc::now(),
@@ -448,7 +448,7 @@ pub(super) fn reviewed_git_d1_import_stages_one_exact_clean_head_and_fails_on_dr
 )]
 pub(super) fn mln_0143_lineage_binds_post_restore_to_the_same_pre_baseline() {
     let root = tempfile::tempdir().expect("runtime root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
     let mut catalog = CatalogSnapshot {
         schema_version: 1,
         generated_at: Utc::now(),

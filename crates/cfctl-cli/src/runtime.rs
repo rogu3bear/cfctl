@@ -22,6 +22,7 @@ mod entitlement_state;
 mod error;
 mod event_batch;
 mod events_commands;
+mod evidence_key_commands;
 mod governed_cli;
 mod guide_generation;
 mod health_commands;
@@ -63,6 +64,7 @@ mod workspace_commands;
 mod workspace_d1_evidence;
 mod workspace_d1_migration;
 mod workspace_d1_projection;
+mod workspace_d1_qualification;
 mod workspace_d1_reply_admission;
 mod workspace_reply_subdomain_ingress;
 mod workspace_state;
@@ -113,7 +115,11 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     if matches!(command, Command::Commands) {
         return Ok(crate::command_help::envelope());
     }
-    let store = StateStore::open(RuntimePaths::discover()?)?;
+    let store = if command_uses_nonqualifying_audit_evidence(&command) {
+        runtime_unqualified_state_store()?
+    } else {
+        runtime_qualifying_state_store()?
+    };
     match command {
         Command::Commands => Ok(crate::command_help::envelope()),
         Command::Auth(arguments) => auth_command(&store, arguments.command).await,
@@ -137,7 +143,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
 }
 
 pub async fn execute_natural_language(intent: &str) -> Result<ResultEnvelopeV2> {
-    let store = StateStore::open(RuntimePaths::discover()?)?;
+    let store = runtime_qualifying_state_store()?;
     let agent = configured_agent()?;
     let context = InvocationContext {
         agent_session: env::var_os("CFCTL_AGENT_SESSION").is_some(),
@@ -170,6 +176,29 @@ pub async fn execute_natural_language(intent: &str) -> Result<ResultEnvelopeV2> 
     .with_evidence(evidence);
     envelope.ok = status.success();
     Ok(envelope)
+}
+
+fn runtime_unqualified_state_store() -> Result<StateStore> {
+    Ok(StateStore::open(RuntimePaths::discover()?)?)
+}
+
+fn runtime_qualifying_state_store() -> Result<StateStore> {
+    let store = StateStore::open(RuntimePaths::discover()?)?;
+    let authenticator = std::sync::Arc::new(store.platform_evidence_key_manager()?);
+    Ok(store.with_evidence_authenticator(authenticator)?)
+}
+
+fn command_uses_nonqualifying_audit_evidence(command: &Command) -> bool {
+    match command {
+        // Cancellation de-authorizes a plan and migration imports only
+        // non-secret historical state. Neither command may be blocked by a
+        // missing evidence key, and neither output qualifies future authority.
+        Command::Plans(arguments) => {
+            matches!(&arguments.command, crate::PlansCommand::Cancel(_))
+        }
+        Command::Migrate(_) => true,
+        _ => false,
+    }
 }
 
 pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> {

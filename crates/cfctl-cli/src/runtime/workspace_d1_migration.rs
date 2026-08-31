@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -18,13 +18,72 @@ use super::{
     },
     read_execution::credential_generation_for_read,
     support::cli_io,
-    worker_deployment, workspace_d1_evidence, workspace_d1_projection,
+    worker_deployment, workspace_d1_evidence, workspace_d1_projection, workspace_d1_qualification,
     workspace_d1_reply_admission,
 };
 
 const TARGET_KEY: &str = "workspace_d1_migration";
 const QUERY_TIMEOUT: Duration = Duration::from_mins(2);
 const APPLY_TIMEOUT: Duration = Duration::from_mins(5);
+
+struct MigrationSelection {
+    dir: String,
+    pattern: String,
+    table: String,
+}
+
+fn require_manifest_production_eligibility(
+    contract: &cfctl_core::WorkspaceD1MigrationContractV1,
+    evidence_joins: Option<&cfctl_core::WorkspaceD1EvidenceJoinsV1>,
+) -> Result<()> {
+    let Some(manifest) = contract.manifest_migration.as_ref() else {
+        return Ok(());
+    };
+    if !manifest.require_exact_post_ledger
+        || !manifest.require_exact_schema_sql
+        || !manifest.require_foreign_key_check_empty
+        || !manifest.require_integrity_check_ok
+        || !manifest.require_unchanged_worker_identity
+        || !manifest.require_old_worker_compatibility
+    {
+        return Err(CliError::Input(
+            "workspace D1 manifest production eligibility requires exact post-ledger and schema verification, empty foreign-key checks, a successful integrity check, unchanged Worker identity, and old-Worker compatibility"
+                .to_owned(),
+        ));
+    }
+    let joins = evidence_joins.ok_or_else(|| {
+        CliError::Input(
+            "workspace D1 manifest production eligibility requires provider-isolated atomicity and old-Worker compatibility evidence through six distinct canonical evidence joins"
+                .to_owned(),
+        )
+    })?;
+    let hashes = [
+        joins.atomicity_qualification_evidence_hash.as_str(),
+        joins.old_worker_canary_evidence_hash.as_str(),
+        joins.worker_deployments_evidence_hash.as_str(),
+        joins.worker_version_evidence_hash.as_str(),
+        joins.worker_settings_evidence_hash.as_str(),
+        joins.worker_deployment_plan_hash.as_str(),
+    ];
+    if hashes.iter().any(|hash| !is_canonical_sha256(hash))
+        || hashes.into_iter().collect::<BTreeSet<_>>().len() != 6
+    {
+        return Err(CliError::Input(
+            "workspace D1 manifest production eligibility requires six distinct canonical SHA-256 evidence joins"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
 
 pub(super) fn load(store: &StateStore, capability_id: &str) -> Result<Option<CapabilityV1>> {
     Ok(cfctl_workspace::load_workspace_d1_migration_capability(
@@ -45,8 +104,22 @@ pub(super) fn prepare_plan_target(
         return Ok(None);
     };
     let config = validated_config(contract, input)?;
+    let evidence_joins = contract
+        .manifest_migration
+        .as_ref()
+        .map(|_| workspace_d1_qualification::requested_evidence_joins(store, input))
+        .transpose()?;
+    require_manifest_production_eligibility(contract, evidence_joins.as_ref())?;
+    if let Some(manifest) = &contract.manifest_migration
+        && (account_id != manifest.account_id || profile.id != manifest.profile_id)
+    {
+        return Err(CliError::Input(
+            "workspace D1 manifest operation account or profile differs from its closed contract"
+                .to_owned(),
+        ));
+    }
     let generation = credential_generation_for_read(profile)?;
-    let recovery = fresh_recovery_proof(
+    let mut recovery = fresh_recovery_proof(
         store,
         catalog,
         input,
@@ -56,6 +129,26 @@ pub(super) fn prepare_plan_target(
         contract.recovery_max_age_seconds,
         Utc::now(),
     )?;
+    if contract.manifest_migration.is_some() {
+        recovery
+            .as_object_mut()
+            .ok_or_else(|| {
+                CliError::Input("workspace D1 recovery projection is invalid".to_owned())
+            })?
+            .insert(
+                "full_export".to_owned(),
+                fresh_full_export_proof(
+                    store,
+                    catalog,
+                    input,
+                    &profile.id,
+                    account_id,
+                    &generation,
+                    contract.recovery_max_age_seconds,
+                    Utc::now(),
+                )?,
+            );
+    }
     Ok(Some(json!({
         "schema_version": 1,
         "repository_root": contract.repository_root,
@@ -69,6 +162,16 @@ pub(super) fn prepare_plan_target(
         "account_id": account_id,
         "profile_id": profile.id,
         "credential_generation_id": generation,
+        "manifest_path": contract.manifest_migration.as_ref().map(|value| &value.manifest_path),
+        "manifest_sha256": contract.manifest_migration.as_ref().map(|value| &value.manifest_sha256),
+        "baseline_digest": contract.manifest_migration.as_ref().map(|value| &value.baseline_digest),
+        "target_migration": contract.manifest_migration.as_ref().map(|value| &value.ledger_name),
+        "target_git_blob_oid": contract.manifest_migration.as_ref().map(|value| &value.target_git_blob_oid),
+        "target_sha256": contract.migrations.first().map(|value| &value.sha256),
+        "target_path": contract.migrations.first().map(|value| &value.path),
+        "wrangler_version": contract.wrangler_version,
+        "wrangler_cli_sha256": contract.manifest_migration.as_ref().map(|value| &value.wrangler_cli_sha256),
+        "evidence_joins": evidence_joins,
         "recovery": recovery,
     })))
 }
@@ -122,6 +225,19 @@ fn validate_bound_plan_inner(
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let config = validated_config(contract, &input)?;
     let target = target(plan)?;
+    let evidence_joins = match target.get("evidence_joins") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<cfctl_core::WorkspaceD1EvidenceJoinsV1>(value.clone())
+                .map_err(|_| {
+                    CliError::Input(
+                        "workspace D1 migration evidence joins are malformed; create a new plan"
+                            .to_owned(),
+                    )
+                })?,
+        ),
+    };
+    require_manifest_production_eligibility(contract, evidence_joins.as_ref())?;
     require_target_string(target, "repository_head", &contract.repository_head)?;
     require_target_string(
         target,
@@ -133,6 +249,51 @@ fn validate_bound_plan_inner(
     require_target_string(target, "database_name", &config.database_name)?;
     require_target_string(target, "database_id", &config.database_id)?;
     require_target_string(target, "account_id", &plan.account_id)?;
+    if let Some(manifest) = &contract.manifest_migration {
+        require_target_string(target, "manifest_path", &manifest.manifest_path)?;
+        require_target_string(target, "manifest_sha256", &manifest.manifest_sha256)?;
+        require_target_string(target, "baseline_digest", &manifest.baseline_digest)?;
+        require_target_string(target, "target_migration", &manifest.ledger_name)?;
+        require_target_string(target, "target_git_blob_oid", &manifest.target_git_blob_oid)?;
+        require_target_string(target, "wrangler_version", &contract.wrangler_version)?;
+        require_target_string(target, "wrangler_cli_sha256", &manifest.wrangler_cli_sha256)?;
+        require_target_string(
+            target,
+            "target_sha256",
+            &contract
+                .migrations
+                .first()
+                .ok_or_else(|| CliError::Input("workspace D1 target is missing".to_owned()))?
+                .sha256,
+        )?;
+        require_target_string(
+            target,
+            "target_path",
+            &contract
+                .migrations
+                .first()
+                .ok_or_else(|| CliError::Input("workspace D1 target is missing".to_owned()))?
+                .path,
+        )?;
+        if plan.account_id != manifest.account_id
+            || target_string(target, "profile_id")? != manifest.profile_id
+            || config.database_name != manifest.database_name
+            || config.database_id != manifest.database_id
+        {
+            return Err(CliError::Input(
+                "workspace D1 manifest operation provider identity drifted; create a new plan"
+                    .to_owned(),
+            ));
+        }
+        validate_pinned_wrangler(contract)?;
+        validate_full_export_target(
+            store,
+            target,
+            &plan.catalog_hash,
+            contract.recovery_max_age_seconds,
+            Utc::now(),
+        )?;
+    }
     if require_fresh_recovery {
         validate_recovery_target(
             store,
@@ -146,6 +307,7 @@ fn validate_bound_plan_inner(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run(
     store: &StateStore,
     plan: &PlanV1,
@@ -194,10 +356,14 @@ pub(super) async fn run(
     .await
     .map_err(CliError::delegated_mutation_not_attempted)?;
     let declared = declared_migration_names(contract)?;
-    if !is_prefix(&before, &declared) {
+    let baseline_matches = if contract.manifest_migration.is_some() {
+        before == expected_ledger_before(contract)?
+    } else {
+        is_prefix(&before, &declared)
+    };
+    if !baseline_matches {
         return Err(CliError::Input(
-            "remote Wrangler migration ledger is not a prefix of the repository declaration"
-                .to_owned(),
+            "remote Wrangler migration ledger does not equal the exact planned baseline".to_owned(),
         ));
     }
     if before.len() == declared.len() {
@@ -206,7 +372,18 @@ pub(super) async fn run(
         ));
     }
 
-    let apply = run_wrangler_with_expected_config(
+    let migration_selection = contract.manifest_migration.as_ref().map(|manifest| {
+        let root = Path::new(&contract.repository_root);
+        MigrationSelection {
+            dir: root.join(&contract.migrations_dir).display().to_string(),
+            pattern: root
+                .join(&manifest.migrations_pattern)
+                .display()
+                .to_string(),
+            table: manifest.ledger_table.clone(),
+        }
+    });
+    let apply = run_wrangler_with_migration_selection(
         &[
             "d1".to_owned(),
             "migrations".to_owned(),
@@ -224,6 +401,7 @@ pub(super) async fn run(
         Some(config_sha256),
         Some(&contract.config_template_sha256),
         Some(&contract.database_binding),
+        migration_selection.as_ref(),
     )
     .await?;
     Ok(json!({
@@ -280,6 +458,7 @@ async fn verify_inner(
     verify_inner_with_authority(store, plan, credential, true).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn verify_inner_with_authority(
     store: &StateStore,
     plan: &PlanV1,
@@ -334,7 +513,89 @@ async fn verify_inner_with_authority(
     )
     .await?;
     let assertions_passed = assertion_rows_pass(&assertion_rows, contract.assertions.len());
-    let passed = ledger == declared && assertions_passed;
+    let integrity_rows = if contract
+        .manifest_migration
+        .as_ref()
+        .is_some_and(|manifest| manifest.require_integrity_check_ok)
+    {
+        execute_json_query_with_expected_config(
+            database_name,
+            Some(&contract.database_binding),
+            config,
+            "PRAGMA integrity_check",
+            root,
+            credential,
+            &plan.account_id,
+            &store.paths().cache_dir,
+            Some(config_sha256),
+            Some(&contract.config_template_sha256),
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let integrity_passed = integrity_rows.is_empty()
+        || (integrity_rows.len() == 1
+            && integrity_rows[0]
+                .get("integrity_check")
+                .and_then(Value::as_str)
+                == Some("ok"));
+    let passed = ledger == declared && assertions_passed && integrity_passed;
+    if let Some(manifest) = &contract.manifest_migration {
+        let qualification_evidence_hashes = [
+            workspace_d1_qualification::ATOMICITY_QUALIFICATION_PRECONDITION,
+            workspace_d1_qualification::OLD_WORKER_CANARY_PRECONDITION,
+            workspace_d1_qualification::WORKER_DEPLOYMENTS_PRECONDITION,
+            workspace_d1_qualification::WORKER_VERSION_PRECONDITION,
+            workspace_d1_qualification::WORKER_SETTINGS_PRECONDITION,
+            workspace_d1_qualification::WORKER_DEPLOYMENT_PLAN_PRECONDITION,
+        ]
+        .into_iter()
+        .map(|name| {
+            plan.precondition_hashes
+                .get(name)
+                .cloned()
+                .map(|hash| (name.to_owned(), hash))
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "workspace D1 completion receipt omitted qualification identity `{name}`"
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+        return Ok(json!({
+            "schema_version": 1,
+            "kind": "workspace_d1_migration_completion_v1",
+            "passed": passed,
+            "operation_id": plan.operation_id,
+            "plan_content_hash": plan.content_hash,
+            "cfctl_build_identity_hash": hash_value(&serde_json::to_value(crate::build_identity::current_build_info())?)?,
+            "repository_head": contract.repository_head,
+            "operation_pack_sha256": contract.operation_pack_sha256,
+            "manifest_path": manifest.manifest_path,
+            "manifest_sha256": manifest.manifest_sha256,
+            "account_id": plan.account_id,
+            "profile_id": plan.profile_id,
+            "database_name": database_name,
+            "database_id": manifest.database_id,
+            "database_binding": contract.database_binding,
+            "wrangler_version": contract.wrangler_version,
+            "wrangler_cli_sha256": manifest.wrangler_cli_sha256,
+            "target_sequence": manifest.target_sequence,
+            "target_name": manifest.ledger_name,
+            "target_path": contract.migrations.first().map(|migration| &migration.path),
+            "target_git_blob_oid": manifest.target_git_blob_oid,
+            "target_sha256": contract.migrations.first().map(|migration| &migration.sha256),
+            "post_ledger": ledger,
+            "declared_ledger": declared,
+            "schema_assertions": assertion_rows,
+            "integrity_check": integrity_rows,
+            "qualification_evidence_hashes": qualification_evidence_hashes,
+            "recovery": target.get("recovery").cloned().unwrap_or(Value::Null),
+            "provider_verified": passed,
+            "repository_projection_performed": false,
+        }));
+    }
     Ok(json!({
         "passed": passed,
         "basis": if passed {
@@ -345,6 +606,7 @@ async fn verify_inner_with_authority(
         "ledger": ledger,
         "declared_migrations": declared,
         "schema_assertions": assertion_rows,
+        "integrity_check": integrity_rows,
         "recovery": target.get("recovery").cloned().unwrap_or(Value::Null),
     }))
 }
@@ -378,20 +640,33 @@ pub(super) struct ValidatedConfig {
     pub(super) database_id: String,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn validated_config(
     contract: &cfctl_core::WorkspaceD1MigrationContractV1,
     input: &CallInput,
 ) -> Result<ValidatedConfig> {
-    let raw = input
-        .query
-        .get("config")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("workspace D1 migration requires query config".to_owned())
-        })?;
     let root = fs::canonicalize(&contract.repository_root)
         .map_err(|source| cli_io(Path::new(&contract.repository_root), source))?;
     let expected = root.join(&contract.production_config_path);
+    let raw = if let Some(manifest) = &contract.manifest_migration {
+        if input.query.get("migration").and_then(Value::as_str) != Some(&manifest.ledger_name) {
+            return Err(CliError::Input(
+                "workspace D1 manifest operation requires its exact sole target migration"
+                    .to_owned(),
+            ));
+        }
+        expected.to_str().ok_or_else(|| {
+            CliError::Input("workspace D1 production config path is not UTF-8".to_owned())
+        })?
+    } else {
+        input
+            .query
+            .get("config")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("workspace D1 migration requires query config".to_owned())
+            })?
+    };
     let canonical = fs::canonicalize(raw).map_err(|source| cli_io(Path::new(raw), source))?;
     if canonical != expected {
         return Err(CliError::Input(format!(
@@ -455,6 +730,15 @@ pub(super) fn validated_config(
     if selected_database != identity.database_id {
         return Err(CliError::Input(
             "workspace D1 migration database selector differs from production config".to_owned(),
+        ));
+    }
+    if let Some(manifest) = &contract.manifest_migration
+        && (identity.database_name != manifest.database_name
+            || identity.database_id != manifest.database_id)
+    {
+        return Err(CliError::Input(
+            "workspace D1 production identity differs from the manifest operation contract"
+                .to_owned(),
         ));
     }
     Ok(ValidatedConfig {
@@ -549,6 +833,133 @@ pub(super) fn fresh_recovery_proof(
         "account_id": account_id,
         "credential_generation_id": generation,
     }))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the governed export anchor is valid only under the exact target, catalog, profile, credential generation, and freshness window"
+)]
+fn fresh_full_export_proof(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    input: &CallInput,
+    profile_id: &str,
+    account_id: &str,
+    generation: &str,
+    max_age_seconds: u64,
+    now: chrono::DateTime<Utc>,
+) -> Result<Value> {
+    let database_id = input
+        .selectors
+        .get("database_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("workspace D1 migration requires database_id".to_owned()))?;
+    let export_input = CallInput {
+        selectors: json!({"account_id": account_id, "database_id": database_id}),
+        query: json!({}),
+        ..CallInput::default()
+    };
+    let input_hash = hash_value(&serde_json::to_value(export_input)?)?;
+    let floor = now - ChronoDuration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX));
+    let matches = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| {
+            proof.capability_id == "d1-full-export"
+                && proof.catalog_hash == catalog.schema_hash
+                && proof.input_hash == input_hash
+                && proof.profile_id.as_deref() == Some(profile_id)
+                && proof.account_id.as_deref() == Some(account_id)
+                && proof.credential_generation_id.as_deref() == Some(generation)
+                && proof.outcome == OperationalProofOutcomeV1::Succeeded
+                && proof.observed_at >= floor
+                && proof.observed_at < now
+                && proof
+                    .d1_full_export_governed_execution()
+                    .is_some_and(|binding| {
+                        binding.completion_status == "completed"
+                            && binding.credential_generation_id == generation
+                            && binding.profile_id == profile_id
+                            && binding.catalog_hash == catalog.schema_hash
+                            && binding.request_hash == input_hash
+                    })
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(CliError::Input(
+            "workspace D1 manifest migration requires exactly one fresh completed governed full export bound to the target, catalog, profile, and credential generation"
+                .to_owned(),
+        ));
+    }
+    let proof = &matches[0];
+    let binding = proof
+        .d1_full_export_governed_execution()
+        .ok_or_else(|| CliError::Input("workspace D1 full export lost its binding".to_owned()))?;
+    Ok(json!({
+        "capability_id": proof.capability_id,
+        "observed_at": proof.observed_at,
+        "evidence_hash": proof.evidence.content_hash,
+        "output_file_sha256": binding.output_file_sha256,
+        "bookmark_hash": binding.at_bookmark_hash,
+        "catalog_hash": proof.catalog_hash,
+        "input_hash": proof.input_hash,
+        "profile_id": profile_id,
+        "account_id": account_id,
+        "credential_generation_id": generation,
+        "completion_status": binding.completion_status,
+    }))
+}
+
+fn validate_full_export_target(
+    store: &StateStore,
+    target: &Map<String, Value>,
+    catalog_hash: &str,
+    max_age_seconds: u64,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let export = target
+        .get("recovery")
+        .and_then(Value::as_object)
+        .and_then(|recovery| recovery.get("full_export"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("workspace D1 plan omitted its full-export anchor".to_owned())
+        })?;
+    require_target_string(export, "catalog_hash", catalog_hash)?;
+    require_target_string(export, "profile_id", target_string(target, "profile_id")?)?;
+    require_target_string(export, "account_id", target_string(target, "account_id")?)?;
+    require_target_string(
+        export,
+        "credential_generation_id",
+        target_string(target, "credential_generation_id")?,
+    )?;
+    require_target_string(export, "completion_status", "completed")?;
+    let evidence_hash = target_string(export, "evidence_hash")?;
+    let evidence = store.read_evidence_value(evidence_hash)?;
+    if evidence
+        .pointer("/result/output_file/complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || evidence
+            .pointer("/result/output_file/hash_matches")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(CliError::Input(
+            "workspace D1 full-export evidence is incomplete".to_owned(),
+        ));
+    }
+    let observed_at = target_string(export, "observed_at")?
+        .parse::<chrono::DateTime<Utc>>()
+        .map_err(|_| CliError::Input("workspace D1 full-export time is invalid".to_owned()))?;
+    if now.signed_duration_since(observed_at)
+        > ChronoDuration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX))
+    {
+        return Err(CliError::Input(
+            "workspace D1 full-export anchor is no longer fresh; create a new plan".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_recovery_target(
@@ -879,8 +1290,14 @@ async fn run_wrangler_with_expected_config(
     expected_template_sha256: Option<&str>,
     database_binding: Option<&str>,
 ) -> Result<WranglerOutput> {
+    let local_wrangler = root.join("node_modules/wrangler/bin/wrangler.js");
+    let program = if local_wrangler.is_file() {
+        local_wrangler.as_path()
+    } else {
+        Path::new("wrangler")
+    };
     run_wrangler_program(
-        Path::new("wrangler"),
+        program,
         arguments,
         root,
         credential,
@@ -890,6 +1307,44 @@ async fn run_wrangler_with_expected_config(
         expected_config_sha256,
         expected_template_sha256,
         database_binding,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the closed one-file migration selection joins the immutable private-config identities at the subprocess boundary"
+)]
+async fn run_wrangler_with_migration_selection(
+    arguments: &[String],
+    root: &Path,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+    timeout: Duration,
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+    database_binding: Option<&str>,
+    migration: Option<&MigrationSelection>,
+) -> Result<WranglerOutput> {
+    let local_wrangler = root.join("node_modules/wrangler/bin/wrangler.js");
+    let program = if local_wrangler.is_file() {
+        local_wrangler.as_path()
+    } else {
+        Path::new("wrangler")
+    };
+    run_wrangler_program_inner(
+        program,
+        arguments,
+        root,
+        credential,
+        account_id,
+        cache_dir,
+        timeout,
+        expected_config_sha256,
+        expected_template_sha256,
+        database_binding,
+        migration,
     )
     .await
 }
@@ -910,12 +1365,46 @@ async fn run_wrangler_program(
     expected_template_sha256: Option<&str>,
     database_binding: Option<&str>,
 ) -> Result<WranglerOutput> {
+    run_wrangler_program_inner(
+        program,
+        arguments,
+        root,
+        credential,
+        account_id,
+        cache_dir,
+        timeout,
+        expected_config_sha256,
+        expected_template_sha256,
+        database_binding,
+        None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test seam retains immutable config identities and the optional closed migration selection at one subprocess boundary"
+)]
+async fn run_wrangler_program_inner(
+    program: &Path,
+    arguments: &[String],
+    root: &Path,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+    timeout: Duration,
+    expected_config_sha256: Option<&str>,
+    expected_template_sha256: Option<&str>,
+    database_binding: Option<&str>,
+    migration: Option<&MigrationSelection>,
+) -> Result<WranglerOutput> {
     let mut execution_arguments = arguments.to_vec();
-    let private_config = bind_private_config_from_arguments(
+    let private_config = bind_private_config_from_arguments_inner(
         &mut execution_arguments,
         expected_config_sha256,
         expected_template_sha256,
         database_binding,
+        migration,
     )?;
     let token = credential.bearer_token().ok_or_else(|| {
         CliError::Input(
@@ -991,11 +1480,12 @@ async fn run_wrangler_program(
     })
 }
 
-fn bind_private_config_from_arguments(
+fn bind_private_config_from_arguments_inner(
     arguments: &mut [String],
     expected_config_sha256: Option<&str>,
     expected_template_sha256: Option<&str>,
     database_binding: Option<&str>,
+    migration: Option<&MigrationSelection>,
 ) -> Result<Option<worker_deployment::BoundPrivateConfig>> {
     if arguments
         .iter()
@@ -1038,24 +1528,70 @@ fn bind_private_config_from_arguments(
             )
         })?
     };
-    let bound = Some(
-        worker_deployment::bind_workspace_d1_private_config_for_execution(
-            config,
-            &template,
-            expected_config_sha256,
-            expected_template_sha256,
-            database_binding.ok_or_else(|| {
-                CliError::Input(
-                    "workspace D1 private execution requires the planned database binding"
-                        .to_owned(),
-                )
-            })?,
-        )?,
-    );
+    let database_binding = database_binding.ok_or_else(|| {
+        CliError::Input(
+            "workspace D1 private execution requires the planned database binding".to_owned(),
+        )
+    })?;
+    let mut bound = worker_deployment::bind_workspace_d1_private_config_for_execution(
+        config,
+        &template,
+        expected_config_sha256,
+        expected_template_sha256,
+        database_binding,
+    )?;
+    if let Some(migration) = migration {
+        stage_migration_selection(&mut bound, database_binding, migration)?;
+    }
+    let bound = Some(bound);
     if let Some(bound) = &bound {
         arguments[position] = bound.path().display().to_string();
     }
     Ok(bound)
+}
+
+fn stage_migration_selection(
+    bound: &mut worker_deployment::BoundPrivateConfig,
+    database_binding: &str,
+    migration: &MigrationSelection,
+) -> Result<()> {
+    let text = fs::read_to_string(bound.path()).map_err(|source| cli_io(bound.path(), source))?;
+    let mut document: toml::Value = toml::from_str(&text)
+        .map_err(|_| CliError::Input("workspace D1 staged config is invalid".to_owned()))?;
+    let databases = document
+        .get_mut("d1_databases")
+        .and_then(toml::Value::as_array_mut)
+        .ok_or_else(|| CliError::Input("workspace D1 config omitted bindings".to_owned()))?;
+    let mut selected = databases
+        .iter_mut()
+        .filter(|database| {
+            database.get("binding").and_then(toml::Value::as_str) == Some(database_binding)
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err(CliError::Input(
+            "workspace D1 config did not contain exactly one selected binding".to_owned(),
+        ));
+    }
+    let table = selected[0]
+        .as_table_mut()
+        .ok_or_else(|| CliError::Input("workspace D1 selected binding was invalid".to_owned()))?;
+    table.insert(
+        "migrations_dir".to_owned(),
+        toml::Value::String(migration.dir.clone()),
+    );
+    table.insert(
+        "migrations_pattern".to_owned(),
+        toml::Value::String(migration.pattern.clone()),
+    );
+    table.insert(
+        "migrations_table".to_owned(),
+        toml::Value::String(migration.table.clone()),
+    );
+    let bytes = toml::to_string(&document).map_err(|_| {
+        CliError::Input("workspace D1 staged config could not be rendered".to_owned())
+    })?;
+    bound.replace_staged_bytes(bytes.as_bytes())
 }
 
 #[cfg(test)]
@@ -1107,6 +1643,17 @@ fn project_private_json_query_inner(
     reason = "migration ledger names intentionally require the canonical lowercase .sql suffix; case-insensitive matching would widen the closed private query schema"
 )]
 fn project_migration_query_rows(sql: &str, rows: &[Map<String, Value>]) -> Option<Result<()>> {
+    if sql == "PRAGMA integrity_check" {
+        return Some((|| {
+            if rows.len() != 1
+                || !exact_query_fields(&rows[0], &["integrity_check"])
+                || rows[0].get("integrity_check").and_then(Value::as_str) != Some("ok")
+            {
+                return Err(private_query_value_error());
+            }
+            Ok(())
+        })());
+    }
     if sql.starts_with("SELECT COUNT(*) AS present FROM sqlite_schema ") {
         return Some((|| {
             if rows.len() != 1 || !exact_query_fields(&rows[0], &["present"]) {
@@ -1206,20 +1753,90 @@ pub(super) fn parse_query_rows(stdout: &str) -> Result<Vec<Map<String, Value>>> 
 fn declared_migration_names(
     contract: &cfctl_core::WorkspaceD1MigrationContractV1,
 ) -> Result<Vec<String>> {
-    contract
-        .migrations
-        .iter()
-        .map(|migration| {
-            Path::new(&migration.path)
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    CliError::Input("declared migration path has no filename".to_owned())
-                })
+    let mut names = contract
+        .manifest_migration
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .baseline
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
         })
-        .collect()
+        .unwrap_or_default();
+    names.extend(
+        contract
+            .migrations
+            .iter()
+            .map(|migration| {
+                Path::new(&migration.path)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CliError::Input("declared migration path has no filename".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(names)
+}
+
+fn expected_ledger_before(
+    contract: &cfctl_core::WorkspaceD1MigrationContractV1,
+) -> Result<Vec<String>> {
+    if let Some(manifest) = &contract.manifest_migration {
+        return Ok(manifest
+            .baseline
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect());
+    }
+    let declared = declared_migration_names(contract)?;
+    Ok(declared[..declared.len().saturating_sub(1)].to_vec())
+}
+
+fn validate_pinned_wrangler(contract: &cfctl_core::WorkspaceD1MigrationContractV1) -> Result<()> {
+    let Some(manifest) = &contract.manifest_migration else {
+        return Ok(());
+    };
+    let cli =
+        Path::new(&contract.repository_root).join("node_modules/wrangler/wrangler-dist/cli.js");
+    let bytes = fs::read(&cli).map_err(|source| cli_io(&cli, source))?;
+    if sha256(&bytes) != manifest.wrangler_cli_sha256 {
+        return Err(CliError::Input(
+            "workspace D1 pinned Wrangler entrypoint hash drifted; create a new plan".to_owned(),
+        ));
+    }
+    let source = std::str::from_utf8(&bytes).map_err(|_| {
+        CliError::Input("workspace D1 pinned Wrangler entrypoint is not UTF-8".to_owned())
+    })?;
+    let migration_read = source
+        .find("fs11__namespace.default.readFileSync(\n            `${migrationsPath}/${migration.name}`")
+        .ok_or_else(|| CliError::Input("workspace D1 pinned Wrangler migration builder is unsupported".to_owned()))?;
+    let ledger_insert = source[migration_read..]
+        .find("INSERT INTO ${migrationsConfig.migrationsTableName} (name)")
+        .map(|offset| migration_read + offset)
+        .ok_or_else(|| {
+            CliError::Input("workspace D1 pinned Wrangler ledger builder is unsupported".to_owned())
+        })?;
+    let submitted_query = source[ledger_insert..]
+        .find("command: query")
+        .map(|offset| ledger_insert + offset)
+        .ok_or_else(|| {
+            CliError::Input(
+                "workspace D1 pinned Wrangler does not submit one combined migration query"
+                    .to_owned(),
+            )
+        })?;
+    if !(migration_read < ledger_insert && ledger_insert < submitted_query) {
+        return Err(CliError::Input(
+            "workspace D1 pinned Wrangler migration/ledger query ordering is unsupported"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_prefix(observed: &[String], declared: &[String]) -> bool {
@@ -1251,6 +1868,41 @@ fn compile_assertion_sql(
                 identifier(assertion.table.as_deref())?,
                 identifier(assertion.index.as_deref())?
             ),
+            "object_definition_equals" => {
+                if assertion.table.is_some()
+                    || assertion.column.is_some()
+                    || assertion.index.is_some()
+                {
+                    return Err(CliError::Input(
+                        "workspace D1 exact-object assertion mixed incompatible fields".to_owned(),
+                    ));
+                }
+                let exact = assertion.exact_object.as_ref().ok_or_else(|| {
+                    CliError::Input(
+                        "workspace D1 exact-object assertion omitted its definition".to_owned(),
+                    )
+                })?;
+                if !matches!(exact.object_type.as_str(), "index" | "trigger")
+                    || identifier(Some(&exact.name)).is_err()
+                    || exact
+                        .table
+                        .as_deref()
+                        .is_none_or(|table| identifier(Some(table)).is_err())
+                    || sha256(exact.definition.as_bytes()) != exact.definition_sha256
+                {
+                    return Err(CliError::Input(
+                        "workspace D1 exact-object assertion identity or digest is invalid"
+                            .to_owned(),
+                    ));
+                }
+                format!(
+                    "EXISTS (SELECT 1 FROM sqlite_schema WHERE type = '{}' AND name = '{}' AND tbl_name = '{}' AND sql = '{}')",
+                    exact.object_type,
+                    exact.name,
+                    exact.table.as_deref().unwrap_or_default(),
+                    sql_literal(&exact.definition)?,
+                )
+            }
             "foreign_key_check_empty" => {
                 "NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check)".to_owned()
             }
@@ -1266,6 +1918,15 @@ fn compile_assertion_sql(
         "WITH assertions(assertion, passed) AS (VALUES {}) SELECT assertion, passed FROM assertions",
         values.join(", ")
     ))
+}
+
+fn sql_literal(value: &str) -> Result<String> {
+    if value.is_empty() || value.len() > 32_768 || value.bytes().any(|byte| byte == 0) {
+        return Err(CliError::Input(
+            "workspace D1 exact schema definition is not a bounded SQL string".to_owned(),
+        ));
+    }
+    Ok(value.replace('\'', "''"))
 }
 
 fn identifier(value: Option<&str>) -> Result<&str> {

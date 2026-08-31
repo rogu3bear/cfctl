@@ -1982,6 +1982,7 @@ fn config_contract(
         recovery_capability_id: c.recovery_capability_id.clone(),
         recovery_max_age_seconds: c.recovery_max_age_seconds,
         rollback_capability_id: c.rollback_capability_id.clone(),
+        manifest_migration: None,
     }
 }
 

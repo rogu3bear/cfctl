@@ -1,18 +1,27 @@
 //! Platform-local persistence for plans, evidence, catalogs, and registered roots.
 
+mod evidence;
+
+use evidence::{
+    atomic_create_capability_file, open_evidence_directories, read_optional_capability_file,
+    require_same_canonical_data_root, require_same_capability_directory,
+    require_same_capability_entry,
+};
+
 use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use cap_std::fs::Dir;
+use cfctl_auth::{EvidenceKeyManager, EvidenceMacProvider};
 use cfctl_core::{
-    AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, DeploymentPlanSetV1, EvidenceClass,
-    EvidenceV1, OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1,
-    hash_value, redact_json, redact_json_schema,
+    AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, DeploymentPlanSetV1,
+    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, redact_json,
+    redact_json_schema,
 };
 use cfctl_workspace::{
     WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
@@ -20,7 +29,7 @@ use cfctl_workspace::{
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -46,6 +55,15 @@ pub enum StorageError {
     },
     #[error("stored JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(
+        "managed capability publication crossed for {path}, but temporary alias `{temporary_name}` could not be removed; do not replay the write, and resolve the exact alias before lifecycle scans continue. Directory durability: {directory_durability}. Cleanup error: {source}"
+    )]
+    CapabilityPublicationCleanupFailed {
+        path: String,
+        temporary_name: String,
+        directory_durability: String,
+        source: std::io::Error,
+    },
     #[error("the document contains secret material; store a keychain reference instead")]
     SensitiveData,
     #[error("plan transaction state is invalid: {0}")]
@@ -125,6 +143,8 @@ pub enum StorageError {
     Clock,
     #[error("operational proof is invalid: {0}")]
     InvalidOperationalProof(String),
+    #[error("evidence authentication failed: {0}")]
+    EvidenceAuthentication(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -181,9 +201,44 @@ impl RuntimePaths {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StateStore {
     paths: RuntimePaths,
+    evidence_directories: Arc<EvidenceDirectoryCapabilities>,
+    evidence_authenticator: Option<Arc<dyn EvidenceMacProvider>>,
+}
+
+impl std::fmt::Debug for StateStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StateStore")
+            .field("paths", &self.paths)
+            .field(
+                "evidence_authenticator",
+                &self.evidence_authenticator.as_ref().map(|_| "configured"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+struct EvidenceDirectoryCapabilities {
+    data: Dir,
+    data_identity: Vec<u8>,
+    locks: Dir,
+    lifecycle_lock: cap_std::fs::File,
+    bodies: Dir,
+    bodies_identity: Vec<u8>,
+    descriptors: Dir,
+    descriptors_identity: Vec<u8>,
+    proofs: Dir,
+    proofs_identity: Vec<u8>,
+    location_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EvidenceRootMarkerV1 {
+    schema_version: u8,
+    state_root_identity: String,
 }
 
 /// A bounded projection of the most recently indexed durable proof rows.
@@ -265,8 +320,6 @@ impl StateStore {
             &paths.config_dir,
             &paths.data_dir,
             &paths.cache_dir,
-            &paths.data_dir.join("evidence"),
-            &paths.data_dir.join("evidence-index"),
             &paths.data_dir.join("plans"),
             &paths.data_dir.join("plans-v2"),
             &paths.data_dir.join("plan-sets"),
@@ -283,7 +336,33 @@ impl StateStore {
         ] {
             create_dir_all(path)?;
         }
-        Ok(Self { paths })
+        let evidence_directories = Arc::new(open_evidence_directories(&paths)?);
+        Ok(Self {
+            paths,
+            evidence_directories,
+            evidence_authenticator: None,
+        })
+    }
+
+    pub fn open_authenticated(
+        paths: RuntimePaths,
+        authenticator: Arc<dyn EvidenceMacProvider>,
+    ) -> Result<Self> {
+        Self::open(paths)?.with_evidence_authenticator(authenticator)
+    }
+
+    pub fn with_evidence_authenticator(
+        mut self,
+        authenticator: Arc<dyn EvidenceMacProvider>,
+    ) -> Result<Self> {
+        if authenticator.location_identity() != self.evidence_location_identity() {
+            return Err(StorageError::EvidenceAuthentication(
+                "evidence key authority is bound to a different canonical state location"
+                    .to_owned(),
+            ));
+        }
+        self.evidence_authenticator = Some(authenticator);
+        Ok(self)
     }
 
     #[must_use]
@@ -291,24 +370,64 @@ impl StateStore {
         &self.paths
     }
 
-    pub fn write_evidence(&self, class: EvidenceClass, value: &Value) -> Result<EvidenceV1> {
-        let redacted = redact_json(value);
-        let encoded = serde_json::to_vec_pretty(&redacted)?;
-        let digest = hex::encode(Sha256::digest(&encoded));
-        let content_hash = format!("sha256:{digest}");
-        let path = self
-            .paths
-            .data_dir
-            .join("evidence")
-            .join(format!("{digest}.json"));
-        if !path.exists() {
-            atomic_write(&path, &encoded)?;
+    #[must_use]
+    pub fn evidence_location_identity(&self) -> &str {
+        &self.evidence_directories.location_identity
+    }
+
+    fn require_canonical_evidence_data_root(&self) -> Result<()> {
+        require_same_canonical_data_root(
+            &self.paths.data_dir,
+            &self.evidence_directories.data,
+            &self.evidence_directories.data_identity,
+        )
+    }
+
+    pub fn evidence_root_identity(&self) -> Result<Option<String>> {
+        let Some(bytes) = read_optional_capability_file(
+            &self.evidence_directories.data,
+            "evidence-root-v1.json",
+            &self.paths.data_dir.join("evidence-root-v1.json"),
+        )?
+        else {
+            return Ok(None);
+        };
+        let marker: EvidenceRootMarkerV1 = serde_json::from_slice(&bytes)?;
+        if marker.schema_version != 1 || !is_canonical_sha256_identity(&marker.state_root_identity)
+        {
+            return Err(StorageError::EvidenceAuthentication(
+                "evidence state-root marker is malformed".to_owned(),
+            ));
         }
-        Ok(EvidenceV1::new(
-            class,
-            &content_hash,
-            &path.display().to_string(),
-        ))
+        Ok(Some(marker.state_root_identity))
+    }
+
+    pub fn initialize_evidence_root_identity(&self, state_root_identity: &str) -> Result<()> {
+        if !is_canonical_sha256_identity(state_root_identity) {
+            return Err(StorageError::EvidenceAuthentication(
+                "evidence state-root identity must be canonical lowercase sha256".to_owned(),
+            ));
+        }
+        if self.evidence_root_identity()?.is_some() {
+            return Err(StorageError::EvidenceAuthentication(
+                "evidence state-root marker already exists".to_owned(),
+            ));
+        }
+        let marker = EvidenceRootMarkerV1 {
+            schema_version: 1,
+            state_root_identity: state_root_identity.to_owned(),
+        };
+        atomic_create_capability_file(
+            &self.evidence_directories.data,
+            "evidence-root-v1.json",
+            &serde_json::to_vec_pretty(&marker)?,
+            &self.paths.data_dir.join("evidence-root-v1.json"),
+        )
+    }
+
+    pub fn platform_evidence_key_manager(&self) -> Result<EvidenceKeyManager> {
+        EvidenceKeyManager::platform(self.evidence_location_identity())
+            .map_err(|error| StorageError::EvidenceAuthentication(error.to_string()))
     }
 
     /// Appends one immutable import-protocol checkpoint. The plan lock held by
@@ -406,140 +525,6 @@ impl StateStore {
             checkpoints.push((hash, value));
         }
         Ok(checkpoints)
-    }
-
-    /// Loads one immutable evidence body by its content hash and revalidates
-    /// that the stored bytes still match the requested identity.
-    pub fn read_evidence_value(&self, content_hash: &str) -> Result<Value> {
-        let digest = content_hash.strip_prefix("sha256:").filter(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        });
-        let digest = digest.ok_or_else(|| StorageError::UnsafeManagedDocument {
-            path: "evidence".to_owned(),
-            reason: "evidence hash must be canonical lowercase sha256".to_owned(),
-        })?;
-        let path = self
-            .paths
-            .data_dir
-            .join("evidence")
-            .join(format!("{digest}.json"));
-        let bytes = std::fs::read(&path).map_err(|source| StorageError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        if hex::encode(Sha256::digest(&bytes)) != digest {
-            return Err(StorageError::UnsafeManagedDocument {
-                path: path.display().to_string(),
-                reason: "evidence bytes do not match the requested content hash".to_owned(),
-            });
-        }
-        serde_json::from_slice(&bytes).map_err(StorageError::Json)
-    }
-
-    /// Indexes a live-read receipt by public contract and account scope. The
-    /// evidence body remains immutable and content-addressed; this side index
-    /// is a redacted, append-only lookup surface for coverage and workflows.
-    pub fn record_operational_proof(&self, proof: &OperationalProofV1) -> Result<()> {
-        validate_operational_proof(proof, true)?;
-        validate_operational_evidence(&self.paths, proof)?;
-        let value = serde_json::to_value(proof)?;
-        if redact_json(&value) != value {
-            return Err(StorageError::SensitiveData);
-        }
-        let encoded = serde_json::to_vec_pretty(proof)?;
-        let digest = hex::encode(Sha256::digest(&encoded));
-        let path = self
-            .paths
-            .data_dir
-            .join("evidence-index")
-            .join(format!("{digest}.json"));
-        if validate_existing_managed_file(&path)? {
-            let stored = read_operational_proof_index(&self.paths, &path)?;
-            if stored != *proof {
-                return Err(StorageError::InvalidOperationalProof(
-                    "content-addressed index entry does not match its stored document".to_owned(),
-                ));
-            }
-            return Ok(());
-        }
-        match atomic_create(&path, &encoded) {
-            Ok(()) => Ok(()),
-            Err(StorageError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::AlreadyExists =>
-            {
-                let stored = read_operational_proof_index(&self.paths, &path)?;
-                if stored == *proof {
-                    Ok(())
-                } else {
-                    Err(StorageError::InvalidOperationalProof(
-                        "concurrent content-addressed index entry did not match".to_owned(),
-                    ))
-                }
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn list_operational_proofs(&self) -> Result<Vec<OperationalProofV1>> {
-        let directory = self.paths.data_dir.join("evidence-index");
-        let mut proofs = Vec::new();
-        for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
-            let entry = entry.map_err(|source| io_error(&directory, source))?;
-            if entry.path().extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
-                continue;
-            }
-            proofs.push(read_operational_proof_index(&self.paths, &entry.path())?);
-        }
-        proofs.sort_by_key(|proof| proof.observed_at);
-        Ok(proofs)
-    }
-
-    /// Returns at most `limit` most recently indexed proof rows. The directory
-    /// walk validates every candidate's managed filename and file type, but
-    /// only the bounded projection is decoded and joined to evidence bodies.
-    pub fn list_recent_operational_proofs(&self, limit: usize) -> Result<OperationalProofPageV1> {
-        let directory = self.paths.data_dir.join("evidence-index");
-        let mut newest = BinaryHeap::<Reverse<(SystemTime, PathBuf)>>::new();
-        let mut total_count = 0_usize;
-        for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
-            let entry = entry.map_err(|source| io_error(&directory, source))?;
-            let path = entry.path();
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
-                continue;
-            }
-            validate_proof_index_filename(&path)?;
-            if !validate_existing_managed_file(&path)? {
-                return Err(unsafe_managed_document(
-                    &path,
-                    "directory entry disappeared while listing",
-                ));
-            }
-            total_count = total_count.saturating_add(1);
-            if limit == 0 {
-                continue;
-            }
-            let modified = fs::metadata(&path)
-                .map_err(|source| io_error(&path, source))?
-                .modified()
-                .map_err(|source| io_error(&path, source))?;
-            newest.push(Reverse((modified, path)));
-            if newest.len() > limit {
-                newest.pop();
-            }
-        }
-        let mut proofs = newest
-            .into_iter()
-            .map(|Reverse((_, path))| read_operational_proof_index(&self.paths, &path))
-            .collect::<Result<Vec<_>>>()?;
-        proofs.sort_by_key(|proof| proof.observed_at);
-        Ok(OperationalProofPageV1 {
-            truncated: total_count > proofs.len(),
-            total_count,
-            proofs,
-        })
     }
 
     pub fn save_plan(&self, plan: &PlanV1) -> Result<()> {
@@ -917,6 +902,79 @@ impl StateStore {
         }
         authorities.sort_by_key(|authority: &StandingAuthorityV1| authority.created_at);
         Ok(authorities)
+    }
+
+    /// Serializes the platform evidence-key lifecycle with authenticated
+    /// descriptor and proof publication for this exact state root.
+    ///
+    /// Lock order is stable: callers may already hold one resource lock such
+    /// as a plan lock, then acquire this lifecycle lock. Code holding this
+    /// guard must never acquire another `StateStore` lock.
+    pub fn lock_evidence_lifecycle(&self) -> Result<EvidenceLifecycleLock> {
+        let name = "evidence-lifecycle.lock";
+        let path = self.paths.data_dir.join("locks").join(name);
+        let pinned_metadata = self
+            .evidence_directories
+            .lifecycle_lock
+            .metadata()
+            .map_err(|source| io_error(&path, source))?;
+        require_same_capability_entry(
+            &self.evidence_directories.locks,
+            name,
+            &pinned_metadata,
+            &path,
+        )?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        let capability_file = self
+            .evidence_directories
+            .locks
+            .open_with(name, &options)
+            .map_err(|source| io_error(&path, source))?;
+        let opened_metadata = capability_file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?;
+        if !same_filesystem_identity(&pinned_metadata, &opened_metadata) {
+            return Err(unsafe_managed_document(
+                &path,
+                "evidence lifecycle lock changed while its capability was opened",
+            ));
+        }
+        let file = capability_file.into_std();
+        file.lock().map_err(|source| io_error(&path, source))?;
+        require_same_capability_entry(
+            &self.evidence_directories.locks,
+            name,
+            &pinned_metadata,
+            &path,
+        )?;
+        self.require_canonical_evidence_data_root()?;
+        for (name, directory, identity) in [
+            (
+                "evidence",
+                &self.evidence_directories.bodies,
+                self.evidence_directories.bodies_identity.as_slice(),
+            ),
+            (
+                "evidence-descriptors",
+                &self.evidence_directories.descriptors,
+                self.evidence_directories.descriptors_identity.as_slice(),
+            ),
+            (
+                "evidence-index",
+                &self.evidence_directories.proofs,
+                self.evidence_directories.proofs_identity.as_slice(),
+            ),
+        ] {
+            require_same_capability_directory(
+                &self.evidence_directories.data,
+                name,
+                directory,
+                identity,
+                &self.paths.data_dir.join(name),
+            )?;
+        }
+        Ok(EvidenceLifecycleLock { _file: file })
     }
 
     pub fn lock_plan(&self, operation_id: &str) -> Result<PlanLock> {
@@ -1487,331 +1545,6 @@ fn ensure_authority_identity(authority: &StandingAuthorityV1, filename_id: &str)
     Ok(())
 }
 
-fn validate_operational_proof(
-    proof: &OperationalProofV1,
-    require_credential_generation: bool,
-) -> Result<()> {
-    if proof.schema_version != 1 {
-        return Err(StorageError::InvalidOperationalProof(format!(
-            "unsupported schema version {}",
-            proof.schema_version
-        )));
-    }
-    if proof.capability_id.trim().is_empty() {
-        return Err(StorageError::InvalidOperationalProof(
-            "capability identity must be non-empty".to_owned(),
-        ));
-    }
-    validate_sha256_identity("catalog", &proof.catalog_hash)?;
-    validate_sha256_identity("input", &proof.input_hash)?;
-    validate_optional_scope("profile", proof.profile_id.as_deref())?;
-    validate_optional_scope("account", proof.account_id.as_deref())?;
-    validate_optional_scope(
-        "credential generation",
-        proof.credential_generation_id.as_deref(),
-    )?;
-    if proof.credential_generation_id.is_some() && proof.profile_id.is_none() {
-        return Err(StorageError::InvalidOperationalProof(
-            "credential generation requires a profile scope".to_owned(),
-        ));
-    }
-    if require_credential_generation
-        && (proof.profile_id.is_none() || proof.credential_generation_id.is_none())
-    {
-        return Err(StorageError::InvalidOperationalProof(
-            "new operational proof requires profile and credential-generation scope".to_owned(),
-        ));
-    }
-    if let Some(generation) = proof.credential_generation_id.as_deref()
-        && Uuid::parse_str(generation).is_err()
-    {
-        return Err(StorageError::InvalidOperationalProof(
-            "credential generation must be a UUID".to_owned(),
-        ));
-    }
-    if proof.evidence.class != EvidenceClass::LiveRead {
-        return Err(StorageError::InvalidOperationalProof(
-            "only live-read evidence can enter the operational proof index".to_owned(),
-        ));
-    }
-    validate_sha256_identity("evidence", &proof.evidence.content_hash)?;
-    validate_d1_full_export_execution_binding(proof)?;
-    validate_mln_0142_execution_binding(proof)?;
-    validate_mln_0143_execution_binding(proof)?;
-    Ok(())
-}
-
-fn validate_d1_full_export_execution_binding(proof: &OperationalProofV1) -> Result<()> {
-    let binding = proof.d1_full_export_governed_execution();
-    if proof.capability_id == "d1-full-export" && binding.is_none() {
-        return Err(StorageError::InvalidOperationalProof(
-            "D1 full-export operational proof requires governed-execution provenance".to_owned(),
-        ));
-    }
-    let Some(binding) = binding else {
-        return Ok(());
-    };
-    for (label, value) in [
-        ("binding catalog", binding.catalog_hash.as_str()),
-        ("target scope", binding.target_scope_hash.as_str()),
-        ("output file", binding.output_file_sha256.as_str()),
-        ("captured bookmark", binding.at_bookmark_hash.as_str()),
-        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
-        ("request", binding.request_hash.as_str()),
-    ] {
-        validate_sha256_identity(label, value)?;
-    }
-    if binding.schema_version != 1
-        || binding.capability_id != "d1-full-export"
-        || proof.capability_id != binding.capability_id
-        || proof.catalog_hash != binding.catalog_hash
-        || proof.input_hash != binding.request_hash
-        || proof.evidence.content_hash != binding.manifest_evidence_hash
-        || proof.profile_id.as_deref() != Some(binding.profile_id.as_str())
-        || proof.credential_generation_id.as_deref()
-            != Some(binding.credential_generation_id.as_str())
-        || Uuid::parse_str(&binding.operation_id).is_err()
-        || Uuid::parse_str(&binding.credential_generation_id).is_err()
-        || binding.profile_id.trim().is_empty()
-        || binding.completion_status != "completed"
-        || proof.outcome != cfctl_core::OperationalProofOutcomeV1::Succeeded
-        || proof.observed_at != binding.completed_at
-    {
-        return Err(StorageError::InvalidOperationalProof(
-            "D1 full-export binding drifted from its immutable completed proof".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_mln_0142_execution_binding(proof: &OperationalProofV1) -> Result<()> {
-    let binding = proof.mln_0142_governed_execution();
-    if proof.capability_id == "mln-0142-post-import-schema" && binding.is_none() {
-        return Err(StorageError::InvalidOperationalProof(
-            "MLN 0142 operational proof requires governed-execution provenance".to_owned(),
-        ));
-    }
-    let Some(binding) = binding else {
-        return Ok(());
-    };
-    for (label, value) in [
-        ("binding catalog", binding.catalog_hash.as_str()),
-        ("target scope", binding.target_scope_hash.as_str()),
-        (
-            "import boundary",
-            binding.import_boundary_evidence_hash.as_str(),
-        ),
-        ("import source", binding.import_source_sha256.as_str()),
-        ("import plan", binding.import_plan_hash.as_str()),
-        ("final bookmark", binding.final_bookmark_hash.as_str()),
-        (
-            "trigger definition",
-            binding.trigger_definition_sha256.as_str(),
-        ),
-        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
-        ("request", binding.request_hash.as_str()),
-    ] {
-        validate_sha256_identity(label, value)?;
-    }
-    let credential_generation_id = proof.credential_generation_id.as_deref().ok_or_else(|| {
-        StorageError::InvalidOperationalProof(
-            "MLN 0142 execution binding requires a credential generation".to_owned(),
-        )
-    })?;
-    if binding.schema_version != 1
-        || Uuid::parse_str(&binding.operation_id).is_err()
-        || Uuid::parse_str(&binding.import_operation_id).is_err()
-        || binding.capability_id != proof.capability_id
-        || binding.capability_version != 1
-        || binding.catalog_hash != proof.catalog_hash
-        || binding.manifest_evidence_hash != proof.evidence.content_hash
-        || binding.request_hash != proof.input_hash
-        || binding.credential_generation_id != credential_generation_id
-        || binding.trigger_name != "document_render_jobs_terminal_generation_guard"
-        || binding.trigger_definition_sha256
-            != "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"
-        || binding.completion_status != "completed"
-        || binding.completed_at != proof.observed_at
-    {
-        return Err(StorageError::InvalidOperationalProof(
-            "MLN 0142 governed-execution provenance is incomplete or does not match its operational proof"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()> {
-    let binding = proof.mln_0143_governed_execution();
-    if proof.capability_id == "mln-0143-data-invariants" && binding.is_none() {
-        return Err(StorageError::InvalidOperationalProof(
-            "MLN 0143 operational proof requires governed-execution provenance".to_owned(),
-        ));
-    }
-    let Some(binding) = binding else {
-        return Ok(());
-    };
-    let profile_id = proof.profile_id.as_deref().ok_or_else(|| {
-        StorageError::InvalidOperationalProof(
-            "MLN 0143 execution binding requires a profile identity".to_owned(),
-        )
-    })?;
-    let credential_generation_id = proof.credential_generation_id.as_deref().ok_or_else(|| {
-        StorageError::InvalidOperationalProof(
-            "MLN 0143 execution binding requires a credential generation".to_owned(),
-        )
-    })?;
-    for (label, value) in [
-        (
-            "validator contract",
-            binding.validator_contract_hash.as_str(),
-        ),
-        ("fixed query", binding.fixed_query_sha256.as_str()),
-        ("binding catalog", binding.catalog_hash.as_str()),
-        ("target scope", binding.target_scope_hash.as_str()),
-        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
-        ("request", binding.request_hash.as_str()),
-        ("profile identity", binding.profile_identity_hash.as_str()),
-    ] {
-        validate_sha256_identity(label, value)?;
-    }
-    if let Some(lineage_hash) = binding.cross_operation_lineage_hash.as_deref() {
-        validate_sha256_identity("cross-operation lineage", lineage_hash)?;
-    }
-    let expected_profile_identity = hash_value(&json!({
-        "profile_id": profile_id,
-        "credential_generation_id": credential_generation_id,
-    }))
-    .map_err(|error| StorageError::InvalidOperationalProof(error.to_string()))?;
-    if binding.schema_version != 1
-        || Uuid::parse_str(&binding.operation_id).is_err()
-        || binding.capability_id != proof.capability_id
-        || binding.capability_version != 5
-        || binding.catalog_hash != proof.catalog_hash
-        || binding.manifest_evidence_hash != proof.evidence.content_hash
-        || binding.request_hash != proof.input_hash
-        || binding.profile_identity_hash != expected_profile_identity
-        || binding.credential_generation_id != credential_generation_id
-        || !matches!(
-            binding.phase.as_str(),
-            "pre_import" | "post_import" | "post_restore"
-        )
-        || binding.completion_status != "completed"
-        || binding.completed_at != proof.observed_at
-        || (binding.phase == "pre_import") != binding.cross_operation_lineage_hash.is_none()
-    {
-        return Err(StorageError::InvalidOperationalProof(
-            "MLN 0143 governed-execution provenance is incomplete or does not match its operational proof"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_sha256_identity(label: &str, identity: &str) -> Result<()> {
-    let Some(digest) = identity.strip_prefix("sha256:") else {
-        return Err(StorageError::InvalidOperationalProof(format!(
-            "{label} identity must use sha256"
-        )));
-    };
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(StorageError::InvalidOperationalProof(format!(
-            "{label} identity must be an exact lowercase sha256 digest"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_optional_scope(label: &str, value: Option<&str>) -> Result<()> {
-    if value.is_some_and(|value| value.trim().is_empty()) {
-        return Err(StorageError::InvalidOperationalProof(format!(
-            "{label} scope must be non-empty when present"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_operational_evidence(paths: &RuntimePaths, proof: &OperationalProofV1) -> Result<()> {
-    let Some(digest) = proof.evidence.content_hash.strip_prefix("sha256:") else {
-        return Err(StorageError::InvalidOperationalProof(
-            "evidence content identity is not sha256".to_owned(),
-        ));
-    };
-    let expected = paths
-        .data_dir
-        .join("evidence")
-        .join(format!("{digest}.json"));
-    let recorded = Path::new(&proof.evidence.path);
-    if recorded != expected {
-        return Err(StorageError::InvalidOperationalProof(
-            "evidence path is not the content-addressed file in this state store".to_owned(),
-        ));
-    }
-    if !validate_existing_managed_file(&expected)? {
-        return Err(StorageError::InvalidOperationalProof(
-            "indexed evidence file does not exist".to_owned(),
-        ));
-    }
-    let encoded = fs::read(&expected).map_err(|source| io_error(&expected, source))?;
-    if hex::encode(Sha256::digest(&encoded)) != digest {
-        return Err(StorageError::InvalidOperationalProof(
-            "indexed evidence file no longer matches its content hash".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_proof_index_filename(path: &Path) -> Result<()> {
-    let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
-        return Err(unsafe_managed_document(
-            path,
-            "proof-index filename is not valid UTF-8",
-        ));
-    };
-    if stem.len() != 64
-        || !stem
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(unsafe_managed_document(
-            path,
-            "proof-index filename is not a lowercase sha256 digest",
-        ));
-    }
-    Ok(())
-}
-
-fn read_operational_proof_index(paths: &RuntimePaths, path: &Path) -> Result<OperationalProofV1> {
-    validate_proof_index_filename(path)?;
-    if !validate_existing_managed_file(path)? {
-        return Err(unsafe_managed_document(
-            path,
-            "proof-index entry disappeared while reading",
-        ));
-    }
-    let encoded = fs::read(path).map_err(|source| io_error(path, source))?;
-    let actual_digest = hex::encode(Sha256::digest(&encoded));
-    let filename_digest = path
-        .file_stem()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| unsafe_managed_document(path, "proof-index filename is not valid UTF-8"))?;
-    if actual_digest != filename_digest {
-        return Err(StorageError::InvalidOperationalProof(
-            "proof-index filename does not match the exact stored bytes".to_owned(),
-        ));
-    }
-    let proof: OperationalProofV1 = serde_json::from_slice(&encoded)?;
-    // Pre-generation rows remain readable for audit/history, but freshness
-    // projects them as credential_unbound and the writer never creates more.
-    validate_operational_proof(&proof, false)?;
-    validate_operational_evidence(paths, &proof)?;
-    Ok(proof)
-}
-
 fn validate_existing_managed_file(path: &Path) -> Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1955,6 +1688,11 @@ impl Drop for PlanLock {
 }
 
 #[derive(Debug)]
+pub struct EvidenceLifecycleLock {
+    _file: fs::File,
+}
+
+#[derive(Debug)]
 pub struct AuthorityLock {
     _file: fs::File,
     authority_id: String,
@@ -2052,6 +1790,51 @@ fn validate_admission_bundle_identity(
         });
     }
     Ok(())
+}
+
+fn sync_capability_directory(directory: &Dir) -> std::io::Result<()> {
+    directory
+        .try_clone()
+        .and_then(|clone| clone.into_std_file().sync_all())
+}
+
+#[cfg(unix)]
+fn same_filesystem_identity(first: &cap_std::fs::Metadata, second: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    first.dev() == second.dev() && first.ino() == second.ino()
+}
+
+#[cfg(windows)]
+fn same_filesystem_identity(first: &cap_std::fs::Metadata, second: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    stable_windows_identity_matches(
+        (
+            first.volume_serial_number(),
+            first.file_index(),
+            first.creation_time(),
+        ),
+        (
+            second.volume_serial_number(),
+            second.file_index(),
+            second.creation_time(),
+        ),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_filesystem_identity(first: &cap_std::fs::Metadata, second: &cap_std::fs::Metadata) -> bool {
+    first.file_type() == second.file_type() && first.len() == second.len()
+}
+
+fn is_canonical_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn create_dir_all(path: &Path) -> Result<()> {
@@ -2154,115 +1937,33 @@ fn write_durability_unknown(path: &Path, source: std::io::Error) -> StorageError
 mod durability_tests {
     use super::*;
 
-    fn injected_directory_sync_failure(_directory: &Path) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "injected parent-directory sync failure",
-        ))
-    }
-
     #[test]
-    fn atomic_create_does_not_acknowledge_a_failed_directory_sync() {
+    fn atomic_state_writes_never_acknowledge_failed_directory_durability() {
         let root = tempfile::tempdir().expect("temporary storage root");
-        let path = root.path().join("authority.json");
-        let expected_path = path.display().to_string();
-
-        let error = atomic_create_with_directory_sync(
-            &path,
-            b"new authority",
-            injected_directory_sync_failure,
-        )
-        .expect_err("create must not report success without directory durability");
-        assert!(error.to_string().contains("reload the exact document"));
-
-        assert!(matches!(
-            error,
-            StorageError::WriteDurabilityUnknown { path: error_path, source }
-                if error_path == expected_path
-                    && source.kind() == std::io::ErrorKind::Other
-                    && source.to_string().contains("parent-directory sync failure")
-        ));
-        assert_eq!(
-            fs::read(&path).expect("rename completed before injected sync failure"),
-            b"new authority"
-        );
-    }
-
-    #[test]
-    fn atomic_replace_reports_ambiguous_durability_after_directory_sync_failure() {
-        let root = tempfile::tempdir().expect("temporary storage root");
-        let path = root.path().join("authority.json");
-        let expected_path = path.display().to_string();
-        fs::write(&path, b"active authority").expect("write existing authority");
-
-        let error = atomic_write_with_directory_sync(
-            &path,
-            b"revoked authority",
-            injected_directory_sync_failure,
-        )
-        .expect_err("replace must not report success without directory durability");
-
-        assert!(matches!(
-            error,
-            StorageError::WriteDurabilityUnknown { path: error_path, source }
-                if error_path == expected_path
-                    && source.kind() == std::io::ErrorKind::Other
-                    && source.to_string().contains("parent-directory sync failure")
-        ));
-        assert_eq!(
-            fs::read(&path).expect("rename completed before injected sync failure"),
-            b"revoked authority"
-        );
-    }
-
-    #[test]
-    fn worker_deployment_lock_serializes_one_exact_account_and_script() {
-        let root = tempfile::tempdir().expect("temporary storage root");
-        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
-        let account = "a".repeat(32);
-        let first = store
-            .lock_worker_deployment(&account, "jkca-web-drop")
-            .expect("first exact target lock");
-        assert!(matches!(
-            store.lock_worker_deployment(&account, "jkca-web-drop"),
-            Err(StorageError::WorkerDeploymentLocked { .. })
-        ));
-        assert!(
-            store
-                .lock_worker_deployment(&account, "jkca-web-sign")
-                .is_ok()
-        );
-        drop(first);
-        assert!(
-            store
-                .lock_worker_deployment(&account, "jkca-web-drop")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn email_routing_catch_all_lock_serializes_one_exact_account_and_zone() {
-        let root = tempfile::tempdir().expect("temporary storage root");
-        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
-        let account = "a".repeat(32);
-        let zone = "b".repeat(32);
-        let first = store
-            .lock_email_routing_catch_all(&account, &zone)
-            .expect("first exact target lock");
-        assert!(matches!(
-            store.lock_email_routing_catch_all(&account, &zone),
-            Err(StorageError::EmailRoutingCatchAllLocked { .. })
-        ));
-        assert!(
-            store
-                .lock_email_routing_catch_all(&account, &"c".repeat(32))
-                .is_ok()
-        );
-        drop(first);
-        assert!(store.lock_email_routing_catch_all(&account, &zone).is_ok());
-        assert!(
-            store
-                .lock_email_routing_catch_all(&account, "not-a-zone-id")
-                .is_err()
-        );
+        for (name, replace, expected) in [
+            ("create.json", false, b"new authority".as_slice()),
+            ("replace.json", true, b"revoked authority".as_slice()),
+        ] {
+            let path = root.path().join(name);
+            if replace {
+                fs::write(&path, b"active authority").expect("seed authority");
+            }
+            let result = if replace {
+                atomic_write_with_directory_sync(&path, expected, |_| {
+                    Err(std::io::Error::other("injected directory sync failure"))
+                })
+            } else {
+                atomic_create_with_directory_sync(&path, expected, |_| {
+                    Err(std::io::Error::other("injected directory sync failure"))
+                })
+            };
+            assert!(matches!(
+                result,
+                Err(StorageError::WriteDurabilityUnknown { path: failed, source })
+                    if failed == path.display().to_string()
+                        && source.to_string().contains("directory sync failure")
+            ));
+            assert_eq!(fs::read(path).expect("replacement crossed"), expected);
+        }
     }
 }

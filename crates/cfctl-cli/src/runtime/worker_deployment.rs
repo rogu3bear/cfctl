@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Read as _, Write as _},
+    io::{Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -371,6 +371,27 @@ impl BoundPrivateConfig {
 
     pub(super) fn retained_text_contains_private_representation(&self, value: &str) -> bool {
         self.private_representations.contains_in_text(value)
+    }
+
+    pub(super) fn replace_staged_bytes(&mut self, bytes: &[u8]) -> Result<(), CliError> {
+        let path = self.staged.path().display().to_string();
+        let file = self.staged.as_file_mut();
+        file.set_len(0)
+            .and_then(|()| file.rewind())
+            .and_then(|()| file.write_all(bytes))
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_data())
+            .map_err(|source| CliError::Io { path, source })?;
+        if fs::read(self.staged.path()).map_err(|source| CliError::Io {
+            path: self.staged.path().display().to_string(),
+            source,
+        })? != bytes
+        {
+            return Err(CliError::Input(
+                "private Worker execution config staging failed closed".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -793,6 +814,7 @@ pub(super) fn bind_workspace_d1_private_config_for_execution(
     )
 }
 
+#[derive(Clone, Copy)]
 enum PrivateConfigOverlay<'a> {
     WorkerDeployment,
     WorkspaceD1 { database_binding: &'a str },
@@ -911,6 +933,8 @@ fn bind_private_config_path_with_template_and_overlay_for_execution(
     let private_representations =
         PrivateRepresentationGuard::from_documents(&production, &normalized);
 
+    let expected_staged_bytes = production_bytes;
+
     let directory = config.parent().ok_or_else(|| {
         CliError::Input("private Worker production config has no containing directory".to_owned())
     })?;
@@ -923,7 +947,7 @@ fn bind_private_config_path_with_template_and_overlay_for_execution(
             source,
         })?;
     staged
-        .write_all(&production_bytes)
+        .write_all(&expected_staged_bytes)
         .and_then(|()| staged.flush())
         .and_then(|()| staged.as_file().sync_data())
         .map_err(|source| CliError::Io {
@@ -943,7 +967,7 @@ fn bind_private_config_path_with_template_and_overlay_for_execution(
         path: staged.path().display().to_string(),
         source,
     })?;
-    if staged_bytes != production_bytes {
+    if staged_bytes != expected_staged_bytes {
         return Err(CliError::Input(
             "private Worker execution config did not preserve the reviewed bytes".to_owned(),
         ));
@@ -1641,7 +1665,9 @@ pub(super) fn apply_state_responses(
     )))
 }
 
-fn current_active_deployment_identity(deployments: &Value) -> Result<(&str, &str), CliError> {
+pub(super) fn current_active_deployment_identity(
+    deployments: &Value,
+) -> Result<(&str, &str), CliError> {
     let history = deployments
         .get("deployments")
         .and_then(Value::as_array)

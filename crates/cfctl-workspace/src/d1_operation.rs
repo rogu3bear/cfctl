@@ -7,8 +7,9 @@ use std::{
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1, CostExposureV1,
     CostV1, EffectClass, EntitlementV1, KnowledgeReferenceV1, Maturity, RiskClass, RollbackSpecV1,
-    SelectorV1, VerificationSpecV1, WorkspaceD1MigrationContractV1, WorkspaceD1MigrationFileV1,
-    WorkspaceD1SchemaAssertionV1,
+    SelectorV1, VerificationSpecV1, WorkspaceD1ExactObjectAssertionV1,
+    WorkspaceD1ManifestMigrationContractV1, WorkspaceD1MigrationContractV1,
+    WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1, WorkspaceD1SchemaAssertionV1,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -45,6 +46,89 @@ struct OperationDeclaration {
 struct MigrationDeclaration {
     path: String,
     sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationPackV2 {
+    schema_version: u8,
+    operation: Vec<OperationDeclarationV2>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationDeclarationV2 {
+    id: String,
+    title: String,
+    description: String,
+    authority: String,
+    manifest_path: String,
+    config_template: String,
+    account_id: String,
+    profile_id: String,
+    database_name: String,
+    database_id: String,
+    database_binding: String,
+    baseline_start_sequence: u64,
+    baseline_end_sequence: u64,
+    target_sequence: u64,
+    migrations_dir: String,
+    migrations_pattern: String,
+    ledger_table: String,
+    ledger_name: String,
+    wrangler_version: String,
+    wrangler_cli_sha256: String,
+    recovery: RecoveryDeclarationV2,
+    atomicity: AtomicityDeclarationV2,
+    verification: VerificationDeclarationV2,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryDeclarationV2 {
+    full_export_capability_id: String,
+    bookmark_capability_id: String,
+    rollback_capability_id: String,
+    requires_fresh_full_export: bool,
+    requires_fresh_bookmark: bool,
+    existing_anchor_reusable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct AtomicityDeclarationV2 {
+    local_ddl_failure_zero_schema_delta: bool,
+    local_ddl_failure_zero_ledger_delta: bool,
+    local_ledger_failure_zero_schema_delta: bool,
+    local_ledger_failure_zero_ledger_delta: bool,
+    remote_ddl_failure_zero_schema_delta: bool,
+    remote_ddl_failure_zero_ledger_delta: bool,
+    remote_ledger_failure_zero_schema_delta: bool,
+    remote_ledger_failure_zero_ledger_delta: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct VerificationDeclarationV2 {
+    require_exact_post_ledger: bool,
+    forbidden_future_sequences: Vec<u64>,
+    require_exact_schema_sql: bool,
+    require_foreign_key_check_empty: bool,
+    require_integrity_check_ok: bool,
+    require_unchanged_worker_identity: bool,
+    require_old_worker_compatibility: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationManifestV1 {
+    manifest_version: u8,
+    migrations: Vec<MigrationManifestEntryV1>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationManifestEntryV1 {
+    sequence: u64,
+    file: String,
+    sha256: String,
+    predecessor: Option<String>,
+    production_applied: bool,
 }
 
 /// Loads one uniquely named D1 migration capability from clean repositories
@@ -103,11 +187,21 @@ fn load_from_repository(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invariant("workspace operation repository has no origin"))?;
     let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH))?;
-    let pack: OperationPack = toml::from_str(
-        std::str::from_utf8(&pack_bytes)
-            .map_err(|_| invariant("workspace operation pack is not UTF-8"))?,
-    )
-    .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
+    let pack_text = std::str::from_utf8(&pack_bytes)
+        .map_err(|_| invariant("workspace operation pack is not UTF-8"))?;
+    let pack_value: toml::Value = toml::from_str(pack_text)
+        .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
+    if pack_value
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        == Some(2)
+    {
+        let pack: OperationPackV2 = toml::from_str(pack_text)
+            .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
+        return load_manifest_operation(repository, capability_id, head, origin, &pack_bytes, pack);
+    }
+    let pack: OperationPack = toml::from_str(pack_text)
+        .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
     if pack.schema_version != PACK_SCHEMA_VERSION {
         return Err(invariant(
             "workspace operation pack schema version is unsupported",
@@ -185,8 +279,482 @@ fn load_from_repository(
         recovery_capability_id: operation.recovery_capability_id.clone(),
         recovery_max_age_seconds: operation.recovery_max_age_seconds,
         rollback_capability_id: operation.rollback_capability_id.clone(),
+        manifest_migration: None,
     };
     Ok(Some(capability(operation, contract)))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the v2 loader atomically binds manifest, baseline, sole target, pinned Wrangler, recovery, and verification authority"
+)]
+fn load_manifest_operation(
+    repository: &super::RepositoryNode,
+    capability_id: &str,
+    head: &str,
+    origin: String,
+    pack_bytes: &[u8],
+    pack: OperationPackV2,
+) -> Result<Option<CapabilityV1>> {
+    if pack.schema_version != 2 {
+        return Err(invariant(
+            "workspace operation pack schema version is unsupported",
+        ));
+    }
+    if pack
+        .operation
+        .iter()
+        .map(|operation| operation.id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != pack.operation.len()
+    {
+        return Err(invariant("workspace operation pack contains duplicate ids"));
+    }
+    let Some(operation) = pack
+        .operation
+        .iter()
+        .find(|operation| operation.id == capability_id)
+    else {
+        return Ok(None);
+    };
+    validate_manifest_operation(operation)?;
+
+    let manifest_relative = safe_relative(&operation.manifest_path)?;
+    let manifest_bytes = committed_file(&repository.path, &manifest_relative)?;
+    let manifest: MigrationManifestV1 = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| invariant("workspace D1 migration manifest is invalid"))?;
+    if manifest.manifest_version != 1 {
+        return Err(invariant(
+            "workspace D1 migration manifest version is unsupported",
+        ));
+    }
+    let unique_sequences = manifest
+        .migrations
+        .iter()
+        .map(|entry| entry.sequence)
+        .collect::<BTreeSet<_>>();
+    let unique_names = manifest
+        .migrations
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect::<BTreeSet<_>>();
+    let pending = manifest
+        .migrations
+        .iter()
+        .filter(|entry| !entry.production_applied)
+        .collect::<Vec<_>>();
+    let governed = manifest
+        .migrations
+        .iter()
+        .filter(|entry| entry.sequence >= operation.baseline_start_sequence)
+        .collect::<Vec<_>>();
+    let mut pending_seen = false;
+    for (index, entry) in governed.iter().enumerate() {
+        let expected_sequence = operation.baseline_start_sequence
+            + u64::try_from(index)
+                .map_err(|_| invariant("workspace D1 manifest succession is too large"))?;
+        let expected_predecessor = index
+            .checked_sub(1)
+            .and_then(|previous| governed.get(previous))
+            .map(|previous| previous.file.as_str());
+        if entry.sequence != expected_sequence
+            || !valid_migration_name(&entry.file)
+            || !is_lower_hex(&entry.sha256, 64)
+            || (index > 0 && entry.predecessor.as_deref() != expected_predecessor)
+            || (pending_seen && entry.production_applied)
+        {
+            return Err(invariant(
+                "workspace D1 manifest must be one contiguous applied prefix followed by one contiguous deferred suffix",
+            ));
+        }
+        pending_seen |= !entry.production_applied;
+    }
+    if unique_sequences.len() != manifest.migrations.len()
+        || unique_names.len() != manifest.migrations.len()
+        || pending.is_empty()
+        || pending[0].sequence != operation.target_sequence
+        || pending[0].file != operation.ledger_name
+    {
+        return Err(invariant(
+            "workspace D1 manifest must contain unique identities and select the first deferred migration as its sole immediate target",
+        ));
+    }
+    let baseline = manifest
+        .migrations
+        .iter()
+        .filter(|entry| {
+            (operation.baseline_start_sequence..=operation.baseline_end_sequence)
+                .contains(&entry.sequence)
+        })
+        .collect::<Vec<_>>();
+    let expected_len = operation
+        .baseline_end_sequence
+        .checked_sub(operation.baseline_start_sequence)
+        .and_then(|distance| distance.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| invariant("workspace D1 baseline range is invalid"))?;
+    if baseline.len() != expected_len || !(1..=64).contains(&baseline.len()) {
+        return Err(invariant(
+            "workspace D1 manifest does not contain the exact bounded baseline",
+        ));
+    }
+    for (offset, entry) in baseline.iter().enumerate() {
+        let expected_sequence = operation.baseline_start_sequence
+            + u64::try_from(offset).map_err(|_| invariant("workspace D1 baseline is too large"))?;
+        if entry.sequence != expected_sequence
+            || !valid_migration_name(&entry.file)
+            || !is_lower_hex(&entry.sha256, 64)
+            || !entry.production_applied
+            || (offset > 0
+                && entry.predecessor.as_deref() != Some(baseline[offset - 1].file.as_str()))
+        {
+            return Err(invariant(
+                "workspace D1 manifest baseline identity is invalid",
+            ));
+        }
+    }
+    let target = manifest
+        .migrations
+        .iter()
+        .find(|entry| entry.sequence == operation.target_sequence)
+        .ok_or_else(|| invariant("workspace D1 manifest omitted the sole target"))?;
+    let migrations_dir = safe_relative(&operation.migrations_dir)?;
+    let target_path = safe_relative(&operation.migrations_pattern)?;
+    if target.file != operation.ledger_name
+        || target.predecessor.as_deref() != baseline.last().map(|entry| entry.file.as_str())
+        || target.production_applied
+        || target_path.parent() != Some(migrations_dir.as_path())
+        || target_path.file_name().and_then(std::ffi::OsStr::to_str) != Some(target.file.as_str())
+        || !is_lower_hex(&target.sha256, 64)
+    {
+        return Err(invariant(
+            "workspace D1 manifest target identity is invalid",
+        ));
+    }
+    for entry in &pending {
+        let relative = migrations_dir.join(&entry.file);
+        let bytes = committed_file(&repository.path, &relative)?;
+        if sha256(&bytes) != format!("sha256:{}", entry.sha256) {
+            return Err(invariant(format!(
+                "workspace D1 deferred migration `{}` differs from its committed manifest identity",
+                entry.file
+            )));
+        }
+    }
+    let target_bytes = committed_file(&repository.path, &target_path)?;
+    let target_blob_spec = format!("HEAD:{}", target_path.to_string_lossy());
+    let target_git_blob_oid = git_optional(
+        &repository.path,
+        &["rev-parse", "--verify", &target_blob_spec],
+    )?
+    .filter(|value| is_lower_hex(value, 40))
+    .ok_or_else(|| invariant("workspace D1 target has no canonical Git blob identity"))?;
+    if sha256(&target_bytes) != format!("sha256:{}", target.sha256) {
+        return Err(invariant(
+            "workspace D1 target bytes differ from the manifest",
+        ));
+    }
+    if target_bytes.contains(&b'\r') || !target_bytes.ends_with(b"\n") {
+        return Err(invariant(
+            "workspace D1 target must be exact LF text ending in a newline",
+        ));
+    }
+    let assertions = derive_manifest_schema_assertions(&target_bytes)?;
+    let template_relative = safe_relative(&operation.config_template)?;
+    let template = committed_file(&repository.path, &template_relative)?;
+    let production_config = template_relative.with_file_name("wrangler.production.toml");
+    let baseline_names = baseline
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect::<Vec<_>>();
+    let baseline_digest = sha256(format!("{}\n", baseline_names.join("\n")).as_bytes());
+    let baseline = baseline
+        .into_iter()
+        .map(|entry| WorkspaceD1MigrationLedgerEntryV1 {
+            sequence: entry.sequence,
+            name: entry.file.clone(),
+            sha256: format!("sha256:{}", entry.sha256),
+        })
+        .collect::<Vec<_>>();
+    let manifest_contract = WorkspaceD1ManifestMigrationContractV1 {
+        manifest_path: operation.manifest_path.clone(),
+        manifest_sha256: sha256(&manifest_bytes),
+        account_id: operation.account_id.clone(),
+        profile_id: operation.profile_id.clone(),
+        database_name: operation.database_name.clone(),
+        database_id: operation.database_id.clone(),
+        baseline_start_sequence: operation.baseline_start_sequence,
+        baseline_end_sequence: operation.baseline_end_sequence,
+        baseline,
+        baseline_digest,
+        target_sequence: operation.target_sequence,
+        target_git_blob_oid,
+        migrations_pattern: operation.migrations_pattern.clone(),
+        ledger_table: operation.ledger_table.clone(),
+        ledger_name: operation.ledger_name.clone(),
+        wrangler_cli_sha256: format!("sha256:{}", operation.wrangler_cli_sha256),
+        full_export_capability_id: operation.recovery.full_export_capability_id.clone(),
+        require_exact_post_ledger: operation.verification.require_exact_post_ledger,
+        forbidden_future_sequences: operation.verification.forbidden_future_sequences.clone(),
+        require_exact_schema_sql: operation.verification.require_exact_schema_sql,
+        require_foreign_key_check_empty: operation.verification.require_foreign_key_check_empty,
+        require_integrity_check_ok: operation.verification.require_integrity_check_ok,
+        require_unchanged_worker_identity: operation.verification.require_unchanged_worker_identity,
+        require_old_worker_compatibility: operation.verification.require_old_worker_compatibility,
+    };
+    let contract = WorkspaceD1MigrationContractV1 {
+        repository_root: repository.path.display().to_string(),
+        repository_head: head.to_owned(),
+        repository_origin: origin,
+        operation_pack_path: PACK_RELATIVE_PATH.to_owned(),
+        operation_pack_sha256: sha256(pack_bytes),
+        config_template_path: operation.config_template.clone(),
+        config_template_sha256: sha256(&template),
+        production_config_path: production_config.display().to_string(),
+        migrations_dir: operation.migrations_dir.clone(),
+        database_binding: operation.database_binding.clone(),
+        wrangler_version: operation.wrangler_version.clone(),
+        migrations: vec![WorkspaceD1MigrationFileV1 {
+            path: operation.migrations_pattern.clone(),
+            sha256: format!("sha256:{}", target.sha256),
+        }],
+        assertions,
+        recovery_capability_id: operation.recovery.bookmark_capability_id.clone(),
+        recovery_max_age_seconds: 600,
+        rollback_capability_id: operation.recovery.rollback_capability_id.clone(),
+        manifest_migration: Some(manifest_contract),
+    };
+    Ok(Some(capability_manifest(operation, contract)))
+}
+
+fn validate_manifest_operation(operation: &OperationDeclarationV2) -> Result<()> {
+    let atomicity = &operation.atomicity;
+    if !valid_operation_id(&operation.id)
+        || operation.title.trim().is_empty()
+        || operation.description.trim().is_empty()
+        || operation.authority != "cfctl_native_workspace_operation"
+        || !safe_identifier(&operation.database_binding)
+        || !safe_identifier(&operation.ledger_table)
+        || !valid_migration_name(&operation.ledger_name)
+        || !valid_wrangler_version(&operation.wrangler_version)
+        || !is_lower_hex(&operation.wrangler_cli_sha256, 64)
+        || operation.baseline_start_sequence == 0
+        || operation.baseline_end_sequence < operation.baseline_start_sequence
+        || operation.target_sequence != operation.baseline_end_sequence + 1
+        || operation.recovery.full_export_capability_id != "d1-full-export"
+        || operation.recovery.bookmark_capability_id != "d1-time-travel-get-bookmark"
+        || operation.recovery.rollback_capability_id != "d1-restore-exact-bookmark"
+        || !operation.recovery.requires_fresh_full_export
+        || !operation.recovery.requires_fresh_bookmark
+        || operation.recovery.existing_anchor_reusable
+        || ![
+            atomicity.local_ddl_failure_zero_schema_delta,
+            atomicity.local_ddl_failure_zero_ledger_delta,
+            atomicity.local_ledger_failure_zero_schema_delta,
+            atomicity.local_ledger_failure_zero_ledger_delta,
+            atomicity.remote_ddl_failure_zero_schema_delta,
+            atomicity.remote_ddl_failure_zero_ledger_delta,
+            atomicity.remote_ledger_failure_zero_schema_delta,
+            atomicity.remote_ledger_failure_zero_ledger_delta,
+        ]
+        .into_iter()
+        .all(std::convert::identity)
+        || !operation.verification.require_exact_post_ledger
+        || !operation.verification.require_exact_schema_sql
+        || !operation.verification.require_foreign_key_check_empty
+        || !operation.verification.require_integrity_check_ok
+        || !operation.verification.require_unchanged_worker_identity
+        || !operation.verification.require_old_worker_compatibility
+    {
+        return Err(invariant(
+            "workspace D1 manifest operation contract is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn valid_migration_name(value: &str) -> bool {
+    (5..=128).contains(&value.len())
+        && value.ends_with(".sql")
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn derive_manifest_schema_assertions(bytes: &[u8]) -> Result<Vec<WorkspaceD1SchemaAssertionV1>> {
+    let source = std::str::from_utf8(bytes)
+        .map_err(|_| invariant("workspace D1 target migration is not UTF-8"))?;
+    let statements = exact_migration_statements(source)?;
+    let mut assertions = Vec::new();
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for statement in &statements {
+        let tokens = statement.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() >= 6 && tokens[..2] == ["ALTER", "TABLE"] {
+            let table = tokens[2];
+            let column = if tokens.get(3..5) == Some(&["ADD", "COLUMN"])
+                || tokens.get(3..5) == Some(&["RENAME", "COLUMN"])
+            {
+                if tokens[3] == "ADD" {
+                    tokens.get(5).copied()
+                } else {
+                    tokens
+                        .iter()
+                        .position(|token| *token == "TO")
+                        .and_then(|position| tokens.get(position + 1).copied())
+                }
+            } else {
+                None
+            };
+            if let Some(column) = column {
+                let column = column.trim_end_matches(';');
+                if safe_identifier(table)
+                    && safe_identifier(column)
+                    && seen.insert(("column".to_owned(), table.to_owned(), column.to_owned()))
+                {
+                    assertions.push(WorkspaceD1SchemaAssertionV1 {
+                        kind: "column_exists".to_owned(),
+                        table: Some(table.to_owned()),
+                        column: Some(column.to_owned()),
+                        index: None,
+                        exact_object: None,
+                    });
+                }
+            }
+        }
+        let exact = exact_object_from_statement(statement, &tokens)?;
+        if let Some(exact) = exact {
+            let table = exact.table.clone().unwrap_or_default();
+            if seen.insert((exact.object_type.clone(), table, exact.name.clone())) {
+                assertions.push(WorkspaceD1SchemaAssertionV1 {
+                    kind: "object_definition_equals".to_owned(),
+                    table: None,
+                    column: None,
+                    index: None,
+                    exact_object: Some(exact),
+                });
+            }
+        }
+    }
+    assertions.push(WorkspaceD1SchemaAssertionV1 {
+        kind: "foreign_key_check_empty".to_owned(),
+        table: None,
+        column: None,
+        index: None,
+        exact_object: None,
+    });
+    if assertions.len() == 1 {
+        return Err(invariant(
+            "workspace D1 target yielded no compiler-owned schema assertions",
+        ));
+    }
+    Ok(assertions)
+}
+
+fn exact_migration_statements(source: &str) -> Result<Vec<String>> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut trigger = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || (current.is_empty() && trimmed.starts_with("--")) {
+            continue;
+        }
+        if current.is_empty() {
+            current.push_str(trimmed);
+        } else {
+            current.push('\n');
+            current.push_str(line.trim_end());
+        }
+        if current.lines().count() == 1 {
+            trigger = trimmed.starts_with("CREATE TRIGGER ");
+        }
+        let terminal = if trigger {
+            trimmed == "END;"
+        } else {
+            trimmed.ends_with(';')
+        };
+        if terminal {
+            let definition = current
+                .strip_suffix(';')
+                .unwrap_or(&current)
+                .trim()
+                .to_owned();
+            if definition.is_empty() {
+                return Err(invariant(
+                    "workspace D1 migration contains an empty statement",
+                ));
+            }
+            statements.push(definition);
+            current.clear();
+            trigger = false;
+        }
+    }
+    if !current.trim().is_empty() {
+        return Err(invariant(
+            "workspace D1 migration contains an unterminated statement or trigger",
+        ));
+    }
+    Ok(statements)
+}
+
+fn exact_object_from_statement(
+    definition: &str,
+    tokens: &[&str],
+) -> Result<Option<WorkspaceD1ExactObjectAssertionV1>> {
+    let (object_type, name) = match tokens {
+        ["CREATE", "INDEX", name, ..] | ["CREATE", "UNIQUE", "INDEX", name, ..] => ("index", *name),
+        ["CREATE", "TRIGGER", name, ..] => ("trigger", *name),
+        _ => return Ok(None),
+    };
+    let table = tokens
+        .windows(2)
+        .find_map(|pair| (pair[0] == "ON").then(|| pair[1].split('(').next().unwrap_or_default()))
+        .ok_or_else(|| invariant("workspace D1 exact schema object omitted its table"))?;
+    if !safe_identifier(name) || !safe_identifier(table) || definition.len() > 32_768 {
+        return Err(invariant(
+            "workspace D1 exact schema object identity or definition is invalid",
+        ));
+    }
+    Ok(Some(WorkspaceD1ExactObjectAssertionV1 {
+        object_type: object_type.to_owned(),
+        name: name.to_owned(),
+        table: Some(table.to_owned()),
+        definition: definition.to_owned(),
+        definition_sha256: sha256(definition.as_bytes()),
+    }))
+}
+
+fn capability_manifest(
+    operation: &OperationDeclarationV2,
+    contract: WorkspaceD1MigrationContractV1,
+) -> CapabilityV1 {
+    let compatibility = OperationDeclaration {
+        id: operation.id.clone(),
+        title: operation.title.clone(),
+        description: operation.description.clone(),
+        config_template: operation.config_template.clone(),
+        production_config: operation.config_template.clone(),
+        migrations_dir: operation.migrations_dir.clone(),
+        database_binding: operation.database_binding.clone(),
+        wrangler_version: operation.wrangler_version.clone(),
+        recovery_capability_id: operation.recovery.bookmark_capability_id.clone(),
+        recovery_max_age_seconds: 600,
+        rollback_capability_id: operation.recovery.rollback_capability_id.clone(),
+        migration: Vec::new(),
+        assertion: Vec::new(),
+    };
+    let mut capability = capability(&compatibility, contract);
+    capability.selectors = vec![
+        selector("account_id", "path"),
+        selector("database_id", "path"),
+        selector("migration", "query"),
+        selector("atomicity_evidence_hash", "query"),
+        selector("old_worker_canary_evidence_hash", "query"),
+    ];
+    capability
 }
 
 fn validate_closed_migration_directory(
@@ -255,19 +823,25 @@ fn validate_operation(operation: &OperationDeclaration) -> Result<()> {
                 assertion.table.as_deref().is_some_and(safe_identifier)
                     && assertion.column.is_none()
                     && assertion.index.is_none()
+                    && assertion.exact_object.is_none()
             }
             "column_exists" => {
                 assertion.table.as_deref().is_some_and(safe_identifier)
                     && assertion.column.as_deref().is_some_and(safe_identifier)
                     && assertion.index.is_none()
+                    && assertion.exact_object.is_none()
             }
             "index_exists" => {
                 assertion.table.as_deref().is_some_and(safe_identifier)
                     && assertion.index.as_deref().is_some_and(safe_identifier)
                     && assertion.column.is_none()
+                    && assertion.exact_object.is_none()
             }
             "foreign_key_check_empty" => {
-                assertion.table.is_none() && assertion.column.is_none() && assertion.index.is_none()
+                assertion.table.is_none()
+                    && assertion.column.is_none()
+                    && assertion.index.is_none()
+                    && assertion.exact_object.is_none()
             }
             _ => false,
         };
@@ -546,6 +1120,121 @@ kind = "foreign_key_check_empty"
         root
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn manifest_fixture() -> TempDir {
+        let root = tempfile::tempdir().expect("temp repository");
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "user.email", "test@example.com"]);
+        git(root.path(), &["config", "user.name", "Test"]);
+        git(
+            root.path(),
+            &["remote", "add", "origin", "https://example.com/mln-web.git"],
+        );
+        fs::create_dir_all(root.path().join(".cfctl/operations")).expect("pack dir");
+        fs::create_dir_all(root.path().join(".control-plane")).expect("manifest dir");
+        fs::create_dir_all(root.path().join("crates/founder/migrations/d1"))
+            .expect("migration dir");
+        fs::create_dir_all(root.path().join("workers/founder")).expect("config dir");
+        let target_name = "0172_offer_authority_provenance.sql";
+        let target_path = format!("crates/founder/migrations/d1/{target_name}");
+        let target = b"ALTER TABLE existing ADD COLUMN governed INTEGER;\nCREATE TRIGGER governed_guard\nBEFORE INSERT ON existing\nBEGIN\n  SELECT RAISE(ABORT, 'guard');\nEND;\n";
+        fs::write(root.path().join(&target_path), target).expect("target");
+        fs::write(
+            root.path().join("workers/founder/wrangler.toml"),
+            "name = \"founder\"\n[[d1_databases]]\nbinding = \"FOUNDER_DB\"\ndatabase_name = \"founder\"\ndatabase_id = \"7c282983-2e48-4ea4-9f0d-09b0d718fe65\"\n",
+        )
+        .expect("config");
+        let mut entries = Vec::new();
+        for sequence in 116_u64..=171 {
+            let name = format!("{sequence:04}_baseline.sql");
+            entries.push(serde_json::json!({
+                "sequence": sequence,
+                "file": name,
+                "sha256": hex::encode(Sha256::digest(format!("baseline-{sequence}"))),
+                "predecessor": (sequence > 116).then(|| format!("{:04}_baseline.sql", sequence - 1)),
+                "production_applied": true,
+            }));
+        }
+        entries.push(serde_json::json!({
+            "sequence": 172,
+            "file": target_name,
+            "sha256": hex::encode(Sha256::digest(target)),
+            "predecessor": "0171_baseline.sql",
+            "production_applied": false,
+        }));
+        fs::write(
+            root.path()
+                .join(".control-plane/d1_migration_manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "manifest_version": 1,
+                "migrations": entries,
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest");
+        fs::write(
+            root.path().join(PACK_RELATIVE_PATH),
+            format!(
+                r#"schema_version = 2
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+title = "Apply one governed Founder D1 migration"
+description = "Apply one exact target after an exact remote baseline."
+authority = "cfctl_native_workspace_operation"
+manifest_path = ".control-plane/d1_migration_manifest.json"
+config_template = "workers/founder/wrangler.toml"
+account_id = "ca30e922fda7f5578e49873542e4aaca"
+profile_id = "mln-founder-d1"
+database_name = "founder"
+database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65"
+database_binding = "FOUNDER_DB"
+baseline_start_sequence = 116
+baseline_end_sequence = 171
+target_sequence = 172
+migrations_dir = "crates/founder/migrations/d1"
+migrations_pattern = "{target_path}"
+ledger_table = "d1_migrations"
+ledger_name = "{target_name}"
+wrangler_version = "4.100.0"
+wrangler_cli_sha256 = "{}"
+
+[operation.recovery]
+full_export_capability_id = "d1-full-export"
+bookmark_capability_id = "d1-time-travel-get-bookmark"
+rollback_capability_id = "d1-restore-exact-bookmark"
+requires_fresh_full_export = true
+requires_fresh_bookmark = true
+existing_anchor_reusable = false
+
+[operation.atomicity]
+local_ddl_failure_zero_schema_delta = true
+local_ddl_failure_zero_ledger_delta = true
+local_ledger_failure_zero_schema_delta = true
+local_ledger_failure_zero_ledger_delta = true
+remote_ddl_failure_zero_schema_delta = true
+remote_ddl_failure_zero_ledger_delta = true
+remote_ledger_failure_zero_schema_delta = true
+remote_ledger_failure_zero_ledger_delta = true
+
+[operation.verification]
+require_exact_post_ledger = true
+forbidden_future_sequences = [173, 174]
+require_exact_schema_sql = true
+require_foreign_key_check_empty = true
+require_integrity_check_ok = true
+require_unchanged_worker_identity = true
+require_old_worker_compatibility = true
+"#,
+                "a".repeat(64)
+            ),
+        )
+        .expect("pack");
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "fixture"]);
+        root
+    }
+
     #[test]
     fn loads_hash_bound_capability_from_clean_registered_repository() {
         let root = fixture();
@@ -655,6 +1344,226 @@ kind = "foreign_key_check_empty"
             error
                 .to_string()
                 .contains("exactly the declared migration files")
+        );
+    }
+
+    #[test]
+    fn loads_manifest_baseline_and_one_target_without_local_baseline_files() {
+        let root = manifest_fixture();
+        let capability = load_workspace_d1_migration_capability(
+            &[root.path().to_path_buf()],
+            "mln-web.founder-d1-migration-apply",
+        )
+        .expect("load")
+        .expect("capability");
+        assert_eq!(capability.adapter_status, AdapterStatus::DelegatedCli);
+        let contract = capability
+            .workspace_d1_migration
+            .as_ref()
+            .expect("workspace contract");
+        let manifest = contract
+            .manifest_migration
+            .as_ref()
+            .expect("manifest contract");
+        assert_eq!(manifest.baseline.len(), 56);
+        assert_eq!(manifest.baseline[0].sequence, 116);
+        assert_eq!(manifest.baseline[55].sequence, 171);
+        assert_eq!(manifest.target_sequence, 172);
+        assert_eq!(manifest.ledger_name, "0172_offer_authority_provenance.sql");
+        assert_eq!(contract.migrations.len(), 1);
+        let exact_objects = contract
+            .assertions
+            .iter()
+            .filter_map(|assertion| assertion.exact_object.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(exact_objects.len(), 1);
+        assert_eq!(exact_objects[0].object_type, "trigger");
+        assert_eq!(exact_objects[0].name, "governed_guard");
+        assert!(exact_objects[0].definition.contains("SELECT RAISE"));
+        assert_eq!(
+            exact_objects[0].definition_sha256,
+            sha256(exact_objects[0].definition.as_bytes())
+        );
+        assert_eq!(
+            capability
+                .selectors
+                .iter()
+                .map(|selector| selector.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "account_id",
+                "database_id",
+                "migration",
+                "atomicity_evidence_hash",
+                "old_worker_canary_evidence_hash",
+            ]
+        );
+        assert!(capability.mutation_contract_gaps().is_empty());
+    }
+
+    #[test]
+    fn selects_only_the_first_migration_from_a_contiguous_deferred_suffix() {
+        let root = manifest_fixture();
+        let manifest_path = root
+            .path()
+            .join(".control-plane/d1_migration_manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest bytes"))
+                .expect("manifest JSON");
+        let migrations = manifest["migrations"]
+            .as_array_mut()
+            .expect("migration array");
+        for sequence in 173_u64..=175 {
+            let file = format!("{sequence:04}_deferred.sql");
+            let predecessor = if sequence == 173 {
+                "0172_offer_authority_provenance.sql".to_owned()
+            } else {
+                format!("{:04}_deferred.sql", sequence - 1)
+            };
+            let bytes = format!("ALTER TABLE existing ADD COLUMN deferred_{sequence} INTEGER;\n");
+            fs::write(
+                root.path().join("crates/founder/migrations/d1").join(&file),
+                &bytes,
+            )
+            .expect("deferred migration");
+            migrations.push(serde_json::json!({
+                "sequence": sequence,
+                "file": file,
+                "sha256": hex::encode(Sha256::digest(bytes.as_bytes())),
+                "predecessor": predecessor,
+                "production_applied": false,
+            }));
+        }
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("render manifest"),
+        )
+        .expect("write manifest");
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "deferred succession"]);
+
+        let capability = load_workspace_d1_migration_capability(
+            &[root.path().to_path_buf()],
+            "mln-web.founder-d1-migration-apply",
+        )
+        .expect("load")
+        .expect("capability");
+        let contract = capability
+            .workspace_d1_migration
+            .expect("workspace contract");
+        let selected = contract.manifest_migration.expect("manifest contract");
+        assert_eq!(selected.target_sequence, 172);
+        assert_eq!(selected.ledger_name, "0172_offer_authority_provenance.sql");
+        assert_eq!(contract.migrations.len(), 1);
+        assert_eq!(
+            contract.migrations[0].path,
+            "crates/founder/migrations/d1/0172_offer_authority_provenance.sql"
+        );
+    }
+
+    #[test]
+    fn schema_v2_pack_does_not_block_an_unrelated_workspace_intent() {
+        let root = manifest_fixture();
+        let capability = load_workspace_d1_migration_capability(
+            &[root.path().to_path_buf()],
+            "deploy JKCA workers",
+        )
+        .expect("valid schema-v2 pack must not block an unrelated workspace intent");
+        assert!(capability.is_none());
+    }
+
+    #[test]
+    fn manifest_operation_fails_closed_on_target_name_or_lf_drift() {
+        let root = manifest_fixture();
+        let pack = root.path().join(PACK_RELATIVE_PATH);
+        let source = fs::read_to_string(&pack).expect("pack");
+        fs::write(
+            &pack,
+            source.replace(
+                "ledger_name = \"0172_offer_authority_provenance.sql\"",
+                "ledger_name = \"0172_wrong.sql\"",
+            ),
+        )
+        .expect("drift");
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "drift"]);
+        assert!(
+            load_workspace_d1_migration_capability(
+                &[root.path().to_path_buf()],
+                "mln-web.founder-d1-migration-apply",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_operation_requires_unique_identities_and_one_pending_target() {
+        for mutation in ["duplicate-sequence", "duplicate-name", "second-pending"] {
+            let root = manifest_fixture();
+            let manifest_path = root
+                .path()
+                .join(".control-plane/d1_migration_manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(&manifest_path).expect("manifest bytes"))
+                    .expect("manifest JSON");
+            let migrations = manifest["migrations"]
+                .as_array_mut()
+                .expect("migration array");
+            match mutation {
+                "duplicate-sequence" => {
+                    migrations[1]["sequence"] = migrations[0]["sequence"].clone();
+                }
+                "duplicate-name" => {
+                    migrations[1]["file"] = migrations[0]["file"].clone();
+                }
+                "second-pending" => {
+                    migrations[0]["production_applied"] = serde_json::Value::Bool(false);
+                }
+                _ => unreachable!("closed fixture mutation"),
+            }
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("render manifest"),
+            )
+            .expect("write drift");
+            git(root.path(), &["add", "."]);
+            git(root.path(), &["commit", "-qm", mutation]);
+            let error = load_workspace_d1_migration_capability(
+                &[root.path().to_path_buf()],
+                "mln-web.founder-d1-migration-apply",
+            )
+            .expect_err("ambiguous manifest identity fails closed");
+            assert!(error.to_string().contains("workspace D1 manifest"));
+        }
+    }
+
+    #[test]
+    fn exact_statement_parser_preserves_trigger_bodies_and_fails_closed() {
+        let source = "CREATE INDEX idx_users ON users(id);\nCREATE TRIGGER users_guard\nBEFORE INSERT ON users\nBEGIN\n  SELECT RAISE(ABORT, 'guard');\nEND;\n";
+        let statements = exact_migration_statements(source).expect("statements");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0], "CREATE INDEX idx_users ON users(id)");
+        assert_eq!(
+            statements[1],
+            "CREATE TRIGGER users_guard\nBEFORE INSERT ON users\nBEGIN\n  SELECT RAISE(ABORT, 'guard');\nEND"
+        );
+        let assertions = derive_manifest_schema_assertions(source.as_bytes()).expect("assertions");
+        let exact = assertions
+            .iter()
+            .filter_map(|assertion| assertion.exact_object.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact
+                .iter()
+                .map(|object| object.object_type.as_str())
+                .collect::<Vec<_>>(),
+            ["index", "trigger"]
+        );
+        assert!(
+            exact_migration_statements(
+                "CREATE TRIGGER users_guard BEFORE INSERT ON users BEGIN SELECT 1;"
+            )
+            .is_err()
         );
     }
 }

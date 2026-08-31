@@ -125,7 +125,8 @@ maintain a second command registry.
 
 Open-ended intent remains available as `cfctl "<natural-language request>"`.
 Existing v2 paths remain compatible; the command map includes newer paths such
-as `auth repair-keychain-access`, `keys renew-analytics-profile`, and
+as `auth evidence-key status`, `auth repair-keychain-access`,
+`keys renew-analytics-profile`, and
 `plans bundle` that a hand-maintained list could omit.
 
 Every command has concise human output and stable `--json` output, shaped by
@@ -146,6 +147,12 @@ printf '%s' "$CLOUDFLARE_API_TOKEN" | \
 The token lives in the platform keyring (Keychain on macOS, Secret Service on
 Linux) and falls back to a mode-0600 file store when the keyring is
 unavailable; `cfctl doctor` reports which backend is active.
+
+Qualifying local evidence uses a separate platform-only integrity key. It
+never falls back to a file: initialize it explicitly with
+`cfctl auth evidence-key init --json`, inspect it with `status`, rotate to a
+new signing generation with `rotate`, and retire an inactive generation only
+when cfctl reports that no authenticated local artifact still depends on it.
 
 Two things that commonly bite:
 

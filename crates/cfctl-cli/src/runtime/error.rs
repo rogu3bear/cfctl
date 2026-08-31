@@ -302,15 +302,38 @@ fn storage_guidance(error: &cfctl_storage::StorageError) -> Option<(&'static str
             "Pass the operation id exactly as printed by `cfctl call` (a lowercase hyphenated UUID)."
                 .to_owned(),
         ),
+        E::WriteDurabilityUnknown { path, .. } if evidence_durability_path(path) => (
+            "CFCTL_EVIDENCE_DURABILITY",
+            "The exact evidence entry is visible, but its containing-directory durability is unconfirmed. Do not blindly replay the write. Reconcile the exact body, descriptor, or proof through its owning evidence path; success requires exact authentication and byte equality followed by a successful held-directory sync. Temporary-alias cleanup is a separate recovery condition."
+                .to_owned(),
+        ),
         E::WriteDurabilityUnknown { .. } => (
             "CFCTL_PLAN_LIFECYCLE",
             "The write is not durably confirmed. Reload with `cfctl plans status <operation-id>` before retrying."
+                .to_owned(),
+        ),
+        E::CapabilityPublicationCleanupFailed { .. } => (
+            "CFCTL_EVIDENCE_PUBLICATION_CLEANUP",
+            "The final evidence document was published, but its temporary hard-link alias remains. Do not replay the write; inspect and resolve the exact reported alias before evidence lifecycle scans continue."
                 .to_owned(),
         ),
         E::InvalidPlan(core) => return core_guidance(core),
         _ => return None,
     };
     Some((code, step))
+}
+
+fn evidence_durability_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    if path.file_name().and_then(std::ffi::OsStr::to_str) == Some("evidence-root-v1.json") {
+        return true;
+    }
+    matches!(
+        path.parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(std::ffi::OsStr::to_str),
+        Some("evidence" | "evidence-descriptors" | "evidence-index")
+    )
 }
 
 fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)> {
@@ -336,6 +359,20 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
         E::UnsupportedLegacyWranglerSession(id) => format!(
             "Remove the legacy profile and re-authenticate: `cfctl auth logout {id}` then `cfctl auth login --profile {id}`."
         ),
+        E::EvidenceKeyLifecycle(cfctl_auth::EvidenceKeyLifecycleError::Unchanged { .. }) => {
+            return Some((
+                "CFCTL_EVIDENCE_KEY_UNCHANGED",
+                "Run `cfctl auth evidence-key status --json`; exact registry readback proved the attempted mutation did not cross, so retry only after confirming the same lifecycle intent."
+                    .to_owned(),
+            ));
+        }
+        E::EvidenceKeyLifecycle(cfctl_auth::EvidenceKeyLifecycleError::Indeterminate { .. }) => {
+            return Some((
+                "CFCTL_EVIDENCE_KEY_INDETERMINATE",
+                "Do not replay rotate or retire. Run `cfctl auth evidence-key status --json` and reconcile the exact platform registry before any further evidence-key mutation."
+                    .to_owned(),
+            ));
+        }
         E::SecretStore(_) => {
             "The secret backend is unavailable. Run `cfctl doctor --json` to inspect the credential store."
                 .to_owned()

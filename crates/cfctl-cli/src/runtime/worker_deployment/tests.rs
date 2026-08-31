@@ -754,8 +754,7 @@ database_id = "11111111-1111-4111-8111-111111111111"
     );
 }
 
-#[test]
-fn private_config_normalizes_only_bounded_canonical_verified_sender_domains() {
+fn verified_sender_domain_documents(allowlist: &str) -> (Value, Value) {
     let parse = |text: &str| {
         let document: toml::Value = toml::from_str(text).expect("Wrangler TOML");
         serde_json::to_value(document).expect("Wrangler JSON")
@@ -773,9 +772,8 @@ database_name = "relay-db"
 database_id = "00000000-0000-4000-8000-000000000000"
 "#,
     );
-    let production = |allowlist: &str| {
-        parse(&format!(
-            r#"name = "relay-router"
+    let production = parse(&format!(
+        r#"name = "relay-router"
 main = "build/worker.js"
 
 [vars]
@@ -786,8 +784,14 @@ binding = "MAILDESK_DB"
 database_name = "relay-db"
 database_id = "11111111-1111-4111-8111-111111111111"
 "#
-        ))
-    };
+    ));
+    (template, production)
+}
+
+#[test]
+fn private_config_normalizes_only_bounded_canonical_verified_sender_domains() {
+    let (template, _) = verified_sender_domain_documents("sender.example.com");
+    let production = |allowlist: &str| verified_sender_domain_documents(allowlist).1;
 
     for allowlist in ["sender.example.com", "sender.example.com,relay.example.org"] {
         let mut allowed = production(allowlist);

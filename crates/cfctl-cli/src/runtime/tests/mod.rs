@@ -60,8 +60,9 @@ use crate::{
     SearchArgs,
 };
 use cfctl_auth::{
-    AuthCredential, AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind,
-    ProfileMetadata, SecretStore,
+    AuthCredential, AuthError, CredentialUnavailableReason, EvidenceKeyManager,
+    EvidenceMacProvider, MemorySecretStore, ProfileKind, ProfileMetadata, SecretBackend,
+    SecretStore,
 };
 use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
 use cfctl_cloudflare::{
@@ -83,7 +84,7 @@ use cfctl_core::{
     WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, WorkflowContractV1, WorkflowStepV1,
     WorkspaceD1MigrationContractV1, WorkspaceD1PolicyProjectionContractV1, hash_value,
 };
-use cfctl_storage::{RuntimePaths, StateStore};
+use cfctl_storage::{RuntimePaths, StateStore as StorageStateStore, StorageError};
 use chrono::{Duration as ChronoDuration, Utc};
 use md5::Md5;
 use serde_json::{Value, json};
@@ -94,13 +95,108 @@ use std::{
     fs,
     process::Command as StdCommand,
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
 use uuid::Uuid;
+
+// Runtime test stores are authenticated by default. Use StorageStateStore::open
+// explicitly only when the subject is an absent, split, or invalid authority.
+struct StateStore;
+
+static TEST_EVIDENCE_SECRETS: OnceLock<Arc<MemorySecretStore>> = OnceLock::new();
+static TEST_EVIDENCE_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
+
+impl StateStore {
+    fn open(paths: RuntimePaths) -> cfctl_storage::Result<StorageStateStore> {
+        let store = StorageStateStore::open(paths)?;
+        let manager = Arc::new(
+            EvidenceKeyManager::new(
+                TEST_EVIDENCE_SECRETS
+                    .get_or_init(|| Arc::new(MemorySecretStore::default()))
+                    .clone(),
+                store.evidence_location_identity(),
+                SecretBackend::Memory,
+            )
+            .map_err(storage_authentication_error)?,
+        );
+        let root_identity = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                format!(
+                    "cfctl-cli-runtime-test-evidence-root\0{}",
+                    store.evidence_location_identity()
+                )
+                .as_bytes()
+            ))
+        );
+        let _transition = TEST_EVIDENCE_TRANSITION
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| {
+                StorageError::EvidenceAuthentication(
+                    "test evidence authority transition lock is poisoned".to_owned(),
+                )
+            })?;
+        let marker = store.evidence_root_identity()?;
+        let status = manager.status(None).map_err(storage_authentication_error)?;
+        match (marker.as_deref(), status.initialized) {
+            (None, false) => {
+                manager
+                    .initialize(&root_identity)
+                    .map_err(storage_authentication_error)?;
+                if let Err(error) = store.initialize_evidence_root_identity(&root_identity) {
+                    if matches!(store.evidence_root_identity(), Ok(None)) {
+                        manager
+                            .rollback_initialize(&root_identity)
+                            .map_err(storage_authentication_error)?;
+                    }
+                    return Err(error);
+                }
+            }
+            (Some(marker), true) if marker == root_identity => {
+                manager
+                    .status(Some(marker))
+                    .map_err(storage_authentication_error)?;
+            }
+            _ => {
+                return Err(StorageError::EvidenceAuthentication(
+                    "test evidence state-root marker and key registry are split or drifted"
+                        .to_owned(),
+                ));
+            }
+        }
+        store.with_evidence_authenticator(manager)
+    }
+}
+
+fn storage_authentication_error(error: AuthError) -> StorageError {
+    StorageError::EvidenceAuthentication(error.to_string())
+}
+
+pub(super) fn authenticated_test_store(paths: RuntimePaths) -> StorageStateStore {
+    StateStore::open(paths).expect("authenticated test state store")
+}
+
+#[test]
+fn authenticated_test_store_reopens_the_same_authority() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let paths = RuntimePaths::from_root(root.path());
+    let first = authenticated_test_store(paths.clone());
+    let evidence = first
+        .write_evidence(EvidenceClass::LiveRead, &json!({"authenticated":true}))
+        .expect("authenticated evidence");
+    let reopened = authenticated_test_store(paths);
+    assert_eq!(
+        reopened
+            .read_evidence_value(&evidence.content_hash)
+            .expect("authenticated evidence reopens"),
+        json!({"authenticated":true})
+    );
+}
 
 mod pages_and_delegated;
 use pages_and_delegated::*;

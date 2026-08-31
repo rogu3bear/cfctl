@@ -169,7 +169,7 @@ pub(super) fn approved_mln_completion_requires_one_exact_durable_provider_bounda
         .find(|migration| migration.migration_id == "0143")
         .expect("0143 migration");
     let build = |root: &std::path::Path| {
-        let store = StateStore::open(RuntimePaths::from_root(root)).expect("runtime state store");
+        let store = authenticated_test_store(RuntimePaths::from_root(root));
         let mut plan = PlanV1::draft(
             "profile-a",
             &contract.account_id,
@@ -284,7 +284,7 @@ pub(super) fn approved_mln_completion_requires_one_exact_durable_provider_bounda
             }
         })
     };
-    let persist = |store: &StateStore, plan: &PlanV1, value: &Value| {
+    let persist = |store: &StorageStateStore, plan: &PlanV1, value: &Value| {
         let hash = store
             .record_d1_import_checkpoint(&plan.operation_id, value)
             .expect("checkpoint");
@@ -1333,8 +1333,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
     );
 
     let root = tempfile::tempdir().expect("known failure root");
-    let store =
-        StateStore::open(RuntimePaths::from_root(root.path())).expect("known failure store");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
     let mut plan = build_plan();
     let receipt = checkpoint(&plan);
     let hash = store
@@ -1374,8 +1373,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
     assert_ne!(plan.status, PlanStatus::Running);
 
     let init_root = tempfile::tempdir().expect("init failure root");
-    let init_store =
-        StateStore::open(RuntimePaths::from_root(init_root.path())).expect("init store");
+    let init_store = authenticated_test_store(RuntimePaths::from_root(init_root.path()));
     let mut init_plan = build_plan();
     let mut init_receipt = checkpoint(&init_plan);
     init_receipt["step"] = json!("init_response");
@@ -1401,8 +1399,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
     assert_ne!(init_plan.status, PlanStatus::Running);
 
     let poll_root = tempfile::tempdir().expect("poll failure root");
-    let poll_store =
-        StateStore::open(RuntimePaths::from_root(poll_root.path())).expect("poll store");
+    let poll_store = authenticated_test_store(RuntimePaths::from_root(poll_root.path()));
     let poll_plan = build_plan();
     let mut accepted_ingest = checkpoint(&poll_plan);
     accepted_ingest["rectification_required"] = json!(false);
@@ -1593,8 +1590,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         }),
     ] {
         let invalid_root = tempfile::tempdir().expect("invalid receipt root");
-        let invalid_store =
-            StateStore::open(RuntimePaths::from_root(invalid_root.path())).expect("store");
+        let invalid_store = authenticated_test_store(RuntimePaths::from_root(invalid_root.path()));
         let mut invalid_plan = build_plan();
         if let Some(mut invalid_receipt) = receipt_fixture {
             invalid_receipt["operation_id"] = json!(invalid_plan.operation_id);

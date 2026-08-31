@@ -19,6 +19,13 @@ allow = [
 ]
 confidence-threshold = 1.0
 
+# `winx` is cap-std's Windows-only transitive support for the held-directory
+# capability boundary. A version change or a second crate using this license
+# expression requires fresh review; do not promote it to the global allowlist.
+[[licenses.exceptions]]
+crate = "winx@0.36.4"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

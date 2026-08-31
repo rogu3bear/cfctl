@@ -213,8 +213,9 @@ pub(super) use std::{
 };
 pub(super) use cfctl_agent::{AgentKind, AgentLauncher, InstallMode, InvocationContext};
 pub(super) use cfctl_auth::{
-    AuthCredential, ManagedApiTokenV1, OAuthClientConfig, PkceSession, PlatformSecretStore,
-    ProfileKind, ProfileMetadata, SecretBackend, SecretStore,
+    AuthCredential, EvidenceKeyManager, EvidenceKeyStatusV1, EvidenceMacProvider,
+    ManagedApiTokenV1, OAuthClientConfig, PkceSession, PlatformSecretStore, ProfileKind,
+    ProfileMetadata, SecretBackend, SecretStore,
 };
 pub(super) use cfctl_catalog::{CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1};
 pub(super) use cfctl_cloudflare::{
@@ -247,13 +248,14 @@ pub(super) use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub(super) use crate::{
     AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand,
     Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
-    EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, GuideArgs,
-    GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
-    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector,
-    KeyRenewAnalyticsProfileArgs, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand,
-    PlanApproveArgs, PlanSelector, PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand,
-    RegistryDeclarationsCommand, RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg,
-    RegistryScopesCommand, ResolveArgs, SearchArgs, WorkspaceCommand,
+    EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, EvidenceKeyCommand,
+    EvidenceKeyRetireArgs, GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs,
+    KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand,
+    KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs, KeyRevokeArgs,
+    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
+    PolicyCommand, ProfileSelector, RegistryCommand, RegistryDeclarationsCommand,
+    RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand,
+    ResolveArgs, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig},
 };
 pub(super) use super::{CliError, Result};

@@ -46,6 +46,7 @@ use super::r2_credentials::R2_PARENT_TOKEN_PRECONDITION;
 use super::r2_credentials::is_r2_temporary_credentials_operation_identity;
 use super::r2_credentials::should_bind_r2_parent_token;
 use super::secret_io::preflight_secret_sink;
+use super::workspace_d1_qualification;
 use super::workspace_state::discover_registered;
 use super::workspace_state::workspace_precondition_hashes_for_scope;
 use super::{pages_deployment, worker_custom_domain, worker_deployment};
@@ -567,6 +568,7 @@ pub(super) fn persist_prepared_plan(
             &impact.affected_repositories,
             &impact.local_artifact_paths,
         )?);
+    workspace_d1_qualification::bind_plan_evidence_hashes(&mut plan, &adapter_targets)?;
     plan.affected_repositories = impact.affected_repositories;
     plan.affected_resources = impact.affected_resources;
     plan.local_diffs = impact.local_diffs;

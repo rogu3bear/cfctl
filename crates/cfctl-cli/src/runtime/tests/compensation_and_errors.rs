@@ -1,5 +1,57 @@
 use super::*;
 
+#[tokio::test]
+pub(super) async fn plan_run_rejects_missing_evidence_authority_before_loading_execution_state() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store =
+        StorageStateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+
+    let error = Box::pin(run_plan(
+        &store,
+        &PlanSelector {
+            operation_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        },
+    ))
+    .await
+    .expect_err("missing evidence authority blocks execution");
+
+    assert!(
+        error
+            .to_string()
+            .contains("evidence state-root identity is missing"),
+        "the evidence authority precondition must precede catalog, plan, credential, and provider access: {error}"
+    );
+}
+
+#[test]
+pub(super) fn cancellation_remains_available_without_an_evidence_key() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StorageStateStore::open(RuntimePaths::from_root(root.path()))
+        .expect("storage opens without evidence authority");
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "catalog-sha",
+        CapabilityV1::new(
+            "dns.records.update",
+            "Update DNS record",
+            "PUT",
+            "/zones/{zone_id}/dns_records/{record_id}",
+        ),
+        json!({"zone_id":"zone-a","record_id":"record-a"}),
+    )
+    .expect("draft plan");
+    plan.approve(true, None).expect("approve in-memory plan");
+    let operation_id = plan.operation_id.clone();
+    save_current_test_plan(&store, &plan);
+
+    let envelope = cancel_plan(&store, &PlanSelector { operation_id })
+        .expect("cancellation uses audit evidence without a key");
+    assert_eq!(envelope.result["status"], "cancelled");
+    assert_eq!(store.evidence_root_identity().expect("marker read"), None);
+    assert_eq!(envelope.evidence.len(), 1);
+}
+
 #[test]
 pub(super) fn token_creation_rectification_builds_a_separate_revoke_request() {
     let mut capability = CapabilityV1::new(
@@ -606,6 +658,77 @@ pub(super) fn missing_credential_points_at_import() {
             .next_step()
             .expect("auth carries a step")
             .contains("import-api-token")
+    );
+}
+#[test]
+pub(super) fn evidence_key_transition_guidance_distinguishes_unchanged_and_indeterminate() {
+    let unchanged = super::CliError::Auth(cfctl_auth::AuthError::EvidenceKeyLifecycle(
+        cfctl_auth::EvidenceKeyLifecycleError::Unchanged {
+            action: "rotation".to_owned(),
+            cause: "injected prepublication failure".to_owned(),
+        },
+    ));
+    assert_eq!(unchanged.code(), "CFCTL_EVIDENCE_KEY_UNCHANGED");
+    let unchanged_step = unchanged.next_step().expect("unchanged guidance");
+    assert!(unchanged_step.contains("evidence-key status"));
+    assert!(unchanged_step.contains("did not cross"));
+
+    let indeterminate = super::CliError::Auth(cfctl_auth::AuthError::EvidenceKeyLifecycle(
+        cfctl_auth::EvidenceKeyLifecycleError::Indeterminate {
+            action: "retirement".to_owned(),
+            cause: "injected crossed write".to_owned(),
+            readback: "injected readback failure".to_owned(),
+        },
+    ));
+    assert_eq!(indeterminate.code(), "CFCTL_EVIDENCE_KEY_INDETERMINATE");
+    let indeterminate_step = indeterminate.next_step().expect("indeterminate guidance");
+    assert!(indeterminate_step.contains("Do not replay"));
+    assert!(indeterminate_step.contains("evidence-key status"));
+}
+
+#[test]
+pub(super) fn crossed_evidence_publication_cleanup_guidance_forbids_replay() {
+    let error = super::CliError::Storage(
+        cfctl_storage::StorageError::CapabilityPublicationCleanupFailed {
+            path: "/managed/evidence.json".to_owned(),
+            temporary_name: ".evidence.json.tmp-test".to_owned(),
+            directory_durability: "confirmed after the final hard link".to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cleanup failure",
+            ),
+        },
+    );
+    assert_eq!(error.code(), "CFCTL_EVIDENCE_PUBLICATION_CLEANUP");
+    let step = error.next_step().expect("cleanup guidance");
+    assert!(step.contains("Do not replay"));
+    assert!(step.contains("temporary hard-link alias"));
+}
+
+#[test]
+pub(super) fn evidence_durability_guidance_requires_exact_reconciliation_before_retry() {
+    let error = super::CliError::Storage(cfctl_storage::StorageError::WriteDurabilityUnknown {
+        path: "/managed/evidence-descriptors/digest.json".to_owned(),
+        source: std::io::Error::other("injected directory sync failure"),
+    });
+    assert_eq!(error.code(), "CFCTL_EVIDENCE_DURABILITY");
+    let step = error.next_step().expect("evidence durability guidance");
+    assert!(step.contains("Do not blindly replay"));
+    assert!(step.contains("exact authentication and byte equality"));
+    assert!(step.contains("held-directory sync"));
+    assert!(step.contains("Temporary-alias cleanup is a separate"));
+
+    let plan_error =
+        super::CliError::Storage(cfctl_storage::StorageError::WriteDurabilityUnknown {
+            path: "/managed/evidence/cfctl/data/plans/operation.json".to_owned(),
+            source: std::io::Error::other("injected directory sync failure"),
+        });
+    assert_eq!(plan_error.code(), "CFCTL_PLAN_LIFECYCLE");
+    assert!(
+        plan_error
+            .next_step()
+            .expect("plan durability guidance")
+            .contains("cfctl plans status")
     );
 }
 

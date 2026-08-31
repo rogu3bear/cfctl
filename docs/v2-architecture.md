@@ -17,6 +17,7 @@ flowchart TD
     CLI -->|scope sync and event reconciliation| REG[cfctl-registry]
     REG -.->|immutable evidence references| STORE
     PLAN -->|canonical pinned PlanV2 and policy decision| STORE[cfctl-storage]
+    AUTH -->|platform-only evidence integrity authority| STORE
     STORE -->|approved, durably consumed plan| CF[cfctl-cloudflare]
     AUTH -->|one selected credential| CF
     CF -->|receipts and verification| STORE
@@ -26,13 +27,13 @@ flowchart TD
 |---|---|
 | `cfctl-cli` | Public command parser, human/JSON rendering, orchestration |
 | `cfctl-core` | Versioned contracts, hashes, evidence, redaction, plan lifecycle |
-| `cfctl-auth` | OAuth PKCE, profiles, account selection, Keychain/Secret Service with mode-0600 file fallback |
+| `cfctl-auth` | OAuth PKCE, profiles, account selection, ordinary credential storage with governed mode-0600 fallback, and the separate platform-only evidence-integrity key with no fallback |
 | `cfctl-cloudflare` | Schema-validated HTTP execution, retries, pagination, conditionals, and idempotency |
 | `cfctl-catalog` | Official OpenAPI/docs/changelog/CLI ingestion and SQLite search index |
 | `cfctl-planner` | Risk, impact, cost, and approval policy |
 | `cfctl-workspace` | Registered-root Git/IaC discovery, exact local diffs, and repository/resource graph |
 | `cfctl-agent` | Agent discovery, maintained instructions, recursion-safe handoff |
-| `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence, tamper-evident operational-proof rows, and bounded recent-proof projections |
+| `cfctl-storage` | Platform paths, atomic plans and locks, immutable evidence bodies and descriptors, authenticated proof envelopes, capability-held evidence directories, lifecycle locking, generation-usage scans, and bounded recent-proof projections |
 | `cfctl-registry` | Rebuildable SQLite projection for scopes, normalized resources, observations, desired declarations, ownership, provider coverage, events, authorities, and operation maturity |
 | `xtask` | Local verification, reproducible release assembly, publication |
 
@@ -99,9 +100,15 @@ pack's pinned Wrangler. cfctl binds the registered repository, clean HEAD,
 pack/template/migration hashes, account, database, mode-restricted production
 config, and a fresh pre-change bookmark. It requires the observed migration
 ledger to be an exact prefix before apply and an exact match after apply, then
-runs only compiler-owned schema assertions. The assertion compiler returns one
-bounded `VALUES`-backed result set with stable assertion labels, avoiding
-provider compound-select limits without exposing repository-supplied SQL.
+runs only compiler-owned schema assertions. Exact index and trigger assertions
+compare the complete normalized `sqlite_schema` definition. The ordered ledger
+uses one bound filename per position and rejects more than 64 rows. The
+assertion compiler returns one bounded `VALUES`-backed result set with stable
+labels, avoiding provider compound-select limits without exposing
+repository-supplied SQL. Manifest-selected production planning remains blocked
+until the provider-atomicity and old-Worker-canary PostChangeVerification joins
+pass; those receipts qualify immutable inputs and do not grant deployment
+authority.
 
 Private D1 policy projection bytes enter through an exact mode-0600
 plan-creation source and are copied to a managed mode-0600 stage. SQL and
@@ -185,6 +192,15 @@ account-backed network mutation proof.
 Live reads also write `OperationalProofV1` index rows beside their immutable
 evidence. Each row binds the capability, catalog hash, redacted input hash,
 profile/account scope, captured credential generation, outcome, and receipt.
+`cfctl-storage` is the single durable qualification owner: it keeps historical
+body-only evidence behind an explicit audit reader, while current descriptors
+and proof indexes use strict storage-v2 envelopes authenticated over the full
+public V1 payload, state-root identity, and key generation. `cfctl-auth` owns
+the platform-only HMAC key lifecycle; callers cannot substitute the ordinary
+credential fallback store or silently promote legacy rows into qualification.
+Capability-held handles bind the body, descriptor, proof, and lifecycle-lock
+directories to the opened state incarnation, while generation-usage scans keep
+verification keys until every authenticated local artifact releases them.
 Login or import assigns a new opaque generation without persisting a
 secret-derived verifier. Credential replacement first persists an unbound
 profile, writes the secret, and only then commits the new generation; an
@@ -222,7 +238,8 @@ complete inventory.
 8. Append the boundary-attempt checkpoint and cross one adapter boundary.
 9. Persist the response and secret sink, then run the operation-specific verifier.
 10. Close verified/rejected transactions or require rectification without replay.
-11. Write redacted, content-addressed evidence.
+11. Write the redacted content-addressed body and its authenticated descriptor
+    or operational-proof envelope.
 
 Apply, sink, and verification receipts are hash-bound into their journal
 checkpoints: they are outside the pre-execution approval hash but cannot

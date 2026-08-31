@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::build_identity::current_build_info;
 use crate::profiles::ProfilesConfig;
 use crate::runtime::{
     CliError, Result, capability_call_argv, capability_has_meaningful_request_body,
@@ -218,6 +219,7 @@ pub(crate) fn record_operational_proof(
         },
         evidence,
     );
+    proof.bind_build_identity_hash(&hash_value(&serde_json::to_value(current_build_info())?)?)?;
     if capability.d1_full_export.is_some() {
         // `call` retains the provider's Cloudflare envelope under `result`.
         // Require that production shape so an invented flat fixture cannot be

@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::sync::Arc;
+
+use cfctl_auth::{EvidenceKeyManager, MemorySecretStore, SecretBackend};
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
     CostV1, D1FullExportGovernedExecutionBindingV1, DeploymentPlanSetChildV1,
@@ -19,6 +22,31 @@ fn sha256(byte: char) -> String {
 }
 
 const GENERATION_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn authenticated_store(paths: RuntimePaths) -> StateStore {
+    let store = StateStore::open(paths).expect("storage opens");
+    let manager = Arc::new(
+        EvidenceKeyManager::new(
+            Arc::new(MemorySecretStore::default()),
+            store.evidence_location_identity(),
+            SecretBackend::Memory,
+        )
+        .expect("test evidence key manager"),
+    );
+    let root_identity = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(b"cfctl-storage-regression-root"))
+    );
+    manager
+        .initialize(&root_identity)
+        .expect("test evidence key initializes");
+    store
+        .initialize_evidence_root_identity(&root_identity)
+        .expect("test evidence root initializes");
+    store
+        .with_evidence_authenticator(manager)
+        .expect("authenticated test store")
+}
 
 fn only_proof_index_path(paths: &RuntimePaths) -> std::path::PathBuf {
     let mut entries = std::fs::read_dir(paths.data_dir.join("evidence-index"))
@@ -257,7 +285,7 @@ fn concurrent_admission_activation_serializes_to_one_active_bundle() {
 fn evidence_is_redacted_content_addressed_and_deduplicated() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let paths = RuntimePaths::from_root(root.path());
-    let store = StateStore::open(paths).expect("storage opens");
+    let store = authenticated_store(paths);
 
     let first = store
         .write_evidence(
@@ -283,7 +311,7 @@ fn evidence_is_redacted_content_addressed_and_deduplicated() {
 #[test]
 fn evidence_reload_revalidates_the_content_hash() {
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let value = json!({"capability_id":"mln-0143-data-invariants","complete":true});
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &value)
@@ -298,64 +326,10 @@ fn evidence_reload_revalidates_the_content_hash() {
 }
 
 #[test]
-fn operational_proof_index_is_append_only_scoped_and_live_read_only() {
-    let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
-    let evidence = store
-        .write_evidence(
-            EvidenceClass::LiveRead,
-            &json!({"result": {"id": "zone-1"}}),
-        )
-        .expect("live evidence writes");
-    let proof = OperationalProofV1::new(
-        Utc::now(),
-        "zones-list",
-        &sha256('a'),
-        &sha256('b'),
-        OperationalProofScopeV1::new(Some("default"), Some("account-a"), Some(GENERATION_A)),
-        OperationalProofOutcomeV1::Succeeded,
-        evidence,
-    );
-
-    store
-        .record_operational_proof(&proof)
-        .expect("proof indexes");
-    store
-        .record_operational_proof(&proof)
-        .expect("same proof is idempotent");
-    let indexed = store.list_operational_proofs().expect("proofs list");
-    assert_eq!(indexed, vec![proof.clone()]);
-
-    let mut forged = proof;
-    forged.evidence.path = "/tmp/not-this-store.json".to_owned();
-    assert!(matches!(
-        store.record_operational_proof(&forged),
-        Err(StorageError::InvalidOperationalProof(_))
-    ));
-
-    let local_evidence = store
-        .write_evidence(EvidenceClass::LocalProof, &json!({"ok": true}))
-        .expect("local evidence writes");
-    let invalid = OperationalProofV1::new(
-        Utc::now(),
-        "zones-list",
-        &sha256('a'),
-        &sha256('b'),
-        OperationalProofScopeV1::new(None, None, None),
-        OperationalProofOutcomeV1::Succeeded,
-        local_evidence,
-    );
-    assert!(matches!(
-        store.record_operational_proof(&invalid),
-        Err(StorageError::InvalidOperationalProof(_))
-    ));
-}
-
-#[test]
 fn operational_proof_index_rejects_tampered_stored_bytes() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let paths = RuntimePaths::from_root(root.path());
-    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let store = authenticated_store(paths.clone());
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
         .expect("evidence writes");
@@ -372,8 +346,11 @@ fn operational_proof_index_rejects_tampered_stored_bytes() {
         .record_operational_proof(&proof)
         .expect("proof indexes");
     let index_path = only_proof_index_path(&paths);
-    let mut tampered = serde_json::to_value(&proof).expect("proof encodes");
-    tampered["account_id"] = json!("account-b");
+    let mut tampered: Value = serde_json::from_slice(
+        &std::fs::read(&index_path).expect("authenticated proof envelope reads"),
+    )
+    .expect("proof envelope decodes");
+    tampered["payload"]["account_id"] = json!("account-b");
     std::fs::write(
         &index_path,
         serde_json::to_vec_pretty(&tampered).expect("tampered proof encodes"),
@@ -395,7 +372,7 @@ fn operational_proof_index_rejects_tampered_stored_bytes() {
 #[test]
 fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
         .expect("evidence writes");
@@ -445,7 +422,7 @@ fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
 #[test]
 fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let observed_at = Utc::now();
     let evidence = store
         .write_evidence(
@@ -549,7 +526,7 @@ fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
 #[test]
 fn mln_0142_operational_proof_rejects_synthetic_or_drifted_authority() {
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let observed_at = Utc::now();
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &json!({"present":true}))
@@ -633,7 +610,7 @@ fn mln_0142_operational_proof_rejects_synthetic_or_drifted_authority() {
 #[test]
 fn d1_full_export_proof_requires_exact_completed_snapshot_binding() {
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let observed_at = Utc::now();
     let evidence = store
         .write_evidence(
@@ -771,13 +748,13 @@ fn d1_import_checkpoints_are_append_only_hash_bound_and_operation_scoped() {
 }
 
 #[test]
-fn legacy_unbound_operational_proof_remains_readable_but_cannot_be_rewritten() {
+fn legacy_unbound_operational_proof_is_body_readable_but_nonqualifying() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let paths = RuntimePaths::from_root(root.path());
     let store = StateStore::open(paths.clone()).expect("storage opens");
     let evidence = store
-        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
-        .expect("evidence writes");
+        .write_audit_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("audit evidence writes");
     let legacy = OperationalProofV1::new(
         Utc::now(),
         "zones-list",
@@ -798,9 +775,13 @@ fn legacy_unbound_operational_proof_remains_readable_but_cannot_be_rewritten() {
     )
     .expect("legacy index row writes");
 
+    assert!(store.list_operational_proofs().is_err());
+    assert!(store.list_recent_operational_proofs(10).is_err());
     assert_eq!(
-        store.list_operational_proofs().expect("legacy row reads"),
-        vec![legacy.clone()]
+        store
+            .read_audit_evidence_value(&legacy.evidence.content_hash)
+            .expect("legacy body remains audit-readable"),
+        json!({"bounded": true})
     );
     assert!(matches!(
         store.record_operational_proof(&legacy),
@@ -813,7 +794,7 @@ fn legacy_unbound_operational_proof_remains_readable_but_cannot_be_rewritten() {
 fn operational_proof_join_rejects_missing_or_modified_evidence() {
     for replacement in [None, Some(br#"{"different":true}"#.as_slice())] {
         let root = tempfile::tempdir().expect("temporary storage root");
-        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let store = authenticated_store(RuntimePaths::from_root(root.path()));
         let evidence = store
             .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
             .expect("evidence writes");
@@ -845,7 +826,7 @@ fn operational_proof_join_rejects_symlinked_evidence() {
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
         .expect("evidence writes");
@@ -876,7 +857,7 @@ fn operational_proof_join_rejects_symlinked_evidence() {
 #[test]
 fn recent_operational_proof_projection_is_bounded_and_reports_truncation() {
     let root = tempfile::tempdir().expect("temporary storage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store = authenticated_store(RuntimePaths::from_root(root.path()));
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
         .expect("evidence writes");

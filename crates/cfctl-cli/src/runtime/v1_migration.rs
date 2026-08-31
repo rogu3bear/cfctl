@@ -64,7 +64,7 @@ pub(super) fn migrate_command(
                             .join(source_relative),
                         content.as_bytes(),
                     )?;
-                    let evidence = store.write_evidence(
+                    let evidence = store.write_audit_evidence(
                         EvidenceClass::SourceConfig,
                         &json!({
                             "source_path": path,

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn save_current_test_plan(store: &StateStore, plan: &PlanV1) {
+pub(super) fn save_current_test_plan(store: &StorageStateStore, plan: &PlanV1) {
     let document = PlanV2::new(
         plan.clone(),
         PlanPinsV2 {
@@ -22,7 +22,7 @@ pub(super) fn save_current_test_plan(store: &StateStore, plan: &PlanV1) {
 
 pub(super) struct PollChildLineageFixture {
     pub(super) _root: tempfile::TempDir,
-    pub(super) store: StateStore,
+    pub(super) store: StorageStateStore,
     pub(super) root_plan: PlanV1,
     pub(super) children: Vec<PlanV1>,
 }
@@ -32,7 +32,7 @@ pub(super) const POLL_FIXTURE_CATALOG_HASH: &str =
 pub(super) const POLL_FIXTURE_CREDENTIAL_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 
 pub(super) fn persist_poll_lineage_checkpoint(
-    store: &StateStore,
+    store: &StorageStateStore,
     operation_id: &str,
     checkpoint: &Value,
 ) -> String {
@@ -50,7 +50,7 @@ pub(super) fn persist_poll_lineage_checkpoint(
 }
 
 pub(super) fn record_test_export_anchor(
-    store: &StateStore,
+    store: &StorageStateStore,
     contract: &cfctl_core::D1ApprovedMlnImportContractV1,
     catalog_hash: &str,
     completed_at: chrono::DateTime<Utc>,
@@ -129,7 +129,7 @@ pub(super) fn record_test_export_anchor(
     reason = "the production-shaped fixture materializes the entire governed 0142 to 0143 authority chain"
 )]
 pub(super) fn authentic_0143_prerequisites(
-    store: &StateStore,
+    store: &StorageStateStore,
     root_capability: &CapabilityV1,
     root_created_at: chrono::DateTime<Utc>,
 ) -> Value {
@@ -410,7 +410,7 @@ pub(super) fn authentic_0143_prerequisites(
 pub(super) fn build_poll_child_lineage(generations: usize) -> PollChildLineageFixture {
     assert!((1..=2).contains(&generations));
     let root = tempfile::tempdir().expect("poll lineage root");
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("poll lineage store");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
     let mut catalog = CatalogSnapshot {
         schema_version: 1,
         generated_at: Utc::now(),
@@ -834,7 +834,7 @@ pub(super) fn reset_poll_child_to_draft(child: &mut PlanV1) {
         .expect("restore prepared draft lifecycle");
 }
 
-pub(super) fn persist_rebound_poll_child(store: &StateStore, child: &PlanV1) {
+pub(super) fn persist_rebound_poll_child(store: &StorageStateStore, child: &PlanV1) {
     store
         .save_plan(child)
         .expect("persist rebound canonical child and projection");
@@ -1013,7 +1013,7 @@ pub(super) fn poll_child_resolver_rejects_duplicate_completion_and_lineage_graft
     }
 }
 
-pub(super) fn poll_test_evidence_path(store: &StateStore, hash: &str) -> PathBuf {
+pub(super) fn poll_test_evidence_path(store: &StorageStateStore, hash: &str) -> PathBuf {
     store
         .paths()
         .data_dir
@@ -1065,7 +1065,7 @@ pub(super) fn rebuild_poll_child_terminal_lifecycle(
 }
 
 pub(super) fn rebind_poll_child_terminal_lifecycle(
-    store: &StateStore,
+    store: &StorageStateStore,
     child: &mut PlanV1,
     terminal_status: PlanStatus,
     response_artifact: Value,
@@ -1074,7 +1074,11 @@ pub(super) fn rebind_poll_child_terminal_lifecycle(
     persist_rebound_poll_child(store, child);
 }
 
-pub(super) fn persist_poll_test_plan_v2(store: &StateStore, plan: &PlanV1, pins: PlanPinsV2) {
+pub(super) fn persist_poll_test_plan_v2(
+    store: &StorageStateStore,
+    plan: &PlanV1,
+    pins: PlanPinsV2,
+) {
     let document = PlanV2::new(plan.clone(), pins).expect("valid drifted PlanV2");
     let projection_path = store
         .paths()
@@ -1099,7 +1103,7 @@ pub(super) fn persist_poll_test_plan_v2(store: &StateStore, plan: &PlanV1, pins:
 }
 
 pub(super) fn rewrite_poll_test_checkpoints_for_target(
-    store: &StateStore,
+    store: &StorageStateStore,
     plan: &PlanV1,
     expected_target: &Value,
 ) -> BTreeMap<String, (String, Value)> {

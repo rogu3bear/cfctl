@@ -8,10 +8,13 @@ repository.workspace = true
 
 [dependencies]
 cfctl-core = { workspace = true }
+cfctl-auth = { workspace = true }
 cfctl-workspace = { workspace = true }
+cap-std.workspace = true
 chrono.workspace = true
 directories.workspace = true
 hex.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

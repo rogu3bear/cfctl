@@ -1111,7 +1111,7 @@ pub(super) fn mln_0143_pre_import_requires_one_current_authority_proof_after_rec
 pub(super) fn closed_import_recovery_bookmark_must_be_fresh_at_plan_time() {
     let evaluate = |age: ChronoDuration| {
         let root = tempfile::tempdir().expect("runtime root");
-        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+        let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
         let mut catalog = CatalogSnapshot {
             schema_version: 1,
             generated_at: Utc::now(),
