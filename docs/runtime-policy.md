@@ -181,8 +181,21 @@ send the value only through stdin and trust only `/usr/bin/security`, the same
 reader used by unattended cfctl processes. `cfctl auth
 repair-keychain-access <profile>` performs a one-time opaque rewrite for items
 created before this contract. An interactive access prompt becomes a nonzero
-scheduler failure instead of an indefinite hang. No token value enters stdout,
-arguments, profiles, plans, evidence, or repository files.
+scheduler failure instead of an indefinite hang. Keychain reads receive the
+credential only through a private, bounded child-process pipe; no token value
+reaches inherited or user-visible cfctl stdout, arguments, logs, profiles,
+plans, evidence, or repository files.
+
+The cfctl v2 macOS Keychain representation is a one-way storage migration.
+After a v2 build writes or migrates a credential, running a binary released
+before this storage contract against that Keychain item is unsupported,
+including side-by-side use: the older binary cannot interpret the v2 root
+marker or discover the associated inventory, manifests, and chunks, so it can
+misread the marker or report a successful deletion while secret-bearing chunks
+remain. Do not downgrade or use an older cfctl binary for credential reads,
+writes, repair, or logout after v2 migration. Return to a current v2 binary to
+inspect or remove the credential; the v2 reader fails closed when managed or
+legacy ownership is ambiguous.
 
 Once the governed fallback contains state, it is the deterministic authority
 for ordinary credential reads, locations, fresh writes, and logout deletion.
