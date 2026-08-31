@@ -13,9 +13,11 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 
 mod observations;
+mod observer;
 mod producer;
 
 use observations::{derive_zero_delta_comparison, validate_cleanup_absence_body};
+pub(super) use observer::{CAPABILITY_ID as OBSERVER_CAPABILITY_ID, observe};
 pub(super) use producer::{CAPABILITY_ID as PRODUCER_CAPABILITY_ID, produce};
 
 use super::prelude::{CliError, PlanV1, Result, StateStore};
@@ -191,18 +193,32 @@ impl OwnedProofExpectation {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the atomicity validator keeps the closed receipt and child matrices visible together"
-)]
 pub(super) fn validate_atomicity_qualification(
     store: &StateStore,
     evidence: &EvidenceV1,
     expected: &AtomicityExpectations<'_>,
     now: DateTime<Utc>,
 ) -> Result<WorkspaceD1AtomicityQualificationV1> {
+    validate_atomicity_qualification_body(store, evidence, expected, now, false)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the atomicity validator keeps the closed receipt and child matrices visible together"
+)]
+fn validate_atomicity_qualification_body(
+    store: &StateStore,
+    evidence: &EvidenceV1,
+    expected: &AtomicityExpectations<'_>,
+    now: DateTime<Utc>,
+    audit_body_only: bool,
+) -> Result<WorkspaceD1AtomicityQualificationV1> {
     require_post_change_evidence(evidence)?;
-    let value = store.read_evidence_value(&evidence.content_hash)?;
+    let value = if audit_body_only {
+        store.read_audit_evidence_value(&evidence.content_hash)?
+    } else {
+        store.read_evidence_value(&evidence.content_hash)?
+    };
     let receipt: WorkspaceD1AtomicityQualificationV1 = serde_json::from_value(value)
         .map_err(|_| CliError::Input("workspace D1 atomicity receipt is malformed".to_owned()))?;
     let plan_hashes = [
@@ -219,6 +235,24 @@ pub(super) fn validate_atomicity_qualification(
         &receipt.ledger_failure_schema_delta,
         &receipt.ledger_failure_ledger_delta,
     ];
+    let delta_proof_hashes = delta_comparisons
+        .iter()
+        .flat_map(|delta| {
+            [
+                delta.before_proof_hash.as_str(),
+                delta.after_proof_hash.as_str(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let delta_evidence_hashes = delta_comparisons
+        .iter()
+        .flat_map(|delta| {
+            [
+                delta.before_evidence_hash.as_str(),
+                delta.after_evidence_hash.as_str(),
+            ]
+        })
+        .collect::<Vec<_>>();
     let outcome_hashes = [
         receipt.success_outcome_evidence_hash.as_str(),
         receipt.ddl_failure_outcome_evidence_hash.as_str(),
@@ -293,6 +327,9 @@ pub(super) fn validate_atomicity_qualification(
         || !plan_hashes.iter().all(|hash| is_sha256(hash))
         || plan_hashes.iter().collect::<BTreeSet<_>>().len() != plan_hashes.len()
         || !outcome_hashes.iter().all(|hash| is_sha256(hash))
+        || delta_proof_hashes.iter().collect::<BTreeSet<_>>().len() != delta_proof_hashes.len()
+        || delta_evidence_hashes.iter().collect::<BTreeSet<_>>().len()
+            != delta_evidence_hashes.len()
         || !delta_comparisons.iter().all(|delta| delta.zero_delta)
         || !receipt.success_passed
         || !receipt.ddl_failure_observed
@@ -1464,7 +1501,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ddl_failure_schema_delta
                 .before_evidence_hash
                 .as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1474,7 +1511,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ddl_failure_schema_delta
                 .after_evidence_hash
                 .as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1487,7 +1524,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ddl_failure_ledger_delta
                 .before_evidence_hash
                 .as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1497,7 +1534,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ddl_failure_ledger_delta
                 .after_evidence_hash
                 .as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1510,7 +1547,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ledger_failure_schema_delta
                 .before_evidence_hash
                 .as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1523,7 +1560,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ledger_failure_schema_delta
                 .after_evidence_hash
                 .as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1536,7 +1573,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ledger_failure_ledger_delta
                 .before_evidence_hash
                 .as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1549,7 +1586,7 @@ pub(super) fn current_plan_evidence_hashes(
                 .ledger_failure_ledger_delta
                 .after_evidence_hash
                 .as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -1568,7 +1605,11 @@ pub(super) fn current_plan_evidence_hashes(
                 proof_role(role),
                 proof,
                 capability,
-                Some(&d1_input_hash),
+                if capability == "workspace-d1-qualification-observe" {
+                    None
+                } else {
+                    Some(&d1_input_hash)
+                },
                 None,
                 outcome,
             )

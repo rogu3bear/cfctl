@@ -1,23 +1,56 @@
 use cfctl_cloudflare::CallInput;
 use cfctl_core::{
-    EvidenceClass, OperationalProofOutcomeV1, PlanStatus, TransactionStageV1,
-    WorkspaceD1AtomicityQualificationV1, WorkspaceD1OldWorkerCanaryV1, hash_value,
+    EvidenceClass, EvidenceV1, OperationalProofOutcomeV1, PlanStatus, TransactionStageV1,
+    WorkspaceD1AtomicityQualificationV1, WorkspaceD1EvidenceJoinsV1, WorkspaceD1OldWorkerCanaryV1,
+    hash_value,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
     AtomicityExpectations, CanaryExpectations, OwnedPlanExpectation, OwnedProofExpectation,
-    capability_role, derive_zero_delta_comparison, resolve_plan_expectation,
+    capability_role, derive_zero_delta_comparison, evidence_joins, resolve_plan_expectation,
     resolve_proof_expectation, resolve_worker_plan_expectation, single_migration_sha256,
-    validate_old_worker_canary, validate_qualification_pair,
+    validate_atomicity_qualification_body, validate_old_worker_canary,
 };
 use crate::runtime::prelude::{
     CatalogSnapshot, CliError, Result, ResultEnvelopeV2, StateStore, VerificationState,
 };
 
 pub(crate) const CAPABILITY_ID: &str = "workspace-d1-qualification-produce";
+
+fn validate_qualification_pair(
+    store: &StateStore,
+    atomicity_evidence: &EvidenceV1,
+    canary_evidence: &EvidenceV1,
+    atomicity_expected: &AtomicityExpectations<'_>,
+    canary_expected: &CanaryExpectations<'_>,
+    now: DateTime<Utc>,
+) -> Result<WorkspaceD1EvidenceJoinsV1> {
+    let atomicity = validate_atomicity_qualification_body(
+        store,
+        atomicity_evidence,
+        atomicity_expected,
+        now,
+        true,
+    )?;
+    let canary = validate_old_worker_canary(store, canary_evidence, canary_expected, now)?;
+    if canary.migration_operation_id != atomicity.success_apply_operation_id
+        || canary.migration_plan_hash != atomicity.success_apply_plan_hash
+        || canary.migration_apply_evidence_hash != atomicity.success_outcome_evidence_hash
+        || canary.account_id != atomicity.account_id
+        || canary.profile_id != atomicity.profile_id
+        || canary.credential_generation_id != atomicity.credential_generation_id
+        || canary.database_id != atomicity.isolated_database_id
+    {
+        return Err(CliError::Input(
+            "workspace D1 qualification evidence is not operation- and target-continuous"
+                .to_owned(),
+        ));
+    }
+    evidence_joins(atomicity_evidence, canary_evidence, &canary)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,49 +218,49 @@ fn produce_validated(
         (
             "ddl_schema_before",
             atomic.ddl_failure_schema_before_proof_hash.as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ddl_schema_after",
             atomic.ddl_failure_schema_after_proof_hash.as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ddl_ledger_before",
             atomic.ddl_failure_ledger_before_proof_hash.as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ddl_ledger_after",
             atomic.ddl_failure_ledger_after_proof_hash.as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ledger_schema_before",
             atomic.ledger_failure_schema_before_proof_hash.as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ledger_schema_after",
             atomic.ledger_failure_schema_after_proof_hash.as_str(),
-            "d1-schema-introspection",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ledger_ledger_before",
             atomic.ledger_failure_ledger_before_proof_hash.as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "ledger_ledger_after",
             atomic.ledger_failure_ledger_after_proof_hash.as_str(),
-            "mln-web.founder-d1-migration-apply",
+            "workspace-d1-qualification-observe",
             OperationalProofOutcomeV1::Succeeded,
         ),
         (
@@ -245,7 +278,11 @@ fn produce_validated(
                 proof_role(role),
                 proof_hash,
                 capability,
-                Some(&d1_input_hash),
+                if capability == "workspace-d1-qualification-observe" {
+                    None
+                } else {
+                    Some(&d1_input_hash)
+                },
                 None,
                 outcome,
             )
@@ -363,18 +400,27 @@ fn produce_validated(
         &database_id,
         now,
     )?;
-    let atomicity_evidence = store.write_evidence(
-        EvidenceClass::PostChangeVerification,
-        &serde_json::to_value(&atomicity)?,
-    )?;
+    let atomicity_value = serde_json::to_value(&atomicity)?;
+    let staged_atomicity_evidence =
+        store.write_audit_evidence(EvidenceClass::PostChangeVerification, &atomicity_value)?;
     let joins = validate_qualification_pair(
         store,
-        &atomicity_evidence,
+        &staged_atomicity_evidence,
         &canary_evidence,
         &atomic_expected,
         &canary_expected,
         Utc::now(),
     )?;
+    let atomicity_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &atomicity_value)?;
+    if atomicity_evidence.class != staged_atomicity_evidence.class
+        || atomicity_evidence.content_hash != staged_atomicity_evidence.content_hash
+        || atomicity_evidence.path != staged_atomicity_evidence.path
+    {
+        return Err(CliError::Input(
+            "workspace D1 atomicity publication identity drifted after validation".into(),
+        ));
+    }
     let mut envelope = ResultEnvelopeV2::success(
         "call",
         json!({
@@ -627,6 +673,28 @@ mod tests {
             super::super::tests::producer_fixture_with_duplicate_delta_identity();
 
         assert!(produce(&store, &catalog, &input).is_err());
+    }
+
+    #[test]
+    fn producer_rejects_cross_operation_pair_replay_and_shared_interval_reversal() {
+        let (_root, store, catalog, input) =
+            super::super::tests::producer_fixture_with_cross_operation_pair_replay();
+
+        assert!(produce(&store, &catalog, &input).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn producer_validates_the_complete_pair_before_authoritative_publication() {
+        let source = include_str!("producer.rs");
+        let validate = source
+            .find("let joins = validate_qualification_pair(")
+            .expect("pair validation call");
+        let publish = source
+            .find("let atomicity_evidence = store.write_evidence(")
+            .expect("authoritative publication call");
+
+        assert!(validate < publish);
     }
 
     #[test]

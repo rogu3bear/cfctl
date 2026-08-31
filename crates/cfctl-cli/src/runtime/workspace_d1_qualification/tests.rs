@@ -22,6 +22,8 @@ const PROFILE: &str = "profile-a";
 const GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 const DATABASE: &str = "33333333-3333-4333-8333-333333333333";
 
+mod observer_command;
+
 fn digest(label: &str) -> String {
     hash_value(&Value::String(label.to_owned())).expect("hash")
 }
@@ -455,7 +457,7 @@ fn fixture_with_migrations(
         )
     };
     let state_proof =
-        |role: &str, capability: &str, plan_role: &str, observation: &str, before: bool| {
+        |role: &str, _capability: &str, plan_role: &str, observation: &str, before: bool| {
             let attempted = plan(plan_role);
             let observed_at = if before {
                 attempted.boundary_attempted_at - chrono::Duration::milliseconds(1)
@@ -465,7 +467,7 @@ fn fixture_with_migrations(
             stored_proof_at(
                 store,
                 role,
-                capability,
+                "workspace-d1-qualification-observe",
                 &candidate,
                 &catalog,
                 d1_input(),
@@ -473,8 +475,14 @@ fn fixture_with_migrations(
                     "schema_version":1,
                     "kind":"workspace_d1_state_observation_v1",
                     "observation":observation,
+                    "phase":if before { "before" } else { "after" },
+                    "attempted_operation_id":attempted.operation_id,
+                    "attempted_plan_hash":attempted.plan_hash,
                     "observed_at":observed_at,
-                    "state":{"rows":[]},
+                    "source_proof_hash":digest(&format!("{role}-source-proof")),
+                    "source_evidence_hash":digest(&format!("{role}-source-evidence")),
+                    "source_input_hash":digest(&format!("{role}-source-input")),
+                    "semantic_state":{"rows":[]},
                 }),
                 observed_at,
                 OperationalProofOutcomeV1::Succeeded,
@@ -550,7 +558,7 @@ fn fixture_with_migrations(
             json!({
                 "status":404,"success":false,"result":null,
                 "errors":[{"code":7404,"message":"D1 database not found"}],
-                "result_info":null,"etag":null,"cf_ray":null,
+                "result_info":null,"etag":null,"cf_ray":null,"availability":{},
             }),
             Utc::now(),
             OperationalProofOutcomeV1::Failed,
@@ -883,6 +891,68 @@ pub(super) fn producer_fixture_with_duplicate_delta_identity()
     let body = input.body.as_mut().expect("producer body");
     body["atomicity"]["ddl_failure_schema_after_proof_hash"] =
         body["atomicity"]["ddl_failure_schema_before_proof_hash"].clone();
+    (root, store, catalog, input)
+}
+
+pub(super) fn producer_fixture_with_cross_operation_pair_replay()
+-> (tempfile::TempDir, StateStore, CatalogSnapshot, CallInput) {
+    let (root, store, catalog, mut input) = producer_fixture();
+    let body = input.body.as_ref().expect("producer body");
+    let operation_id = |name: &str| body["atomicity"][name].as_str().expect("operation id");
+    let boundary = |operation: &str, stage: TransactionStageV1| {
+        let cfctl_storage::StoredPlanRecord::Current(plan) = store
+            .load_stored_plan_record(operation)
+            .expect("stored plan")
+        else {
+            panic!("current PlanV2")
+        };
+        plan.plan
+            .transaction_journal
+            .iter()
+            .find(|checkpoint| checkpoint.stage == stage)
+            .map(|checkpoint| checkpoint.recorded_at)
+            .expect("boundary checkpoint")
+    };
+    let before_at = boundary(
+        operation_id("ddl_failure_apply_operation_id"),
+        TransactionStageV1::BoundaryAttemptPersisted,
+    ) - Duration::milliseconds(1);
+    let after_at = boundary(
+        operation_id("ledger_failure_apply_operation_id"),
+        TransactionStageV1::BoundaryResponsePersisted,
+    ) + Duration::milliseconds(1);
+    let source_input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":ACCOUNT,"database_id":DATABASE}),
+        query: json!({}),
+        ..CallInput::default()
+    })
+    .expect("source input");
+    let observation = |role: &str, observed_at| {
+        stored_proof_at(
+            &store,
+            role,
+            "d1-schema-introspection",
+            &digest("cfctl-candidate"),
+            &catalog.schema_hash,
+            source_input.clone(),
+            json!({
+                "schema_version":1,
+                "kind":"workspace_d1_state_observation_v1",
+                "observation":"schema",
+                "observed_at":observed_at,
+                "state":{"rows":[]},
+            }),
+            observed_at,
+            OperationalProofOutcomeV1::Succeeded,
+        )
+    };
+    let before = observation("shared_schema_before", before_at);
+    let after = observation("shared_schema_after", after_at);
+    let body = input.body.as_mut().expect("producer body");
+    for failure in ["ddl_failure", "ledger_failure"] {
+        body["atomicity"][format!("{failure}_schema_before_proof_hash")] = json!(before.proof_hash);
+        body["atomicity"][format!("{failure}_schema_after_proof_hash")] = json!(after.proof_hash);
+    }
     (root, store, catalog, input)
 }
 

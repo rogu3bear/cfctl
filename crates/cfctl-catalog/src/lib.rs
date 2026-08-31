@@ -32,7 +32,9 @@ use thiserror::Error;
 
 mod workspace_d1_qualification;
 
-use workspace_d1_qualification::workspace_d1_qualification_producer_capability;
+use workspace_d1_qualification::{
+    workspace_d1_qualification_observer_capability, workspace_d1_qualification_producer_capability,
+};
 
 pub const OFFICIAL_OPENAPI_URL: &str =
     "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json";
@@ -2595,6 +2597,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
     for capability in vec![
+        workspace_d1_qualification_observer_capability(),
         workspace_d1_qualification_producer_capability(),
         worker_deployment_plan_capability(),
         worker_version_rollback_capability(),

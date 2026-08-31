@@ -13,8 +13,14 @@ struct StateObservationV1 {
     schema_version: u8,
     kind: String,
     observation: String,
+    phase: String,
+    attempted_operation_id: String,
+    attempted_plan_hash: String,
     observed_at: DateTime<Utc>,
-    state: Value,
+    source_proof_hash: String,
+    source_evidence_hash: String,
+    source_input_hash: String,
+    semantic_state: Value,
 }
 
 pub(super) fn derive_zero_delta_comparison(
@@ -38,19 +44,29 @@ pub(super) fn derive_zero_delta_comparison(
         || after_observation.kind != "workspace_d1_state_observation_v1"
         || before_observation.observation != expected_observation
         || after_observation.observation != expected_observation
+        || before_observation.phase != "before"
+        || after_observation.phase != "after"
+        || before_observation.attempted_operation_id != attempted.operation_id
+        || after_observation.attempted_operation_id != attempted.operation_id
+        || before_observation.attempted_plan_hash != attempted.plan_content_hash
+        || after_observation.attempted_plan_hash != attempted.plan_content_hash
+        || before_observation.source_proof_hash == after_observation.source_proof_hash
+        || before_observation.source_evidence_hash == after_observation.source_evidence_hash
+        || before_observation.source_input_hash.is_empty()
+        || after_observation.source_input_hash.is_empty()
         || before_observation.observed_at != before_proof.observed_at
         || after_observation.observed_at != after_proof.observed_at
         || before_proof.observed_at >= after_proof.observed_at
-        || before_proof.observed_at > attempted.boundary_attempted_at
-        || after_proof.observed_at < attempted.boundary_responded_at
+        || before_proof.observed_at >= attempted.boundary_attempted_at
+        || after_proof.observed_at <= attempted.boundary_responded_at
     {
         return Err(CliError::Input(
             "workspace D1 zero-delta observations are not distinct and temporally bracketing"
                 .to_owned(),
         ));
     }
-    let before_state_hash = hash_value(&before_observation.state)?;
-    let after_state_hash = hash_value(&after_observation.state)?;
+    let before_state_hash = hash_value(&before_observation.semantic_state)?;
+    let after_state_hash = hash_value(&after_observation.semantic_state)?;
     if before_state_hash != after_state_hash {
         return Err(CliError::Input(
             "workspace D1 zero-delta observations changed semantic state".to_owned(),
@@ -59,6 +75,7 @@ pub(super) fn derive_zero_delta_comparison(
     Ok(WorkspaceD1ZeroDeltaComparisonV1 {
         observation: expected_observation.to_owned(),
         attempted_operation_id: attempted.operation_id.to_owned(),
+        attempted_plan_hash: attempted.plan_content_hash.to_owned(),
         before_proof_hash: before.proof_hash.to_owned(),
         before_evidence_hash: before.evidence_hash.to_owned(),
         before_observed_at: before_proof.observed_at,
@@ -72,7 +89,7 @@ pub(super) fn derive_zero_delta_comparison(
 
 pub(super) fn validate_cleanup_absence_body(body: Value) -> Result<()> {
     let exact_shape = body.as_object().is_some_and(|object| {
-        object.len() == 7
+        object.len() == 8
             && [
                 "status",
                 "success",
@@ -81,13 +98,20 @@ pub(super) fn validate_cleanup_absence_body(body: Value) -> Result<()> {
                 "result_info",
                 "etag",
                 "cf_ray",
+                "availability",
             ]
             .iter()
             .all(|field| object.contains_key(*field))
     });
-    let response: CloudflareResponseV1 = serde_json::from_value(body)
+    let availability_valid = body.get("availability").is_some_and(Value::is_object);
+    let mut response_body = body;
+    response_body
+        .as_object_mut()
+        .map(|object| object.remove("availability"));
+    let response: CloudflareResponseV1 = serde_json::from_value(response_body)
         .map_err(|_| CliError::Input("workspace D1 cleanup proof body is malformed".to_owned()))?;
     if !exact_shape
+        || !availability_valid
         || response.status != 404
         || response.success
         || !response.result.is_null()

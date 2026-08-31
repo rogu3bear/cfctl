@@ -117,6 +117,7 @@ pub struct WorkspaceD1SchemaAssertionV1 {
 pub struct WorkspaceD1ZeroDeltaComparisonV1 {
     pub observation: String,
     pub attempted_operation_id: String,
+    pub attempted_plan_hash: String,
     pub before_proof_hash: String,
     pub before_evidence_hash: String,
     pub before_observed_at: DateTime<Utc>,
