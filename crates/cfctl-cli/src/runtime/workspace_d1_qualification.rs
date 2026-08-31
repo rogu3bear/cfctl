@@ -3,16 +3,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
 use cfctl_core::{
     EvidenceClass, EvidenceV1, OperationalProofOutcomeV1, PlanStatus, PlanV2, TransactionStageV1,
-    WorkspaceD1AtomicityQualificationV1, WorkspaceD1EvidenceJoinsV1,
-    WorkspaceD1MigrationContractV1, WorkspaceD1OldWorkerCanaryV1, hash_value,
+    WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID, WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION,
+    WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY, WorkspaceD1AtomicityQualificationV1,
+    WorkspaceD1EvidenceJoinsV1, WorkspaceD1MigrationContractV1, WorkspaceD1OldWorkerCanaryV1,
+    hash_value,
 };
 use cfctl_storage::StoredPlanRecord;
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod observations;
 mod producer;
 
+use observations::{derive_zero_delta_comparison, validate_cleanup_absence_body};
 pub(super) use producer::{CAPABILITY_ID as PRODUCER_CAPABILITY_ID, produce};
 
 use super::prelude::{CliError, PlanV1, Result, StateStore};
@@ -72,6 +75,8 @@ pub(super) struct PlanExpectation<'a> {
     pub expected_stage: TransactionStageV1,
     pub expected_evidence_class: EvidenceClass,
     pub evidence_hash: &'a str,
+    pub boundary_attempted_at: DateTime<Utc>,
+    pub boundary_responded_at: DateTime<Utc>,
 }
 
 pub(super) struct ProofExpectation<'a> {
@@ -125,6 +130,8 @@ struct OwnedPlanExpectation {
     expected_status: PlanStatus,
     expected_stage: TransactionStageV1,
     evidence_hash: String,
+    boundary_attempted_at: DateTime<Utc>,
+    boundary_responded_at: DateTime<Utc>,
     input: CallInput,
     workspace_d1_migration: Option<WorkspaceD1MigrationContractV1>,
 }
@@ -146,6 +153,8 @@ impl OwnedPlanExpectation {
             expected_stage: self.expected_stage,
             expected_evidence_class: EvidenceClass::PostChangeVerification,
             evidence_hash: &self.evidence_hash,
+            boundary_attempted_at: self.boundary_attempted_at,
+            boundary_responded_at: self.boundary_responded_at,
         }
     }
 }
@@ -161,6 +170,7 @@ struct OwnedProofExpectation {
     profile_id: String,
     account_id: String,
     credential_generation_id: String,
+    expected_outcome: OperationalProofOutcomeV1,
 }
 
 impl OwnedProofExpectation {
@@ -176,21 +186,15 @@ impl OwnedProofExpectation {
             profile_id: &self.profile_id,
             account_id: &self.account_id,
             credential_generation_id: &self.credential_generation_id,
-            expected_outcome: OperationalProofOutcomeV1::Succeeded,
+            expected_outcome: self.expected_outcome,
         }
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ZeroDeltaObservationV1 {
-    schema_version: u8,
-    kind: String,
-    observation: String,
-    before_evidence_hash: String,
-    after_evidence_hash: String,
-}
-
+#[expect(
+    clippy::too_many_lines,
+    reason = "the atomicity validator keeps the closed receipt and child matrices visible together"
+)]
 pub(super) fn validate_atomicity_qualification(
     store: &StateStore,
     evidence: &EvidenceV1,
@@ -209,15 +213,49 @@ pub(super) fn validate_atomicity_qualification(
         &receipt.restore_plan_hash,
         &receipt.delete_database_plan_hash,
     ];
+    let delta_comparisons = [
+        &receipt.ddl_failure_schema_delta,
+        &receipt.ddl_failure_ledger_delta,
+        &receipt.ledger_failure_schema_delta,
+        &receipt.ledger_failure_ledger_delta,
+    ];
     let outcome_hashes = [
-        &receipt.success_outcome_evidence_hash,
-        &receipt.ddl_failure_outcome_evidence_hash,
-        &receipt.ddl_failure_zero_schema_delta_hash,
-        &receipt.ddl_failure_zero_ledger_delta_hash,
-        &receipt.ledger_failure_outcome_evidence_hash,
-        &receipt.ledger_failure_zero_schema_delta_hash,
-        &receipt.ledger_failure_zero_ledger_delta_hash,
-        &receipt.cleanup_evidence_hash,
+        receipt.success_outcome_evidence_hash.as_str(),
+        receipt.ddl_failure_outcome_evidence_hash.as_str(),
+        receipt.ledger_failure_outcome_evidence_hash.as_str(),
+        receipt.cleanup_evidence_hash.as_str(),
+        receipt
+            .ddl_failure_schema_delta
+            .before_evidence_hash
+            .as_str(),
+        receipt
+            .ddl_failure_schema_delta
+            .after_evidence_hash
+            .as_str(),
+        receipt
+            .ddl_failure_ledger_delta
+            .before_evidence_hash
+            .as_str(),
+        receipt
+            .ddl_failure_ledger_delta
+            .after_evidence_hash
+            .as_str(),
+        receipt
+            .ledger_failure_schema_delta
+            .before_evidence_hash
+            .as_str(),
+        receipt
+            .ledger_failure_schema_delta
+            .after_evidence_hash
+            .as_str(),
+        receipt
+            .ledger_failure_ledger_delta
+            .before_evidence_hash
+            .as_str(),
+        receipt
+            .ledger_failure_ledger_delta
+            .after_evidence_hash
+            .as_str(),
     ];
     let isolated_identity = hash_value(&json!({
         "account_id": receipt.account_id,
@@ -255,13 +293,10 @@ pub(super) fn validate_atomicity_qualification(
         || !plan_hashes.iter().all(|hash| is_sha256(hash))
         || plan_hashes.iter().collect::<BTreeSet<_>>().len() != plan_hashes.len()
         || !outcome_hashes.iter().all(|hash| is_sha256(hash))
+        || !delta_comparisons.iter().all(|delta| delta.zero_delta)
         || !receipt.success_passed
         || !receipt.ddl_failure_observed
-        || !receipt.ddl_failure_zero_schema_delta
-        || !receipt.ddl_failure_zero_ledger_delta
         || !receipt.ledger_failure_observed
-        || !receipt.ledger_failure_zero_schema_delta
-        || !receipt.ledger_failure_zero_ledger_delta
         || !receipt.cleanup_database_absent
         || receipt.completed_at > now
         || evidence.generated_at < receipt.completed_at
@@ -301,6 +336,9 @@ pub(super) fn validate_old_worker_canary(
     if receipt.schema_version != 1
         || receipt.kind != "workspace_d1_old_worker_canary_v1"
         || receipt.evidence_class != EvidenceClass::PostChangeVerification
+        || receipt.owner_repository != WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY
+        || receipt.cross_repository_contract_id != WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID
+        || receipt.cross_repository_contract_version != WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION
         || receipt.capability_id != expected.capability_id
         || receipt.workspace_contract_sha256 != expected.workspace_contract_sha256
         || receipt.cfctl_candidate_hash != expected.cfctl_candidate_hash
@@ -467,24 +505,80 @@ fn validate_atomicity_children(
             receipt.bookmark_evidence_hash.as_str(),
         ),
         (
-            "ddl_zero_schema",
-            receipt.ddl_failure_zero_schema_proof_hash.as_str(),
-            receipt.ddl_failure_zero_schema_delta_hash.as_str(),
+            "ddl_schema_before",
+            receipt.ddl_failure_schema_delta.before_proof_hash.as_str(),
+            receipt
+                .ddl_failure_schema_delta
+                .before_evidence_hash
+                .as_str(),
         ),
         (
-            "ddl_zero_ledger",
-            receipt.ddl_failure_zero_ledger_proof_hash.as_str(),
-            receipt.ddl_failure_zero_ledger_delta_hash.as_str(),
+            "ddl_schema_after",
+            receipt.ddl_failure_schema_delta.after_proof_hash.as_str(),
+            receipt
+                .ddl_failure_schema_delta
+                .after_evidence_hash
+                .as_str(),
         ),
         (
-            "ledger_zero_schema",
-            receipt.ledger_failure_zero_schema_proof_hash.as_str(),
-            receipt.ledger_failure_zero_schema_delta_hash.as_str(),
+            "ddl_ledger_before",
+            receipt.ddl_failure_ledger_delta.before_proof_hash.as_str(),
+            receipt
+                .ddl_failure_ledger_delta
+                .before_evidence_hash
+                .as_str(),
         ),
         (
-            "ledger_zero_ledger",
-            receipt.ledger_failure_zero_ledger_proof_hash.as_str(),
-            receipt.ledger_failure_zero_ledger_delta_hash.as_str(),
+            "ddl_ledger_after",
+            receipt.ddl_failure_ledger_delta.after_proof_hash.as_str(),
+            receipt
+                .ddl_failure_ledger_delta
+                .after_evidence_hash
+                .as_str(),
+        ),
+        (
+            "ledger_schema_before",
+            receipt
+                .ledger_failure_schema_delta
+                .before_proof_hash
+                .as_str(),
+            receipt
+                .ledger_failure_schema_delta
+                .before_evidence_hash
+                .as_str(),
+        ),
+        (
+            "ledger_schema_after",
+            receipt
+                .ledger_failure_schema_delta
+                .after_proof_hash
+                .as_str(),
+            receipt
+                .ledger_failure_schema_delta
+                .after_evidence_hash
+                .as_str(),
+        ),
+        (
+            "ledger_ledger_before",
+            receipt
+                .ledger_failure_ledger_delta
+                .before_proof_hash
+                .as_str(),
+            receipt
+                .ledger_failure_ledger_delta
+                .before_evidence_hash
+                .as_str(),
+        ),
+        (
+            "ledger_ledger_after",
+            receipt
+                .ledger_failure_ledger_delta
+                .after_proof_hash
+                .as_str(),
+            receipt
+                .ledger_failure_ledger_delta
+                .after_evidence_hash
+                .as_str(),
         ),
         (
             "cleanup_absence",
@@ -520,7 +614,7 @@ fn validate_atomicity_children(
                 "workspace D1 atomicity proof authority drifted".to_owned(),
             ));
         }
-        let (proof, body) = validate_proof(store, expectation)?;
+        let (proof, _body) = validate_proof(store, expectation)?;
         if proof.observed_at > receipt.completed_at
             || receipt
                 .completed_at
@@ -531,13 +625,69 @@ fn validate_atomicity_children(
                 "workspace D1 atomicity proof is stale or postdates qualification".to_owned(),
             ));
         }
-        if matches!(
-            role,
-            "ddl_zero_schema" | "ddl_zero_ledger" | "ledger_zero_schema" | "ledger_zero_ledger"
-        ) {
-            validate_zero_delta_body(store, role, body)?;
+    }
+    let expected_proof = |role: &str| {
+        expected
+            .proofs
+            .iter()
+            .find(|proof| proof.role == role)
+            .ok_or_else(|| CliError::Input("workspace D1 zero-delta proof is missing".to_owned()))
+    };
+    let expected_plan = |role: &str| {
+        expected
+            .plans
+            .iter()
+            .find(|plan| plan.role == role)
+            .ok_or_else(|| CliError::Input("workspace D1 attempted plan is missing".to_owned()))
+    };
+    let delta_specs = [
+        (
+            &receipt.ddl_failure_schema_delta,
+            "schema",
+            "ddl_schema_before",
+            "ddl_schema_after",
+            "ddl_failure_apply",
+        ),
+        (
+            &receipt.ddl_failure_ledger_delta,
+            "ledger",
+            "ddl_ledger_before",
+            "ddl_ledger_after",
+            "ddl_failure_apply",
+        ),
+        (
+            &receipt.ledger_failure_schema_delta,
+            "schema",
+            "ledger_schema_before",
+            "ledger_schema_after",
+            "ledger_failure_apply",
+        ),
+        (
+            &receipt.ledger_failure_ledger_delta,
+            "ledger",
+            "ledger_ledger_before",
+            "ledger_ledger_after",
+            "ledger_failure_apply",
+        ),
+    ];
+    for (claimed, observation, before_role, after_role, plan_role) in delta_specs {
+        let derived = derive_zero_delta_comparison(
+            store,
+            observation,
+            expected_proof(before_role)?,
+            expected_proof(after_role)?,
+            expected_plan(plan_role)?,
+        )?;
+        if claimed != &derived {
+            return Err(CliError::Input(
+                "workspace D1 zero-delta comparison differs from its authenticated observations"
+                    .to_owned(),
+            ));
         }
     }
+    let cleanup = expected_proof("cleanup_absence")?;
+    let (_, cleanup_body) = validate_proof(store, cleanup)?;
+    validate_cleanup_absence_body(cleanup_body)?;
     Ok(())
 }
 
@@ -614,29 +764,6 @@ fn validate_proof(
     }
     let body = store.read_evidence_value(expected.evidence_hash)?;
     Ok((proof, body))
-}
-
-fn validate_zero_delta_body(store: &StateStore, role: &str, body: Value) -> Result<()> {
-    let observation: ZeroDeltaObservationV1 = serde_json::from_value(body).map_err(|_| {
-        CliError::Input("workspace D1 zero-delta proof body is malformed".to_owned())
-    })?;
-    let expected_observation = if role.ends_with("_schema") {
-        "schema"
-    } else {
-        "ledger"
-    };
-    if observation.schema_version != 1
-        || observation.kind != "workspace_d1_zero_delta_observation_v1"
-        || observation.observation != expected_observation
-        || !is_sha256(&observation.before_evidence_hash)
-        || observation.before_evidence_hash != observation.after_evidence_hash
-    {
-        return Err(CliError::Input(
-            "workspace D1 zero-delta proof did not establish exact equality".to_owned(),
-        ));
-    }
-    store.read_evidence_value(&observation.before_evidence_hash)?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -796,6 +923,20 @@ fn resolve_plan_expectation(
     let input: CallInput = serde_json::from_value(plan.plan.input.clone()).map_err(|_| {
         CliError::Input("workspace D1 qualification child input is malformed".to_owned())
     })?;
+    let checkpoint_time = |stage| {
+        plan.plan
+            .transaction_journal
+            .iter()
+            .find(|checkpoint| checkpoint.stage == stage)
+            .map(|checkpoint| checkpoint.recorded_at)
+            .ok_or_else(|| {
+                CliError::Input(
+                    "workspace D1 qualification child boundary chronology is incomplete".to_owned(),
+                )
+            })
+    };
+    let boundary_attempted_at = checkpoint_time(TransactionStageV1::BoundaryAttemptPersisted)?;
+    let boundary_responded_at = checkpoint_time(TransactionStageV1::BoundaryResponsePersisted)?;
     Ok(OwnedPlanExpectation {
         role,
         operation_id: operation_id.to_owned(),
@@ -811,6 +952,8 @@ fn resolve_plan_expectation(
         expected_status,
         expected_stage,
         evidence_hash: evidence_hash.to_owned(),
+        boundary_attempted_at,
+        boundary_responded_at,
         input,
         workspace_d1_migration: plan.plan.capability.workspace_d1_migration.clone(),
     })
@@ -823,6 +966,7 @@ fn resolve_proof_expectation(
     capability_id: &'static str,
     expected_input_hash: Option<&str>,
     expected_evidence_hash: Option<&str>,
+    expected_outcome: OperationalProofOutcomeV1,
 ) -> Result<OwnedProofExpectation> {
     let proof = store.load_operational_proof(proof_hash)?;
     if expected_evidence_hash.is_some_and(|expected| proof.evidence.content_hash != expected) {
@@ -842,6 +986,7 @@ fn resolve_proof_expectation(
         profile_id: proof.profile_id.unwrap_or_default(),
         account_id: proof.account_id.unwrap_or_default(),
         credential_generation_id: proof.credential_generation_id.unwrap_or_default(),
+        expected_outcome,
     })
 }
 
@@ -1293,53 +1438,131 @@ pub(super) fn current_plan_evidence_hashes(
             atomicity.get_database_proof_hash.as_str(),
             atomicity.get_database_evidence_hash.as_str(),
             "d1-get-database",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "full_export",
             atomicity.full_export_proof_hash.as_str(),
             atomicity.full_export_evidence_hash.as_str(),
             "d1-full-export",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "bookmark",
             atomicity.bookmark_proof_hash.as_str(),
             atomicity.bookmark_evidence_hash.as_str(),
             "d1-time-travel-get-bookmark",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
-            "ddl_zero_schema",
-            atomicity.ddl_failure_zero_schema_proof_hash.as_str(),
-            atomicity.ddl_failure_zero_schema_delta_hash.as_str(),
+            "ddl_schema_before",
+            atomicity
+                .ddl_failure_schema_delta
+                .before_proof_hash
+                .as_str(),
+            atomicity
+                .ddl_failure_schema_delta
+                .before_evidence_hash
+                .as_str(),
             "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
-            "ddl_zero_ledger",
-            atomicity.ddl_failure_zero_ledger_proof_hash.as_str(),
-            atomicity.ddl_failure_zero_ledger_delta_hash.as_str(),
-            "mln-web.founder-d1-migration-apply",
-        ),
-        (
-            "ledger_zero_schema",
-            atomicity.ledger_failure_zero_schema_proof_hash.as_str(),
-            atomicity.ledger_failure_zero_schema_delta_hash.as_str(),
+            "ddl_schema_after",
+            atomicity.ddl_failure_schema_delta.after_proof_hash.as_str(),
+            atomicity
+                .ddl_failure_schema_delta
+                .after_evidence_hash
+                .as_str(),
             "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
-            "ledger_zero_ledger",
-            atomicity.ledger_failure_zero_ledger_proof_hash.as_str(),
-            atomicity.ledger_failure_zero_ledger_delta_hash.as_str(),
+            "ddl_ledger_before",
+            atomicity
+                .ddl_failure_ledger_delta
+                .before_proof_hash
+                .as_str(),
+            atomicity
+                .ddl_failure_ledger_delta
+                .before_evidence_hash
+                .as_str(),
             "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ddl_ledger_after",
+            atomicity.ddl_failure_ledger_delta.after_proof_hash.as_str(),
+            atomicity
+                .ddl_failure_ledger_delta
+                .after_evidence_hash
+                .as_str(),
+            "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_schema_before",
+            atomicity
+                .ledger_failure_schema_delta
+                .before_proof_hash
+                .as_str(),
+            atomicity
+                .ledger_failure_schema_delta
+                .before_evidence_hash
+                .as_str(),
+            "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_schema_after",
+            atomicity
+                .ledger_failure_schema_delta
+                .after_proof_hash
+                .as_str(),
+            atomicity
+                .ledger_failure_schema_delta
+                .after_evidence_hash
+                .as_str(),
+            "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_ledger_before",
+            atomicity
+                .ledger_failure_ledger_delta
+                .before_proof_hash
+                .as_str(),
+            atomicity
+                .ledger_failure_ledger_delta
+                .before_evidence_hash
+                .as_str(),
+            "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_ledger_after",
+            atomicity
+                .ledger_failure_ledger_delta
+                .after_proof_hash
+                .as_str(),
+            atomicity
+                .ledger_failure_ledger_delta
+                .after_evidence_hash
+                .as_str(),
+            "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "cleanup_absence",
             atomicity.cleanup_proof_hash.as_str(),
             atomicity.cleanup_evidence_hash.as_str(),
             "d1-get-database",
+            OperationalProofOutcomeV1::Failed,
         ),
     ];
     let owned_proofs = proof_specs
         .into_iter()
-        .map(|(role, proof, _evidence, capability)| {
+        .map(|(role, proof, _evidence, capability, outcome)| {
             resolve_proof_expectation(
                 store,
                 proof_role(role),
@@ -1347,6 +1570,7 @@ pub(super) fn current_plan_evidence_hashes(
                 capability,
                 Some(&d1_input_hash),
                 None,
+                outcome,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1418,6 +1642,7 @@ pub(super) fn current_plan_evidence_hashes(
                 capability,
                 None,
                 Some(bound_evidence),
+                OperationalProofOutcomeV1::Succeeded,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1526,10 +1751,14 @@ fn proof_role(role: &str) -> &'static str {
         "get_database" => "get_database",
         "full_export" => "full_export",
         "bookmark" => "bookmark",
-        "ddl_zero_schema" => "ddl_zero_schema",
-        "ddl_zero_ledger" => "ddl_zero_ledger",
-        "ledger_zero_schema" => "ledger_zero_schema",
-        "ledger_zero_ledger" => "ledger_zero_ledger",
+        "ddl_schema_before" => "ddl_schema_before",
+        "ddl_schema_after" => "ddl_schema_after",
+        "ddl_ledger_before" => "ddl_ledger_before",
+        "ddl_ledger_after" => "ddl_ledger_after",
+        "ledger_schema_before" => "ledger_schema_before",
+        "ledger_schema_after" => "ledger_schema_after",
+        "ledger_ledger_before" => "ledger_ledger_before",
+        "ledger_ledger_after" => "ledger_ledger_after",
         "cleanup_absence" => "cleanup_absence",
         _ => unreachable!(),
     }

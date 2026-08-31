@@ -12,10 +12,14 @@ pub(super) fn workspace_d1_qualification_producer_capability() -> CapabilityV1 {
         "get_database_proof_hash",
         "full_export_proof_hash",
         "bookmark_proof_hash",
-        "ddl_failure_zero_schema_proof_hash",
-        "ddl_failure_zero_ledger_proof_hash",
-        "ledger_failure_zero_schema_proof_hash",
-        "ledger_failure_zero_ledger_proof_hash",
+        "ddl_failure_schema_before_proof_hash",
+        "ddl_failure_schema_after_proof_hash",
+        "ddl_failure_ledger_before_proof_hash",
+        "ddl_failure_ledger_after_proof_hash",
+        "ledger_failure_schema_before_proof_hash",
+        "ledger_failure_schema_after_proof_hash",
+        "ledger_failure_ledger_before_proof_hash",
+        "ledger_failure_ledger_after_proof_hash",
         "cleanup_proof_hash",
     ];
     let operation_fields = [
@@ -35,12 +39,12 @@ pub(super) fn workspace_d1_qualification_producer_capability() -> CapabilityV1 {
     }
     let mut capability = CapabilityV1::new(
         "workspace-d1-qualification-produce",
-        "Produce authenticated workspace D1 qualification receipts",
+        "Produce authenticated workspace D1 qualification joins",
         "POST",
         "/cfctl/workspace/d1/qualification/produce",
     );
     capability.description = Some(
-        "Resolve an already-executed isolated D1 qualification and fresh old-Worker canary from exact current PlanV2 and authenticated OperationalProofV1 identities. The local producer accepts no raw receipt, SQL, provider output, or secret key material; it invokes the existing closed validators and returns the two authenticated PostChangeVerification outer hashes plus six continuity joins. It performs no Cloudflare or Wrangler boundary and creates, approves, or runs no provider plan."
+        "Resolve an already-executed isolated D1 qualification from exact current PlanV2 identities, distinct authenticated before/after OperationalProofV1 observations, an exact-database not-found cleanup proof, and one authenticated Founder-owned behavioral canary EvidenceV1. The local producer accepts no raw receipt, SQL, provider output, caller-authored canary semantics, or secret key material; it invokes the existing closed validators and returns the two authenticated PostChangeVerification outer hashes plus six continuity joins. It performs no Cloudflare or Wrangler boundary and creates, approves, or runs no provider plan."
             .to_owned(),
     );
     capability.authority_scope = Some(CapabilityAuthorityScopeV1::ProviderGeneric);
@@ -48,7 +52,7 @@ pub(super) fn workspace_d1_qualification_producer_capability() -> CapabilityV1 {
     "cfctl native workspace D1 qualification producer".clone_into(&mut capability.source);
     "local_authenticated_evidence".clone_into(&mut capability.account_scope);
     capability.aliases = vec![
-        "produce workspace D1 atomicity and old Worker canary receipts".to_owned(),
+        "produce a workspace D1 atomicity receipt and join a Founder canary".to_owned(),
         "finalize D1 migration qualification joins".to_owned(),
     ];
     capability.mutating = false;
@@ -72,24 +76,9 @@ pub(super) fn workspace_d1_qualification_producer_capability() -> CapabilityV1 {
             },
             "old_worker_canary":{
                 "type":"object","additionalProperties":false,
-                "required":["worker_deployment_operation_id","deployments_read_proof_hash","version_detail_proof_hash","settings_proof_hash","request_sha256","result_sha256","semantic_assertions_sha256","declared_evidence_hashes","disposition"],
+                "required":["founder_canary_evidence_hash"],
                 "properties":{
-                    "worker_deployment_operation_id":operation,
-                    "deployments_read_proof_hash":hash,
-                    "version_detail_proof_hash":hash,
-                    "settings_proof_hash":hash,
-                    "request_sha256":hash,
-                    "result_sha256":hash,
-                    "semantic_assertions_sha256":hash,
-                    "declared_evidence_hashes":{
-                        "type":"object","additionalProperties":false,
-                        "required":["diagz_build_after","diagz_build_before","post_state","pre_state","recovery_bookmark","schema_ledger"],
-                        "properties":{
-                            "diagz_build_after":hash,"diagz_build_before":hash,"post_state":hash,
-                            "pre_state":hash,"recovery_bookmark":hash,"schema_ledger":hash
-                        }
-                    },
-                    "disposition":{"type":"string","enum":["pass"]}
+                    "founder_canary_evidence_hash":hash
                 }
             }
         }
@@ -123,6 +112,17 @@ mod tests {
         assert!(
             schema
                 .pointer("/properties/atomicity/properties/atomicity_receipt")
+                .is_none()
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/old_worker_canary/required/0",)
+                .and_then(Value::as_str),
+            Some("founder_canary_evidence_hash")
+        );
+        assert!(
+            schema
+                .pointer("/properties/old_worker_canary/properties/semantic_assertions_sha256",)
                 .is_none()
         );
         Ok(())

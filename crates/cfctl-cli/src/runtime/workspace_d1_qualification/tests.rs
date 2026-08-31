@@ -6,10 +6,11 @@ use cfctl_catalog::CatalogSnapshot;
 use cfctl_core::{
     CapabilityV1, D1FullExportGovernedExecutionBindingV1, EvidenceClass, EvidenceV1,
     OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanPinsV2, PlanStatus,
-    PlanV1, PlanV2, TransactionStageV1, WorkspaceD1AtomicityQualificationV1,
-    WorkspaceD1ManifestMigrationContractV1, WorkspaceD1MigrationContractV1,
-    WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1, WorkspaceD1OldWorkerCanaryV1,
-    hash_value,
+    PlanV1, PlanV2, TransactionStageV1, WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID,
+    WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION, WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY,
+    WorkspaceD1AtomicityQualificationV1, WorkspaceD1ManifestMigrationContractV1,
+    WorkspaceD1MigrationContractV1, WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1,
+    WorkspaceD1OldWorkerCanaryV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StorageError};
 use serde_json::{Value, json};
@@ -99,10 +100,13 @@ struct StoredPlan {
     status: PlanStatus,
     stage: TransactionStageV1,
     evidence_hash: String,
+    boundary_attempted_at: DateTime<Utc>,
+    boundary_responded_at: DateTime<Utc>,
 }
 
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the authenticated plan fixture keeps each authority and migration identity explicit"
 )]
 fn stored_plan(
@@ -180,6 +184,15 @@ fn stored_plan(
     };
     let plan_hash = plan.content_hash.clone();
     let operation_id = plan.operation_id.clone();
+    let checkpoint_time = |stage| {
+        plan.transaction_journal
+            .iter()
+            .find(|checkpoint| checkpoint.stage == stage)
+            .map(|checkpoint| checkpoint.recorded_at)
+            .expect("boundary checkpoint")
+    };
+    let boundary_attempted_at = checkpoint_time(TransactionStageV1::BoundaryAttemptPersisted);
+    let boundary_responded_at = checkpoint_time(TransactionStageV1::BoundaryResponsePersisted);
     let pins = PlanPinsV2 {
         build_identity_hash: candidate_hash.to_owned(),
         catalog_hash: catalog_hash.to_owned(),
@@ -205,6 +218,8 @@ fn stored_plan(
         status,
         stage,
         evidence_hash: verification.content_hash,
+        boundary_attempted_at,
+        boundary_responded_at,
     }
 }
 
@@ -224,6 +239,8 @@ fn plan_expectation(plan: &StoredPlan) -> PlanExpectation<'_> {
         expected_stage: plan.stage,
         expected_evidence_class: EvidenceClass::PostChangeVerification,
         evidence_hash: &plan.evidence_hash,
+        boundary_attempted_at: plan.boundary_attempted_at,
+        boundary_responded_at: plan.boundary_responded_at,
     }
 }
 
@@ -235,6 +252,7 @@ struct StoredProof {
     catalog_hash: String,
     input_hash: String,
     build_identity_hash: String,
+    outcome: OperationalProofOutcomeV1,
 }
 
 fn stored_proof(
@@ -246,18 +264,45 @@ fn stored_proof(
     input: Value,
     body: Value,
 ) -> StoredProof {
+    stored_proof_at(
+        store,
+        role,
+        capability_id,
+        candidate_hash,
+        catalog_hash,
+        input,
+        body,
+        Utc::now(),
+        OperationalProofOutcomeV1::Succeeded,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the proof fixture keeps authority, chronology, and outcome explicit"
+)]
+fn stored_proof_at(
+    store: &StateStore,
+    role: &str,
+    capability_id: &str,
+    candidate_hash: &str,
+    catalog_hash: &str,
+    input: Value,
+    body: Value,
+    observed_at: DateTime<Utc>,
+    outcome: OperationalProofOutcomeV1,
+) -> StoredProof {
     let evidence = store
         .write_evidence(EvidenceClass::LiveRead, &body)
         .expect("live-read evidence");
     let input_hash = hash_value(&input).expect("input hash");
-    let observed_at = Utc::now();
     let mut proof = OperationalProofV1::new(
         observed_at,
         capability_id,
         catalog_hash,
         &input_hash,
         OperationalProofScopeV1::new(Some(PROFILE), Some(ACCOUNT), Some(GENERATION)),
-        OperationalProofOutcomeV1::Succeeded,
+        outcome,
         evidence,
     );
     proof
@@ -296,6 +341,7 @@ fn stored_proof(
         catalog_hash: catalog_hash.to_owned(),
         input_hash,
         build_identity_hash: candidate_hash.to_owned(),
+        outcome,
     }
 }
 
@@ -311,7 +357,7 @@ fn proof_expectation(proof: &StoredProof) -> ProofExpectation<'_> {
         profile_id: PROFILE,
         account_id: ACCOUNT,
         credential_generation_id: GENERATION,
-        expected_outcome: OperationalProofOutcomeV1::Succeeded,
+        expected_outcome: proof.outcome,
     }
 }
 
@@ -383,66 +429,148 @@ fn fixture_with_migrations(
         )
     })
     .collect::<Vec<_>>();
-    let zero_delta_body = |role: &str, observation: &str| {
-        let snapshot = store
-            .write_evidence(
-                EvidenceClass::LiveRead,
-                &json!({"role":role,"observation":observation,"rows":[]}),
-            )
-            .expect("snapshot evidence");
-        json!({
-            "schema_version":1,
-            "kind":"workspace_d1_zero_delta_observation_v1",
-            "observation":observation,
-            "before_evidence_hash":snapshot.content_hash,
-            "after_evidence_hash":snapshot.content_hash,
-        })
-    };
-    let proofs = [
-        ("get_database", "d1-get-database"),
-        ("full_export", "d1-full-export"),
-        ("bookmark", "d1-time-travel-get-bookmark"),
-        ("ddl_zero_schema", "d1-schema-introspection"),
-        ("ddl_zero_ledger", "mln-web.founder-d1-migration-apply"),
-        ("ledger_zero_schema", "d1-schema-introspection"),
-        ("ledger_zero_ledger", "mln-web.founder-d1-migration-apply"),
-        ("cleanup_absence", "d1-get-database"),
-    ]
-    .into_iter()
-    .map(|(role, capability)| {
-        let input = serde_json::to_value(CallInput {
-            selectors: target.clone(),
-            query: json!({}),
-            ..CallInput::default()
-        })
-        .expect("D1 proof input");
-        let body = match role {
-            "ddl_zero_schema" | "ledger_zero_schema" => zero_delta_body(role, "schema"),
-            "ddl_zero_ledger" | "ledger_zero_ledger" => zero_delta_body(role, "ledger"),
-            _ => json!({"status":200,"success":true,"result":{"id":DATABASE},"errors":[],"result_info":null,"etag":null,"cf_ray":null}),
-        };
-        stored_proof(
-            store,
-            role,
-            capability,
-            &candidate,
-            &catalog,
-            input,
-            body,
-        )
-    })
-    .collect::<Vec<_>>();
     let plan = |role: &str| {
         plans
             .iter()
             .find(|plan| plan.role == role)
             .expect("plan role")
     };
+    let d1_input = || {
+        serde_json::to_value(CallInput {
+            selectors: target.clone(),
+            query: json!({}),
+            ..CallInput::default()
+        })
+        .expect("D1 proof input")
+    };
+    let ordinary_proof = |role: &str, capability: &str| {
+        stored_proof(
+            store,
+            role,
+            capability,
+            &candidate,
+            &catalog,
+            d1_input(),
+            json!({"status":200,"success":true,"result":{"id":DATABASE},"errors":[],"result_info":null,"etag":null,"cf_ray":null}),
+        )
+    };
+    let state_proof =
+        |role: &str, capability: &str, plan_role: &str, observation: &str, before: bool| {
+            let attempted = plan(plan_role);
+            let observed_at = if before {
+                attempted.boundary_attempted_at - chrono::Duration::milliseconds(1)
+            } else {
+                attempted.boundary_responded_at + chrono::Duration::microseconds(1)
+            };
+            stored_proof_at(
+                store,
+                role,
+                capability,
+                &candidate,
+                &catalog,
+                d1_input(),
+                json!({
+                    "schema_version":1,
+                    "kind":"workspace_d1_state_observation_v1",
+                    "observation":observation,
+                    "observed_at":observed_at,
+                    "state":{"rows":[]},
+                }),
+                observed_at,
+                OperationalProofOutcomeV1::Succeeded,
+            )
+        };
+    let proofs = vec![
+        ordinary_proof("get_database", "d1-get-database"),
+        ordinary_proof("full_export", "d1-full-export"),
+        ordinary_proof("bookmark", "d1-time-travel-get-bookmark"),
+        state_proof(
+            "ddl_schema_before",
+            "d1-schema-introspection",
+            "ddl_failure_apply",
+            "schema",
+            true,
+        ),
+        state_proof(
+            "ddl_schema_after",
+            "d1-schema-introspection",
+            "ddl_failure_apply",
+            "schema",
+            false,
+        ),
+        state_proof(
+            "ddl_ledger_before",
+            "mln-web.founder-d1-migration-apply",
+            "ddl_failure_apply",
+            "ledger",
+            true,
+        ),
+        state_proof(
+            "ddl_ledger_after",
+            "mln-web.founder-d1-migration-apply",
+            "ddl_failure_apply",
+            "ledger",
+            false,
+        ),
+        state_proof(
+            "ledger_schema_before",
+            "d1-schema-introspection",
+            "ledger_failure_apply",
+            "schema",
+            true,
+        ),
+        state_proof(
+            "ledger_schema_after",
+            "d1-schema-introspection",
+            "ledger_failure_apply",
+            "schema",
+            false,
+        ),
+        state_proof(
+            "ledger_ledger_before",
+            "mln-web.founder-d1-migration-apply",
+            "ledger_failure_apply",
+            "ledger",
+            true,
+        ),
+        state_proof(
+            "ledger_ledger_after",
+            "mln-web.founder-d1-migration-apply",
+            "ledger_failure_apply",
+            "ledger",
+            false,
+        ),
+        stored_proof_at(
+            store,
+            "cleanup_absence",
+            "d1-get-database",
+            &candidate,
+            &catalog,
+            d1_input(),
+            json!({
+                "status":404,"success":false,"result":null,
+                "errors":[{"code":7404,"message":"D1 database not found"}],
+                "result_info":null,"etag":null,"cf_ray":null,
+            }),
+            Utc::now(),
+            OperationalProofOutcomeV1::Failed,
+        ),
+    ];
     let proof = |role: &str| {
         proofs
             .iter()
             .find(|proof| proof.role == role)
             .expect("proof role")
+    };
+    let delta = |observation: &str, before_role: &str, after_role: &str, plan_role: &str| {
+        derive_zero_delta_comparison(
+            store,
+            observation,
+            &proof_expectation(proof(before_role)),
+            &proof_expectation(proof(after_role)),
+            &plan_expectation(plan(plan_role)),
+        )
+        .expect("zero-delta comparison")
     };
     let atomicity = WorkspaceD1AtomicityQualificationV1 {
         schema_version: 1,
@@ -487,24 +615,36 @@ fn fixture_with_migrations(
         delete_database_evidence_hash: plan("delete_database").evidence_hash.clone(),
         success_outcome_evidence_hash: plan("success_apply").evidence_hash.clone(),
         ddl_failure_outcome_evidence_hash: plan("ddl_failure_apply").evidence_hash.clone(),
-        ddl_failure_zero_schema_proof_hash: proof("ddl_zero_schema").proof_hash.clone(),
-        ddl_failure_zero_schema_delta_hash: proof("ddl_zero_schema").evidence_hash.clone(),
-        ddl_failure_zero_ledger_proof_hash: proof("ddl_zero_ledger").proof_hash.clone(),
-        ddl_failure_zero_ledger_delta_hash: proof("ddl_zero_ledger").evidence_hash.clone(),
+        ddl_failure_schema_delta: delta(
+            "schema",
+            "ddl_schema_before",
+            "ddl_schema_after",
+            "ddl_failure_apply",
+        ),
+        ddl_failure_ledger_delta: delta(
+            "ledger",
+            "ddl_ledger_before",
+            "ddl_ledger_after",
+            "ddl_failure_apply",
+        ),
         ledger_failure_outcome_evidence_hash: plan("ledger_failure_apply").evidence_hash.clone(),
-        ledger_failure_zero_schema_proof_hash: proof("ledger_zero_schema").proof_hash.clone(),
-        ledger_failure_zero_schema_delta_hash: proof("ledger_zero_schema").evidence_hash.clone(),
-        ledger_failure_zero_ledger_proof_hash: proof("ledger_zero_ledger").proof_hash.clone(),
-        ledger_failure_zero_ledger_delta_hash: proof("ledger_zero_ledger").evidence_hash.clone(),
+        ledger_failure_schema_delta: delta(
+            "schema",
+            "ledger_schema_before",
+            "ledger_schema_after",
+            "ledger_failure_apply",
+        ),
+        ledger_failure_ledger_delta: delta(
+            "ledger",
+            "ledger_ledger_before",
+            "ledger_ledger_after",
+            "ledger_failure_apply",
+        ),
         cleanup_proof_hash: proof("cleanup_absence").proof_hash.clone(),
         cleanup_evidence_hash: proof("cleanup_absence").evidence_hash.clone(),
         success_passed: true,
         ddl_failure_observed: true,
-        ddl_failure_zero_schema_delta: true,
-        ddl_failure_zero_ledger_delta: true,
         ledger_failure_observed: true,
-        ledger_failure_zero_schema_delta: true,
-        ledger_failure_zero_ledger_delta: true,
         cleanup_database_absent: true,
         completed_at: Utc::now(),
     };
@@ -579,6 +719,9 @@ fn fixture_with_migrations(
         schema_version: 1,
         kind: "workspace_d1_old_worker_canary_v1".to_owned(),
         evidence_class: EvidenceClass::PostChangeVerification,
+        owner_repository: WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY.to_owned(),
+        cross_repository_contract_id: WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID.to_owned(),
+        cross_repository_contract_version: WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION,
         capability_id: "mln-web.founder-d1-migration-apply".to_owned(),
         workspace_contract_sha256: hash_value(
             &serde_json::to_value(&production_contract).expect("workspace contract JSON"),
@@ -641,7 +784,17 @@ fn fixture_with_migrations(
 
 pub(super) fn producer_fixture() -> (tempfile::TempDir, StateStore, CatalogSnapshot, CallInput) {
     let (root, store) = store();
-    let fixture = fixture(&store);
+    let mut fixture = fixture(&store);
+    let producer_contract =
+        migration_contract(&fixture.atomicity.synthetic_migration_sha256, false);
+    fixture.canary.workspace_contract_sha256 = hash_value(
+        &serde_json::to_value(producer_contract).expect("producer workspace contract JSON"),
+    )
+    .expect("producer workspace contract hash");
+    fixture.canary.canary_receipt_sha256.clear();
+    fixture.canary.canary_receipt_sha256 =
+        hash_value(&serde_json::to_value(&fixture.canary).expect("producer canary JSON"))
+            .expect("producer canary hash");
     let plan = |role: &str| {
         fixture
             .plans
@@ -656,13 +809,7 @@ pub(super) fn producer_fixture() -> (tempfile::TempDir, StateStore, CatalogSnaps
             .find(|proof| proof.role == role)
             .expect("proof role")
     };
-    let worker_proof = |role: &str| {
-        fixture
-            .worker_proofs
-            .iter()
-            .find(|proof| proof.role == role)
-            .expect("Worker proof role")
-    };
+    let canary_evidence = outer(&store, &fixture.canary);
     let catalog = CatalogSnapshot {
         schema_version: 2,
         generated_at: Utc::now(),
@@ -684,26 +831,58 @@ pub(super) fn producer_fixture() -> (tempfile::TempDir, StateStore, CatalogSnaps
                 "get_database_proof_hash":proof("get_database").proof_hash,
                 "full_export_proof_hash":proof("full_export").proof_hash,
                 "bookmark_proof_hash":proof("bookmark").proof_hash,
-                "ddl_failure_zero_schema_proof_hash":proof("ddl_zero_schema").proof_hash,
-                "ddl_failure_zero_ledger_proof_hash":proof("ddl_zero_ledger").proof_hash,
-                "ledger_failure_zero_schema_proof_hash":proof("ledger_zero_schema").proof_hash,
-                "ledger_failure_zero_ledger_proof_hash":proof("ledger_zero_ledger").proof_hash,
+                "ddl_failure_schema_before_proof_hash":proof("ddl_schema_before").proof_hash,
+                "ddl_failure_schema_after_proof_hash":proof("ddl_schema_after").proof_hash,
+                "ddl_failure_ledger_before_proof_hash":proof("ddl_ledger_before").proof_hash,
+                "ddl_failure_ledger_after_proof_hash":proof("ddl_ledger_after").proof_hash,
+                "ledger_failure_schema_before_proof_hash":proof("ledger_schema_before").proof_hash,
+                "ledger_failure_schema_after_proof_hash":proof("ledger_schema_after").proof_hash,
+                "ledger_failure_ledger_before_proof_hash":proof("ledger_ledger_before").proof_hash,
+                "ledger_failure_ledger_after_proof_hash":proof("ledger_ledger_after").proof_hash,
                 "cleanup_proof_hash":proof("cleanup_absence").proof_hash,
             },
             "old_worker_canary":{
-                "worker_deployment_operation_id":fixture.worker_plan.operation_id,
-                "deployments_read_proof_hash":worker_proof("deployments").proof_hash,
-                "version_detail_proof_hash":worker_proof("version").proof_hash,
-                "settings_proof_hash":worker_proof("settings").proof_hash,
-                "request_sha256":fixture.canary.request_sha256,
-                "result_sha256":fixture.canary.result_sha256,
-                "semantic_assertions_sha256":fixture.canary.semantic_assertions_sha256,
-                "declared_evidence_hashes":fixture.canary.declared_evidence_hashes,
-                "disposition":"pass"
+                "founder_canary_evidence_hash":canary_evidence.content_hash
             }
         })),
         ..CallInput::default()
     };
+    (root, store, catalog, input)
+}
+
+pub(super) fn producer_fixture_with_successful_cleanup()
+-> (tempfile::TempDir, StateStore, CatalogSnapshot, CallInput) {
+    let (root, store, catalog, mut input) = producer_fixture();
+    let successful = stored_proof_at(
+        &store,
+        "cleanup_absence",
+        "d1-get-database",
+        &digest("cfctl-candidate"),
+        &catalog.schema_hash,
+        serde_json::to_value(CallInput {
+            selectors: json!({"account_id":ACCOUNT,"database_id":DATABASE}),
+            query: json!({}),
+            ..CallInput::default()
+        })
+        .expect("cleanup input"),
+        json!({
+            "status":200,"success":true,"result":{"uuid":DATABASE},
+            "errors":[],"result_info":null,"etag":null,"cf_ray":null,
+        }),
+        Utc::now(),
+        OperationalProofOutcomeV1::Succeeded,
+    );
+    input.body.as_mut().expect("producer body")["atomicity"]["cleanup_proof_hash"] =
+        json!(successful.proof_hash);
+    (root, store, catalog, input)
+}
+
+pub(super) fn producer_fixture_with_duplicate_delta_identity()
+-> (tempfile::TempDir, StateStore, CatalogSnapshot, CallInput) {
+    let (root, store, catalog, mut input) = producer_fixture();
+    let body = input.body.as_mut().expect("producer body");
+    body["atomicity"]["ddl_failure_schema_after_proof_hash"] =
+        body["atomicity"]["ddl_failure_schema_before_proof_hash"].clone();
     (root, store, catalog, input)
 }
 
@@ -1385,6 +1564,10 @@ fn recomputed_cross_worker_and_cross_child_substitutions_fail() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the adversarial test keeps both recomputed substitution cases in one proof family"
+)]
 fn recomputed_worker_body_and_zero_delta_semantic_substitutions_fail() {
     let (_root, store) = store();
     let now = Utc::now();
@@ -1437,33 +1620,37 @@ fn recomputed_worker_body_and_zero_delta_semantic_substitutions_fail() {
         .is_err()
     );
 
-    let before = store
-        .write_evidence(EvidenceClass::LiveRead, &json!({"rows":[]}))
-        .expect("before");
-    let after = store
-        .write_evidence(
-            EvidenceClass::LiveRead,
-            &json!({"rows":[{"name":"smuggled"}]}),
-        )
-        .expect("after");
-    let bad_delta = stored_proof(
+    let attempted = fixture
+        .plans
+        .iter()
+        .find(|plan| plan.role == "ddl_failure_apply")
+        .expect("DDL failure plan");
+    let observed_at = attempted.boundary_responded_at + Duration::microseconds(1);
+    let bad_delta = stored_proof_at(
         &store,
-        "ddl_zero_schema",
+        "ddl_schema_after",
         "d1-schema-introspection",
         &fixture.atomicity.cfctl_candidate_hash,
         &fixture.atomicity.catalog_hash,
-        json!({"account_id":ACCOUNT,"database_id":DATABASE}),
+        serde_json::to_value(CallInput {
+            selectors: json!({"account_id":ACCOUNT,"database_id":DATABASE}),
+            query: json!({}),
+            ..CallInput::default()
+        })
+        .expect("input"),
         json!({
-            "schema_version":1,"kind":"workspace_d1_zero_delta_observation_v1",
-            "observation":"schema","before_evidence_hash":before.content_hash,
-            "after_evidence_hash":after.content_hash,
+            "schema_version":1,"kind":"workspace_d1_state_observation_v1",
+            "observation":"schema","observed_at":observed_at,
+            "state":{"rows":[{"name":"smuggled"}]},
         }),
+        observed_at,
+        OperationalProofOutcomeV1::Succeeded,
     );
     let proof_expectations = fixture
         .proofs
         .iter()
         .map(|proof| {
-            if proof.role == "ddl_zero_schema" {
+            if proof.role == "ddl_schema_after" {
                 proof_expectation(&bad_delta)
             } else {
                 proof_expectation(proof)
@@ -1476,14 +1663,62 @@ fn recomputed_worker_body_and_zero_delta_semantic_substitutions_fail() {
         .map(plan_expectation)
         .collect::<Vec<_>>();
     let mut atomicity = fixture.atomicity.clone();
-    atomicity.ddl_failure_zero_schema_proof_hash = bad_delta.proof_hash.clone();
-    atomicity.ddl_failure_zero_schema_delta_hash = bad_delta.evidence_hash.clone();
+    atomicity.ddl_failure_schema_delta.after_proof_hash = bad_delta.proof_hash.clone();
+    atomicity.ddl_failure_schema_delta.after_evidence_hash = bad_delta.evidence_hash.clone();
     assert!(
         validate_atomicity_qualification(
             &store,
             &outer(&store, &atomicity),
             &atomicity_expected(&fixture, &plans, &proof_expectations),
             now + Duration::seconds(1),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn zero_delta_observations_must_bracket_the_exact_attempted_operation() {
+    let (_root, store) = store();
+    let fixture = fixture(&store);
+    let attempted = fixture
+        .plans
+        .iter()
+        .find(|plan| plan.role == "ddl_failure_apply")
+        .expect("DDL failure plan");
+    let before = fixture
+        .proofs
+        .iter()
+        .find(|proof| proof.role == "ddl_schema_before")
+        .expect("before proof");
+    let observed_at = attempted.boundary_responded_at - Duration::nanoseconds(1);
+    let after = stored_proof_at(
+        &store,
+        "ddl_schema_after",
+        "d1-schema-introspection",
+        &fixture.atomicity.cfctl_candidate_hash,
+        &fixture.atomicity.catalog_hash,
+        serde_json::to_value(CallInput {
+            selectors: json!({"account_id":ACCOUNT,"database_id":DATABASE}),
+            query: json!({}),
+            ..CallInput::default()
+        })
+        .expect("input"),
+        json!({
+            "schema_version":1,"kind":"workspace_d1_state_observation_v1",
+            "observation":"schema","observed_at":observed_at,
+            "state":{"rows":[]},
+        }),
+        observed_at,
+        OperationalProofOutcomeV1::Succeeded,
+    );
+
+    assert!(
+        derive_zero_delta_comparison(
+            &store,
+            "schema",
+            &proof_expectation(before),
+            &proof_expectation(&after),
+            &plan_expectation(attempted),
         )
         .is_err()
     );
@@ -1527,6 +1762,32 @@ fn canary_retains_only_semantic_hash_and_exact_six_names() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn canary_requires_the_explicit_founder_cross_repository_contract() {
+    let (_root, store) = store();
+    let fixture = fixture(&store);
+    let worker_proofs = fixture
+        .worker_proofs
+        .iter()
+        .map(proof_expectation)
+        .collect::<Vec<_>>();
+    let mut canary = fixture.canary.clone();
+    canary.owner_repository = "cfctl".to_owned();
+    canary.canary_receipt_sha256.clear();
+    canary.canary_receipt_sha256 =
+        hash_value(&serde_json::to_value(&canary).expect("canary JSON")).expect("canary hash");
+
+    assert!(
+        validate_old_worker_canary(
+            &store,
+            &outer(&store, &canary),
+            &canary_expected(&fixture, &worker_proofs),
+            Utc::now() + Duration::seconds(1),
+        )
+        .is_err()
+    );
 }
 
 #[test]

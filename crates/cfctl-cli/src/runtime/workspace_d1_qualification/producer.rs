@@ -1,9 +1,7 @@
-use std::collections::BTreeMap;
-
 use cfctl_cloudflare::CallInput;
 use cfctl_core::{
-    EvidenceClass, PlanStatus, TransactionStageV1, WorkspaceD1AtomicityQualificationV1,
-    WorkspaceD1OldWorkerCanaryV1, hash_value,
+    EvidenceClass, OperationalProofOutcomeV1, PlanStatus, TransactionStageV1,
+    WorkspaceD1AtomicityQualificationV1, WorkspaceD1OldWorkerCanaryV1, hash_value,
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -11,9 +9,9 @@ use serde_json::{Value, json};
 
 use super::{
     AtomicityExpectations, CanaryExpectations, OwnedPlanExpectation, OwnedProofExpectation,
-    capability_role, resolve_plan_expectation, resolve_proof_expectation,
-    resolve_worker_plan_expectation, single_migration_sha256, validate_qualification_pair,
-    worker_identity_join_hash,
+    capability_role, derive_zero_delta_comparison, resolve_plan_expectation,
+    resolve_proof_expectation, resolve_worker_plan_expectation, single_migration_sha256,
+    validate_old_worker_canary, validate_qualification_pair,
 };
 use crate::runtime::prelude::{
     CatalogSnapshot, CliError, Result, ResultEnvelopeV2, StateStore, VerificationState,
@@ -41,25 +39,21 @@ struct AtomicityChildrenV1 {
     get_database_proof_hash: String,
     full_export_proof_hash: String,
     bookmark_proof_hash: String,
-    ddl_failure_zero_schema_proof_hash: String,
-    ddl_failure_zero_ledger_proof_hash: String,
-    ledger_failure_zero_schema_proof_hash: String,
-    ledger_failure_zero_ledger_proof_hash: String,
+    ddl_failure_schema_before_proof_hash: String,
+    ddl_failure_schema_after_proof_hash: String,
+    ddl_failure_ledger_before_proof_hash: String,
+    ddl_failure_ledger_after_proof_hash: String,
+    ledger_failure_schema_before_proof_hash: String,
+    ledger_failure_schema_after_proof_hash: String,
+    ledger_failure_ledger_before_proof_hash: String,
+    ledger_failure_ledger_after_proof_hash: String,
     cleanup_proof_hash: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OldWorkerCanaryInputV1 {
-    worker_deployment_operation_id: String,
-    deployments_read_proof_hash: String,
-    version_detail_proof_hash: String,
-    settings_proof_hash: String,
-    request_sha256: String,
-    result_sha256: String,
-    semantic_assertions_sha256: String,
-    declared_evidence_hashes: BTreeMap<String, String>,
-    disposition: String,
+    founder_canary_evidence_hash: String,
 }
 
 pub(crate) fn produce(
@@ -73,10 +67,9 @@ pub(crate) fn produce(
     let request: ProducerInputV1 = serde_json::from_value(body).map_err(|_| {
         CliError::Input("workspace D1 qualification producer input is malformed".into())
     })?;
-    if request.schema_version != 1 || request.old_worker_canary.disposition != "pass" {
+    if request.schema_version != 1 {
         return Err(CliError::Input(
-            "workspace D1 qualification producer requires schema_version 1 and an explicit pass disposition"
-                .into(),
+            "workspace D1 qualification producer requires schema_version 1".into(),
         ));
     }
     produce_validated(store, catalog, request)
@@ -175,46 +168,78 @@ fn produce_validated(
             "get_database",
             atomic.get_database_proof_hash.as_str(),
             "d1-get-database",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "full_export",
             atomic.full_export_proof_hash.as_str(),
             "d1-full-export",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "bookmark",
             atomic.bookmark_proof_hash.as_str(),
             "d1-time-travel-get-bookmark",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
-            "ddl_zero_schema",
-            atomic.ddl_failure_zero_schema_proof_hash.as_str(),
+            "ddl_schema_before",
+            atomic.ddl_failure_schema_before_proof_hash.as_str(),
             "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
-            "ddl_zero_ledger",
-            atomic.ddl_failure_zero_ledger_proof_hash.as_str(),
-            "mln-web.founder-d1-migration-apply",
-        ),
-        (
-            "ledger_zero_schema",
-            atomic.ledger_failure_zero_schema_proof_hash.as_str(),
+            "ddl_schema_after",
+            atomic.ddl_failure_schema_after_proof_hash.as_str(),
             "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
-            "ledger_zero_ledger",
-            atomic.ledger_failure_zero_ledger_proof_hash.as_str(),
+            "ddl_ledger_before",
+            atomic.ddl_failure_ledger_before_proof_hash.as_str(),
             "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ddl_ledger_after",
+            atomic.ddl_failure_ledger_after_proof_hash.as_str(),
+            "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_schema_before",
+            atomic.ledger_failure_schema_before_proof_hash.as_str(),
+            "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_schema_after",
+            atomic.ledger_failure_schema_after_proof_hash.as_str(),
+            "d1-schema-introspection",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_ledger_before",
+            atomic.ledger_failure_ledger_before_proof_hash.as_str(),
+            "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
+        ),
+        (
+            "ledger_ledger_after",
+            atomic.ledger_failure_ledger_after_proof_hash.as_str(),
+            "mln-web.founder-d1-migration-apply",
+            OperationalProofOutcomeV1::Succeeded,
         ),
         (
             "cleanup_absence",
             atomic.cleanup_proof_hash.as_str(),
             "d1-get-database",
+            OperationalProofOutcomeV1::Failed,
         ),
     ];
     let proofs = proof_specs
         .into_iter()
-        .map(|(role, proof_hash, capability)| {
+        .map(|(role, proof_hash, capability, outcome)| {
             resolve_proof_expectation(
                 store,
                 proof_role(role),
@@ -222,38 +247,51 @@ fn produce_validated(
                 capability,
                 Some(&d1_input_hash),
                 None,
+                outcome,
             )
         })
         .collect::<Result<Vec<_>>>()?;
 
     let worker = request.old_worker_canary;
+    let canary_evidence = store.load_evidence(&worker.founder_canary_evidence_hash)?;
+    let canary: WorkspaceD1OldWorkerCanaryV1 =
+        serde_json::from_value(store.read_evidence_value(&canary_evidence.content_hash)?)
+            .map_err(|_| CliError::Input("Founder-owned old-Worker canary is malformed".into()))?;
     let worker_plan = resolve_worker_plan_expectation(
         store,
-        &worker.worker_deployment_operation_id,
-        &stored_plan_hash(store, &worker.worker_deployment_operation_id)?,
+        &canary.worker_deployment_operation_id,
+        &canary.worker_deployment_plan_hash,
     )?;
     let worker_script_name = selector(&worker_plan.input, "script_name")?.to_owned();
     let worker_specs = [
         (
             "deployments",
-            worker.deployments_read_proof_hash.as_str(),
+            canary.deployments_read_proof_hash.as_str(),
             "worker-deployments-list-deployments",
         ),
         (
             "version",
-            worker.version_detail_proof_hash.as_str(),
+            canary.version_detail_proof_hash.as_str(),
             "worker-versions-get-version-detail",
         ),
         (
             "settings",
-            worker.settings_proof_hash.as_str(),
+            canary.settings_proof_hash.as_str(),
             "worker-script-get-settings",
         ),
     ];
     let worker_proofs = worker_specs
         .into_iter()
         .map(|(role, proof_hash, capability)| {
-            resolve_proof_expectation(store, worker_role(role), proof_hash, capability, None, None)
+            resolve_proof_expectation(
+                store,
+                worker_role(role),
+                proof_hash,
+                capability,
+                None,
+                None,
+                OperationalProofOutcomeV1::Succeeded,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let deployments = proof(&worker_proofs, "deployments")?;
@@ -314,8 +352,10 @@ fn produce_validated(
         worker_plan: worker_plan_expectation,
         worker_proofs: &worker_expectations,
     };
+    validate_old_worker_canary(store, &canary_evidence, &canary_expected, Utc::now())?;
 
     let atomicity = atomicity_receipt(
+        store,
         &atomic,
         &plans,
         &proofs,
@@ -326,51 +366,6 @@ fn produce_validated(
     let atomicity_evidence = store.write_evidence(
         EvidenceClass::PostChangeVerification,
         &serde_json::to_value(&atomicity)?,
-    )?;
-    let mut canary = WorkspaceD1OldWorkerCanaryV1 {
-        schema_version: 1,
-        kind: "workspace_d1_old_worker_canary_v1".into(),
-        evidence_class: EvidenceClass::PostChangeVerification,
-        capability_id: success.capability_id.into(),
-        workspace_contract_sha256: workspace_contract_sha256.clone(),
-        cfctl_candidate_hash: success.build_identity_hash.clone(),
-        repository_head: repository_head.clone(),
-        operation_pack_sha256: operation_pack_sha256.clone(),
-        catalog_hash: catalog.schema_hash.clone(),
-        account_id: account_id.clone(),
-        profile_id: success.profile_id.clone(),
-        credential_generation_id: success.credential_generation_id.clone(),
-        database_id: database_id.clone(),
-        migration_sha256: migration_sha256.clone(),
-        migration_operation_id: success.operation_id.clone(),
-        migration_plan_hash: success.plan_content_hash.clone(),
-        migration_apply_evidence_hash: success.evidence_hash.clone(),
-        worker_script_name: worker_script_name.clone(),
-        worker_deployment_operation_id: worker_plan.operation_id.clone(),
-        worker_deployment_plan_hash: worker_plan.plan_content_hash.clone(),
-        deployments_read_proof_hash: proof(&worker_proofs, "deployments")?.proof_hash.clone(),
-        deployments_read_evidence_hash: proof(&worker_proofs, "deployments")?.evidence_hash.clone(),
-        version_detail_proof_hash: proof(&worker_proofs, "version")?.proof_hash.clone(),
-        version_detail_evidence_hash: proof(&worker_proofs, "version")?.evidence_hash.clone(),
-        settings_proof_hash: proof(&worker_proofs, "settings")?.proof_hash.clone(),
-        settings_evidence_hash: proof(&worker_proofs, "settings")?.evidence_hash.clone(),
-        deployment_id: deployment_id.clone(),
-        version_id: version_id.clone(),
-        request_sha256: worker.request_sha256,
-        result_sha256: worker.result_sha256,
-        semantic_assertions_sha256: worker.semantic_assertions_sha256,
-        declared_evidence_hashes: worker.declared_evidence_hashes,
-        disposition: "pass".into(),
-        passed: true,
-        observed_at: now,
-        canary_receipt_sha256: String::new(),
-        worker_identity_evidence_sha256: String::new(),
-    };
-    canary.worker_identity_evidence_sha256 = worker_identity_join_hash(&canary)?;
-    canary.canary_receipt_sha256 = hash_value(&serde_json::to_value(&canary)?)?;
-    let canary_evidence = store.write_evidence(
-        EvidenceClass::PostChangeVerification,
-        &serde_json::to_value(&canary)?,
     )?;
     let joins = validate_qualification_pair(
         store,
@@ -403,6 +398,7 @@ fn produce_validated(
 }
 
 fn atomicity_receipt(
+    store: &StateStore,
     input: &AtomicityChildrenV1,
     plans: &[OwnedPlanExpectation],
     proofs: &[OwnedProofExpectation],
@@ -412,6 +408,39 @@ fn atomicity_receipt(
 ) -> Result<WorkspaceD1AtomicityQualificationV1> {
     let p = |role| plan(plans, role);
     let r = |role| proof(proofs, role);
+    let delta = |observation, before_role, after_role, plan_role| {
+        derive_zero_delta_comparison(
+            store,
+            observation,
+            &r(before_role)?.borrowed(),
+            &r(after_role)?.borrowed(),
+            &p(plan_role)?.borrowed(),
+        )
+    };
+    let ddl_failure_schema_delta = delta(
+        "schema",
+        "ddl_schema_before",
+        "ddl_schema_after",
+        "ddl_failure_apply",
+    )?;
+    let ddl_failure_ledger_delta = delta(
+        "ledger",
+        "ddl_ledger_before",
+        "ddl_ledger_after",
+        "ddl_failure_apply",
+    )?;
+    let ledger_failure_schema_delta = delta(
+        "schema",
+        "ledger_schema_before",
+        "ledger_schema_after",
+        "ledger_failure_apply",
+    )?;
+    let ledger_failure_ledger_delta = delta(
+        "ledger",
+        "ledger_ledger_before",
+        "ledger_ledger_after",
+        "ledger_failure_apply",
+    )?;
     Ok(WorkspaceD1AtomicityQualificationV1 {
         schema_version: 1,
         kind: "workspace_d1_provider_atomicity_v1".into(),
@@ -454,24 +483,16 @@ fn atomicity_receipt(
         delete_database_evidence_hash: p("delete_database")?.evidence_hash.clone(),
         success_outcome_evidence_hash: p("success_apply")?.evidence_hash.clone(),
         ddl_failure_outcome_evidence_hash: p("ddl_failure_apply")?.evidence_hash.clone(),
-        ddl_failure_zero_schema_proof_hash: r("ddl_zero_schema")?.proof_hash.clone(),
-        ddl_failure_zero_schema_delta_hash: r("ddl_zero_schema")?.evidence_hash.clone(),
-        ddl_failure_zero_ledger_proof_hash: r("ddl_zero_ledger")?.proof_hash.clone(),
-        ddl_failure_zero_ledger_delta_hash: r("ddl_zero_ledger")?.evidence_hash.clone(),
+        ddl_failure_schema_delta,
+        ddl_failure_ledger_delta,
         ledger_failure_outcome_evidence_hash: p("ledger_failure_apply")?.evidence_hash.clone(),
-        ledger_failure_zero_schema_proof_hash: r("ledger_zero_schema")?.proof_hash.clone(),
-        ledger_failure_zero_schema_delta_hash: r("ledger_zero_schema")?.evidence_hash.clone(),
-        ledger_failure_zero_ledger_proof_hash: r("ledger_zero_ledger")?.proof_hash.clone(),
-        ledger_failure_zero_ledger_delta_hash: r("ledger_zero_ledger")?.evidence_hash.clone(),
+        ledger_failure_schema_delta,
+        ledger_failure_ledger_delta,
         cleanup_proof_hash: r("cleanup_absence")?.proof_hash.clone(),
         cleanup_evidence_hash: r("cleanup_absence")?.evidence_hash.clone(),
         success_passed: true,
         ddl_failure_observed: true,
-        ddl_failure_zero_schema_delta: true,
-        ddl_failure_zero_ledger_delta: true,
         ledger_failure_observed: true,
-        ledger_failure_zero_schema_delta: true,
-        ledger_failure_zero_ledger_delta: true,
         cleanup_database_absent: true,
         completed_at: now,
     })
@@ -524,23 +545,19 @@ fn stored_plan_target(store: &StateStore, operation_id: &str) -> Result<Value> {
         )),
     }
 }
-fn stored_plan_hash(store: &StateStore, operation_id: &str) -> Result<String> {
-    match store.load_stored_plan_record(operation_id)? {
-        cfctl_storage::StoredPlanRecord::Current(plan) => Ok(plan.plan.content_hash),
-        _ => Err(CliError::Input(
-            "workspace D1 Worker plan is not current PlanV2".into(),
-        )),
-    }
-}
 fn proof_role(role: &str) -> &'static str {
     match role {
         "get_database" => "get_database",
         "full_export" => "full_export",
         "bookmark" => "bookmark",
-        "ddl_zero_schema" => "ddl_zero_schema",
-        "ddl_zero_ledger" => "ddl_zero_ledger",
-        "ledger_zero_schema" => "ledger_zero_schema",
-        "ledger_zero_ledger" => "ledger_zero_ledger",
+        "ddl_schema_before" => "ddl_schema_before",
+        "ddl_schema_after" => "ddl_schema_after",
+        "ddl_ledger_before" => "ddl_ledger_before",
+        "ddl_ledger_after" => "ddl_ledger_after",
+        "ledger_schema_before" => "ledger_schema_before",
+        "ledger_schema_after" => "ledger_schema_after",
+        "ledger_ledger_before" => "ledger_ledger_before",
+        "ledger_ledger_after" => "ledger_ledger_after",
         "cleanup_absence" => "cleanup_absence",
         _ => unreachable!(),
     }
@@ -580,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_rejects_raw_receipt_injection_and_hold_disposition()
+    fn producer_rejects_raw_receipt_and_caller_authored_canary_injection()
     -> std::result::Result<(), CliError> {
         let (_root, store, catalog, mut input) = super::super::tests::producer_fixture();
         input.body = Some(json!({"schema_version":1,"atomicity_receipt":{}}));
@@ -591,7 +608,37 @@ mod tests {
             .body
             .as_mut()
             .ok_or_else(|| CliError::Input("producer fixture body is missing".to_owned()))?;
-        body["old_worker_canary"]["disposition"] = json!("hold");
+        body["old_worker_canary"]["disposition"] = json!("pass");
+        assert!(produce(&store, &catalog, &input).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn producer_rejects_successful_database_detail_as_cleanup_absence() {
+        let (_root, store, catalog, input) =
+            super::super::tests::producer_fixture_with_successful_cleanup();
+
+        assert!(produce(&store, &catalog, &input).is_err());
+    }
+
+    #[test]
+    fn producer_rejects_identical_zero_delta_receipt_identity() {
+        let (_root, store, catalog, input) =
+            super::super::tests::producer_fixture_with_duplicate_delta_identity();
+
+        assert!(produce(&store, &catalog, &input).is_err());
+    }
+
+    #[test]
+    fn producer_rejects_caller_authored_canary_semantics() -> std::result::Result<(), CliError> {
+        let (_root, store, catalog, mut input) = super::super::tests::producer_fixture();
+        let body = input
+            .body
+            .as_mut()
+            .ok_or_else(|| CliError::Input("producer fixture body is missing".to_owned()))?;
+        body["old_worker_canary"]["semantic_assertions_sha256"] =
+            json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
         assert!(produce(&store, &catalog, &input).is_err());
         Ok(())
     }

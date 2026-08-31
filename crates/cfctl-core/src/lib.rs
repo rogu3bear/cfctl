@@ -2,11 +2,13 @@
 
 mod workspace_d1;
 pub use workspace_d1::{
-    WorkspaceD1AtomicityQualificationV1, WorkspaceD1EvidenceContractV1, WorkspaceD1EvidenceJoinsV1,
-    WorkspaceD1ExactObjectAssertionV1, WorkspaceD1ManifestMigrationContractV1,
-    WorkspaceD1MigrationContractV1, WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1,
-    WorkspaceD1OldWorkerCanaryV1, WorkspaceD1PolicyProjectionContractV1,
-    WorkspaceD1ReplyAdmissionContractV1, WorkspaceD1SchemaAssertionV1,
+    WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID, WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION,
+    WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY, WorkspaceD1AtomicityQualificationV1,
+    WorkspaceD1EvidenceContractV1, WorkspaceD1EvidenceJoinsV1, WorkspaceD1ExactObjectAssertionV1,
+    WorkspaceD1ManifestMigrationContractV1, WorkspaceD1MigrationContractV1,
+    WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1, WorkspaceD1OldWorkerCanaryV1,
+    WorkspaceD1PolicyProjectionContractV1, WorkspaceD1ReplyAdmissionContractV1,
+    WorkspaceD1SchemaAssertionV1, WorkspaceD1ZeroDeltaComparisonV1,
 };
 
 use std::{

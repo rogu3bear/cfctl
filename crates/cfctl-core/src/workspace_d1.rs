@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use super::EvidenceClass;
 
+pub const WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY: &str = "mln-web";
+pub const WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID: &str =
+    "mln-web.workspace-d1-old-worker-canary-v1";
+pub const WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION: u8 = 1;
+
 /// One append-only migration file bound by a workspace-owned D1 operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,6 +108,25 @@ pub struct WorkspaceD1SchemaAssertionV1 {
     pub exact_object: Option<WorkspaceD1ExactObjectAssertionV1>,
 }
 
+/// One exact before/after comparison derived from two independently
+/// authenticated live-read receipts around a single attempted provider
+/// operation. Equal semantic state is required; receipt identity equality is
+/// forbidden because one observation cannot prove a temporal delta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceD1ZeroDeltaComparisonV1 {
+    pub observation: String,
+    pub attempted_operation_id: String,
+    pub before_proof_hash: String,
+    pub before_evidence_hash: String,
+    pub before_observed_at: DateTime<Utc>,
+    pub after_proof_hash: String,
+    pub after_evidence_hash: String,
+    pub after_observed_at: DateTime<Utc>,
+    pub semantic_state_sha256: String,
+    pub zero_delta: bool,
+}
+
 /// Provider-isolated qualification body stored through
 /// `EvidenceV1::PostChangeVerification`. This is the one atomicity join for a
 /// workspace D1 migration; individual child reads remain `OperationalProofV1`.
@@ -149,37 +173,33 @@ pub struct WorkspaceD1AtomicityQualificationV1 {
     pub delete_database_evidence_hash: String,
     pub success_outcome_evidence_hash: String,
     pub ddl_failure_outcome_evidence_hash: String,
-    pub ddl_failure_zero_schema_proof_hash: String,
-    pub ddl_failure_zero_schema_delta_hash: String,
-    pub ddl_failure_zero_ledger_proof_hash: String,
-    pub ddl_failure_zero_ledger_delta_hash: String,
+    pub ddl_failure_schema_delta: WorkspaceD1ZeroDeltaComparisonV1,
+    pub ddl_failure_ledger_delta: WorkspaceD1ZeroDeltaComparisonV1,
     pub ledger_failure_outcome_evidence_hash: String,
-    pub ledger_failure_zero_schema_proof_hash: String,
-    pub ledger_failure_zero_schema_delta_hash: String,
-    pub ledger_failure_zero_ledger_proof_hash: String,
-    pub ledger_failure_zero_ledger_delta_hash: String,
+    pub ledger_failure_schema_delta: WorkspaceD1ZeroDeltaComparisonV1,
+    pub ledger_failure_ledger_delta: WorkspaceD1ZeroDeltaComparisonV1,
     pub cleanup_proof_hash: String,
     pub cleanup_evidence_hash: String,
     pub success_passed: bool,
     pub ddl_failure_observed: bool,
-    pub ddl_failure_zero_schema_delta: bool,
-    pub ddl_failure_zero_ledger_delta: bool,
     pub ledger_failure_observed: bool,
-    pub ledger_failure_zero_schema_delta: bool,
-    pub ledger_failure_zero_ledger_delta: bool,
     pub cleanup_database_absent: bool,
     pub completed_at: DateTime<Utc>,
 }
 
-/// Founder-owned behavioral canary receipt that cfctl may validate and bind.
+/// Founder-owned behavioral canary receipt that cfctl may authenticate,
+/// validate, and bind under the explicit cross-repository contract fields.
 /// cfctl owns only the identity join; endpoint and request semantics remain in
-/// the workspace that produced the receipt.
+/// the Founder workspace that produced the receipt under the authenticated contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceD1OldWorkerCanaryV1 {
     pub schema_version: u8,
     pub kind: String,
     pub evidence_class: EvidenceClass,
+    pub owner_repository: String,
+    pub cross_repository_contract_id: String,
+    pub cross_repository_contract_version: u8,
     pub capability_id: String,
     pub workspace_contract_sha256: String,
     pub cfctl_candidate_hash: String,

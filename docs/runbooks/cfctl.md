@@ -1646,12 +1646,16 @@ preview, apply, and post-change verification evidence.
   generate it with `cfctl call`, show the exact operation to Prime, approve
   only that reviewed ID, run it once, and retain its post-change evidence.
   After the isolated success, declared DDL-failure, declared ledger-failure,
-  exact zero-delta reads, cleanup absence, fresh Worker
-  deployment/version/settings reads, and workspace-owned semantic canary have
+  distinct before/after zero-delta reads bracketing each exact failed operation,
+  an exact-database 404 not-found cleanup read, fresh Worker
+  deployment/version/settings reads, and the Founder-owned semantic canary have
   authenticated child identities, call `workspace-d1-qualification-produce`
-  with those identities. The producer performs no Cloudflare or Wrangler
-  boundary, accepts no raw receipt body or SQL, and creates, approves, or runs
-  no provider plan. Production planning stops until
+  with the PlanV2/proof identities and the existing Founder canary EvidenceV1
+  hash. The producer performs no Cloudflare or Wrangler boundary, derives
+  delta predicates from the two semantic-state observations, accepts no raw
+  receipt body, SQL, successful cleanup detail, caller-selected canary hashes,
+  or caller disposition, and creates, approves, or runs no provider plan.
+  Production planning stops until
   one `workspace_d1_provider_atomicity_v1` PostChangeVerification receipt and
   one `workspace_d1_old_worker_canary_v1` workspace receipt pass the closed
   validators. The atomicity receipt binds an isolated database, exact cfctl and
@@ -1661,7 +1665,10 @@ preview, apply, and post-change verification evidence.
   semantics opaque behind one digest without retaining the semantic body. Both
   receipt hashes, the three Worker live-read
   hashes, and the Worker deployment-plan hash become PlanV2 resource
-  observations. The canary self-hash is the canonical JSON receipt hash with
+  observations. The canary is owned and authenticated by Founder under the
+  exact `mln-web.workspace-d1-old-worker-canary-v1` version-1 cross-repository
+  contract; cfctl consumes and validates that receipt rather than authoring or
+  re-signing its behavioral semantics. The canary self-hash is the canonical JSON receipt hash with
   `canary_receipt_sha256` set to the empty string; the Worker-identity join is a
   separate canonical hash over the deployment-plan and three live-read hashes
   plus deployment/version UUIDs. Exact index and trigger definitions are compared for equality;
