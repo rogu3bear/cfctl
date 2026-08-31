@@ -1,0 +1,4 @@
+[alias]
+description = """
+xtask = ["run", "--locked", "-p", "xtask", "--"]
+"""

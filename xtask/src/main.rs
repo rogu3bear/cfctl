@@ -457,15 +457,12 @@ fn verify_source_contract() -> Result<(), TaskError> {
             "packaging/install.sh",
             "tests/account-backed-smoke.sh",
             "tests/bootstrap-cleanliness.sh",
-            "tests/xtask-alias-contract.sh",
-            "tests/xtask-alias-contract.test.sh",
         ],
     )?;
 
     run("sh", &["tests/bootstrap-cleanliness.sh"])?;
-    run("sh", &["tests/xtask-alias-contract.sh"])?;
-    run("sh", &["tests/xtask-alias-contract.test.sh"])?;
 
+    verify_xtask_alias_contract()?;
     verify_bootstrap_contract()?;
     verify_local_only_ci_contract()?;
     verify_workspace_contract()?;
@@ -473,6 +470,68 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
     verify_documented_contracts()
+}
+
+const EXPECTED_XTASK_ALIAS: [&str; 5] = ["run", "--locked", "-p", "xtask", "--"];
+
+fn verify_xtask_alias_contract() -> Result<(), TaskError> {
+    let path = Path::new(".cargo/config.toml");
+    let source = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
+    validate_xtask_alias_contract(&source)
+}
+
+fn validate_xtask_alias_contract(source: &str) -> Result<(), TaskError> {
+    let document: toml::Value = toml::from_str(source).map_err(|error| {
+        TaskError::InvalidSourceContract(format!(".cargo/config.toml must be valid TOML: {error}"))
+    })?;
+
+    let assignments = count_semantic_key(&document, "xtask");
+    if assignments != 1 {
+        return Err(TaskError::InvalidSourceContract(format!(
+            ".cargo/config.toml must define exactly one semantic `xtask` key, found {assignments}"
+        )));
+    }
+
+    let tokens = document
+        .get("alias")
+        .and_then(toml::Value::as_table)
+        .and_then(|aliases| aliases.get("xtask"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract(
+                ".cargo/config.toml alias.xtask must be an array of canonical Cargo tokens"
+                    .to_owned(),
+            )
+        })?;
+
+    let exact = tokens.len() == EXPECTED_XTASK_ALIAS.len()
+        && tokens
+            .iter()
+            .zip(EXPECTED_XTASK_ALIAS)
+            .all(|(value, expected)| value.as_str() == Some(expected));
+    if !exact {
+        return Err(TaskError::InvalidSourceContract(format!(
+            ".cargo/config.toml alias.xtask must equal {:?}",
+            EXPECTED_XTASK_ALIAS
+        )));
+    }
+
+    Ok(())
+}
+
+fn count_semantic_key(value: &toml::Value, expected: &str) -> usize {
+    if let Some(table) = value.as_table() {
+        return table
+            .iter()
+            .map(|(key, value)| usize::from(key == expected) + count_semantic_key(value, expected))
+            .sum();
+    }
+    value.as_array().map_or(0, |values| {
+        values
+            .iter()
+            .map(|value| count_semantic_key(value, expected))
+            .sum()
+    })
 }
 
 fn verify_public_domain_contract() -> Result<(), TaskError> {
@@ -3611,12 +3670,12 @@ mod tests {
         validate_macos_provenance, validate_notary_receipt_value, validate_public_domain_anchor,
         validate_release_identity_inputs, validate_rollback_readback,
         validate_signed_release_file_set, validate_signed_release_posture_contract,
-        validated_release_targets, verify_active_guidance_has_no_v1_commands,
-        verify_documented_contracts, verify_generated_guidance_section_text,
-        verify_managed_agent_documents, verify_public_domain_contract,
-        verify_quickstart_pins_the_release_version, verify_signed_release_posture_contract,
-        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
-        verify_workspace_dependency_versions,
+        validate_xtask_alias_contract, validated_release_targets,
+        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
+        verify_generated_guidance_section_text, verify_managed_agent_documents,
+        verify_public_domain_contract, verify_quickstart_pins_the_release_version,
+        verify_signed_release_posture_contract, verify_tracked_cfctl_command_references,
+        verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -3643,6 +3702,64 @@ mod tests {
                 .contains("tracked-and-untracked cleanliness invariant"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn xtask_alias_contract_rejects_toml_lookalikes() {
+        validate_xtask_alias_contract(include_str!("../../.cargo/config.toml"))
+            .expect("repository xtask alias is canonical");
+
+        for (name, source) in [
+            (
+                "relocated assignment",
+                include_str!("../../tests/fixtures/xtask-alias-relocated.toml"),
+            ),
+            (
+                "single-quoted relocated duplicate",
+                include_str!("../../tests/fixtures/xtask-alias-single-quoted-relocated.toml"),
+            ),
+            (
+                "multiline string lookalike",
+                include_str!("../../tests/fixtures/xtask-alias-multiline-string.toml"),
+            ),
+        ] {
+            let error = validate_xtask_alias_contract(source)
+                .expect_err("TOML lookalike must not satisfy alias.xtask");
+            assert!(
+                error.to_string().contains("xtask"),
+                "unexpected {name} error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn xtask_alias_contract_rejects_wrong_semantic_shapes() {
+        for (name, source) in [
+            ("absence", "[alias]\nother = [\"run\"]\n"),
+            (
+                "wrong type",
+                "[alias]\nxtask = \"run --locked -p xtask --\"\n",
+            ),
+            (
+                "wrong value",
+                "[alias]\nxtask = [\"run\", \"-p\", \"xtask\", \"--\"]\n",
+            ),
+            (
+                "duplicate",
+                concat!(
+                    "[alias]\n",
+                    "xtask = [\"run\", \"--locked\", \"-p\", \"xtask\", \"--\"]\n",
+                    "'xtask' = [\"run\", \"--locked\", \"-p\", \"xtask\", \"--\"]\n",
+                ),
+            ),
+        ] {
+            let error = validate_xtask_alias_contract(source)
+                .expect_err("noncanonical semantic shape must fail closed");
+            assert!(
+                error.to_string().contains("xtask") || error.to_string().contains("valid TOML"),
+                "unexpected {name} error: {error}"
+            );
+        }
     }
 
     #[test]
