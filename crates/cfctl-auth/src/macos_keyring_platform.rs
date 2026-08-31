@@ -14,7 +14,7 @@ use crate::{AuthError, Result};
 pub(super) struct SecurityCommandAdapter;
 
 struct KeyringMutationLock {
-    _parent: Dir,
+    parent: Dir,
     _authority_lock: fs::File,
     root: Dir,
     file: fs::File,
@@ -80,14 +80,11 @@ fn mutation_lock_root_with_command(
         .process_group(0)
         .spawn()
         .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let mut stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            kill_and_reap(&mut child);
-            return Err(AuthError::SecretStore(
-                "platform user lock authority lookup produced no output sink".to_owned(),
-            ));
-        }
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_and_reap(&mut child);
+        return Err(AuthError::SecretStore(
+            "platform user lock authority lookup produced no output sink".to_owned(),
+        ));
     };
     let flags = match rustix::fs::fcntl_getfl(&stdout) {
         Ok(flags) => flags,
@@ -161,10 +158,10 @@ fn mutation_lock_root_with_command(
 }
 
 fn kill_and_reap(child: &mut std::process::Child) {
-    if let Ok(raw_pid) = i32::try_from(child.id()) {
-        if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
+    if let Ok(raw_pid) = i32::try_from(child.id())
+        && let Some(pid) = rustix::process::Pid::from_raw(raw_pid)
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -176,8 +173,7 @@ fn parse_mutation_lock_root_output(
 ) -> Result<PathBuf> {
     if !status.success() {
         return Err(AuthError::SecretStore(format!(
-            "platform user lock authority lookup failed with exit status {}",
-            status
+            "platform user lock authority lookup failed with exit status {status}"
         )));
     }
     if stdout.is_empty() || stdout.len() > MAX_GETCONF_STDOUT_BYTES {
@@ -313,7 +309,7 @@ fn open_mutation_lock_file_with_hook(
     set_handle_mode(&file, 0o600)?;
     require_lock_identity(&lock_root, &lock_name, lock_identity)?;
     Ok(KeyringMutationLock {
-        _parent: parent,
+        parent,
         _authority_lock: authority_lock,
         root: lock_root,
         file,
@@ -356,9 +352,9 @@ fn acquire_mutation_lock_at_with_hooks(
 
 impl KeyringMutationLock {
     fn require_identity(&self) -> Result<()> {
-        require_parent_identity(&self.parent_path, &self._parent, self.parent_identity)?;
+        require_parent_identity(&self.parent_path, &self.parent, self.parent_identity)?;
         require_root_identity(
-            &self._parent,
+            &self.parent,
             &self.root_name,
             &self.root,
             self.root_identity,
@@ -773,16 +769,16 @@ mod tests {
             return;
         }
         if mode == "fork-holder" {
-            let mut descendant = getconf_helper_command("descendant", &receipt);
-            descendant
+            let mut descendant = getconf_helper_command("descendant", &receipt)
                 .spawn()
                 .expect("spawn inherited-stdout descendant");
+            descendant.wait().expect("reap inherited-stdout descendant");
             return;
         }
         assert!(mode == "hang" || mode == "descendant");
         fs::write(receipt, std::process::id().to_string()).expect("publish helper pid");
         loop {
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(Duration::from_mins(1));
         }
     }
 
