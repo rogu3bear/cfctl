@@ -716,6 +716,8 @@ mod tests {
     const GETCONF_HELPER_ENV: &str = "CFCTL_TEST_GETCONF_HELPER";
     const GETCONF_HELPER_MODE_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_MODE";
     const GETCONF_HELPER_RECEIPT_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_RECEIPT";
+    const GETCONF_HELPER_EXIT_RECEIPT_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_EXIT_RECEIPT";
+    const GETCONF_HELPER_EXE_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_EXE";
 
     fn wait_for_path(path: &Path, label: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -769,10 +771,26 @@ mod tests {
             return;
         }
         if mode == "fork-holder" {
-            let mut descendant = getconf_helper_command("descendant", &receipt)
-                .spawn()
-                .expect("spawn inherited-stdout descendant");
-            descendant.wait().expect("reap inherited-stdout descendant");
+            let exit_receipt = PathBuf::from(
+                std::env::var_os(GETCONF_HELPER_EXIT_RECEIPT_ENV)
+                    .expect("fork-holder exit receipt"),
+            );
+            let current_exe = std::env::current_exe().expect("current test executable");
+            let launcher = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "\"$CFCTL_TEST_GETCONF_HELPER_EXE\" --exact \
+                     macos_keyring::platform::tests::getconf_process_helper --nocapture &",
+                ])
+                .env(GETCONF_HELPER_EXE_ENV, current_exe)
+                .env(GETCONF_HELPER_ENV, "1")
+                .env(GETCONF_HELPER_MODE_ENV, "descendant")
+                .env(GETCONF_HELPER_RECEIPT_ENV, &receipt)
+                .stdin(Stdio::null())
+                .status()
+                .expect("launch inherited-stdout descendant");
+            assert!(launcher.success(), "descendant launcher failed");
+            fs::write(exit_receipt, b"exited").expect("publish fork-holder exit receipt");
             return;
         }
         assert!(mode == "hang" || mode == "descendant");
@@ -835,6 +853,7 @@ mod tests {
     fn getconf_deadline_survives_an_inherited_stdout_descendant() {
         let temp = tempfile::tempdir().expect("temporary getconf receipt");
         let receipt = temp.path().join("descendant-pid");
+        let exit_receipt = temp.path().join("fork-holder-exited");
         let watchdog_receipt = receipt.clone();
         let watchdog = thread::spawn(move || {
             wait_for_path(&watchdog_receipt, "getconf descendant pid");
@@ -853,6 +872,7 @@ mod tests {
             }
         });
         let mut command = getconf_helper_command("fork-holder", &receipt);
+        command.env(GETCONF_HELPER_EXIT_RECEIPT_ENV, &exit_receipt);
         let started = Instant::now();
         let error = mutation_lock_root_with_command(&mut command, Duration::from_millis(200))
             .expect_err("inherited stdout must not outlive the resolver deadline");
@@ -862,6 +882,10 @@ mod tests {
             .expect("read terminated descendant pid")
             .parse::<u32>()
             .expect("parse terminated descendant pid");
+        assert!(
+            exit_receipt.exists(),
+            "direct fork-holder child did not exit before the inherited stdout deadline"
+        );
         assert!(error.to_string().contains("timed out"));
         assert!(elapsed < Duration::from_millis(500));
         assert!(
