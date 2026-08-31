@@ -1,2 +1,2 @@
 [alias]
-xtask = "run --quiet --locked -p xtask --"
+xtask = ["run", "--locked", "-p", "xtask", "--"]
