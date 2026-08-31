@@ -57,6 +57,22 @@ pub struct WorkspaceD1ManifestMigrationContractV1 {
     pub require_old_worker_compatibility: bool,
 }
 
+pub(crate) fn target_is_immediate_successor(baseline_end: u64, target: u64) -> bool {
+    baseline_end.checked_add(1) == Some(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_is_immediate_successor;
+
+    #[test]
+    fn manifest_target_successor_fails_closed_at_u64_max() {
+        assert!(target_is_immediate_successor(u64::MAX - 1, u64::MAX));
+        assert!(!target_is_immediate_successor(u64::MAX, 0));
+        assert!(!target_is_immediate_successor(u64::MAX, u64::MAX));
+    }
+}
+
 /// One exact schema object definition derived from reviewed migration bytes.
 /// The definition is public source material, not provider output; its digest
 /// prevents a caller from pairing a reviewed object name with different SQL.

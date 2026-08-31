@@ -351,9 +351,11 @@ fn load_manifest_operation(
         .collect::<Vec<_>>();
     let mut pending_seen = false;
     for (index, entry) in governed.iter().enumerate() {
-        let expected_sequence = operation.baseline_start_sequence
-            + u64::try_from(index)
-                .map_err(|_| invariant("workspace D1 manifest succession is too large"))?;
+        let expected_sequence = checked_sequence_offset(
+            operation.baseline_start_sequence,
+            index,
+            "manifest succession",
+        )?;
         let expected_predecessor = index
             .checked_sub(1)
             .and_then(|previous| governed.get(previous))
@@ -400,8 +402,8 @@ fn load_manifest_operation(
         ));
     }
     for (offset, entry) in baseline.iter().enumerate() {
-        let expected_sequence = operation.baseline_start_sequence
-            + u64::try_from(offset).map_err(|_| invariant("workspace D1 baseline is too large"))?;
+        let expected_sequence =
+            checked_sequence_offset(operation.baseline_start_sequence, offset, "baseline")?;
         if entry.sequence != expected_sequence
             || !valid_migration_name(&entry.file)
             || !is_lower_hex(&entry.sha256, 64)
@@ -530,6 +532,7 @@ fn load_manifest_operation(
 
 fn validate_manifest_operation(operation: &OperationDeclarationV2) -> Result<()> {
     let atomicity = &operation.atomicity;
+    let expected_target_sequence = checked_target_sequence(operation.baseline_end_sequence)?;
     if !valid_operation_id(&operation.id)
         || operation.title.trim().is_empty()
         || operation.description.trim().is_empty()
@@ -541,7 +544,7 @@ fn validate_manifest_operation(operation: &OperationDeclarationV2) -> Result<()>
         || !is_lower_hex(&operation.wrangler_cli_sha256, 64)
         || operation.baseline_start_sequence == 0
         || operation.baseline_end_sequence < operation.baseline_start_sequence
-        || operation.target_sequence != operation.baseline_end_sequence + 1
+        || operation.target_sequence != expected_target_sequence
         || operation.recovery.full_export_capability_id != "d1-full-export"
         || operation.recovery.bookmark_capability_id != "d1-time-travel-get-bookmark"
         || operation.recovery.rollback_capability_id != "d1-restore-exact-bookmark"
@@ -572,6 +575,20 @@ fn validate_manifest_operation(operation: &OperationDeclarationV2) -> Result<()>
         ));
     }
     Ok(())
+}
+
+fn checked_sequence_offset(start: u64, offset: usize, context: &str) -> Result<u64> {
+    let offset = u64::try_from(offset)
+        .map_err(|_| invariant(format!("workspace D1 {context} offset is too large")))?;
+    start
+        .checked_add(offset)
+        .ok_or_else(|| invariant(format!("workspace D1 {context} sequence overflows u64")))
+}
+
+fn checked_target_sequence(baseline_end: u64) -> Result<u64> {
+    baseline_end
+        .checked_add(1)
+        .ok_or_else(|| invariant("workspace D1 manifest target sequence overflows u64"))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
@@ -1459,6 +1476,21 @@ require_old_worker_compatibility = true
             contract.migrations[0].path,
             "crates/founder/migrations/d1/0172_offer_authority_provenance.sql"
         );
+    }
+
+    #[test]
+    fn manifest_sequence_arithmetic_fails_closed_at_u64_boundaries() {
+        assert_eq!(
+            checked_sequence_offset(u64::MAX - 1, 1, "test").expect("last sequence"),
+            u64::MAX
+        );
+        assert!(checked_sequence_offset(u64::MAX, 1, "test").is_err());
+        assert!(checked_sequence_offset(u64::MAX - 1, 2, "test").is_err());
+        assert_eq!(
+            checked_target_sequence(u64::MAX - 1).expect("last target"),
+            u64::MAX
+        );
+        assert!(checked_target_sequence(u64::MAX).is_err());
     }
 
     #[test]

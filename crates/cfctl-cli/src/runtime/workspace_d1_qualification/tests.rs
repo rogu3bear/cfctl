@@ -100,6 +100,10 @@ struct StoredPlan {
     evidence_hash: String,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the authenticated plan fixture keeps each authority and migration identity explicit"
+)]
 fn stored_plan(
     store: &StateStore,
     role: &str,
@@ -108,6 +112,7 @@ fn stored_plan(
     catalog_hash: &str,
     target: Value,
     status: PlanStatus,
+    success_migration_sha256: &str,
 ) -> StoredPlan {
     let verification = store
         .write_evidence(
@@ -121,7 +126,7 @@ fn stored_plan(
     let mut capability = CapabilityV1::new(capability_id, role, "POST", "/fixture");
     if role == "success_apply" {
         capability.workspace_d1_migration =
-            Some(migration_contract(&digest("synthetic-migration"), false));
+            Some(migration_contract(success_migration_sha256, false));
     }
     let mut plan = PlanV1::draft(PROFILE, ACCOUNT, catalog_hash, capability, target.clone())
         .expect("draft plan");
@@ -307,9 +312,19 @@ struct Fixture {
 
 #[allow(clippy::too_many_lines)]
 fn fixture(store: &StateStore) -> Fixture {
+    let migration_sha256 = digest("migration");
+    fixture_with_migrations(store, &migration_sha256, &migration_sha256)
+}
+
+#[allow(clippy::too_many_lines)]
+fn fixture_with_migrations(
+    store: &StateStore,
+    production_migration_sha256: &str,
+    success_migration_sha256: &str,
+) -> Fixture {
     let candidate = digest("cfctl-candidate");
     let catalog = digest("catalog");
-    let production_contract = migration_contract(&digest("migration"), true);
+    let production_contract = migration_contract(production_migration_sha256, true);
     let target = json!({"account_id":ACCOUNT,"database_id":DATABASE});
     let plans = [
         (
@@ -349,6 +364,7 @@ fn fixture(store: &StateStore) -> Fixture {
             &catalog,
             target.clone(),
             status,
+            success_migration_sha256,
         )
     })
     .collect::<Vec<_>>();
@@ -432,7 +448,7 @@ fn fixture(store: &StateStore) -> Fixture {
         .expect("database identity"),
         wrangler_version: "4.100.0".to_owned(),
         wrangler_cli_sha256: digest("wrangler"),
-        synthetic_migration_sha256: digest("synthetic-migration"),
+        synthetic_migration_sha256: success_migration_sha256.to_owned(),
         create_database_operation_id: plan("create_database").operation_id.clone(),
         create_database_plan_hash: plan("create_database").plan_hash.clone(),
         get_database_proof_hash: proof("get_database").proof_hash.clone(),
@@ -487,6 +503,7 @@ fn fixture(store: &StateStore) -> Fixture {
         &catalog,
         worker_target.clone(),
         PlanStatus::Verified,
+        success_migration_sha256,
     );
     let worker_proofs = [
         ("deployments", "worker-deployments-list-deployments"),
@@ -560,7 +577,7 @@ fn fixture(store: &StateStore) -> Fixture {
         profile_id: PROFILE.to_owned(),
         credential_generation_id: GENERATION.to_owned(),
         database_id: DATABASE.to_owned(),
-        migration_sha256: digest("migration"),
+        migration_sha256: production_migration_sha256.to_owned(),
         migration_operation_id: atomicity.success_apply_operation_id.clone(),
         migration_plan_hash: atomicity.success_apply_plan_hash.clone(),
         migration_apply_evidence_hash: atomicity.success_outcome_evidence_hash.clone(),
@@ -898,6 +915,17 @@ fn qualification_resolves_children_before_binding_six_joins() {
     assert_eq!(plan.precondition_hashes.len(), 6);
     current_plan_evidence_hashes(&store, &plan, Utc::now())
         .expect("unchanged qualified plan preconditions");
+}
+
+#[test]
+fn execution_rejects_authenticated_success_child_with_different_migration() {
+    let (_root, store) = store();
+    let production = digest("production-migration");
+    let synthetic = digest("synthetic-migration");
+    let fixture = fixture_with_migrations(&store, &production, &synthetic);
+    let plan = bound_execution_plan(&store, &fixture);
+
+    rejects_execution(&store, &plan);
 }
 
 #[test]

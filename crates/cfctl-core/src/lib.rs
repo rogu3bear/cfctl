@@ -2701,7 +2701,10 @@ impl CapabilityV1 {
                                     && !manifest.database_id.is_empty()
                                     && (1..=64).contains(&manifest.baseline.len())
                                     && manifest.baseline_start_sequence <= manifest.baseline_end_sequence
-                                    && manifest.target_sequence == manifest.baseline_end_sequence + 1
+                                    && workspace_d1::target_is_immediate_successor(
+                                        manifest.baseline_end_sequence,
+                                        manifest.target_sequence,
+                                    )
                                     && !manifest.target_git_blob_oid.is_empty()
                                     && contract.migrations.len() == 1
                                     && !manifest.baseline_digest.is_empty()

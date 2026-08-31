@@ -1249,8 +1249,14 @@ pub(super) fn current_plan_evidence_hashes(
         .as_ref()
         .ok_or_else(|| CliError::Input("workspace D1 execution contract is missing".to_owned()))?;
     let workspace_contract_sha256 = hash_value(&serde_json::to_value(execution_contract)?)?;
-    let migration_sha256 =
-        single_migration_sha256(execution_contract, "production execution")?.to_owned();
+    let production_migration_sha256 =
+        single_migration_sha256(execution_contract, "production execution")?;
+    if production_migration_sha256 != synthetic_migration_sha256 {
+        return Err(CliError::Input(
+            "workspace D1 production execution migration differs from the authenticated success child migration"
+                .to_owned(),
+        ));
+    }
     let plan_expectations = owned_plans
         .iter()
         .map(OwnedPlanExpectation::borrowed)
@@ -1454,7 +1460,7 @@ pub(super) fn current_plan_evidence_hashes(
         profile_id: &plan.profile_id,
         credential_generation_id: &execution.pins.credential_generation_id,
         database_id: &isolated_database_id,
-        migration_sha256: &migration_sha256,
+        migration_sha256: &synthetic_migration_sha256,
         migration_operation_id: &success_plan.operation_id,
         migration_plan_hash: &success_plan.plan_content_hash,
         migration_apply_evidence_hash: &success_plan.evidence_hash,
