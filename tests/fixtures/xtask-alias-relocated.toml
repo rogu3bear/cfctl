@@ -1,0 +1,5 @@
+[build]
+xtask = ["run", "--locked", "-p", "xtask", "--"]
+
+[alias]
+other = ["run", "--locked", "-p", "other", "--"]

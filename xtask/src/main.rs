@@ -458,11 +458,13 @@ fn verify_source_contract() -> Result<(), TaskError> {
             "tests/account-backed-smoke.sh",
             "tests/bootstrap-cleanliness.sh",
             "tests/xtask-alias-contract.sh",
+            "tests/xtask-alias-contract.test.sh",
         ],
     )?;
 
     run("sh", &["tests/bootstrap-cleanliness.sh"])?;
     run("sh", &["tests/xtask-alias-contract.sh"])?;
+    run("sh", &["tests/xtask-alias-contract.test.sh"])?;
 
     verify_bootstrap_contract()?;
     verify_local_only_ci_contract()?;
