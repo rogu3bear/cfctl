@@ -1,10 +1,14 @@
-use std::io::{Read as _, Write as _};
-
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{AuthError, Result};
+
+#[path = "macos_keyring_platform.rs"]
+mod platform;
+use platform::SecurityCommandAdapter;
+#[cfg(test)]
+use platform::security_write_arguments;
 
 const PROMPT_SAFE_VALUE_BYTES: usize = 96;
 const PROMPT_MAX_VALUE_BYTES: usize = 127;
@@ -48,10 +52,22 @@ trait MacosKeychainAdapter {
     fn get_raw(&self, service: &str, key: &str) -> Result<Option<String>>;
     fn delete_raw(&self, service: &str, key: &str) -> Result<()>;
 
+    fn acquire_mutation_lock<'a>(
+        &'a self,
+        _service: &str,
+        _key: &str,
+    ) -> Result<Box<dyn MutationGuard + 'a>> {
+        Ok(Box::new(()))
+    }
+
     fn checkpoint(&self, _boundary: LifecycleBoundary) -> Result<()> {
         Ok(())
     }
 }
+
+trait MutationGuard {}
+
+impl<T> MutationGuard for T {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleBoundary {
@@ -66,23 +82,17 @@ enum LifecycleBoundary {
     InventoryDelete,
 }
 
-struct SecurityCommandAdapter;
-
-impl MacosKeychainAdapter for SecurityCommandAdapter {
-    fn put_raw(&self, service: &str, key: &str, value: &str) -> Result<()> {
-        security_command_put(service, key, value)
-    }
-
-    fn get_raw(&self, service: &str, key: &str) -> Result<Option<String>> {
-        security_command_get(service, key)
-    }
-
-    fn delete_raw(&self, service: &str, key: &str) -> Result<()> {
-        security_command_delete(service, key)
-    }
+fn put_with(
+    adapter: &dyn MacosKeychainAdapter,
+    service: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let _guard = adapter.acquire_mutation_lock(service, key)?;
+    put_unlocked(adapter, service, key, value)
 }
 
-fn put_with(
+fn put_unlocked(
     adapter: &dyn MacosKeychainAdapter,
     service: &str,
     key: &str,
@@ -132,20 +142,29 @@ fn get_with(
 }
 
 fn delete_with(adapter: &dyn MacosKeychainAdapter, service: &str, key: &str) -> Result<()> {
+    let _guard = adapter.acquire_mutation_lock(service, key)?;
+    delete_unlocked(adapter, service, key)
+}
+
+fn delete_unlocked(adapter: &dyn MacosKeychainAdapter, service: &str, key: &str) -> Result<()> {
     let Some(inventory) = reconcile(adapter, service, key)? else {
-        if let Some(legacy) = confirmed_legacy_v1_manifest(adapter, service, key)? {
-            read_legacy_v1_generation(adapter, service, key, &legacy)?;
-            let generation = GenerationRef::new(legacy.write_id, legacy.chunk_count)?;
-            let deleting =
-                GenerationInventory::new(InventoryState::DeletingLegacyV1, generation, None)?;
-            write_inventory(
-                adapter,
-                service,
-                key,
-                &deleting,
-                LifecycleBoundary::InventoryTransition,
-            )?;
-            return finish_delete_legacy_v1(adapter, service, key, &deleting.primary);
+        match classify_legacy_v1(adapter, service, key)? {
+            LegacyV1State::Confirmed(legacy) => {
+                read_legacy_v1_generation(adapter, service, key, &legacy)?;
+                let generation = GenerationRef::new(legacy.write_id, legacy.chunk_count)?;
+                let deleting =
+                    GenerationInventory::new(InventoryState::DeletingLegacyV1, generation, None)?;
+                write_inventory(
+                    adapter,
+                    service,
+                    key,
+                    &deleting,
+                    LifecycleBoundary::InventoryTransition,
+                )?;
+                return finish_delete_legacy_v1(adapter, service, key, &deleting.primary);
+            }
+            LegacyV1State::Ambiguous => return Err(ambiguous_legacy_v1()),
+            LegacyV1State::Unmanaged => {}
         }
         delete_raw_exact(adapter, service, key)?;
         adapter.checkpoint(LifecycleBoundary::RootDelete)?;
@@ -168,10 +187,14 @@ fn put_initial(
     key: &str,
     value: &str,
 ) -> Result<()> {
-    let legacy_v1 = confirmed_legacy_v1_manifest(adapter, service, key)?;
-    if let Some(legacy) = legacy_v1.as_ref() {
-        read_legacy_v1_generation(adapter, service, key, legacy)?;
-    }
+    let legacy_v1 = match classify_legacy_v1(adapter, service, key)? {
+        LegacyV1State::Confirmed(legacy) => {
+            read_legacy_v1_generation(adapter, service, key, &legacy)?;
+            Some(legacy)
+        }
+        LegacyV1State::Ambiguous => return Err(ambiguous_legacy_v1()),
+        LegacyV1State::Unmanaged => None,
+    };
     let generation = GenerationRef::for_value(*Uuid::new_v4().as_bytes(), value)?;
     let preparing = GenerationInventory::new(InventoryState::PreparingLegacy, generation, None)?;
     write_inventory(
@@ -781,19 +804,25 @@ fn legacy_v1_chunk_key(key: &str, write_id: &[u8; 16], index: usize) -> String {
     )
 }
 
-fn confirmed_legacy_v1_manifest(
+enum LegacyV1State {
+    Unmanaged,
+    Confirmed(ChunkManifest),
+    Ambiguous,
+}
+
+fn classify_legacy_v1(
     adapter: &dyn MacosKeychainAdapter,
     service: &str,
     key: &str,
-) -> Result<Option<ChunkManifest>> {
+) -> Result<LegacyV1State> {
     let Some(root) = get_raw_bounded(adapter, service, key)? else {
-        return Ok(None);
+        return Ok(LegacyV1State::Unmanaged);
     };
     if !root.starts_with(LEGACY_V1_MANIFEST_PREFIX) {
-        return Ok(None);
+        return Ok(LegacyV1State::Unmanaged);
     }
     let Ok(Some(manifest)) = decode_manifest(&root, LEGACY_V1_MANIFEST_PREFIX, 1) else {
-        return Ok(None);
+        return Ok(LegacyV1State::Unmanaged);
     };
     validate_manifest_fields(manifest.chunk_count, manifest.value_len)?;
     if manifest.write_id == [0; 16] {
@@ -807,10 +836,17 @@ fn confirmed_legacy_v1_manifest(
         )?
         .is_some()
         {
-            return Ok(Some(manifest));
+            return Ok(LegacyV1State::Confirmed(manifest));
         }
     }
-    Ok(None)
+    Ok(LegacyV1State::Ambiguous)
+}
+
+fn ambiguous_legacy_v1() -> AuthError {
+    AuthError::SecretStore(
+        "platform keyring legacy v1 ownership is ambiguous; preserve the item and resolve its provenance explicitly"
+            .to_owned(),
+    )
 }
 
 fn get_unmanaged(
@@ -818,9 +854,12 @@ fn get_unmanaged(
     service: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    match confirmed_legacy_v1_manifest(adapter, service, key)? {
-        Some(manifest) => read_legacy_v1_generation(adapter, service, key, &manifest).map(Some),
-        None => get_raw_bounded(adapter, service, key),
+    match classify_legacy_v1(adapter, service, key)? {
+        LegacyV1State::Confirmed(manifest) => {
+            read_legacy_v1_generation(adapter, service, key, &manifest).map(Some)
+        }
+        LegacyV1State::Ambiguous => Err(ambiguous_legacy_v1()),
+        LegacyV1State::Unmanaged => get_raw_bounded(adapter, service, key),
     }
 }
 
@@ -967,147 +1006,6 @@ fn delete_raw_exact(adapter: &dyn MacosKeychainAdapter, service: &str, key: &str
             Err(AuthError::SecretStore(format!(
                 "platform keyring credential deletion {delete_state}, but exact absence readback is indeterminate ({readback_error})"
             )))
-        }
-    }
-}
-
-fn security_write_arguments(service: &str, key: &str) -> Vec<String> {
-    [
-        "add-generic-password",
-        "-U",
-        "-a",
-        key,
-        "-s",
-        service,
-        "-T",
-        "/usr/bin/security",
-        "-w",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
-
-fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
-    if value.contains(['\n', '\r']) {
-        return Err(AuthError::SecretStore(
-            "macOS Keychain credentials cannot contain line breaks".to_owned(),
-        ));
-    }
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(security_write_arguments(service, key))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            AuthError::SecretStore(
-                "platform keyring credential write produced no input sink".to_owned(),
-            )
-        })?;
-        stdin
-            .write_all(value.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.write_all(value.as_bytes()))
-            .and_then(|()| stdin.write_all(b"\n"))
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    }
-    drop(child.stdin.take());
-    let status = wait_for_child(&mut child)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AuthError::SecretStore(format!(
-            "platform keyring credential write failed with exit status {status}"
-        )))
-    }
-}
-
-fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", service, "-a", key, "-w"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let status = wait_for_child(&mut child)?;
-    if status.code() == Some(44) {
-        return Ok(None);
-    }
-    if !status.success() {
-        return Err(AuthError::SecretStore(format!(
-            "platform keyring credential read failed with exit status {status}"
-        )));
-    }
-    let mut bytes = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(|| {
-            AuthError::SecretStore("platform keyring credential read produced no sink".to_owned())
-        })?
-        .take(
-            u64::try_from(MAX_LOGICAL_CREDENTIAL_BYTES + 1).map_err(|_| {
-                AuthError::SecretStore("platform keyring read bound is invalid".to_owned())
-            })?,
-        )
-        .read_to_end(&mut bytes)
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    if bytes.len() > MAX_LOGICAL_CREDENTIAL_BYTES {
-        return Err(AuthError::SecretStore(
-            "platform keyring item exceeds the maximum encoded byte bound".to_owned(),
-        ));
-    }
-    while bytes
-        .last()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        bytes.pop();
-    }
-    let value = String::from_utf8(bytes).map_err(|_| {
-        AuthError::SecretStore("platform keyring credential is not valid UTF-8".to_owned())
-    })?;
-    Ok(Some(value))
-}
-
-fn security_command_delete(service: &str, key: &str) -> Result<()> {
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", service, "-a", key])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let status = wait_for_child(&mut child)?;
-    if status.success() || status.code() == Some(44) {
-        Ok(())
-    } else {
-        Err(AuthError::SecretStore(format!(
-            "platform keyring credential deletion failed with exit status {status}"
-        )))
-    }
-}
-
-fn wait_for_child(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child
-            .try_wait()
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?
-        {
-            Some(status) => return Ok(status),
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AuthError::SecretStore(
-                    "platform keyring operation timed out after 5 seconds; unlock the login keychain and retry"
-                        .to_owned(),
-                ));
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     }
 }
@@ -1677,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_looking_unconfirmed_legacy_value_is_not_reinterpreted() {
+    fn canonical_looking_unconfirmed_legacy_value_is_preserved_as_ambiguous() {
         let adapter = PromptLimitedAdapter::default();
         let current = encode_manifest_unchecked([11; 16], 1, 1, [12; 32]);
         let encoded = current.strip_prefix(CHUNK_MANIFEST_PREFIX).expect("prefix");
@@ -1691,8 +1589,13 @@ mod tests {
             .put_raw("service", "legacy-canonical", &legacy)
             .expect("legacy seed");
 
+        assert!(get_with(&adapter, "service", "legacy-canonical").is_err());
+        assert!(put_with(&adapter, "service", "legacy-canonical", "replacement").is_err());
+        assert!(delete_with(&adapter, "service", "legacy-canonical").is_err());
         assert_eq!(
-            get_with(&adapter, "service", "legacy-canonical").expect("legacy read"),
+            adapter
+                .get_raw("service", "legacy-canonical")
+                .expect("raw read after rejected operations"),
             Some(legacy)
         );
     }
@@ -1981,3 +1884,7 @@ mod tests {
         assert!(!error.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
 }
+
+#[cfg(test)]
+#[path = "macos_keyring_rework_tests.rs"]
+mod rework_tests;
