@@ -397,7 +397,6 @@ dependencies = [
  "base64",
  "cap-std",
  "chrono",
- "directories",
  "hex",
  "hmac",
  "keyring",

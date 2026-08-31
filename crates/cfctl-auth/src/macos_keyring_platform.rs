@@ -37,6 +37,7 @@ struct FilesystemIdentity {
 
 const MUTATION_LOCK_ROOT_COMPONENT: &str = "io.cfctl.cfctl-keyring-mutations";
 const MAX_GETCONF_STDOUT_BYTES: usize = 4_096;
+const GETCONF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl MacosKeychainAdapter for SecurityCommandAdapter {
     fn put_raw(&self, service: &str, key: &str, value: &str) -> Result<()> {
@@ -61,25 +62,130 @@ impl MacosKeychainAdapter for SecurityCommandAdapter {
 }
 
 fn mutation_lock_root() -> Result<PathBuf> {
-    let output = std::process::Command::new("/usr/bin/getconf")
-        .arg("DARWIN_USER_TEMP_DIR")
-        .env_clear()
+    let mut command = std::process::Command::new("/usr/bin/getconf");
+    command.arg("DARWIN_USER_TEMP_DIR").env_clear();
+    mutation_lock_root_with_command(&mut command, GETCONF_TIMEOUT)
+}
+
+fn mutation_lock_root_with_command(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<PathBuf> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut child = command
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .process_group(0)
+        .spawn()
         .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    if !output.status.success() {
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_and_reap(&mut child);
+            return Err(AuthError::SecretStore(
+                "platform user lock authority lookup produced no output sink".to_owned(),
+            ));
+        }
+    };
+    let flags = match rustix::fs::fcntl_getfl(&stdout) {
+        Ok(flags) => flags,
+        Err(error) => {
+            kill_and_reap(&mut child);
+            return Err(AuthError::SecretStore(error.to_string()));
+        }
+    };
+    if let Err(error) = rustix::fs::fcntl_setfl(&stdout, flags | OFlags::NONBLOCK) {
+        kill_and_reap(&mut child);
+        return Err(AuthError::SecretStore(error.to_string()));
+    }
+    let mut bytes = vec![0_u8; MAX_GETCONF_STDOUT_BYTES + 1];
+    let mut filled = 0;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut status = None;
+    let mut stdout_closed = false;
+    loop {
+        while !stdout_closed && filled < bytes.len() {
+            match stdout.read(&mut bytes[filled..]) {
+                Ok(0) => {
+                    stdout_closed = true;
+                    break;
+                }
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    kill_and_reap(&mut child);
+                    return Err(AuthError::SecretStore(error.to_string()));
+                }
+            }
+        }
+        if filled == bytes.len() {
+            kill_and_reap(&mut child);
+            return Err(AuthError::SecretStore(
+                "platform user lock authority lookup returned an invalid byte length".to_owned(),
+            ));
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => status = observed,
+                Err(error) => {
+                    kill_and_reap(&mut child);
+                    return Err(AuthError::SecretStore(format!(
+                        "platform user lock authority lookup status failed: {error}"
+                    )));
+                }
+            }
+        }
+        if let Some(observed) = status {
+            if !observed.success() {
+                kill_and_reap(&mut child);
+                bytes.truncate(filled);
+                return parse_mutation_lock_root_output(observed, bytes);
+            }
+            if stdout_closed {
+                bytes.truncate(filled);
+                return parse_mutation_lock_root_output(observed, bytes);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            kill_and_reap(&mut child);
+            return Err(AuthError::SecretStore(format!(
+                "platform user lock authority lookup timed out after {} milliseconds",
+                timeout.as_millis()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    if let Ok(raw_pid) = i32::try_from(child.id()) {
+        if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn parse_mutation_lock_root_output(
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+) -> Result<PathBuf> {
+    if !status.success() {
         return Err(AuthError::SecretStore(format!(
             "platform user lock authority lookup failed with exit status {}",
-            output.status
+            status
         )));
     }
-    if output.stdout.is_empty() || output.stdout.len() > MAX_GETCONF_STDOUT_BYTES {
+    if stdout.is_empty() || stdout.len() > MAX_GETCONF_STDOUT_BYTES {
         return Err(AuthError::SecretStore(
             "platform user lock authority lookup returned an invalid byte length".to_owned(),
         ));
     }
-    let value = String::from_utf8(output.stdout).map_err(|_| {
+    let value = String::from_utf8(stdout).map_err(|_| {
         AuthError::SecretStore("platform user lock authority is not valid UTF-8".to_owned())
     })?;
     let Some(path) = value.strip_suffix('\n') else {
@@ -595,6 +701,7 @@ mod tests {
 
     use std::{
         fs,
+        io::Write as _,
         path::Path,
         process::{Command, Stdio},
         thread,
@@ -610,6 +717,9 @@ mod tests {
     const LOCK_KEY_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_KEY";
     const READY_PATH_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_READY";
     const RELEASE_PATH_ENV: &str = "CFCTL_TEST_KEYRING_LOCK_RELEASE";
+    const GETCONF_HELPER_ENV: &str = "CFCTL_TEST_GETCONF_HELPER";
+    const GETCONF_HELPER_MODE_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_MODE";
+    const GETCONF_HELPER_RECEIPT_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_RECEIPT";
 
     fn wait_for_path(path: &Path, label: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -617,6 +727,151 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {label}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn getconf_helper_command(mode: &str, receipt: &Path) -> Command {
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let helper_name = "macos_keyring::platform::tests::getconf_process_helper";
+        let mut command = Command::new(current_exe);
+        command
+            .args(["--exact", helper_name, "--nocapture"])
+            .env(GETCONF_HELPER_ENV, "1")
+            .env(GETCONF_HELPER_MODE_ENV, mode)
+            .env(GETCONF_HELPER_RECEIPT_ENV, receipt);
+        command
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn getconf_process_helper() {
+        if std::env::var_os(GETCONF_HELPER_ENV).is_none() {
+            return;
+        }
+        let mode = std::env::var(GETCONF_HELPER_MODE_ENV).expect("getconf helper mode");
+        let receipt = PathBuf::from(
+            std::env::var_os(GETCONF_HELPER_RECEIPT_ENV).expect("getconf helper receipt"),
+        );
+        if mode == "oversize" {
+            let mut stdout = std::io::stdout().lock();
+            let block = [b'x'; 1_024];
+            for _ in 0..1_024 {
+                if stdout.write_all(&block).is_err() {
+                    return;
+                }
+            }
+            drop(stdout);
+            fs::write(receipt, b"all-output-consumed").expect("publish oversize receipt");
+            return;
+        }
+        if mode == "fork-holder" {
+            let mut descendant = getconf_helper_command("descendant", &receipt);
+            descendant
+                .spawn()
+                .expect("spawn inherited-stdout descendant");
+            return;
+        }
+        assert!(mode == "hang" || mode == "descendant");
+        fs::write(receipt, std::process::id().to_string()).expect("publish helper pid");
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn getconf_stdout_is_cut_off_at_the_sentinel_bound() {
+        let temp = tempfile::tempdir().expect("temporary getconf receipt");
+        let receipt = temp.path().join("oversize-complete");
+        let mut command = getconf_helper_command("oversize", &receipt);
+        let result = mutation_lock_root_with_command(&mut command, Duration::from_secs(1));
+        assert!(result.is_err());
+        assert!(
+            !receipt.exists(),
+            "resolver consumed output beyond its MAX+1 sentinel"
+        );
+    }
+
+    #[test]
+    fn getconf_timeout_kills_and_reaps_a_nonterminating_child() {
+        let temp = tempfile::tempdir().expect("temporary getconf receipt");
+        let receipt = temp.path().join("helper-pid");
+        let watchdog_receipt = receipt.clone();
+        let watchdog = thread::spawn(move || {
+            wait_for_path(&watchdog_receipt, "getconf helper pid");
+            thread::sleep(Duration::from_millis(750));
+            let pid = fs::read_to_string(&watchdog_receipt)
+                .expect("read helper pid")
+                .parse::<u32>()
+                .expect("parse helper pid");
+            if process_is_alive(pid) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        let mut command = getconf_helper_command("hang", &receipt);
+        let started = Instant::now();
+        let error = mutation_lock_root_with_command(&mut command, Duration::from_millis(200))
+            .expect_err("nonterminating resolver must time out");
+        let elapsed = started.elapsed();
+        watchdog.join().expect("join getconf watchdog");
+        let pid = fs::read_to_string(&receipt)
+            .expect("read reaped helper pid")
+            .parse::<u32>()
+            .expect("parse reaped helper pid");
+        assert!(error.to_string().contains("timed out"));
+        assert!(elapsed < Duration::from_millis(500));
+        assert!(!process_is_alive(pid), "timed-out helper was not reaped");
+    }
+
+    #[test]
+    fn getconf_deadline_survives_an_inherited_stdout_descendant() {
+        let temp = tempfile::tempdir().expect("temporary getconf receipt");
+        let receipt = temp.path().join("descendant-pid");
+        let watchdog_receipt = receipt.clone();
+        let watchdog = thread::spawn(move || {
+            wait_for_path(&watchdog_receipt, "getconf descendant pid");
+            thread::sleep(Duration::from_millis(750));
+            let pid = fs::read_to_string(&watchdog_receipt)
+                .expect("read descendant pid")
+                .parse::<u32>()
+                .expect("parse descendant pid");
+            if process_is_alive(pid) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        let mut command = getconf_helper_command("fork-holder", &receipt);
+        let started = Instant::now();
+        let error = mutation_lock_root_with_command(&mut command, Duration::from_millis(200))
+            .expect_err("inherited stdout must not outlive the resolver deadline");
+        let elapsed = started.elapsed();
+        watchdog.join().expect("join descendant watchdog");
+        let pid = fs::read_to_string(&receipt)
+            .expect("read terminated descendant pid")
+            .parse::<u32>()
+            .expect("parse terminated descendant pid");
+        assert!(error.to_string().contains("timed out"));
+        assert!(elapsed < Duration::from_millis(500));
+        assert!(
+            !process_is_alive(pid),
+            "inherited-stdout descendant survived timeout cleanup"
+        );
     }
 
     #[test]
