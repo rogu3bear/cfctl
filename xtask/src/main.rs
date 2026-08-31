@@ -511,8 +511,7 @@ fn validate_xtask_alias_contract(source: &str) -> Result<(), TaskError> {
             .all(|(value, expected)| value.as_str() == Some(expected));
     if !exact {
         return Err(TaskError::InvalidSourceContract(format!(
-            ".cargo/config.toml alias.xtask must equal {:?}",
-            EXPECTED_XTASK_ALIAS
+            ".cargo/config.toml alias.xtask must equal {EXPECTED_XTASK_ALIAS:?}"
         )));
     }
 
