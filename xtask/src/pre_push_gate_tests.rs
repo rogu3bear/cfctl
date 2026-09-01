@@ -49,8 +49,7 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
         let git_local_env_file = root.join("git-local-env-vars.txt");
         let common_git_dir = root.join("common-git");
         let worktree_git_dir = root.join("worktree-git");
-        fs::create_dir_all(repo.join(".githooks"))
-            .expect("fixture hook directory is created");
+        fs::create_dir_all(repo.join(".githooks")).expect("fixture hook directory is created");
         fs::create_dir_all(&fake_bin).expect("fixture binary directory is created");
         fs::create_dir_all(&common_git_dir).expect("fixture common Git directory is created");
         fs::create_dir_all(&worktree_git_dir).expect("fixture worktree Git directory is created");
@@ -118,20 +117,16 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
             &["config", "user.email", "cfctl-test@example.invalid"],
         );
         fs::write(repo.join("tracked.txt"), "clean\n").expect("tracked fixture is written");
-        git(
-            &repo,
-            &["add", ".githooks/pre-push-gate.sh", "tracked.txt"],
-        );
+        git(&repo, &["add", ".githooks/pre-push-gate.sh", "tracked.txt"]);
         git(&repo, &["commit", "-q", "-m", "clean fixture"]);
         let head_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
             .expect("fixture oid is UTF-8")
             .trim()
             .to_owned();
         let zero_oid = "0".repeat(head_oid.len());
-        let mut local_env_vars = String::from_utf8(
-            git(&repo, &["rev-parse", "--local-env-vars"]).stdout,
-        )
-        .expect("Git local environment names are UTF-8");
+        let mut local_env_vars =
+            String::from_utf8(git(&repo, &["rev-parse", "--local-env-vars"]).stdout)
+                .expect("Git local environment names are UTF-8");
         local_env_vars.push_str("GIT_QUARANTINE_PATH\nGIT_CEILING_DIRECTORIES\n");
         fs::write(&git_local_env_file, local_env_vars)
             .expect("Git local environment contract is written");
@@ -178,7 +173,10 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
             .env("FAKE_GIT_LOG", &fixture.git_log)
             .env("FAKE_GIT_LOCAL_ENV_FILE", &fixture.git_local_env_file)
             .env("FAKE_REPO_TRACKED", fixture.repo.join("tracked.txt"))
-            .env("FAKE_POST_GIT_MARKER", fixture.repo.join(".git/during-proof.lock"))
+            .env(
+                "FAKE_POST_GIT_MARKER",
+                fixture.repo.join(".git/during-proof.lock"),
+            )
             .env("GIT_CONFIG_COUNT", "0")
             .env("GIT_IMPLICIT_WORK_TREE", "1")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
@@ -228,10 +226,10 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
             .join(".githooks/pre-push-gate.sh"),
     )
     .expect("tracked pre-push gate is readable");
-    let local_env_contract = git(&fixture(&fixture_root, "env-contract", &hook).repo, &[
-        "rev-parse",
-        "--local-env-vars",
-    ]);
+    let local_env_contract = git(
+        &fixture(&fixture_root, "env-contract", &hook).repo,
+        &["rev-parse", "--local-env-vars"],
+    );
     let local_env_contract = String::from_utf8(local_env_contract.stdout)
         .expect("Git local environment contract is UTF-8");
     for representative in [
@@ -241,7 +239,9 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
         "GIT_REPLACE_REF_BASE",
     ] {
         assert!(
-            local_env_contract.lines().any(|name| name == representative),
+            local_env_contract
+                .lines()
+                .any(|name| name == representative),
             "representative omitted variable {representative} must come from Git"
         );
     }
@@ -353,8 +353,7 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
     let mismatch = run_hook(&mismatch_fixture, &mismatch_update, "pass");
     assert_refused_before_cargo(&mismatch, &mismatch_fixture, "unproved source object");
     assert!(
-        String::from_utf8_lossy(&mismatch.stderr)
-            .contains("must equal the checked-out HEAD"),
+        String::from_utf8_lossy(&mismatch.stderr).contains("must equal the checked-out HEAD"),
         "unexpected source-object error: {}",
         String::from_utf8_lossy(&mismatch.stderr)
     );
@@ -372,14 +371,12 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
         "verification failure must fail closed"
     );
     assert!(
-        String::from_utf8_lossy(&verify_failure.stderr)
-            .contains("cargo xtask verify exited 42"),
+        String::from_utf8_lossy(&verify_failure.stderr).contains("cargo xtask verify exited 42"),
         "unexpected verification error: {}",
         String::from_utf8_lossy(&verify_failure.stderr)
     );
     assert_eq!(
-        fs::read_to_string(&verify_failure_fixture.cargo_log)
-            .expect("failed fake cargo ran once"),
+        fs::read_to_string(&verify_failure_fixture.cargo_log).expect("failed fake cargo ran once"),
         "xtask verify\n"
     );
 
@@ -448,8 +445,7 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
         let blocked = run_hook(&blocked_fixture, &blocked_update, "pass");
         assert_refused_before_cargo(&blocked, &blocked_fixture, name);
         assert!(
-            String::from_utf8_lossy(&blocked.stderr)
-                .contains("Git operation or lock is active"),
+            String::from_utf8_lossy(&blocked.stderr).contains("Git operation or lock is active"),
             "unexpected {name} error: {}",
             String::from_utf8_lossy(&blocked.stderr)
         );
