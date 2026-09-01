@@ -19,9 +19,29 @@
 
 set -euo pipefail
 
-updates=()
-while IFS= read -r update; do
-  [ -n "$update" ] && updates+=("$update")
+update_count=0
+malformed_update=0
+local_ref=""
+local_oid=""
+remote_ref=""
+remote_oid=""
+
+while IFS=' ' read -r update_local_ref update_local_oid update_remote_ref update_remote_oid update_extra; do
+  if [ -z "${update_local_ref}${update_local_oid}${update_remote_ref}${update_remote_oid}${update_extra}" ]; then
+    continue
+  fi
+  update_count=$((update_count + 1))
+  if [ "$update_count" -eq 1 ]; then
+    local_ref="$update_local_ref"
+    local_oid="$update_local_oid"
+    remote_ref="$update_remote_ref"
+    remote_oid="$update_remote_oid"
+  fi
+  if [ -z "$update_local_ref" ] || [ -z "$update_local_oid" ] || \
+     [ -z "$update_remote_ref" ] || [ -z "$update_remote_oid" ] || \
+     [ -n "$update_extra" ]; then
+    malformed_update=1
+  fi
 done
 
 GATE_MODE="${CFCTL_PRE_PUSH_GATE:-on}"
@@ -41,21 +61,24 @@ esac
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
 
-# This gate proves the checked-out source tree, so bind that tree to the exact
-# object Git is about to publish. Multi-ref, detached-HEAD, non-HEAD, and dirty
-# pushes need a separate object-checkout proof lane; accepting them here would
-# let the gate inspect bytes other than the pushed commit.
-if [ "${#updates[@]}" -ne 1 ]; then
-  echo "pre-push REFUSED: expected exactly one pushed ref, got ${#updates[@]}" >&2
+if [ "$update_count" -ne 1 ]; then
+  echo "pre-push REFUSED: expected exactly one pushed ref, got ${update_count}" >&2
+  exit 1
+fi
+if [ "$malformed_update" -ne 0 ]; then
+  echo "pre-push REFUSED: malformed pre-push ref update" >&2
   exit 1
 fi
 
-read -r local_ref local_oid remote_ref _remote_oid <<<"${updates[0]}"
-head_ref="$(git symbolic-ref -q HEAD || true)"
-head_oid="$(git rev-parse HEAD)"
+is_zero_oid() {
+  case "$1" in
+    ""|*[!0]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
-if [ -z "$head_ref" ] || [ "$local_ref" != "$head_ref" ] || [ "$local_oid" != "$head_oid" ]; then
-  echo "pre-push REFUSED: pushed ref/object must equal the checked-out HEAD" >&2
+if is_zero_oid "$local_oid"; then
+  echo "pre-push REFUSED: this proof lane does not publish deletions" >&2
   exit 1
 fi
 
@@ -66,6 +89,59 @@ case "$remote_ref" in
     exit 1
     ;;
 esac
+
+head_ref="$(git symbolic-ref -q HEAD || true)"
+head_oid="$(git rev-parse HEAD)"
+head_tree="$(git rev-parse 'HEAD^{tree}')"
+
+if [ -z "$head_ref" ] || [ "$local_ref" != "$head_ref" ] || [ "$local_oid" != "$head_oid" ]; then
+  echo "pre-push REFUSED: pushed ref/object must equal the checked-out HEAD" >&2
+  exit 1
+fi
+
+git_dir="$(git rev-parse --path-format=absolute --git-dir)"
+git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+if ! git_local_env_output="$(git rev-parse --local-env-vars)"; then
+  echo "pre-push REFUSED: could not derive Git local environment contract" >&2
+  exit 1
+fi
+git_env_unsets=()
+while IFS= read -r git_local_name; do
+  [ -z "$git_local_name" ] && continue
+  if [[ ! "$git_local_name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+    echo "pre-push REFUSED: Git reported an invalid local environment name" >&2
+    exit 1
+  fi
+  git_env_unsets+=("-u" "$git_local_name")
+done <<<"$git_local_env_output"
+if [ "${#git_env_unsets[@]}" -eq 0 ]; then
+  echo "pre-push REFUSED: Git local environment contract is empty" >&2
+  exit 1
+fi
+git_env_unsets+=("-u" "GIT_QUARANTINE_PATH" "-u" "GIT_CEILING_DIRECTORIES")
+
+refuse_if_git_busy() {
+  local lock_path
+  if ! lock_path="$(find "$git_common_dir" "$git_dir" -type f -name '*.lock' -print -quit 2>/dev/null)"; then
+    echo "pre-push REFUSED: could not observe Git operation or lock state" >&2
+    exit 1
+  fi
+  if [ -n "$lock_path" ]; then
+    echo "pre-push REFUSED: Git operation or lock is active" >&2
+    exit 1
+  fi
+
+  local marker marker_path
+  for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG BISECT_START rebase-apply rebase-merge sequencer; do
+    marker_path="$(git rev-parse --path-format=absolute --git-path "$marker")"
+    if [ -e "$marker_path" ]; then
+      echo "pre-push REFUSED: Git operation or lock is active" >&2
+      exit 1
+    fi
+  done
+}
+
+refuse_if_git_busy
 
 if ! initial_status="$(git status --porcelain=v1 --untracked-files=all)"; then
   echo "pre-push REFUSED: could not observe checked-out source cleanliness" >&2
@@ -81,34 +157,30 @@ echo "pre-push: running cargo xtask verify for ${head_oid:0:7}..."
 # Capture unpiped. Piping the gate through tail/head masks its exit status and
 # has produced a false green in this repo before.
 log="$(mktemp -t cfctl-pre-push-gate)"
-proof_parent="$(mktemp -d -t cfctl-pre-push-proof)"
-proof_root="$proof_parent/checkout"
-cleanup() {
-  git worktree remove --force "$proof_root" >/dev/null 2>&1 || true
-  rm -rf "$proof_parent"
-}
-trap cleanup EXIT
-
-# Verify an immutable detached checkout of the exact object supplied by Git's
-# pre-push protocol. The operator's working checkout may change while this
-# long-running proof executes; those bytes must never become proof for the
-# object Git selected before invoking the hook.
-git worktree add --detach --quiet "$proof_root" "$local_oid"
 set +e
 # Git exports GIT_DIR and friends into hooks. Left in place they reach every
 # subprocess the gate starts, including tests that create their own throwaway
 # repositories — and a `git init` that silently retargets at the exported
-# GIT_DIR rewrites this repository's config instead. From a linked worktree the
-# exported path shares the main repository's config file, so that mistake marks
-# the real repository bare. The gate resolved its own root above; nothing past
-# this point should inherit the hook's git context.
-(cd "$proof_root" && \
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-    -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
-    cargo xtask verify) >"$log" 2>&1
+# GIT_DIR rewrites this repository's config instead. The gate resolved its own
+# canonical root above; nothing past this point should inherit hook Git context.
+env "${git_env_unsets[@]}" \
+  cargo xtask verify >"$log" 2>&1
 verify_exit=$?
 set -e
+
+current_head_ref="$(git symbolic-ref -q HEAD || true)"
+current_head_oid="$(git rev-parse HEAD)"
+current_head_tree="$(git rev-parse 'HEAD^{tree}')"
+refuse_if_git_busy
+if ! current_status="$(git status --porcelain=v1 --untracked-files=all)"; then
+  echo "pre-push REFUSED: could not observe checked-out source cleanliness after verification" >&2
+  exit 1
+fi
+if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$head_oid" ] || \
+   [ "$current_head_tree" != "$head_tree" ] || [ -n "$current_status" ]; then
+  echo "pre-push REFUSED: checked-out HEAD, tree, or source changed during verification" >&2
+  exit 1
+fi
 
 if [ "$verify_exit" -ne 0 ]; then
   echo >&2
@@ -120,28 +192,5 @@ if [ "$verify_exit" -ne 0 ]; then
   exit 1
 fi
 
-proof_oid="$(git -C "$proof_root" rev-parse HEAD)"
-current_head_ref="$(git symbolic-ref -q HEAD || true)"
-current_head_oid="$(git rev-parse HEAD)"
-if ! proof_status="$(git -C "$proof_root" status --porcelain=v1 --untracked-files=all)"; then
-  echo "pre-push REFUSED: could not observe exact-object proof checkout cleanliness" >&2
-  exit 1
-fi
-if ! current_status="$(git status --porcelain=v1 --untracked-files=all)"; then
-  echo "pre-push REFUSED: could not observe checked-out source cleanliness after verification" >&2
-  exit 1
-fi
-if [ "$proof_oid" != "$local_oid" ] || [ -n "$proof_status" ]; then
-  echo "pre-push REFUSED: exact-object proof checkout drifted during verification" >&2
-  exit 1
-fi
-if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$local_oid" ] || \
-   [ -n "$current_status" ]; then
-  echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
-  exit 1
-fi
-
 rm -f "$log"
-trap - EXIT
-cleanup
 echo "pre-push: verify passed."
