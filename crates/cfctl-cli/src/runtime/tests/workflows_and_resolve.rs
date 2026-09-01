@@ -1055,27 +1055,30 @@ pub(super) fn workspace_proof_posture_requires_an_account_pin_and_keeps_catalog_
     assert_eq!(account["current_catalog_successes"], 1);
     assert_eq!(account["catalog_drifted_or_unclassified"], 0);
     let failures = vec![cfctl_storage::OperationalProofFailureV1 {
-        account_id: Some("account-b".to_owned()),
+        account_id: None,
         proof_identity: format!("sha256:{}", "f".repeat(64)),
         reason: "authentication failed".to_owned(),
     }];
-    let unaffected = workspace_operational_proof_posture(
+    let original_account = workspace_operational_proof_posture(
         &proofs,
         &failures,
         &profiles,
         Some("account-a"),
         Some("sha256:current"),
     );
-    assert_eq!(unaffected["state"], "recorded");
-    let affected = workspace_operational_proof_posture(
+    assert_eq!(original_account["state"], "invalid");
+    assert_eq!(
+        original_account["proof_failures"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let other_account = workspace_operational_proof_posture(
         &proofs,
         &failures,
         &profiles,
         Some("account-b"),
         Some("sha256:current"),
     );
-    assert_eq!(affected["state"], "invalid");
-    assert_eq!(affected["proof_failures"].as_array().map(Vec::len), Some(1));
+    assert_eq!(other_account["state"], "invalid");
 }
 
 #[test]

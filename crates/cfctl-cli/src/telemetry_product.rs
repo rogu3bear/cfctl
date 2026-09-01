@@ -183,8 +183,9 @@ pub(crate) fn ensure_operational_proof_projection_valid(
 ) -> Result<()> {
     if let Some(failure) = page.failures.first() {
         return Err(CliError::Input(format!(
-            "candidate operational proof {} is invalid: {}",
-            failure.proof_identity, failure.reason
+            "candidate operational proof {identity} is invalid: {reason}",
+            identity = failure.proof_identity,
+            reason = failure.reason,
         )));
     }
     Ok(())

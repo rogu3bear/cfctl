@@ -255,9 +255,9 @@ pub struct OperationalProofPageV1 {
     pub truncated: bool,
 }
 
-/// One candidate qualifying proof that could not be authenticated. An account
-/// is retained only when it can be read from the untrusted public payload; an
-/// unscoped failure must be treated as relevant to every consumer.
+/// One candidate qualifying proof that could not be authenticated. Authentication
+/// failures are unscoped unless separately authenticated metadata supplies scope;
+/// an unscoped failure must be treated as relevant to every consumer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationalProofFailureV1 {
     pub account_id: Option<String>,

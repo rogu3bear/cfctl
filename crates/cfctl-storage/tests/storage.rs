@@ -859,7 +859,7 @@ fn recent_projection_skips_more_than_512_legacy_rows_and_retains_authenticated_r
 }
 
 #[test]
-fn malformed_v2_is_account_scoped_while_unclassifiable_bytes_fail_closed() {
+fn tampered_v2_account_scope_is_untrusted_and_unclassifiable_bytes_fail_closed() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let paths = RuntimePaths::from_root(root.path());
     let store = authenticated_store(paths.clone());
@@ -896,20 +896,20 @@ fn malformed_v2_is_account_scoped_while_unclassifiable_bytes_fail_closed() {
         &std::fs::read(&account_b_path).expect("account-b proof reads"),
     )
     .expect("account-b envelope parses");
-    malformed["authentication"]["tag"] = Value::String("00".repeat(32));
+    malformed["payload"]["account_id"] = Value::String("account-a".to_owned());
     std::fs::write(
         &account_b_path,
         serde_json::to_vec_pretty(&malformed).expect("malformed envelope encodes"),
     )
-    .expect("account-b envelope tampers");
+    .expect("account-b envelope account scope tampers without recomputing the MAC");
 
     let page = store
         .list_recent_operational_proofs(512)
-        .expect("account-scoped failure does not abort projection");
+        .expect("authentication failure remains reportable without trusting its scope");
     assert_eq!(page.proofs.len(), 1);
     assert_eq!(page.proofs[0].account_id.as_deref(), Some("account-a"));
     assert_eq!(page.failures.len(), 1);
-    assert_eq!(page.failures[0].account_id.as_deref(), Some("account-b"));
+    assert_eq!(page.failures[0].account_id, None);
 
     let opaque_path = proof_directory.join(format!("{}.json", "f".repeat(64)));
     std::fs::write(&opaque_path, b"not-json").expect("opaque corruption writes");

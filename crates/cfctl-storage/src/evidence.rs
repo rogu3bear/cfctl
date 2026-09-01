@@ -462,18 +462,14 @@ impl StateStore {
                 legacy_nonqualifying_count = legacy_nonqualifying_count.saturating_add(1);
                 continue;
             }
-            let untrusted = serde_json::from_slice::<Value>(&encoded).map_err(|_| {
+            serde_json::from_slice::<Value>(&encoded).map_err(|_| {
                 StorageError::InvalidOperationalProof(
                     "malformed operational-proof document is nonqualifying".to_owned(),
                 )
             })?;
-            let account_id = untrusted
-                .pointer("/payload/account_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
             if let Err(error) = read_operational_proof_index(self, &name) {
                 failures.push(OperationalProofFailureV1 {
-                    account_id,
+                    account_id: None,
                     proof_identity: format!(
                         "sha256:{}",
                         path.file_stem()
