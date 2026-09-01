@@ -635,8 +635,8 @@ impl EvidenceKeyManager {
     fn validate_recovery_intent(&self, intent: &EvidenceKeyRecoveryIntentV1) -> Result<()> {
         let canonical_plan_id = Uuid::parse_str(&intent.plan_id)
             .ok()
-            .filter(|candidate| candidate.to_string() == intent.plan_id)
-            .is_some();
+            .as_ref()
+            .is_some_and(|candidate| candidate.to_string() == intent.plan_id);
         let digest_is_canonical =
             intent
                 .registry_sha256
