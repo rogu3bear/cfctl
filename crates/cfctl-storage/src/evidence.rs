@@ -414,8 +414,8 @@ impl StateStore {
 
     /// Preserves historical classification while retaining only the newest
     /// qualifying storage-v2 proofs. Exact raw V1 rows remain immutable and
-    /// nonqualifying; candidate-envelope failures retain account scope so one
-    /// unrelated account cannot poison every registered workspace.
+    /// nonqualifying; authenticated proofs retain verified account scope, while
+    /// unauthenticated candidate failures are unscoped and globally relevant.
     pub fn list_recent_operational_proofs(&self, limit: usize) -> Result<OperationalProofPageV1> {
         let directory = self.paths.data_dir.join("evidence-index");
         let mut newest = BinaryHeap::<Reverse<(SystemTime, String)>>::new();

@@ -682,7 +682,7 @@ fn proof_envelope_rejects_rehashed_authority_substitution() {
     assert_eq!(page.proofs[0], original);
     assert_eq!(page.legacy_nonqualifying_count, 0);
     assert_eq!(page.failures.len(), 1);
-    assert_eq!(page.failures[0].account_id.as_deref(), Some("account-a"));
+    assert_eq!(page.failures[0].account_id, None);
 }
 
 #[test]
