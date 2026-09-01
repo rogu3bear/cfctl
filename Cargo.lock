@@ -3320,6 +3320,7 @@ dependencies = [
  "cfctl-core",
  "clap",
  "hex",
+ "rustix",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",

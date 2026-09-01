@@ -12,6 +12,7 @@ cfctl-cli = { workspace = true }
 cfctl-core = { workspace = true }
 clap.workspace = true
 hex.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

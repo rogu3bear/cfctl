@@ -1,5 +1,7 @@
 //! Local verification and release orchestration for cfctl.
 
+mod release_transaction;
+
 use std::{
     collections::BTreeSet,
     env,
@@ -170,7 +172,7 @@ fn execute(arguments: Arguments) -> Result<(), TaskError> {
             certificate_oidc_issuer,
             macos_signing_identity,
             apple_notary_profile,
-        } => release(
+        } => release_transaction::release(
             &certificate_identity,
             &certificate_oidc_issuer,
             &macos_signing_identity,
@@ -1918,42 +1920,19 @@ fn validate_hex_fingerprint(label: &str, value: &str, length: usize) -> Result<(
     Ok(())
 }
 
-fn release(
-    certificate_identity: &str,
-    certificate_oidc_issuer: &str,
-    macos_signing_identity: &str,
-    apple_notary_profile: &str,
-) -> Result<(), TaskError> {
-    let trust_roots = release_trust_roots()?;
-    validate_release_identity_inputs(
-        &trust_roots,
-        certificate_identity,
-        certificate_oidc_issuer,
-        macos_signing_identity,
-    )?;
-    ensure_clean_source_tree()?;
-    run("cosign", &["version"])?;
-    run("xcrun", &["notarytool", "--version"])?;
-    assemble(&[])?;
-    sign_and_notarize_macos_artifacts(
-        macos_signing_identity,
-        &trust_roots.macos_certificate_sha1,
-        &trust_roots.macos_certificate_sha256,
-        apple_notary_profile,
-        certificate_identity,
-        certificate_oidc_issuer,
-    )?;
-    sign_release_artifacts()?;
-    verify_signed_release(
-        certificate_identity,
-        certificate_oidc_issuer,
-        macos_signing_identity,
-        &trust_roots,
-    )?;
-    Ok(())
+fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
+    assemble_into(
+        requested_targets,
+        Path::new("dist"),
+        Path::new("target/release-proof"),
+    )
 }
 
-fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
+fn assemble_into(
+    requested_targets: &[String],
+    dist: &Path,
+    proof_root: &Path,
+) -> Result<(), TaskError> {
     verify()?;
     run("syft", &["version"])?;
     let targets = validated_release_targets(requested_targets)?;
@@ -1962,13 +1941,12 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
     let git_commit = output("git", &["--no-replace-objects", "rev-parse", "HEAD"])?;
     let git_tree = output("git", &["--no-replace-objects", "rev-parse", "HEAD^{tree}"])?;
     let source_tree_clean = source_tree_status()?.is_empty();
-    let dist = PathBuf::from("dist");
-    remove_directory_if_present(&dist)?;
-    fs::create_dir_all(&dist).map_err(|source| io_error(&dist, source))?;
+    remove_directory_if_present(dist)?;
+    fs::create_dir_all(dist).map_err(|source| io_error(dist, source))?;
     let mut artifacts = Vec::new();
     for target in &targets {
-        let first_target_dir = PathBuf::from("target/release-proof").join(format!("{target}-1"));
-        let second_target_dir = PathBuf::from("target/release-proof").join(format!("{target}-2"));
+        let first_target_dir = proof_root.join(format!("{target}-1"));
+        let second_target_dir = proof_root.join(format!("{target}-2"));
         remove_directory_if_present(&first_target_dir)?;
         remove_directory_if_present(&second_target_dir)?;
         let first =
@@ -2004,7 +1982,7 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
             .iter()
             .any(|target| target == "x86_64-unknown-linux-musl")
     {
-        let installer_path = render_linux_installer(&dist, None)?;
+        let installer_path = render_linux_installer(dist, None)?;
         artifacts.push(installer_path);
     }
     if targets
@@ -2012,7 +1990,7 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
         .any(|target| target == "aarch64-apple-darwin")
         && targets.iter().any(|target| target == "x86_64-apple-darwin")
     {
-        let formula_path = render_homebrew_formula(&dist)?;
+        let formula_path = render_homebrew_formula(dist)?;
         artifacts.push(formula_path);
     }
     let generated_at = SystemTime::now()
@@ -2044,29 +2022,6 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
     artifacts.sort();
     let sums_path = dist.join("SHA256SUMS");
     write_checksums(&sums_path, &artifacts)
-}
-
-fn sign_release_artifacts() -> Result<(), TaskError> {
-    run(
-        "cosign",
-        &[
-            "sign-blob",
-            "--yes",
-            "--bundle",
-            "dist/SHA256SUMS.sigstore.json",
-            "dist/SHA256SUMS",
-        ],
-    )?;
-    run(
-        "cosign",
-        &[
-            "sign-blob",
-            "--yes",
-            "--bundle",
-            "dist/provenance.sigstore.json",
-            "dist/provenance.json",
-        ],
-    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2103,11 +2058,31 @@ fn verify_signed_release(
     macos_signing_identity: &str,
     trust_roots: &ReleaseTrustRoots,
 ) -> Result<VerifiedRelease, TaskError> {
-    let artifacts = release_files()?;
+    verify_signed_release_at(
+        Path::new("dist"),
+        Path::new("target/release-proof"),
+        certificate_identity,
+        certificate_oidc_issuer,
+        macos_signing_identity,
+        trust_roots,
+    )
+}
+
+fn verify_signed_release_at(
+    dist: &Path,
+    proof_root: &Path,
+    certificate_identity: &str,
+    certificate_oidc_issuer: &str,
+    macos_signing_identity: &str,
+    trust_roots: &ReleaseTrustRoots,
+) -> Result<VerifiedRelease, TaskError> {
+    let artifacts = release_files_at(dist)?;
     let verified_artifacts = snapshot_release_artifacts(&artifacts)?;
     validate_signed_release_file_set(&artifacts)?;
-    verify_checksum_manifest()?;
-    let team_identifier = verify_macos_distribution(
+    verify_checksum_manifest_at(dist)?;
+    let team_identifier = verify_macos_distribution_at(
+        dist,
+        proof_root,
         macos_signing_identity,
         &trust_roots.macos_certificate_sha1,
         &trust_roots.macos_certificate_sha256,
@@ -2118,27 +2093,34 @@ fn verify_signed_release(
             trust_roots.macos_team_identifier
         )));
     }
-    let commit = validate_release_provenance(
+    let commit = validate_release_provenance_at(
+        dist,
         macos_signing_identity,
         &team_identifier,
         &trust_roots.macos_certificate_sha1,
         &trust_roots.macos_certificate_sha256,
     )?;
     for (bundle, blob) in [
-        ("dist/SHA256SUMS.sigstore.json", "dist/SHA256SUMS"),
-        ("dist/provenance.sigstore.json", "dist/provenance.json"),
+        (
+            dist.join("SHA256SUMS.sigstore.json"),
+            dist.join("SHA256SUMS"),
+        ),
+        (
+            dist.join("provenance.sigstore.json"),
+            dist.join("provenance.json"),
+        ),
     ] {
         run(
             "cosign",
             &[
                 "verify-blob",
                 "--bundle",
-                bundle,
+                path_text(&bundle)?,
                 "--certificate-identity",
                 certificate_identity,
                 "--certificate-oidc-issuer",
                 certificate_oidc_issuer,
-                blob,
+                path_text(&blob)?,
             ],
         )?;
     }
@@ -2379,153 +2361,6 @@ fn shell_single_quote_fragment(value: &str) -> String {
     value.replace('\'', "'\"'\"'")
 }
 
-fn sign_and_notarize_macos_artifacts(
-    signing_identity: &str,
-    signing_certificate_sha1: &str,
-    signing_certificate_sha256: &str,
-    notary_profile: &str,
-    sigstore_identity: &str,
-    sigstore_issuer: &str,
-) -> Result<(), TaskError> {
-    if !signing_identity.starts_with("Developer ID Application: ") {
-        return Err(TaskError::InvalidMacosSignature(
-            "the selected identity must be a Developer ID Application certificate".to_owned(),
-        ));
-    }
-    if notary_profile.trim().is_empty() {
-        return Err(TaskError::InvalidNotarizationReceipt(
-            "the Keychain notary profile name must not be empty".to_owned(),
-        ));
-    }
-    let mut team_identifiers = BTreeSet::new();
-    for target in MACOS_RELEASE_TARGETS {
-        let artifact = Path::new("dist").join(format!("cfctl-{target}"));
-        let artifact_text = path_text(&artifact)?;
-        run(
-            "codesign",
-            &[
-                "--force",
-                "--sign",
-                signing_certificate_sha1,
-                "--options",
-                "runtime",
-                "--timestamp",
-                artifact_text,
-            ],
-        )?;
-        run(
-            "codesign",
-            &["--verify", "--strict", "--verbose=4", artifact_text],
-        )?;
-        let details = output_combined("codesign", &["-dvvv", artifact_text])?;
-        team_identifiers.insert(validate_codesign_details(&details, signing_identity)?);
-        verify_macos_signing_certificate(
-            &artifact,
-            target,
-            signing_certificate_sha1,
-            signing_certificate_sha256,
-        )?;
-    }
-    if team_identifiers.len() != 1 {
-        return Err(TaskError::InvalidMacosSignature(
-            "the two macOS binaries were not signed by the same team".to_owned(),
-        ));
-    }
-    let team_identifier = team_identifiers
-        .into_iter()
-        .next()
-        .ok_or_else(|| TaskError::InvalidMacosSignature("missing TeamIdentifier".to_owned()))?;
-    for target in MACOS_RELEASE_TARGETS {
-        let artifact = Path::new("dist").join(format!("cfctl-{target}"));
-        notarize_macos_artifact(target, &artifact, notary_profile)?;
-    }
-    refresh_macos_distribution_metadata(
-        signing_identity,
-        &team_identifier,
-        signing_certificate_sha1,
-        signing_certificate_sha256,
-        sigstore_identity,
-        sigstore_issuer,
-    )
-}
-
-fn notarize_macos_artifact(
-    target: &str,
-    artifact: &Path,
-    notary_profile: &str,
-) -> Result<(), TaskError> {
-    let work = Path::new("target/release-proof/notary").join(target);
-    fs::create_dir_all(&work).map_err(|source| io_error(&work, source))?;
-    let archive = work.join(format!("cfctl-{target}.zip"));
-    remove_file_if_present(&archive)?;
-    run(
-        "ditto",
-        &[
-            "-c",
-            "-k",
-            "--keepParent",
-            path_text(artifact)?,
-            path_text(&archive)?,
-        ],
-    )?;
-    let submission_text = output(
-        "xcrun",
-        &[
-            "notarytool",
-            "submit",
-            path_text(&archive)?,
-            "--keychain-profile",
-            notary_profile,
-            "--no-progress",
-            "--output-format",
-            "json",
-        ],
-    )?;
-    let submission: serde_json::Value =
-        serde_json::from_str(&submission_text).map_err(|error| {
-            TaskError::InvalidNotarizationReceipt(format!(
-                "notarytool returned invalid JSON for {target}: {error}"
-            ))
-        })?;
-    let submission_id = submission
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            TaskError::InvalidNotarizationReceipt(format!(
-                "notarytool submit omitted the submission id for {target}"
-            ))
-        })?;
-    let artifact_hash = sha256_file(artifact)?;
-    let pending_receipt =
-        notary_receipt_document(target, &artifact_hash, &submission_id, submission);
-    write_notary_receipt(target, &work, &pending_receipt)?;
-    let completed_text = output(
-        "xcrun",
-        &[
-            "notarytool",
-            "wait",
-            &submission_id,
-            "--keychain-profile",
-            notary_profile,
-            "--timeout",
-            "1h",
-            "--no-progress",
-            "--output-format",
-            "json",
-        ],
-    )?;
-    let completed: serde_json::Value = serde_json::from_str(&completed_text).map_err(|error| {
-        TaskError::InvalidNotarizationReceipt(format!(
-            "notarytool wait returned invalid JSON for {target}: {error}"
-        ))
-    })?;
-    let receipt = notary_receipt_document(target, &artifact_hash, &submission_id, completed);
-    write_notary_receipt(target, &work, &receipt)?;
-    validate_notary_receipt_value(&receipt, target, &artifact_hash)
-}
-
 fn notary_receipt_document(
     target: &str,
     artifact_hash: &str,
@@ -2542,101 +2377,32 @@ fn notary_receipt_document(
     })
 }
 
-fn write_notary_receipt(
-    target: &str,
-    work: &Path,
-    receipt: &serde_json::Value,
-) -> Result<(), TaskError> {
-    let bytes = serde_json::to_vec_pretty(receipt).map_err(|error| {
-        TaskError::InvalidNotarizationReceipt(format!("serialize receipt for {target}: {error}"))
-    })?;
-    let receipt_path = notary_receipt_path(target);
-    fs::write(&receipt_path, &bytes).map_err(|source| io_error(&receipt_path, source))?;
-    let durable_path = work.join("receipt.json");
-    fs::write(&durable_path, bytes).map_err(|source| io_error(&durable_path, source))
-}
-
-fn refresh_macos_distribution_metadata(
-    signing_identity: &str,
-    team_identifier: &str,
-    signing_certificate_sha1: &str,
-    signing_certificate_sha256: &str,
-    sigstore_identity: &str,
-    sigstore_issuer: &str,
-) -> Result<(), TaskError> {
-    for target in MACOS_RELEASE_TARGETS {
-        let artifact = Path::new("dist").join(format!("cfctl-{target}"));
-        run(
-            "syft",
-            &[
-                &format!("file:{}", artifact.display()),
-                "-o",
-                &format!("spdx-json={}.spdx.json", artifact.display()),
-            ],
-        )?;
-    }
-    let _formula = render_homebrew_formula(Path::new("dist"))?;
-    let _installer = render_linux_installer(
-        Path::new("dist"),
-        Some((sigstore_identity, sigstore_issuer)),
-    )?;
-    let provenance_path = Path::new("dist/provenance.json");
-    let mut provenance: serde_json::Value = serde_json::from_slice(
-        &fs::read(provenance_path).map_err(|source| io_error(provenance_path, source))?,
-    )
-    .map_err(|error| TaskError::InvalidProvenance(error.to_string()))?;
-    provenance["artifacts"] = serde_json::json!(
-        expected_unsigned_release_file_names()
-            .into_iter()
-            .filter(|name| name != "provenance.json")
-            .collect::<Vec<_>>()
-    );
-    provenance["macos_distribution"] = serde_json::json!({
-        "signing_identity": signing_identity,
-        "team_identifier": team_identifier,
-        "certificate_sha1": signing_certificate_sha1,
-        "certificate_sha256": signing_certificate_sha256,
-        "hardened_runtime": true,
-        "secure_timestamp": true,
-        "notarization_receipts": MACOS_RELEASE_TARGETS
-            .iter()
-            .map(|target| format!("notary-{target}.json"))
-            .collect::<Vec<_>>(),
-    });
-    fs::write(
-        provenance_path,
-        serde_json::to_vec_pretty(&provenance)
-            .map_err(|error| TaskError::InvalidProvenance(error.to_string()))?,
-    )
-    .map_err(|source| io_error(provenance_path, source))?;
-    write_checksums(
-        Path::new("dist/SHA256SUMS"),
-        &unsigned_release_artifact_paths(),
-    )
-}
-
-fn verify_macos_distribution(
+fn verify_macos_distribution_at(
+    dist: &Path,
+    proof_root: &Path,
     expected_identity: &str,
     expected_certificate_sha1: &str,
     expected_certificate_sha256: &str,
 ) -> Result<String, TaskError> {
     let mut team_identifiers = BTreeSet::new();
     for target in MACOS_RELEASE_TARGETS {
-        let artifact = Path::new("dist").join(format!("cfctl-{target}"));
+        let artifact = dist.join(format!("cfctl-{target}"));
         let artifact_text = path_text(&artifact)?;
-        run(
+        let verification = output_combined(
             "codesign",
             &["--verify", "--strict", "--verbose=4", artifact_text],
         )?;
+        reject_codesign_timestamp_mismatch(&verification)?;
         let details = output_combined("codesign", &["-dvvv", artifact_text])?;
         team_identifiers.insert(validate_codesign_details(&details, expected_identity)?);
-        verify_macos_signing_certificate(
+        verify_macos_signing_certificate_at(
             &artifact,
             target,
             expected_certificate_sha1,
             expected_certificate_sha256,
+            &proof_root.join("signature"),
         )?;
-        let receipt_path = notary_receipt_path(target);
+        let receipt_path = dist.join(format!("notary-{target}.json"));
         let receipt: serde_json::Value = serde_json::from_slice(
             &fs::read(&receipt_path).map_err(|source| io_error(&receipt_path, source))?,
         )
@@ -2654,13 +2420,13 @@ fn verify_macos_distribution(
         .ok_or_else(|| TaskError::InvalidMacosSignature("missing TeamIdentifier".to_owned()))
 }
 
-fn verify_macos_signing_certificate(
+fn verify_macos_signing_certificate_at(
     artifact: &Path,
     target: &str,
     expected_certificate_sha1: &str,
     expected_certificate_sha256: &str,
+    directory: &Path,
 ) -> Result<(), TaskError> {
-    let directory = Path::new("target/release-proof/signature");
     fs::create_dir_all(directory).map_err(|source| io_error(directory, source))?;
     let prefix = directory.join(format!("{target}-certificate-"));
     for index in 0..=3 {
@@ -2708,6 +2474,7 @@ fn validate_macos_certificate_fingerprints(
 }
 
 fn validate_codesign_details(details: &str, expected_identity: &str) -> Result<String, TaskError> {
+    reject_codesign_timestamp_mismatch(details)?;
     if !expected_identity.starts_with("Developer ID Application: ") {
         return Err(TaskError::InvalidMacosSignature(
             "expected identity is not a Developer ID Application certificate".to_owned(),
@@ -2748,6 +2515,19 @@ fn validate_codesign_details(details: &str, expected_identity: &str) -> Result<S
         .filter(|value| !value.is_empty() && *value != "not set")
         .map(ToOwned::to_owned)
         .ok_or_else(|| TaskError::InvalidMacosSignature("TeamIdentifier is missing".to_owned()))
+}
+
+fn reject_codesign_timestamp_mismatch(output: &str) -> Result<(), TaskError> {
+    if output
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("timestamp mismatch"))
+    {
+        Err(TaskError::InvalidMacosSignature(
+            "codesign reported a timestamp mismatch".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_notary_receipt_value(
@@ -2799,10 +2579,6 @@ fn validate_notary_receipt_value(
         return Err(invalid("notary service status is not Accepted"));
     }
     Ok(())
-}
-
-fn notary_receipt_path(target: &str) -> PathBuf {
-    Path::new("dist").join(format!("notary-{target}.json"))
 }
 
 fn path_text(path: &Path) -> Result<&str, TaskError> {
@@ -3245,8 +3021,7 @@ fn bind_new_uploaded_asset(
     Ok(matching[0].clone())
 }
 
-fn release_files() -> Result<Vec<PathBuf>, TaskError> {
-    let dist = Path::new("dist");
+fn release_files_at(dist: &Path) -> Result<Vec<PathBuf>, TaskError> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dist).map_err(|source| io_error(dist, source))? {
         let entry = entry.map_err(|source| io_error(dist, source))?;
@@ -3324,17 +3099,17 @@ fn validate_signed_release_file_set(artifacts: &[PathBuf]) -> Result<(), TaskErr
     }
 }
 
-fn unsigned_release_artifact_paths() -> Vec<PathBuf> {
+fn unsigned_release_artifact_paths_at(dist: &Path) -> Vec<PathBuf> {
     expected_unsigned_release_file_names()
         .into_iter()
-        .map(|name| Path::new("dist").join(name))
+        .map(|name| dist.join(name))
         .collect()
 }
 
-fn verify_checksum_manifest() -> Result<(), TaskError> {
-    let expected = checksum_contents(&unsigned_release_artifact_paths())?;
-    let path = Path::new("dist/SHA256SUMS");
-    let actual = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
+fn verify_checksum_manifest_at(dist: &Path) -> Result<(), TaskError> {
+    let expected = checksum_contents(&unsigned_release_artifact_paths_at(dist))?;
+    let path = dist.join("SHA256SUMS");
+    let actual = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
     if actual == expected {
         Ok(())
     } else {
@@ -3359,14 +3134,15 @@ fn release_provenance_commit() -> Result<String, TaskError> {
     Ok(commit.to_owned())
 }
 
-fn validate_release_provenance(
+fn validate_release_provenance_at(
+    dist: &Path,
     expected_macos_identity: &str,
     expected_team_identifier: &str,
     expected_certificate_sha1: &str,
     expected_certificate_sha256: &str,
 ) -> Result<String, TaskError> {
-    let path = Path::new("dist/provenance.json");
-    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+    let path = dist.join("provenance.json");
+    let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
     let provenance: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| TaskError::InvalidProvenance(error.to_string()))?;
     if provenance
