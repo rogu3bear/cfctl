@@ -106,6 +106,12 @@ pub struct EvidenceKeyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EvidenceKeyCommand {
+    /// Preview marker-only adoption of one exact valid platform authority.
+    AdoptPreview,
+    /// Create, inspect, or revoke a private valid-authority adoption plan.
+    AdoptPlan(EvidenceKeyAdoptPlanArgs),
+    /// Execute or resume one exact private valid-authority adoption plan.
+    Adopt(EvidenceKeyAdoptArgs),
     /// Preview the exact non-secret initialization transition without creating a key.
     InitPreview,
     /// Initialize one platform-held evidence authority for this canonical state root.
@@ -122,6 +128,60 @@ pub enum EvidenceKeyCommand {
     RecoverPlan(EvidenceKeyRecoverPlanArgs),
     /// Execute or resume one exact private malformed-registry recovery plan.
     Recover(EvidenceKeyRecoverArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptArgs {
+    /// Opaque random identity returned by adopt-plan create.
+    pub plan_id: String,
+    /// Confirm the protected marker-only transition.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptPlanArgs {
+    #[command(subcommand)]
+    pub command: EvidenceKeyAdoptPlanCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvidenceKeyAdoptPlanCommand {
+    /// Create a short-lived private plan for the current valid split authority.
+    Create(EvidenceKeyAdoptPlanCreateArgs),
+    /// Inspect the current recoverable adoption plan without guessing its identity.
+    Current,
+    /// Inspect public lifecycle state for one opaque adoption plan.
+    Status(EvidenceKeyAdoptPlanSelector),
+    /// Revoke one unused adoption plan before its marker transition begins.
+    Revoke(EvidenceKeyAdoptPlanSelector),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptPlanCreateArgs {
+    /// Exact reviewed source candidate accepted by the operator (for example, a full Git SHA).
+    #[arg(long)]
+    pub source_candidate_identity: String,
+    /// Exact installed artifact identity accepted by the operator (sha256:<64 lowercase hex>).
+    #[arg(long)]
+    pub installed_artifact_identity: String,
+    /// Executing architecture accepted by the operator for this plan.
+    #[arg(long)]
+    pub expected_architecture: String,
+    /// Canonical 20-byte `CDHash` accepted by the operator (exactly 40 hex characters).
+    #[arg(long)]
+    pub expected_running_cdhash: String,
+    /// `CDHash` algorithm accepted by the operator (for example, sha256-truncated-20).
+    #[arg(long)]
+    pub expected_cdhash_algorithm: String,
+    /// Provenance of the accepted algorithm and full digest; this is metadata, not observation.
+    #[arg(long)]
+    pub expected_cdhash_full_digest_provenance: String,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptPlanSelector {
+    pub plan_id: String,
 }
 
 #[derive(Debug, Args)]

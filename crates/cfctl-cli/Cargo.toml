@@ -42,6 +42,10 @@ which.workspace = true
 walkdir.workspace = true
 uuid.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+sysctl.workspace = true
+
 [dev-dependencies]
 cfctl-auth = { workspace = true }
 cfctl-catalog = { workspace = true }

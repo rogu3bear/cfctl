@@ -48,12 +48,8 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "workspace",
 ];
 
-/// One node in the exact public v2 command tree below the top level.
-///
-/// `PUBLIC_V2_SUBCOMMANDS` single-sources the top-level verbs; this tree extends
-/// the same single-source contract one (or more) levels deeper for every verb
-/// that itself takes subcommands. A leaf subcommand carries an empty
-/// `subcommands` slice.
+/// One node in the exact public v2 command tree below the top level. The tree
+/// extends `PUBLIC_V2_SUBCOMMANDS` recursively; leaves carry no subcommands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandNodeV1 {
     /// Exact clap-facing (kebab-cased) name of this subcommand.
@@ -69,14 +65,27 @@ impl CommandNodeV1 {
             subcommands: &[],
         }
     }
+
+    const fn branch(name: &'static str, subcommands: &'static [Self]) -> Self {
+        Self { name, subcommands }
+    }
 }
 
-/// Exact sorted inventory of every public v2 subcommand below each verb that
-/// takes subcommands. Verbs without subcommands (`call`, `resolve`, `guide`,
-/// `commands`, `doctor`, `version`, `update`) are absent by design.
-///
-/// The CLI test binds this tree to the live clap tree recursively, while `xtask`
-/// uses it to reject stale checked-in `cfctl <verb> <sub>` examples.
+const EVIDENCE_KEY_ADOPTION_PLAN_COMMANDS: &[CommandNodeV1] = &[
+    CommandNodeV1::leaf("create"),
+    CommandNodeV1::leaf("current"),
+    CommandNodeV1::leaf("revoke"),
+    CommandNodeV1::leaf("status"),
+];
+
+const EVIDENCE_KEY_RECOVERY_PLAN_COMMANDS: &[CommandNodeV1] = &[
+    CommandNodeV1::leaf("create"),
+    CommandNodeV1::leaf("revoke"),
+    CommandNodeV1::leaf("status"),
+];
+
+/// Exact sorted inventory below every grouped public v2 verb. The CLI binds it
+/// recursively to clap; `xtask` rejects stale checked-in command examples.
 pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
     CommandNodeV1 {
         name: "agents",
@@ -92,17 +101,13 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
             CommandNodeV1 {
                 name: "evidence-key",
                 subcommands: &[
+                    CommandNodeV1::leaf("adopt"),
+                    CommandNodeV1::branch("adopt-plan", EVIDENCE_KEY_ADOPTION_PLAN_COMMANDS),
+                    CommandNodeV1::leaf("adopt-preview"),
                     CommandNodeV1::leaf("init"),
                     CommandNodeV1::leaf("init-preview"),
                     CommandNodeV1::leaf("recover"),
-                    CommandNodeV1 {
-                        name: "recover-plan",
-                        subcommands: &[
-                            CommandNodeV1::leaf("create"),
-                            CommandNodeV1::leaf("revoke"),
-                            CommandNodeV1::leaf("status"),
-                        ],
-                    },
+                    CommandNodeV1::branch("recover-plan", EVIDENCE_KEY_RECOVERY_PLAN_COMMANDS),
                     CommandNodeV1::leaf("recover-preview"),
                     CommandNodeV1::leaf("retire"),
                     CommandNodeV1::leaf("rotate"),

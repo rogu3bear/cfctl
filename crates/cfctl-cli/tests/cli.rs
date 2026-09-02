@@ -371,10 +371,15 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one parser contract enumerates the complete evidence-key lifecycle and exact confirmations"
+)]
 fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmation() {
     use cfctl_cli::{AuthCommand, Command, EvidenceKeyCommand};
 
     for action in [
+        "adopt-preview",
         "init-preview",
         "init",
         "status",
@@ -390,6 +395,9 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             panic!("evidence-key command");
         };
         let parsed = match group.command {
+            EvidenceKeyCommand::AdoptPreview => "adopt-preview",
+            EvidenceKeyCommand::AdoptPlan(_) => "adopt-plan",
+            EvidenceKeyCommand::Adopt(_) => "adopt",
             EvidenceKeyCommand::InitPreview => "init-preview",
             EvidenceKeyCommand::Init => "init",
             EvidenceKeyCommand::Status => "status",
@@ -449,6 +457,59 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         panic!("recover command");
     };
     assert!(recover.yes);
+
+    for action in ["current", "status", "revoke"] {
+        if action == "current" {
+            Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt-plan", action])
+                .expect("current adoption plan parses without an ID");
+            continue;
+        }
+        Cli::try_parse_from([
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "adopt-plan",
+            action,
+            plan_id,
+        ])
+        .expect("adoption-plan lifecycle action parses");
+    }
+    Cli::try_parse_from([
+        "cfctl",
+        "auth",
+        "evidence-key",
+        "adopt-plan",
+        "create",
+        "--source-candidate-identity",
+        "git:0123456789abcdef0123456789abcdef01234567",
+        "--installed-artifact-identity",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--expected-architecture",
+        "arm64",
+        "--expected-running-cdhash",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--expected-cdhash-algorithm",
+        "sha256-truncated-20",
+        "--expected-cdhash-full-digest-provenance",
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    ])
+    .expect("adoption-plan creation requires explicit operator-accepted identity fields");
+    assert!(
+        Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt-plan", "create"]).is_err(),
+        "adoption plan creation never defaults or inherits accepted identity"
+    );
+    let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt", plan_id, "--yes"])
+        .expect("evidence-key adopt parses");
+    let Some(Command::Auth(arguments)) = cli.command else {
+        panic!("auth command");
+    };
+    let AuthCommand::EvidenceKey(group) = arguments.command else {
+        panic!("evidence-key command");
+    };
+    let EvidenceKeyCommand::Adopt(adopt) = group.command else {
+        panic!("adopt command");
+    };
+    assert!(adopt.yes);
 }
 
 #[test]
