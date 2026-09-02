@@ -838,14 +838,8 @@ impl EvidenceKeyManager {
             backend: Some(self.required_backend),
         }
     }
-}
 
-impl EvidenceMacProvider for EvidenceKeyManager {
-    fn location_identity(&self) -> &str {
-        &self.location_identity
-    }
-
-    fn status(&self, state_root_identity: Option<&str>) -> Result<EvidenceKeyStatusV1> {
+    fn status_unchecked(&self, state_root_identity: Option<&str>) -> Result<EvidenceKeyStatusV1> {
         let key = self.registry_key();
         let backend = self.store.locate(&key)?;
         let Some(registry) = self.load_registry()? else {
@@ -869,12 +863,33 @@ impl EvidenceMacProvider for EvidenceKeyManager {
         Ok(status)
     }
 
+    fn require_sealed_adoption_crossing(&self) -> Result<()> {
+        if !self.adoption_crossing_is_sealed_or_absent()? {
+            return Err(AuthError::SecretStore(
+                "evidence authority is blocked by an incomplete adoption crossing".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl EvidenceMacProvider for EvidenceKeyManager {
+    fn location_identity(&self) -> &str {
+        &self.location_identity
+    }
+
+    fn status(&self, state_root_identity: Option<&str>) -> Result<EvidenceKeyStatusV1> {
+        self.require_sealed_adoption_crossing()?;
+        self.status_unchecked(state_root_identity)
+    }
+
     fn authenticate(
         &self,
         state_root_identity: &str,
         domain: &str,
         payload: &[u8],
     ) -> Result<EvidenceAuthenticationV1> {
+        self.require_sealed_adoption_crossing()?;
         let registry = self.require_registry(state_root_identity)?;
         let generation_id = registry.active_generation_id;
         let key = registry.generations.get(&generation_id).ok_or_else(|| {

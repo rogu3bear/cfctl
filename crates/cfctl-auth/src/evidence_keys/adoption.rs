@@ -3,6 +3,7 @@ use super::*;
 pub const EVIDENCE_KEY_ADOPTION_PROTOCOL_ID: &str = "cfctl-evidence-key-adoption-v2";
 pub const EVIDENCE_KEY_ADOPTION_PLAN_RECORD_VERSION: u8 = 2;
 pub const EVIDENCE_KEY_ADOPTION_TERMINAL_VERSION: u8 = 1;
+const CROSSING_COMMITMENT_VERSION: u8 = 1;
 const POINTER_VERSION: u8 = 1;
 const APPROVAL_MINUTES: i64 = 15;
 
@@ -161,6 +162,19 @@ struct TerminalV1 {
     at: DateTime<Utc>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossingCommitmentV1 {
+    version: u8,
+    plan_id: String,
+    record_sha256: String,
+    generation: u64,
+    predecessor_pointer_sha256: Option<String>,
+    boot_identity: String,
+    monotonic_observed_ns: u64,
+    wall_observed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationOutcome {
     Clean,
@@ -179,6 +193,14 @@ enum AdoptionPlanPersistenceStage {
 }
 
 impl EvidenceKeyManager {
+    pub(super) fn adoption_crossing_is_sealed_or_absent(&self) -> Result<bool> {
+        let Some(pointer) = self.load_discoverable_pointer()? else {
+            return Ok(true);
+        };
+        let (record, _) = self.record_for_pointer(&pointer)?;
+        Ok(self.load_crossing_commitment(&record)?.is_some())
+    }
+
     pub fn adoption_preview(
         &self,
         observation: &EvidenceKeyAdoptionObservationV1,
@@ -196,6 +218,10 @@ impl EvidenceKeyManager {
         self.create_adoption_plan_with_hook(observation, acceptance, |_| Ok(()))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the crash-consistent record and pointer publication sequence stays contiguous"
+    )]
     fn create_adoption_plan_with_hook(
         &self,
         observation: &EvidenceKeyAdoptionObservationV1,
@@ -393,7 +419,7 @@ impl EvidenceKeyManager {
         let plan = self.adoption_plan_status(plan_id, observation)?;
         if !matches!(
             plan.state.as_str(),
-            "prepared" | "marker_crossed" | "completed"
+            "prepared" | "crossing_committed" | "marker_crossed" | "completed"
         ) {
             return Err(AuthError::SecretStore(format!(
                 "adoption plan is {} and cannot execute",
@@ -402,6 +428,76 @@ impl EvidenceKeyManager {
         }
         self.require_current_plan_pointer(plan_id)?;
         Ok(plan.status)
+    }
+
+    pub fn commit_adoption_marker_crossing(
+        &self,
+        plan_id: &str,
+        observation: &EvidenceKeyAdoptionObservationV1,
+    ) -> Result<EvidenceKeyAdoptionPlanV1> {
+        let acceptance = self.adoption_plan_acceptance(plan_id)?;
+        validate_runtime(&observation.runtime, &acceptance)?;
+        if observation.runtime.dynamic_self_validation != "satisfied" {
+            return Err(AuthError::SecretStore(
+                "adoption crossing commitment requires successful dynamic self-validation"
+                    .to_owned(),
+            ));
+        }
+        let pointer = self.load_discoverable_pointer()?.ok_or_else(|| {
+            AuthError::SecretStore(
+                "adoption crossing commitment requires a current canonical pointer".to_owned(),
+            )
+        })?;
+        let (record, _) = self.record_for_pointer(&pointer)?;
+        let root = record
+            .status
+            .state_root_identity
+            .as_deref()
+            .ok_or_else(|| {
+                AuthError::SecretStore("adoption record omitted root identity".to_owned())
+            })?;
+        if observation.marker_identity.as_deref() != Some(root) {
+            return Err(AuthError::SecretStore(
+                "adoption crossing commitment requires the exact marker readback".to_owned(),
+            ));
+        }
+        self.require_current_plan_pointer(plan_id)?;
+        if self.load_crossing_commitment(&record)?.is_some() {
+            return self.adoption_plan_status(plan_id, observation);
+        }
+        if !self.binding_matches(&record, observation)? {
+            return Err(AuthError::SecretStore(
+                "valid authority drifted before adoption crossing commitment".to_owned(),
+            ));
+        }
+        if clock_state(&record, &observation.clock) != "prepared" {
+            return Err(AuthError::SecretStore(
+                "adoption crossing authorization expired before durable commitment".to_owned(),
+            ));
+        }
+        let commitment = CrossingCommitmentV1 {
+            version: CROSSING_COMMITMENT_VERSION,
+            plan_id: record.plan_id.clone(),
+            record_sha256: sha256(serde_json::to_string(&record)?.as_bytes()),
+            generation: record.generation,
+            predecessor_pointer_sha256: record.predecessor_pointer_sha256.clone(),
+            boot_identity: observation.clock.boot_identity.clone(),
+            monotonic_observed_ns: observation.clock.monotonic_ns,
+            wall_observed_at: observation.clock.wall_at,
+        };
+        let encoded = serde_json::to_string(&commitment)?;
+        self.create_exact(
+            &self.crossing_commitment_key(plan_id)?,
+            &encoded,
+            "adoption crossing commitment",
+        )?;
+        let committed = self.adoption_plan_status(plan_id, observation)?;
+        if committed.state != "marker_crossed" {
+            return Err(AuthError::SecretStore(
+                "adoption crossing commitment exact readback failed".to_owned(),
+            ));
+        }
+        Ok(committed)
     }
 
     pub fn complete_adoption_plan(
@@ -431,6 +527,10 @@ impl EvidenceKeyManager {
         self.adoption_plan_status(plan_id, observation)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered fail-closed adoption state projection stays visible in one place"
+    )]
     fn status_from_record(
         &self,
         record: PlanRecordV2,
@@ -460,6 +560,7 @@ impl EvidenceKeyManager {
             ));
         }
         let terminal = completed.or(revoked);
+        let crossing = self.load_crossing_commitment(&record)?;
         let root = record
             .status
             .state_root_identity
@@ -496,7 +597,7 @@ impl EvidenceKeyManager {
             .as_ref()
             .is_some_and(|item| item.outcome == "completed")
         {
-            if observation.marker_identity.as_deref() == Some(root) {
+            if observation.marker_identity.as_deref() == Some(root) && crossing.is_some() {
                 "completed"
             } else {
                 "conflict"
@@ -509,8 +610,12 @@ impl EvidenceKeyManager {
             } else {
                 "conflict"
             }
-        } else if observation.marker_identity.as_deref() == Some(root) {
+        } else if observation.marker_identity.as_deref() == Some(root) && crossing.is_some() {
             "marker_crossed"
+        } else if observation.marker_identity.as_deref() == Some(root) {
+            "conflict"
+        } else if crossing.is_some() {
+            "crossing_committed"
         } else if clock_state(&record, &observation.clock) != "prepared" {
             clock_state(&record, &observation.clock)
         } else if runtime == "indeterminate" {
@@ -538,7 +643,7 @@ impl EvidenceKeyManager {
             next_action: match state {
                 "prepared" => "execute_exact_plan",
                 "allocating_recoverable" => "resume_exact_admission",
-                "marker_crossed" => "resume_same_plan_forward",
+                "crossing_committed" | "marker_crossed" => "resume_same_plan_forward",
                 "expired" => "create_successor_or_revoke",
                 _ => "none",
             }
@@ -636,6 +741,14 @@ impl EvidenceKeyManager {
         canonical_plan(plan_id).map(|id| {
             format!(
                 "{REGISTRY_KEY_PREFIX}/{}/adoption-v2/terminals/{id}/{outcome}",
+                self.location_identity
+            )
+        })
+    }
+    fn crossing_commitment_key(&self, plan_id: &str) -> Result<String> {
+        canonical_plan(plan_id).map(|id| {
+            format!(
+                "{REGISTRY_KEY_PREFIX}/{}/adoption-v2/crossing-commitments/{id}",
                 self.location_identity
             )
         })
@@ -784,7 +897,7 @@ impl EvidenceKeyManager {
         }
         hook(AdoptionPlanPersistenceStage::BeforeActivePointerPublication)?;
         let mut active = pointer.clone();
-        active.phase = "active".to_owned();
+        "active".clone_into(&mut active.phase);
         let pointer_outcome = self.save_pointer(&active, Some(pointer))?;
         if pointer_outcome == PublicationOutcome::ResponseLossReconciled {
             hook(AdoptionPlanPersistenceStage::ActivePointerResponseLossReconciled)?;
@@ -843,6 +956,38 @@ impl EvidenceKeyManager {
             ));
         }
         Ok(Some(terminal))
+    }
+
+    fn load_crossing_commitment(
+        &self,
+        record: &PlanRecordV2,
+    ) -> Result<Option<CrossingCommitmentV1>> {
+        let Some(value) = self
+            .store
+            .get(&self.crossing_commitment_key(&record.plan_id)?)?
+        else {
+            return Ok(None);
+        };
+        let commitment: CrossingCommitmentV1 = serde_json::from_str(&value)?;
+        let record_sha256 = sha256(serde_json::to_string(record)?.as_bytes());
+        let observed_clock = EvidenceKeyAdoptionClockV1 {
+            boot_identity: commitment.boot_identity.clone(),
+            monotonic_ns: commitment.monotonic_observed_ns,
+            wall_at: commitment.wall_observed_at,
+        };
+        if commitment.version != CROSSING_COMMITMENT_VERSION
+            || commitment.plan_id != record.plan_id
+            || commitment.record_sha256 != record_sha256
+            || commitment.generation != record.generation
+            || commitment.predecessor_pointer_sha256 != record.predecessor_pointer_sha256
+            || clock_state(record, &observed_clock) != "prepared"
+            || serde_json::to_string(&commitment)? != value
+        {
+            return Err(AuthError::SecretStore(
+                "adoption crossing commitment is malformed".to_owned(),
+            ));
+        }
+        Ok(Some(commitment))
     }
 }
 
@@ -1212,6 +1357,16 @@ mod tests {
                 .is_err()
         );
 
+        let committed_marker = observation(
+            &accepted,
+            "satisfied",
+            Some(&root),
+            clock("boot-a", 101, 1_001),
+        );
+        manager
+            .commit_adoption_marker_crossing(&plan.plan_id, &committed_marker)
+            .expect("crossing commitment");
+
         let crossed_after_boot = observation(
             &accepted,
             "indeterminate",
@@ -1374,6 +1529,9 @@ mod tests {
             Some(&root),
             clock("boot-a", 900_000_000_102, 1_902),
         );
+        manager
+            .commit_adoption_marker_crossing(&successor.plan_id, &successor_crossed)
+            .expect("successor crossing commitment");
         assert_eq!(
             manager
                 .adoption_plan_status(&successor.plan_id, &successor_crossed)
@@ -1413,6 +1571,179 @@ mod tests {
                 .expect("historical terminal readback"),
             None
         );
+    }
+
+    #[test]
+    fn marker_requires_a_durable_pre_expiry_crossing_commitment() {
+        let (_store, manager, root) = manager();
+        let accepted = acceptance('a');
+        let created = observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
+        let plan = manager
+            .create_adoption_plan(&created, accepted.clone())
+            .expect("plan");
+        let expired_marker = observation(
+            &accepted,
+            "satisfied",
+            Some(&root),
+            clock("boot-a", 900_000_000_100, 1_900),
+        );
+        EvidenceMacProvider::status(&manager, Some(&root))
+            .expect_err("an unsealed adoption blocks ordinary authority status");
+        manager
+            .authenticate(&root, "test-domain", b"payload")
+            .expect_err("an unsealed adoption blocks new authenticated evidence");
+        assert_eq!(
+            manager
+                .adoption_plan_status(&plan.plan_id, &expired_marker)
+                .expect("matching marker without commitment is classified")
+                .state,
+            "conflict"
+        );
+        manager
+            .complete_adoption_plan(&plan.plan_id, &expired_marker)
+            .expect_err("an uncommitted marker cannot authorize completion");
+    }
+
+    #[test]
+    fn crossing_commitment_is_admitted_before_expiry_and_recovers_forward_after_expiry() {
+        let (_store, manager, root) = manager();
+        let accepted = acceptance('a');
+        let created = observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
+        let plan = manager
+            .create_adoption_plan(&created, accepted.clone())
+            .expect("plan");
+        let before_deadline = observation(
+            &accepted,
+            "satisfied",
+            Some(&root),
+            clock("boot-a", 900_000_000_099, 1_899),
+        );
+        let committed = manager
+            .commit_adoption_marker_crossing(&plan.plan_id, &before_deadline)
+            .expect("crossing commitment");
+        assert_eq!(committed.state, "marker_crossed");
+        EvidenceMacProvider::status(&manager, Some(&root))
+            .expect("sealed marker re-enables ordinary authority status");
+
+        let after_reboot = observation(
+            &accepted,
+            "satisfied",
+            Some(&root),
+            clock("boot-b", 1, 2_000),
+        );
+        assert_eq!(
+            manager
+                .adoption_plan_status(&plan.plan_id, &after_reboot)
+                .expect("committed crossing survives expiry and reboot")
+                .state,
+            "marker_crossed"
+        );
+        assert_eq!(
+            manager
+                .complete_adoption_plan(&plan.plan_id, &after_reboot)
+                .expect("same plan completes forward")
+                .state,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn deadline_equality_cannot_seal_a_crossed_marker() {
+        let (_store, manager, root) = manager();
+        let accepted = acceptance('a');
+        let created = observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
+        let plan = manager
+            .create_adoption_plan(&created, accepted.clone())
+            .expect("plan");
+        let at_deadline = observation(
+            &accepted,
+            "satisfied",
+            Some(&root),
+            clock("boot-a", 900_000_000_100, 1_900),
+        );
+        manager
+            .commit_adoption_marker_crossing(&plan.plan_id, &at_deadline)
+            .expect_err("deadline equality expires authorization");
+
+        let successor_acceptance = acceptance('b');
+        let successor = manager
+            .create_adoption_plan(
+                &observation(
+                    &successor_acceptance,
+                    "satisfied",
+                    None,
+                    clock("boot-a", 900_000_000_101, 1_901),
+                ),
+                successor_acceptance,
+            )
+            .expect("expired uncommitted plan permits successor");
+        assert_ne!(successor.plan_id, plan.plan_id);
+    }
+
+    #[test]
+    fn crossing_commitment_blocks_successor_while_marker_is_absent() {
+        let (_store, manager, root) = manager();
+        let accepted = acceptance('a');
+        let created = observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
+        let plan = manager
+            .create_adoption_plan(&created, accepted.clone())
+            .expect("plan");
+        let crossed = observation(
+            &accepted,
+            "satisfied",
+            Some(&root),
+            clock("boot-a", 101, 1_001),
+        );
+        manager
+            .commit_adoption_marker_crossing(&plan.plan_id, &crossed)
+            .expect("crossing commitment");
+
+        let successor_acceptance = acceptance('b');
+        manager
+            .create_adoption_plan(
+                &observation(
+                    &successor_acceptance,
+                    "satisfied",
+                    None,
+                    clock("boot-b", 1, 2_000),
+                ),
+                successor_acceptance,
+            )
+            .expect_err("forward-only crossing commitment blocks a successor");
+    }
+
+    #[test]
+    fn crossing_commitment_reconciles_only_exact_response_lost_publication() {
+        let (store, manager, root) = manager();
+        let accepted = acceptance('a');
+        let created = observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
+        let plan = manager
+            .create_adoption_plan(&created, accepted)
+            .expect("plan");
+        let crossed = observation(
+            &acceptance('a'),
+            "satisfied",
+            Some(&root),
+            clock("boot-a", 101, 1_001),
+        );
+        store
+            .fail_next_put_after_write
+            .store(true, Ordering::Release);
+        let committed = manager
+            .commit_adoption_marker_crossing(&plan.plan_id, &crossed)
+            .expect("exact readback reconciles response loss");
+        assert_eq!(committed.state, "marker_crossed");
+
+        let public = serde_json::to_string(&committed).expect("public plan json");
+        for private_field in [
+            "\"record_sha256\":",
+            "\"generation\":",
+            "\"predecessor_pointer_sha256\":",
+            "\"monotonic_observed_ns\":",
+            "\"wall_observed_at\":",
+        ] {
+            assert!(!public.contains(private_field));
+        }
     }
 
     #[test]
@@ -1462,8 +1793,7 @@ mod tests {
         ] {
             let (store, manager, _root) = manager();
             let accepted = acceptance('d');
-            let observed =
-                observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
+            let observed = observation(&accepted, "satisfied", None, clock("boot-a", 100, 1_000));
             if inject_response_loss {
                 store
                     .fail_next_put_after_write
@@ -1737,6 +2067,9 @@ mod tests {
             Some(&root),
             clock("boot-a", 101, 1_001),
         );
+        manager
+            .commit_adoption_marker_crossing(&plan.plan_id, &crossed)
+            .expect("crossing commitment");
         manager
             .complete_adoption_plan(&plan.plan_id, &crossed)
             .expect("completed terminal");

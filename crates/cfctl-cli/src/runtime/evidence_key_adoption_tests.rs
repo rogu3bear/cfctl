@@ -2,8 +2,9 @@
 
 #![allow(clippy::expect_used)]
 
-use cfctl_auth::EvidenceKeyAdoptionAcceptanceV1;
+use cfctl_auth::{EvidenceKeyAdoptionAcceptanceV1, EvidenceKeyAdoptionClockV1};
 use cfctl_auth::{EvidenceKeyManager, MemorySecretStore, SecretBackend, SecretStore};
+use chrono::{DateTime, Utc};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -12,9 +13,18 @@ use std::{cell::RefCell, rc::Rc};
 
 use super::{
     AdoptionExecutionStage, AdoptionRuntimeEvaluationStage, EvidenceKeyAdoptArgs, StateStore,
-    adopt_with_marker_write, adopt_with_runtime_provider_and_marker_write, adoption_observation,
+    adopt_with_marker_write, adopt_with_runtime_clock_provider_and_marker_write,
+    adopt_with_runtime_provider_and_marker_write, adoption_observation, adoption_observation_at,
     classify_native_self_validation, parse_macos_boot_time, runtime_result,
 };
+
+fn clock(boot: &str, monotonic_ns: u64, wall_seconds: i64) -> EvidenceKeyAdoptionClockV1 {
+    EvidenceKeyAdoptionClockV1 {
+        boot_identity: boot.to_owned(),
+        monotonic_ns,
+        wall_at: DateTime::<Utc>::from_timestamp(wall_seconds, 0).expect("test timestamp"),
+    }
+}
 
 #[derive(Default)]
 struct PlatformMemoryStore {
@@ -172,6 +182,70 @@ fn marker_crossing_is_forward_only_and_same_plan_reconciles_without_registry_cha
 }
 
 #[test]
+fn expiry_after_marker_readback_refuses_seal_and_blocks_ordinary_authority() {
+    let root = tempfile::tempdir().expect("temporary state root");
+    let state =
+        StateStore::open(cfctl_storage::RuntimePaths::from_root(root.path())).expect("state store");
+    let secrets = Arc::new(PlatformMemoryStore::default());
+    let manager = EvidenceKeyManager::new(
+        secrets,
+        state.evidence_location_identity(),
+        SecretBackend::PlatformKeyring,
+    )
+    .expect("manager");
+    let state_root_identity = format!("sha256:{}", "5".repeat(64));
+    manager
+        .initialize(&state_root_identity)
+        .expect("valid split authority");
+    let accepted = acceptance(&"a".repeat(40)).expect("accepted runtime");
+    let runtime = runtime_result(&accepted, "injected_native_provider", "satisfied");
+    let created = adoption_observation_at(None, 0, 0, &runtime, clock("boot-a", 100, 1_000));
+    let plan = manager
+        .create_adoption_plan(&created, accepted)
+        .expect("plan");
+    let clock_calls = AtomicUsize::new(0);
+    let marker_calls = AtomicUsize::new(0);
+
+    let error = adopt_with_runtime_clock_provider_and_marker_write(
+        &state,
+        &manager,
+        &EvidenceKeyAdoptArgs {
+            plan_id: plan.plan_id,
+            yes: true,
+        },
+        |_acceptance, _stage| runtime.clone(),
+        || {
+            Ok(match clock_calls.fetch_add(1, Ordering::AcqRel) {
+                0 => clock("boot-a", 101, 1_001),
+                1 => clock("boot-a", 102, 1_002),
+                _ => clock("boot-a", 900_000_000_100, 1_900),
+            })
+        },
+        |identity| {
+            marker_calls.fetch_add(1, Ordering::AcqRel);
+            state.initialize_evidence_root_identity(identity)
+        },
+        |_| Ok(()),
+    )
+    .expect_err("deadline equality blocks post-marker crossing seal");
+    assert!(
+        error.to_string().contains("expired"),
+        "unexpected crossing failure: {error}"
+    );
+    assert_eq!(marker_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        state.evidence_root_identity().expect("marker readback"),
+        Some(state_root_identity.clone())
+    );
+    cfctl_auth::EvidenceMacProvider::status(&manager, Some(&state_root_identity))
+        .expect_err("unsealed marker remains an inert adoption hold");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the single call-order regression asserts every protected transition in sequence"
+)]
 fn runtime_evaluation_is_fresh_for_prepare_marker_and_completion() {
     let root = tempfile::tempdir().expect("temporary state root");
     let state =
@@ -232,7 +306,11 @@ fn runtime_evaluation_is_fresh_for_prepare_marker_and_completion() {
             runtime_result(
                 acceptance,
                 "injected_native_provider",
-                if call < 2 { "satisfied" } else { "not_satisfied" },
+                if call < 2 {
+                    "satisfied"
+                } else {
+                    "not_satisfied"
+                },
             )
         },
         |identity| state.initialize_evidence_root_identity(identity),
@@ -295,7 +373,11 @@ fn runtime_evaluation_is_fresh_for_prepare_marker_and_completion() {
         state.evidence_root_identity().expect("marker readback"),
         Some(state_root_identity.clone())
     );
-    assert_eq!(secrets.puts.load(Ordering::Acquire), puts_before_execute);
+    assert_eq!(
+        secrets.puts.load(Ordering::Acquire),
+        puts_before_execute + 1,
+        "execution persists exactly one private post-marker crossing seal"
+    );
     assert_eq!(
         secrets.inner.get(&registry_key).expect("registry readback"),
         Some(registry_before.clone())

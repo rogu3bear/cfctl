@@ -181,16 +181,25 @@ the calling dynamic `SecCode` against the exact accepted CDHash requirement; on
 Linux it hashes a descriptor opened from `/proc/self/exe` against the accepted
 installed-artifact identity. `adopt <plan-id> --yes` acquires the lifecycle lock,
 then evaluates that identity freshly for prepare, again immediately before a
-missing marker is created, and again immediately before terminal completion. It
-writes only the missing marker and verifies that the
-registry bytes remain unchanged. A failed completion evaluation leaves the plan at
-`marker_crossed`; a crossed transition resumes only the same plan forward. Historical
+missing-marker transition is durably committed, and again immediately before
+terminal completion. Ordinary authority status and authentication remain blocked
+while the current adoption is unsealed. After creating and exactly reading back
+the marker, cfctl takes a fresh boot, wall, and monotonic observation and publishes
+a private create-only seal bound to that marker observation, current plan record,
+and pointer. If the deadline passed before that observation, the marker remains a
+fail-closed operator-recovery hold and cannot authorize evidence. Once the seal is
+exactly read back, `crossing_committed` is forward-only and
+blocks successor creation even if marker materialization is interrupted or the
+plan deadline later passes. A matching marker without that commitment cannot
+authorize completion. Adoption writes only the missing marker and verifies that
+the registry bytes remain unchanged. A failed completion evaluation leaves the
+plan at `marker_crossed`; a crossed transition resumes only the same plan forward. Historical
 terminal and expired records remain readable by ID, but only the record bound by the
 current canonical pointer can prepare, inherit the shared marker, or complete. Its receipt
 states that cfctl adopted the exact sole canonical valid authority and does not
 claim original initialization lineage, signer identity, Gatekeeper or
 notarization status, architecture observation, or source equivalence.
-`adopt-plan revoke` is allowed only before the marker is written.
+`adopt-plan revoke` is allowed only before marker crossing is durably committed.
 If the sole canonical platform registry is malformed while the filesystem
 marker and authenticated storage-v2 artifacts are absent, use
 `recover-preview` for a strictly read-only classification and byte count. It

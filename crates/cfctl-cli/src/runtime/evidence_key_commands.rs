@@ -267,13 +267,29 @@ fn adoption_observation(
     proof_count: usize,
     runtime: &EvidenceKeyAdoptionRuntimeIdentityV1,
 ) -> Result<EvidenceKeyAdoptionObservationV1> {
-    Ok(EvidenceKeyAdoptionObservationV1 {
+    Ok(adoption_observation_at(
+        marker,
+        descriptor_count,
+        proof_count,
+        runtime,
+        current_adoption_clock()?,
+    ))
+}
+
+fn adoption_observation_at(
+    marker: Option<String>,
+    descriptor_count: usize,
+    proof_count: usize,
+    runtime: &EvidenceKeyAdoptionRuntimeIdentityV1,
+    clock: EvidenceKeyAdoptionClockV1,
+) -> EvidenceKeyAdoptionObservationV1 {
+    EvidenceKeyAdoptionObservationV1 {
         marker_identity: marker,
         authenticated_descriptor_count: descriptor_count,
         authenticated_proof_count: proof_count,
         runtime: runtime.clone(),
-        clock: current_adoption_clock()?,
-    })
+        clock,
+    }
 }
 
 fn adoption_preview(store: &StateStore, manager: &EvidenceKeyManager) -> Result<ResultEnvelopeV2> {
@@ -492,10 +508,37 @@ fn adopt_with_runtime_provider_and_marker_write(
     store: &StateStore,
     manager: &EvidenceKeyManager,
     arguments: &EvidenceKeyAdoptArgs,
+    runtime_provider: impl FnMut(
+        &EvidenceKeyAdoptionAcceptanceV1,
+        AdoptionRuntimeEvaluationStage,
+    ) -> EvidenceKeyAdoptionRuntimeIdentityV1,
+    write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
+    stage_hook: impl FnMut(AdoptionExecutionStage) -> Result<()>,
+) -> Result<ResultEnvelopeV2> {
+    adopt_with_runtime_clock_provider_and_marker_write(
+        store,
+        manager,
+        arguments,
+        runtime_provider,
+        current_adoption_clock,
+        write_marker,
+        stage_hook,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the lifecycle lock, durable crossing, marker, and completion sequence stays contiguous"
+)]
+fn adopt_with_runtime_clock_provider_and_marker_write(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    arguments: &EvidenceKeyAdoptArgs,
     mut runtime_provider: impl FnMut(
         &EvidenceKeyAdoptionAcceptanceV1,
         AdoptionRuntimeEvaluationStage,
     ) -> EvidenceKeyAdoptionRuntimeIdentityV1,
+    mut clock_provider: impl FnMut() -> Result<EvidenceKeyAdoptionClockV1>,
     write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
     mut stage_hook: impl FnMut(AdoptionExecutionStage) -> Result<()>,
 ) -> Result<ResultEnvelopeV2> {
@@ -512,12 +555,13 @@ fn adopt_with_runtime_provider_and_marker_write(
     let marker = store.evidence_root_identity()?;
     let marker_was_absent = marker.is_none();
     let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
-    let observation = adoption_observation(
+    let observation = adoption_observation_at(
         marker.clone(),
         counts.descriptor_count,
         counts.proof_count,
         &prepare_runtime,
-    )?;
+        clock_provider()?,
+    );
     let before = manager.adoption_plan_status(&arguments.plan_id, &observation)?;
     let status = manager.prepare_adoption(&arguments.plan_id, &observation)?;
     stage_hook(AdoptionExecutionStage::PrepareAccepted)?;
@@ -525,17 +569,15 @@ fn adopt_with_runtime_provider_and_marker_write(
         CliError::Input("adoption plan omitted its non-secret root binding".to_owned())
     })?;
     let marker_runtime = if marker_was_absent {
-        let runtime = runtime_provider(
-            &acceptance,
-            AdoptionRuntimeEvaluationStage::MarkerCrossing,
-        );
+        let runtime = runtime_provider(&acceptance, AdoptionRuntimeEvaluationStage::MarkerCrossing);
         stage_hook(AdoptionExecutionStage::MarkerRuntimeEvaluated)?;
-        let marker_observation = adoption_observation(
+        let marker_observation = adoption_observation_at(
             marker.clone(),
             counts.descriptor_count,
             counts.proof_count,
             &runtime,
-        )?;
+            clock_provider()?,
+        );
         if manager.prepare_adoption(&arguments.plan_id, &marker_observation)? != status {
             return Err(CliError::Input(
                 "adoption authority drifted before marker crossing".to_owned(),
@@ -545,11 +587,10 @@ fn adopt_with_runtime_provider_and_marker_write(
     } else {
         None
     };
-    if marker_was_absent && let Err(marker_error) = write_marker(state_root_identity) {
-        return match store.evidence_root_identity() {
-            Ok(Some(readback)) if readback == state_root_identity => Err(CliError::Input(format!(
-                "the exact adoption marker crossed but completion was interrupted; rerun the same adoption plan forward: {marker_error}"
-            ))),
+    let marker_response_loss = if marker_was_absent {
+        write_marker(state_root_identity).err().map_or(Ok(None), |marker_error| {
+            match store.evidence_root_identity() {
+            Ok(Some(readback)) if readback == state_root_identity => Ok(Some(marker_error)),
             Ok(None) => Err(CliError::Input(format!(
                 "adoption marker creation did not cross; the private plan remains prepared for an exact retry: {marker_error}"
             ))),
@@ -559,12 +600,35 @@ fn adopt_with_runtime_provider_and_marker_write(
             Err(readback_error) => Err(CliError::Input(format!(
                 "adoption marker state is indeterminate; preserve the private plan and do not create another: write={marker_error}; readback={readback_error}"
             ))),
-        };
-    }
+        }
+        })?
+    } else {
+        None
+    };
     if store.evidence_root_identity()?.as_deref() != Some(state_root_identity) {
         return Err(CliError::Input(
             "adoption marker failed exact readback; preserve the private plan".to_owned(),
         ));
+    }
+    if marker_was_absent {
+        let crossing_observation = adoption_observation_at(
+            Some(state_root_identity.to_owned()),
+            counts.descriptor_count,
+            counts.proof_count,
+            marker_runtime.as_ref().ok_or_else(|| {
+                CliError::Input("adoption marker runtime evidence is unavailable".to_owned())
+            })?,
+            clock_provider()?,
+        );
+        if manager
+            .commit_adoption_marker_crossing(&arguments.plan_id, &crossing_observation)?
+            .state
+            != "marker_crossed"
+        {
+            return Err(CliError::Input(
+                "adoption marker crossing commitment failed exact projection".to_owned(),
+            ));
+        }
     }
     let readback = manager.status(Some(state_root_identity))?;
     if readback != status {
@@ -573,15 +637,21 @@ fn adopt_with_runtime_provider_and_marker_write(
         ));
     }
     stage_hook(AdoptionExecutionStage::MarkerCrossed)?;
+    if let Some(marker_error) = marker_response_loss {
+        return Err(CliError::Input(format!(
+            "the exact adoption marker crossed and its private commitment was sealed, but completion was interrupted; rerun the same adoption plan forward: {marker_error}"
+        )));
+    }
     let completion_runtime =
         runtime_provider(&acceptance, AdoptionRuntimeEvaluationStage::Completion);
     stage_hook(AdoptionExecutionStage::CompletionRuntimeEvaluated)?;
-    let completed_observation = adoption_observation(
+    let completed_observation = adoption_observation_at(
         Some(state_root_identity.to_owned()),
         counts.descriptor_count,
         counts.proof_count,
         &completion_runtime,
-    )?;
+        clock_provider()?,
+    );
     let completed = manager.complete_adoption_plan(&arguments.plan_id, &completed_observation)?;
     stage_hook(AdoptionExecutionStage::TerminalCompleted)?;
     if completed.status != status || completed.state != "completed" {
