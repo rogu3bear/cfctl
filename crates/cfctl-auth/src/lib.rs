@@ -51,6 +51,15 @@ pub enum AuthError {
         "platform keyring credential deletion is incomplete; it must be resumed forward, not hand-removed"
     )]
     SecretStoreDeletionIncomplete,
+    /// The platform refused the operation because it needs an operator to approve or
+    /// unlock, and this context cannot present that decision.
+    ///
+    /// This is a distinct disposition from an unavailable backend. The store is
+    /// present and answering; it is withholding one operation pending authorization.
+    #[error(
+        "platform keyring operation requires operator authorization that this context cannot obtain; approve the keychain prompt in an interactive session and retry"
+    )]
+    SecretStoreAuthorizationRequired,
     #[error(transparent)]
     EvidenceKeyLifecycle(#[from] EvidenceKeyLifecycleError),
     #[error(transparent)]

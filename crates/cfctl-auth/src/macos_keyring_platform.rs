@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{Read as _, Write as _},
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -530,21 +530,50 @@ fn set_handle_mode(file: &fs::File, mode: u32) -> Result<()> {
         .map_err(|error| AuthError::SecretStore(error.to_string()))
 }
 
-pub(super) fn security_write_arguments(service: &str, key: &str) -> Vec<String> {
-    [
-        "add-generic-password",
-        "-U",
-        "-a",
-        key,
-        "-s",
-        service,
-        "-T",
-        "/usr/bin/security",
-        "-w",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+/// Apple status codes this adapter classifies rather than passes through.
+///
+/// `errSecItemNotFound` is absence, not failure. `errSecUserCanceled`,
+/// `errSecAuthFailed`, and `errSecInteractionNotAllowed` all mean the store is
+/// present and answering but is withholding this operation until an operator
+/// authorizes it, which is a different disposition from an unavailable backend.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+const ERR_SEC_USER_CANCELED: i32 = -128;
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+
+fn classify_keychain_error(error: security_framework::base::Error) -> AuthError {
+    match error.code() {
+        ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => {
+            AuthError::SecretStoreAuthorizationRequired
+        }
+        code => AuthError::SecretStore(format!(
+            "platform keyring operation failed with status {code}{}",
+            error
+                .message()
+                .map_or_else(String::new, |message| format!(": {message}"))
+        )),
+    }
+}
+
+/// Validate one value crossing the platform boundary.
+///
+/// The bounds and the line-break rule are contract, not framing: they bound what
+/// this store will hold and keep a value from spanning what any line-oriented
+/// consumer would treat as two.
+fn validate_keychain_value(bytes: Vec<u8>) -> Result<String> {
+    if bytes.len() > MAX_LOGICAL_CREDENTIAL_BYTES {
+        return Err(AuthError::SecretStore(
+            "platform keyring item exceeds the maximum logical byte bound".to_owned(),
+        ));
+    }
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err(AuthError::SecretStore(
+            "platform keyring credential contains an unexpected line break".to_owned(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        AuthError::SecretStore("platform keyring credential is not valid UTF-8".to_owned())
+    })
 }
 
 fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
@@ -553,75 +582,29 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
             "macOS Keychain credentials cannot contain line breaks".to_owned(),
         ));
     }
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(security_write_arguments(service, key))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            AuthError::SecretStore(
-                "platform keyring credential write produced no input sink".to_owned(),
-            )
-        })?;
-        stdin
-            .write_all(value.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.write_all(value.as_bytes()))
-            .and_then(|()| stdin.write_all(b"\n"))
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if value.len() > MAX_LOGICAL_CREDENTIAL_BYTES {
+        return Err(AuthError::SecretStore(
+            "platform keyring item exceeds the maximum logical byte bound".to_owned(),
+        ));
     }
-    drop(child.stdin.take());
-    let status = wait_for_child(&mut child)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AuthError::SecretStore(format!(
-            "platform keyring credential write failed with exit status {status}"
-        )))
-    }
+    security_framework::passwords::set_generic_password(service, key, value.as_bytes())
+        .map_err(classify_keychain_error)
 }
 
 fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", service, "-a", key, "-w"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        AuthError::SecretStore("platform keyring credential read produced no sink".to_owned())
-    })?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take((MAX_SECURITY_STDOUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let status_result = wait_for_child(&mut child);
-    let bytes = reader
-        .join()
-        .map_err(|_| AuthError::SecretStore("platform keyring output reader failed".to_owned()))?
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let status = status_result?;
-    if status.code() == Some(44) {
-        return Ok(None);
+    match security_framework::passwords::get_generic_password(service, key) {
+        Ok(bytes) => validate_keychain_value(bytes).map(Some),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+        Err(error) => Err(classify_keychain_error(error)),
     }
-    if !status.success() {
-        return Err(AuthError::SecretStore(format!(
-            "platform keyring credential read failed with exit status {status}"
-        )));
-    }
-    decode_security_stdout(bytes).map(Some)
 }
 
+#[cfg(test)]
 const MAX_SECURITY_FRAME_BYTES: usize = 2;
+#[cfg(test)]
 const MAX_SECURITY_STDOUT_BYTES: usize = MAX_LOGICAL_CREDENTIAL_BYTES + MAX_SECURITY_FRAME_BYTES;
 
+#[cfg(test)]
 pub(super) fn decode_security_stdout(mut bytes: Vec<u8>) -> Result<String> {
     if bytes.len() > MAX_SECURITY_STDOUT_BYTES {
         return Err(AuthError::SecretStore(
@@ -653,54 +636,12 @@ pub(super) fn decode_security_stdout(mut bytes: Vec<u8>) -> Result<String> {
 }
 
 fn security_command_delete(service: &str, key: &str) -> Result<()> {
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", service, "-a", key])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let status = wait_for_child(&mut child)?;
-    if status.success() || status.code() == Some(44) {
-        Ok(())
-    } else {
-        Err(AuthError::SecretStore(format!(
-            "platform keyring credential deletion failed with exit status {status}"
-        )))
-    }
-}
-
-/// How long one `/usr/bin/security` invocation may run before cfctl gives up.
-///
-/// macOS decides on its own that a keychain operation needs the operator to
-/// approve or unlock, and answers that with a dialog. cfctl cannot see the
-/// dialog, so any deadline shorter than a person's reaction time turns "this is
-/// waiting for you" into "the backend is unavailable" and fails an operation
-/// that would have succeeded. A measured create against an item requiring
-/// approval took roughly fifteen seconds; five seconds could never survive one.
-///
-/// The deadline still exists, because a wedged child must not hang cfctl
-/// forever. It is only long enough to let an operator answer.
-const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
-
-fn wait_for_child(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + CHILD_DEADLINE;
-    loop {
-        match child
-            .try_wait()
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?
-        {
-            Some(status) => return Ok(status),
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AuthError::SecretStore(format!(
-                    "platform keyring operation did not finish within {} seconds; macOS may be waiting on a keychain approval or unlock dialog that was never answered. Approve the dialog and retry, and note the write may or may not have crossed",
-                    CHILD_DEADLINE.as_secs()
-                )));
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(25)),
-        }
+    match security_framework::passwords::delete_generic_password(service, key) {
+        Ok(()) => Ok(()),
+        // Absence is the intended end state, so a missing item is success. The
+        // subprocess adapter expressed the same tolerance as exit status 44.
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+        Err(error) => Err(classify_keychain_error(error)),
     }
 }
 

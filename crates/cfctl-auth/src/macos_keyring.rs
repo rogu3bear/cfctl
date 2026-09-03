@@ -7,8 +7,6 @@ use crate::{AuthError, Result};
 #[path = "macos_keyring_platform.rs"]
 mod platform;
 use platform::SecurityCommandAdapter;
-#[cfg(test)]
-use platform::security_write_arguments;
 #[path = "macos_keyring_recovery.rs"]
 mod macos_keyring_recovery;
 use macos_keyring_recovery::recover_malformed_with;
@@ -1074,10 +1072,13 @@ mod tests {
 
     impl MacosKeychainAdapter for PromptLimitedAdapter {
         fn put_raw(&self, service: &str, key: &str, value: &str) -> Result<()> {
+            // The native adapter passes no process arguments at all, so this records
+            // the non-secret addressing a write carries. The invariant it guards is
+            // unchanged and now structural: secret bytes never leave this boundary.
             self.write_arguments
                 .lock()
                 .expect("write-argument lock")
-                .push(security_write_arguments(service, key));
+                .push(vec![service.to_owned(), key.to_owned()]);
             let truncated = &value.as_bytes()[..value.len().min(PROMPT_VALUE_LIMIT)];
             let truncated = String::from_utf8(truncated.to_vec())
                 .expect("test registry and envelopes are ASCII");
