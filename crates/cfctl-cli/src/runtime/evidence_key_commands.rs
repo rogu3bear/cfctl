@@ -613,9 +613,42 @@ fn initialize_with_marker_write(
     manager: &EvidenceKeyManager,
     write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
 ) -> Result<ResultEnvelopeV2> {
-    let _lifecycle = store.lock_evidence_lifecycle()?;
+    let lifecycle = store.lock_evidence_lifecycle()?;
     let marker = store.evidence_root_identity()?;
     let status = manager.status(marker.as_deref())?;
+    // A registry with no marker is only resumable when this installation published
+    // the intent that names it, and nothing has been authenticated under it yet.
+    // Anything else is an authority of unknown provenance and remains an adoption
+    // question, not an initialization one.
+    if marker.is_none() && status.initialized {
+        let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+        if counts.descriptor_count == 0
+            && counts.proof_count == 0
+            && let Some(interrupted_root) = manager.interrupted_initialization()?
+        {
+            write_marker(&interrupted_root).map_err(|marker_error| {
+                CliError::Input(format!(
+                    "an interrupted evidence-key initialization was identified, but resuming its marker did not cross; the exact platform authority was preserved and the same initialization may be resumed again: {marker_error}"
+                ))
+            })?;
+            let resumed = store
+                .evidence_root_identity()?
+                .filter(|resumed| *resumed == interrupted_root)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "the resumed evidence-root marker did not read back as the exact interrupted state root; the platform authority was preserved. Inspect `cfctl auth evidence-key status --json`"
+                            .to_owned(),
+                    )
+                })?;
+            manager.clear_initialization_intent()?;
+            let resumed_status = manager.status(Some(&resumed))?;
+            return Ok(status_envelope(
+                "auth evidence-key init",
+                resumed_status,
+                "An interrupted initialization was resumed forward. The exact platform authority was preserved and only its missing state-root marker was created.",
+            ));
+        }
+    }
     if marker.is_some() || status.initialized {
         return Err(CliError::Input(
             "evidence key initialization requires both the state-root marker and platform authority to be absent; inspect `cfctl auth evidence-key status --json`"
@@ -626,6 +659,7 @@ fn initialize_with_marker_write(
         "sha256:{}",
         hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()))
     );
+    manager.publish_initialization_intent(&state_root_identity)?;
     let initialized = match manager.initialize(&state_root_identity) {
         Ok(initialized) => initialized,
         Err(initialization_error) => match manager.status(None) {
@@ -666,6 +700,7 @@ fn initialize_with_marker_write(
             ))),
         };
     }
+    manager.clear_initialization_intent()?;
     Ok(status_envelope(
         "auth evidence-key init",
         initialized,
@@ -970,7 +1005,11 @@ mod tests {
     impl SecretStore for PutThenLocateFailsOnceSecretStore {
         fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {
             self.inner.put(key, value)?;
-            self.fail_next_locate.store(true, Ordering::Release);
+            // Arm only on the registry write this fixture is named for. Initialization
+            // publishes its intent first, and that write must not consume the fault.
+            if key.ends_with("/registry-v1") {
+                self.fail_next_locate.store(true, Ordering::Release);
+            }
             Ok(())
         }
 
@@ -1014,6 +1053,121 @@ mod tests {
             .expect("registry and marker agree");
         assert!(status.initialized);
         assert_eq!(status.state_root_identity.as_deref(), Some(marker.as_str()));
+    }
+
+    #[test]
+    fn interrupted_initialization_resumes_the_same_authority_forward() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        // Initialization crosses the platform registry and the filesystem marker in
+        // that order. Model process death between them: the intent and the registry
+        // exist, the marker never does, and no compensation code runs.
+        let state_root_identity = format!("sha256:{}", "a".repeat(64));
+        manager
+            .publish_initialization_intent(&state_root_identity)
+            .expect("intent publishes before the authority it names");
+        let crossed = manager
+            .initialize(&state_root_identity)
+            .expect("platform authority crosses");
+        assert_eq!(
+            store.evidence_root_identity().expect("marker readback"),
+            None
+        );
+
+        let envelope = initialize(&store, &manager).expect("interrupted initialization resumes");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("resumed marker exists");
+        assert_eq!(marker, state_root_identity);
+        let status = manager.status(Some(&marker)).expect("status");
+        assert!(status.initialized);
+        // Resumption finishes the original crossing; it must not mint a replacement.
+        assert_eq!(
+            status.active_generation_id, crossed.active_generation_id,
+            "resume must preserve the exact interrupted authority"
+        );
+        // The intent is retired, so the resumed authority is now an ordinary one.
+        let error = initialize(&store, &manager).expect_err("a complete authority blocks init");
+        assert!(
+            error.to_string().contains(
+                "requires both the state-root marker and platform authority to be absent"
+            )
+        );
+    }
+
+    #[test]
+    fn a_registry_without_a_published_intent_is_not_resumable() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        // An authority this installation cannot attribute to its own interrupted
+        // crossing stays an adoption question. Resumption must not become a
+        // receipt-free path to inheriting an unattributable signing authority.
+        let state_root_identity = format!("sha256:{}", "b".repeat(64));
+        manager
+            .initialize(&state_root_identity)
+            .expect("an unattributable authority exists");
+
+        let error =
+            initialize(&store, &manager).expect_err("unattributable authority fails closed");
+
+        assert!(
+            error.to_string().contains(
+                "requires both the state-root marker and platform authority to be absent"
+            )
+        );
+        assert_eq!(
+            store.evidence_root_identity().expect("marker readback"),
+            None,
+            "a failed resume must not create a marker"
+        );
+    }
+
+    #[test]
+    fn an_intent_that_disagrees_with_the_registry_fails_closed() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        let intended = format!("sha256:{}", "c".repeat(64));
+        let actual = format!("sha256:{}", "d".repeat(64));
+        manager
+            .publish_initialization_intent(&intended)
+            .expect("intent publishes");
+        manager
+            .initialize(&actual)
+            .expect("a different authority crosses");
+
+        let error = initialize(&store, &manager).expect_err("disagreement is never guessed away");
+
+        assert!(error.to_string().contains("different state root"));
+        assert_eq!(
+            store.evidence_root_identity().expect("marker readback"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_completed_initialization_leaves_no_resumable_intent() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        initialize(&store, &manager).expect("initialization succeeds");
+
+        assert_eq!(
+            manager
+                .interrupted_initialization()
+                .expect("intent inspection"),
+            None,
+            "a completed crossing must retire its intent"
+        );
     }
 
     #[test]
