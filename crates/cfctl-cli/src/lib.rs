@@ -128,6 +128,15 @@ pub enum EvidenceKeyCommand {
     RecoverPlan(EvidenceKeyRecoverPlanArgs),
     /// Execute or resume one exact private malformed-registry recovery plan.
     Recover(EvidenceKeyRecoverArgs),
+    /// Discard one unattributable, unused platform authority and initialize a fresh one.
+    Reset(EvidenceKeyResetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyResetArgs {
+    /// Confirm discarding the existing platform authority.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

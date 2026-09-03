@@ -109,6 +109,7 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
                     CommandNodeV1::leaf("recover"),
                     CommandNodeV1::branch("recover-plan", EVIDENCE_KEY_RECOVERY_PLAN_COMMANDS),
                     CommandNodeV1::leaf("recover-preview"),
+                    CommandNodeV1::leaf("reset"),
                     CommandNodeV1::leaf("retire"),
                     CommandNodeV1::leaf("rotate"),
                     CommandNodeV1::leaf("status"),

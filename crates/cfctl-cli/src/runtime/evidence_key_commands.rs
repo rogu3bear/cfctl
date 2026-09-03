@@ -65,6 +65,7 @@ pub(super) fn evidence_key_command(
             }
         },
         EvidenceKeyCommand::Recover(arguments) => recover(store, &manager, &arguments),
+        EvidenceKeyCommand::Reset(arguments) => reset(store, &manager, &arguments),
     }
 }
 
@@ -655,6 +656,23 @@ fn initialize_with_marker_write(
                 .to_owned(),
         ));
     }
+    let initialized = initialize_fresh_locked(store, manager, write_marker)?;
+    Ok(status_envelope(
+        "auth evidence-key init",
+        initialized,
+        "The platform-held evidence authority is initialized for this exact canonical state root.",
+    ))
+}
+
+/// Create one fresh authority and its marker while the lifecycle lock is already held.
+///
+/// Callers own the admissibility decision; this owns only the ordered crossing and
+/// its compensation.
+fn initialize_fresh_locked(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
+) -> Result<EvidenceKeyStatusV1> {
     let state_root_identity = format!(
         "sha256:{}",
         hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()))
@@ -701,10 +719,65 @@ fn initialize_with_marker_write(
         };
     }
     manager.clear_initialization_intent()?;
+    Ok(initialized)
+}
+
+/// Discard one unattributable, unused platform authority and initialize a fresh one.
+///
+/// Adoption *inherits* an existing authority, which is why it must authenticate the
+/// identity of the code asking. Reset inherits nothing: it destroys an authority that
+/// has authenticated no local artifact and creates a new one, exactly as a clean host
+/// would. It claims no lineage, so it needs no installed-identity receipt.
+///
+/// Admissible only for an absent marker, an existing fresh single-generation registry
+/// in direct platform custody, and zero authenticated descriptors and proofs.
+///
+/// Consumer: operators stranded by an initialization that crossed before
+/// `initialization-intent-v1` existed, and so cannot be resumed. Failure mode: refuses
+/// rather than discarding anything an artifact still depends on. Retire this surface
+/// once no supported release can produce an intent-less split.
+fn reset(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    arguments: &crate::EvidenceKeyResetArgs,
+) -> Result<ResultEnvelopeV2> {
+    if !arguments.yes {
+        return Err(CliError::Input(
+            "evidence key reset permanently discards the existing platform authority; rerun with --yes to confirm"
+                .to_owned(),
+        ));
+    }
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    if store.evidence_root_identity()?.is_some() {
+        return Err(CliError::Input(
+            "evidence key reset requires the state-root marker to be absent; a complete authority is rotated or retired, never reset"
+                .to_owned(),
+        ));
+    }
+    let status = manager.status(None)?;
+    let Some(discarded_state_root) = status.state_root_identity.clone() else {
+        return Err(CliError::Input(
+            "evidence key reset requires an existing platform authority; run `cfctl auth evidence-key init --json` instead"
+                .to_owned(),
+        ));
+    };
+    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+    if counts.descriptor_count != 0 || counts.proof_count != 0 {
+        return Err(CliError::Input(format!(
+            "evidence key reset requires zero authenticated local artifacts; {} descriptors and {} proofs still depend on this authority and would become unverifiable",
+            counts.descriptor_count, counts.proof_count
+        )));
+    }
+    // rollback_initialize admits only an exact fresh single-generation authority, so a
+    // rotated or in-use registry is refused here rather than silently destroyed.
+    manager.rollback_initialize(&discarded_state_root)?;
+    let initialized = initialize_fresh_locked(store, manager, |state_root_identity| {
+        store.initialize_evidence_root_identity(state_root_identity)
+    })?;
     Ok(status_envelope(
-        "auth evidence-key init",
+        "auth evidence-key reset",
         initialized,
-        "The platform-held evidence authority is initialized for this exact canonical state root.",
+        "The prior unattributable platform authority was discarded and a fresh authority was initialized for a new canonical state root. No lineage, adoption outcome, or continuity with the discarded authority is claimed.",
     ))
 }
 
@@ -837,7 +910,7 @@ mod tests {
     use super::{
         EvidenceKeyManager, StateStore, initialization_preview, initialize,
         initialize_with_marker_write, recover, recovery_plan_create, recovery_plan_status,
-        recovery_preview,
+        recovery_preview, reset, status as status_command,
     };
     use crate::{EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanSelector};
 
@@ -1053,6 +1126,133 @@ mod tests {
             .expect("registry and marker agree");
         assert!(status.initialized);
         assert_eq!(status.state_root_identity.as_deref(), Some(marker.as_str()));
+    }
+
+    fn stranded_authority(manager: &EvidenceKeyManager) -> String {
+        let stranded = format!("sha256:{}", "e".repeat(64));
+        manager
+            .initialize(&stranded)
+            .expect("an unattributable authority exists");
+        stranded
+    }
+
+    #[test]
+    fn reset_discards_an_unattributable_authority_and_initializes_a_fresh_one() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        let discarded = stranded_authority(&manager);
+        initialize(&store, &manager).expect_err("precondition: the strand is not resumable");
+
+        let envelope = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect("reset discards and reinitializes");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("fresh marker exists");
+        assert_ne!(
+            marker, discarded,
+            "reset must mint a new state root, never resurrect the discarded one"
+        );
+        let fresh = manager.status(Some(&marker)).expect("status");
+        assert!(fresh.initialized);
+        assert_eq!(fresh.state_root_identity.as_deref(), Some(marker.as_str()));
+        // The split is gone: ordinary status now answers instead of failing closed.
+        status_command(&store, &manager).expect("a reset authority is no longer split");
+    }
+
+    #[test]
+    fn reset_requires_explicit_confirmation() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        let discarded = stranded_authority(&manager);
+
+        let error = reset(
+            &store,
+            &manager,
+            &crate::EvidenceKeyResetArgs { yes: false },
+        )
+        .expect_err("an unconfirmed reset discards nothing");
+
+        assert!(error.to_string().contains("--yes"));
+        assert_eq!(
+            manager
+                .status(None)
+                .expect("status")
+                .state_root_identity
+                .as_deref(),
+            Some(discarded.as_str()),
+            "the authority must survive an unconfirmed reset"
+        );
+    }
+
+    #[test]
+    fn reset_refuses_when_authenticated_artifacts_still_depend_on_the_authority() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        let discarded = stranded_authority(&manager);
+        // One authenticated storage-v2 candidate is enough: discarding the authority
+        // would make it permanently unverifiable.
+        std::fs::write(
+            store
+                .paths()
+                .data_dir
+                .join("evidence-descriptors")
+                .join(format!("{}.json", "f".repeat(64))),
+            br#"{"storage_schema_version":2,"authentication":{}}"#,
+        )
+        .expect("candidate descriptor is written");
+
+        let error = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect_err("a depended-upon authority is never discarded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("zero authenticated local artifacts")
+        );
+        assert_eq!(
+            manager
+                .status(None)
+                .expect("status")
+                .state_root_identity
+                .as_deref(),
+            Some(discarded.as_str()),
+            "the authority must survive a refused reset"
+        );
+    }
+
+    #[test]
+    fn reset_refuses_a_complete_authority() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        initialize(&store, &manager).expect("a complete authority exists");
+
+        let error = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect_err("a complete authority is rotated or retired, never reset");
+
+        assert!(error.to_string().contains("marker to be absent"));
+    }
+
+    #[test]
+    fn reset_refuses_when_there_is_no_authority_to_discard() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        let error = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect_err("there is nothing to discard");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an existing platform authority")
+        );
     }
 
     #[test]

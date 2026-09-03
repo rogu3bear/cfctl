@@ -194,6 +194,19 @@ preserved state machine also rejects a record-backed `allocating` pointer as
 crossing authority: it cannot publish a seal, project `marker_crossed`, complete,
 or enable ordinary evidence authentication. This release claims no adoption
 outcome.
+
+A valid registry that cannot be resumed and cannot be adopted is not a dead end.
+`auth evidence-key reset --yes` discards it and initializes a fresh authority.
+Adoption *inherits* an existing authority, which is why it must authenticate the
+identity of the code asking; reset inherits nothing, claims no lineage, and
+produces exactly what a clean host produces, so it requires no installed-identity
+receipt. It is admissible only when the state-root marker is absent, the registry
+is a fresh single-generation authority in direct platform custody, and zero
+authenticated descriptors and proofs exist. That last condition is the point: an
+authority nothing depends on can be discarded without losing anything, and reset
+refuses rather than orphaning a single authenticated artifact. The discarded
+registry is removed through the managed platform-keyring teardown, never by hand.
+
 If the sole canonical platform registry is malformed while the filesystem
 marker and authenticated storage-v2 artifacts are absent, use
 `recover-preview` for a strictly read-only classification and byte count. It

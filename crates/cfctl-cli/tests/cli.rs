@@ -406,6 +406,7 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             EvidenceKeyCommand::RecoverPreview => "recover-preview",
             EvidenceKeyCommand::RecoverPlan(_) => "recover-plan",
             EvidenceKeyCommand::Recover(_) => "recover",
+            EvidenceKeyCommand::Reset(_) => "reset",
         };
         assert_eq!(parsed, action);
     }
@@ -429,6 +430,28 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         panic!("retire command");
     };
     assert!(retire.yes);
+
+    // Reset discards an authority, so confirmation is part of its parser contract and
+    // must never default to true.
+    for (arguments, expected) in [
+        (vec!["cfctl", "auth", "evidence-key", "reset"], false),
+        (
+            vec!["cfctl", "auth", "evidence-key", "reset", "--yes"],
+            true,
+        ),
+    ] {
+        let cli = Cli::try_parse_from(arguments).expect("evidence-key reset parses");
+        let Some(Command::Auth(arguments)) = cli.command else {
+            panic!("auth command");
+        };
+        let AuthCommand::EvidenceKey(group) = arguments.command else {
+            panic!("evidence-key command");
+        };
+        let EvidenceKeyCommand::Reset(reset) = group.command else {
+            panic!("reset command");
+        };
+        assert_eq!(reset.yes, expected);
+    }
 
     let plan_id = "7ff2b63e-f412-4a73-978a-e88b86ef5327";
     for action in ["status", "revoke"] {
