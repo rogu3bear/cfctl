@@ -670,8 +670,21 @@ fn security_command_delete(service: &str, key: &str) -> Result<()> {
     }
 }
 
+/// How long one `/usr/bin/security` invocation may run before cfctl gives up.
+///
+/// macOS decides on its own that a keychain operation needs the operator to
+/// approve or unlock, and answers that with a dialog. cfctl cannot see the
+/// dialog, so any deadline shorter than a person's reaction time turns "this is
+/// waiting for you" into "the backend is unavailable" and fails an operation
+/// that would have succeeded. A measured create against an item requiring
+/// approval took roughly fifteen seconds; five seconds could never survive one.
+///
+/// The deadline still exists, because a wedged child must not hang cfctl
+/// forever. It is only long enough to let an operator answer.
+const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
+
 fn wait_for_child(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + CHILD_DEADLINE;
     loop {
         match child
             .try_wait()
@@ -681,10 +694,10 @@ fn wait_for_child(child: &mut std::process::Child) -> Result<std::process::ExitS
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(AuthError::SecretStore(
-                    "platform keyring operation timed out after 5 seconds; unlock the login keychain and retry"
-                        .to_owned(),
-                ));
+                return Err(AuthError::SecretStore(format!(
+                    "platform keyring operation did not finish within {} seconds; macOS may be waiting on a keychain approval or unlock dialog that was never answered. Approve the dialog and retry, and note the write may or may not have crossed",
+                    CHILD_DEADLINE.as_secs()
+                )));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
