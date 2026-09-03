@@ -161,45 +161,24 @@ backend, custody, state-root transition, verification-generation behavior, and
 recovery semantics without creating a key or exposing key bytes.
 If the exact sole canonical platform registry is already valid while its local
 marker and all authenticated storage-v2 artifacts are absent, use
-`adopt-preview` for a strictly read-only classification, then create and inspect
-the short-lived private intent with `adopt-plan create|current|status`. Creation
-requires a fresh operator-supplied source-candidate identity, installed-artifact
-SHA-256 identity, expected architecture, exact 40-hex running CDHash, CDHash
-algorithm, and full-digest provenance. Those values are accepted claims, not
-observations or release proof. The random opaque plan ID binds them immutably to
-the exact registry bytes, non-secret status, and marker state without disclosing
-the registry, its digest, or secret-derived identity. Plan creation publishes
-and exactly reads back the create-only immutable record before publishing its
-allocating pointer. A crash after the record but before the pointer leaves no
-discoverable allocation and permits a fresh create. A legacy allocating pointer
-whose record is absent is likewise treated as no allocation and may be replaced
-only through exact compare-and-set with the interrupted pointer bound as its
-predecessor; a record-backed allocation remains
-recoverable only by the identical admission, while conflicting values and an
-active pointer without its record fail closed. On macOS, cfctl validates
-the calling dynamic `SecCode` against the exact accepted CDHash requirement; on
-Linux it hashes a descriptor opened from `/proc/self/exe` against the accepted
-installed-artifact identity. `adopt <plan-id> --yes` acquires the lifecycle lock,
-then evaluates that identity freshly for prepare, again immediately before a
-missing-marker transition is durably committed, and again immediately before
-terminal completion. Ordinary authority status and authentication remain blocked
-while the current adoption is unsealed. After creating and exactly reading back
-the marker, cfctl takes a fresh boot, wall, and monotonic observation and publishes
-a private create-only seal bound to that marker observation, current plan record,
-and pointer. If the deadline passed before that observation, the marker remains a
-fail-closed operator-recovery hold and cannot authorize evidence. Once the seal is
-exactly read back, `crossing_committed` is forward-only and
-blocks successor creation even if marker materialization is interrupted or the
-plan deadline later passes. A matching marker without that commitment cannot
-authorize completion. Adoption writes only the missing marker and verifies that
-the registry bytes remain unchanged. A failed completion evaluation leaves the
-plan at `marker_crossed`; a crossed transition resumes only the same plan forward. Historical
-terminal and expired records remain readable by ID, but only the record bound by the
-current canonical pointer can prepare, inherit the shared marker, or complete. Its receipt
-states that cfctl adopted the exact sole canonical valid authority and does not
-claim original initialization lineage, signer identity, Gatekeeper or
-notarization status, architecture observation, or source equivalence.
-`adopt-plan revoke` is allowed only before marker crossing is durably committed.
+`adopt-preview` for a strictly read-only classification. `adopt-plan current`
+and `adopt-plan status` remain read-only so historical records can be inspected,
+and `adopt-plan revoke` remains limited to a plan that has not crossed.
+
+`adopt-plan create` and `adopt <plan-id> --yes` are intentionally unavailable
+in this release. Both fail with
+`CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED` before plan persistence,
+filesystem-marker creation, private crossing-seal publication, or terminal
+completion. Signed publication and installation may proceed independently, but
+adoption must wait for a separately reviewed producer and consumer for an
+authenticated installed-identity receipt. The CLI accepts no raw source,
+artifact, architecture, CDHash, algorithm, or provenance flags as authority.
+
+Receipt-less historical plan records remain readable but non-executable. The
+preserved state machine also rejects a record-backed `allocating` pointer as
+crossing authority: it cannot publish a seal, project `marker_crossed`, complete,
+or enable ordinary evidence authentication. This release claims no adoption
+outcome.
 If the sole canonical platform registry is malformed while the filesystem
 marker and authenticated storage-v2 artifacts are absent, use
 `recover-preview` for a strictly read-only classification and byte count. It

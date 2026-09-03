@@ -474,29 +474,20 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         ])
         .expect("adoption-plan lifecycle action parses");
     }
-    Cli::try_parse_from([
-        "cfctl",
-        "auth",
-        "evidence-key",
-        "adopt-plan",
-        "create",
-        "--source-candidate-identity",
-        "git:0123456789abcdef0123456789abcdef01234567",
-        "--installed-artifact-identity",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--expected-architecture",
-        "arm64",
-        "--expected-running-cdhash",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "--expected-cdhash-algorithm",
-        "sha256-truncated-20",
-        "--expected-cdhash-full-digest-provenance",
-        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    ])
-    .expect("adoption-plan creation requires explicit operator-accepted identity fields");
+    Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt-plan", "create"])
+        .expect("disabled adoption-plan creation remains an explicit command surface");
     assert!(
-        Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt-plan", "create"]).is_err(),
-        "adoption plan creation never defaults or inherits accepted identity"
+        Cli::try_parse_from([
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "adopt-plan",
+            "create",
+            "--source-candidate-identity",
+            "git:0123456789abcdef0123456789abcdef01234567",
+        ])
+        .is_err(),
+        "raw caller identity claims are not accepted as adoption authority"
     );
     let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt", plan_id, "--yes"])
         .expect("evidence-key adopt parses");
@@ -510,6 +501,73 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         panic!("adopt command");
     };
     assert!(adopt.yes);
+}
+
+#[test]
+fn receipt_free_adoption_commands_emit_exact_fail_closed_envelopes() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    for (arguments, command) in [
+        (
+            vec!["auth", "evidence-key", "adopt-plan", "create", "--json"],
+            "auth evidence-key adopt-plan create",
+        ),
+        (
+            vec![
+                "auth",
+                "evidence-key",
+                "adopt",
+                "00000000-0000-4000-8000-000000000001",
+                "--yes",
+                "--json",
+            ],
+            "auth evidence-key adopt",
+        ),
+    ] {
+        let output = ProcessCommand::new(binary)
+            .env("CFCTL_HOME", runtime.path())
+            .args(arguments)
+            .output()
+            .expect("execute disabled adoption command");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("failure envelope JSON");
+        assert_eq!(envelope["command"], command);
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["performed"], false);
+        assert_eq!(
+            envelope["error"]["code"],
+            "CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED"
+        );
+        let next_step = envelope["error"]["next_step"]
+            .as_str()
+            .expect("precise next step");
+        assert!(next_step.contains("Signed publication and installation may proceed"));
+        assert!(next_step.contains("remain unavailable"));
+        assert!(!next_step.contains("doctor"));
+    }
+
+    let help = ProcessCommand::new(binary)
+        .args(["auth", "evidence-key", "adopt-plan", "create", "--help"])
+        .output()
+        .expect("render disabled create help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("UTF-8 help");
+    for removed in [
+        "--source-candidate-identity",
+        "--installed-artifact-identity",
+        "--expected-architecture",
+        "--expected-running-cdhash",
+        "--expected-cdhash-algorithm",
+        "--expected-cdhash-full-digest-provenance",
+    ] {
+        assert!(
+            !help.contains(removed),
+            "raw authority flag survived: {removed}"
+        );
+    }
+    assert!(help.contains("authenticated installed-identity receipt support"));
 }
 
 #[test]

@@ -1,6 +1,9 @@
 use std::{env, io::Write, process::ExitCode};
 
-use cfctl_cli::{Cli, Command, InvocationMode, PlansCommand, classify_invocation, runtime};
+use cfctl_cli::{
+    AuthCommand, Cli, Command, EvidenceKeyAdoptPlanCommand, EvidenceKeyCommand, InvocationMode,
+    PlansCommand, classify_invocation, runtime,
+};
 use cfctl_core::ResultEnvelopeV2;
 use clap::Parser;
 
@@ -18,22 +21,52 @@ impl FailureEnvelopeContext {
     }
 
     fn deterministic(cli: &Cli) -> Self {
-        let Some(Command::Plans(arguments)) = &cli.command else {
-            return Self::generic();
-        };
-        let (command, operation_id) = match &arguments.command {
-            PlansCommand::Show(selector) => ("plans show", &selector.operation_id),
-            PlansCommand::Approve(arguments) => ("plans approve", &arguments.operation_id),
-            PlansCommand::Run(selector) => ("plans run", &selector.operation_id),
-            PlansCommand::Status(selector) => ("plans status", &selector.operation_id),
-            PlansCommand::Resume(selector) => ("plans resume", &selector.operation_id),
-            PlansCommand::Rectify(selector) => ("plans rectify", &selector.operation_id),
-            PlansCommand::Cancel(selector) => ("plans cancel", &selector.operation_id),
-            PlansCommand::Bundle(_) => return Self::generic(),
-        };
-        Self {
-            command,
-            operation_id: Some(operation_id.clone()),
+        match &cli.command {
+            Some(Command::Plans(arguments)) => {
+                let (command, operation_id) = match &arguments.command {
+                    PlansCommand::Show(selector) => ("plans show", &selector.operation_id),
+                    PlansCommand::Approve(arguments) => ("plans approve", &arguments.operation_id),
+                    PlansCommand::Run(selector) => ("plans run", &selector.operation_id),
+                    PlansCommand::Status(selector) => ("plans status", &selector.operation_id),
+                    PlansCommand::Resume(selector) => ("plans resume", &selector.operation_id),
+                    PlansCommand::Rectify(selector) => ("plans rectify", &selector.operation_id),
+                    PlansCommand::Cancel(selector) => ("plans cancel", &selector.operation_id),
+                    PlansCommand::Bundle(_) => return Self::generic(),
+                };
+                Self {
+                    command,
+                    operation_id: Some(operation_id.clone()),
+                }
+            }
+            Some(Command::Auth(arguments)) => {
+                let AuthCommand::EvidenceKey(group) = &arguments.command else {
+                    return Self::generic();
+                };
+                let command = match &group.command {
+                    EvidenceKeyCommand::AdoptPreview => "auth evidence-key adopt-preview",
+                    EvidenceKeyCommand::AdoptPlan(arguments) => match &arguments.command {
+                        EvidenceKeyAdoptPlanCommand::Create => {
+                            "auth evidence-key adopt-plan create"
+                        }
+                        EvidenceKeyAdoptPlanCommand::Current => {
+                            "auth evidence-key adopt-plan current"
+                        }
+                        EvidenceKeyAdoptPlanCommand::Status(_) => {
+                            "auth evidence-key adopt-plan status"
+                        }
+                        EvidenceKeyAdoptPlanCommand::Revoke(_) => {
+                            "auth evidence-key adopt-plan revoke"
+                        }
+                    },
+                    EvidenceKeyCommand::Adopt(_) => "auth evidence-key adopt",
+                    _ => return Self::generic(),
+                };
+                Self {
+                    command,
+                    operation_id: None,
+                }
+            }
+            _ => Self::generic(),
         }
     }
 }
@@ -123,11 +156,46 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
+    use cfctl_auth::EvidenceKeyAdoptionError;
     use cfctl_cli::runtime::CliError;
     use cfctl_core::{CoreError, PlanStatus};
     use clap::Parser as _;
 
     use super::{Cli, FailureEnvelopeContext, failure_envelope};
+
+    #[test]
+    fn adoption_current_failure_keeps_exact_command_and_typed_hold() {
+        let cli = Cli::try_parse_from([
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "adopt-plan",
+            "current",
+            "--json",
+        ])
+        .expect("adoption current command parses");
+        let context = FailureEnvelopeContext::deterministic(&cli);
+        let error = CliError::from(cfctl_auth::AuthError::from(
+            EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+        ));
+
+        let envelope = failure_envelope(&context, &error);
+
+        assert_eq!(envelope.command, "auth evidence-key adopt-plan current");
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        let detail = envelope.error.expect("typed adoption failure");
+        assert_eq!(
+            detail.code,
+            "CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED"
+        );
+        let next_step = detail.next_step.expect("precise hold guidance");
+        assert!(next_step.contains("Signed publication and installation may proceed"));
+        assert!(next_step.contains("do not run `cfctl auth evidence-key adopt-plan create`"));
+        assert!(!next_step.contains("doctor"));
+    }
 
     #[test]
     fn duplicate_plan_approval_failure_keeps_command_and_operation_context() {

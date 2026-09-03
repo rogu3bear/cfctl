@@ -10,12 +10,14 @@ use uuid::Uuid;
 use crate::{AuthError, KeyringSecretStore, Result, SecretBackend, SecretStore};
 
 mod adoption;
+mod adoption_error;
 pub use adoption::{
     EVIDENCE_KEY_ADOPTION_PLAN_RECORD_VERSION, EVIDENCE_KEY_ADOPTION_PROTOCOL_ID,
     EVIDENCE_KEY_ADOPTION_TERMINAL_VERSION, EvidenceKeyAdoptionAcceptanceV1,
     EvidenceKeyAdoptionClockV1, EvidenceKeyAdoptionObservationV1, EvidenceKeyAdoptionPlanV1,
     EvidenceKeyAdoptionRuntimeIdentityV1, platform_adoption_monotonic_ns,
 };
+pub use adoption_error::EvidenceKeyAdoptionError;
 
 pub const EVIDENCE_HMAC_ALGORITHM: &str = "hmac-sha256";
 const REGISTRY_SCHEMA_VERSION: u8 = 1;

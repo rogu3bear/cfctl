@@ -46,6 +46,8 @@ pub enum AuthError {
     SecretStore(String),
     #[error(transparent)]
     EvidenceKeyLifecycle(#[from] EvidenceKeyLifecycleError),
+    #[error(transparent)]
+    EvidenceKeyAdoption(#[from] EvidenceKeyAdoptionError),
     #[error("profile `{0}` has no stored credential")]
     MissingCredential(String),
     #[error("credential unavailable for profile `{profile_id}`: {reason}")]

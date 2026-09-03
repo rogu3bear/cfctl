@@ -4,48 +4,39 @@ use super::prelude::{
     EvidenceKeyStatusV1, EvidenceMacProvider as _, Result, ResultEnvelopeV2, Sha256, StateStore,
     Uuid, json,
 };
-use crate::{
-    EvidenceKeyAdoptArgs, EvidenceKeyAdoptPlanCommand, EvidenceKeyAdoptPlanCreateArgs,
-    EvidenceKeyAdoptPlanSelector,
-};
+use crate::{EvidenceKeyAdoptPlanCommand, EvidenceKeyAdoptPlanSelector};
 use cfctl_auth::{
     EVIDENCE_KEY_ADOPTION_PROTOCOL_ID, EvidenceKeyAdoptionAcceptanceV1, EvidenceKeyAdoptionClockV1,
-    EvidenceKeyAdoptionObservationV1, EvidenceKeyAdoptionRuntimeIdentityV1,
+    EvidenceKeyAdoptionError, EvidenceKeyAdoptionObservationV1, EvidenceKeyAdoptionPlanV1,
+    EvidenceKeyAdoptionRuntimeIdentityV1,
 };
 use sha2::Digest as _;
 
 const ADOPTION_LINEAGE_BOUNDARY: &str = "adopted the exact sole canonical valid authority; original initialization lineage is not proven";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdoptionRuntimeEvaluationStage {
-    Prepare,
-    MarkerCrossing,
-    Completion,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdoptionExecutionStage {
-    LifecycleLockAcquired,
-    PrepareRuntimeEvaluated,
-    PrepareAccepted,
-    MarkerRuntimeEvaluated,
-    MarkerCrossed,
-    CompletionRuntimeEvaluated,
-    TerminalCompleted,
-}
-
 pub(super) fn evidence_key_command(
     store: &StateStore,
     command: EvidenceKeyCommand,
 ) -> Result<ResultEnvelopeV2> {
+    if matches!(
+        command,
+        EvidenceKeyCommand::AdoptPlan(crate::EvidenceKeyAdoptPlanArgs {
+            command: EvidenceKeyAdoptPlanCommand::Create,
+        }) | EvidenceKeyCommand::Adopt(_)
+    ) {
+        return Err(cfctl_auth::AuthError::from(
+            EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+        )
+        .into());
+    }
     let manager = store.platform_evidence_key_manager()?;
     match command {
         EvidenceKeyCommand::AdoptPreview => adoption_preview(store, &manager),
         EvidenceKeyCommand::AdoptPlan(arguments) => match arguments.command {
-            EvidenceKeyAdoptPlanCommand::Create(arguments) => {
-                let acceptance = adoption_acceptance(&arguments)?;
-                adoption_plan_create(store, &manager, &acceptance)
-            }
+            EvidenceKeyAdoptPlanCommand::Create => Err(cfctl_auth::AuthError::from(
+                EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+            )
+            .into()),
             EvidenceKeyAdoptPlanCommand::Current => adoption_plan_current(store, &manager),
             EvidenceKeyAdoptPlanCommand::Status(selector) => {
                 adoption_plan_status(store, &manager, &selector)
@@ -54,7 +45,10 @@ pub(super) fn evidence_key_command(
                 adoption_plan_revoke(store, &manager, &selector)
             }
         },
-        EvidenceKeyCommand::Adopt(arguments) => adopt(store, &manager, &arguments),
+        EvidenceKeyCommand::Adopt(_) => Err(cfctl_auth::AuthError::from(
+            EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+        )
+        .into()),
         EvidenceKeyCommand::InitPreview => initialization_preview(store, &manager),
         EvidenceKeyCommand::Init => initialize(store, &manager),
         EvidenceKeyCommand::Status => status(store, &manager),
@@ -72,19 +66,6 @@ pub(super) fn evidence_key_command(
         },
         EvidenceKeyCommand::Recover(arguments) => recover(store, &manager, &arguments),
     }
-}
-
-fn adoption_acceptance(
-    arguments: &EvidenceKeyAdoptPlanCreateArgs,
-) -> Result<EvidenceKeyAdoptionAcceptanceV1> {
-    Ok(EvidenceKeyAdoptionAcceptanceV1::operator_supplied(
-        arguments.source_candidate_identity.clone(),
-        arguments.installed_artifact_identity.clone(),
-        arguments.expected_architecture.clone(),
-        arguments.expected_running_cdhash.clone(),
-        arguments.expected_cdhash_algorithm.clone(),
-        arguments.expected_cdhash_full_digest_provenance.clone(),
-    )?)
 }
 
 fn runtime_result(
@@ -326,67 +307,9 @@ fn adoption_preview(store: &StateStore, manager: &EvidenceKeyManager) -> Result<
                 "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
             },
             "secret_or_private_values_exposed": false,
-            "next_action": "Collect fresh operator-accepted source candidate, installed artifact SHA-256, architecture, 40-hex running CDHash, CDHash algorithm, and full-digest provenance; then pass every value explicitly to `cfctl auth evidence-key adopt-plan create`.",
+            "next_action": "Preserve this read-only classification. Signed publication and installation may proceed independently, but adoption plan creation and marker crossing remain unavailable until authenticated, independently reviewed installed-identity receipt support lands.",
         }),
     ))
-}
-
-fn adoption_plan_create(
-    store: &StateStore,
-    manager: &EvidenceKeyManager,
-    acceptance: &EvidenceKeyAdoptionAcceptanceV1,
-) -> Result<ResultEnvelopeV2> {
-    adoption_plan_create_with_runtime(
-        store,
-        manager,
-        acceptance,
-        current_adoption_runtime_identity,
-    )
-}
-
-fn adoption_plan_create_with_runtime(
-    store: &StateStore,
-    manager: &EvidenceKeyManager,
-    acceptance: &EvidenceKeyAdoptionAcceptanceV1,
-    runtime_provider: impl FnOnce(
-        &EvidenceKeyAdoptionAcceptanceV1,
-    ) -> EvidenceKeyAdoptionRuntimeIdentityV1,
-) -> Result<ResultEnvelopeV2> {
-    let lifecycle = store.lock_evidence_lifecycle()?;
-    let runtime = runtime_provider(acceptance);
-    let marker = store.evidence_root_identity()?;
-    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
-    let observation = adoption_observation(
-        marker,
-        counts.descriptor_count,
-        counts.proof_count,
-        &runtime,
-    )?;
-    let plan = manager.create_adoption_plan(&observation, acceptance.clone())?;
-    let mut envelope = ResultEnvelopeV2::success(
-        "auth evidence-key adopt-plan create",
-        json!({
-            "plan": plan,
-            "canonical_location_identity": manager.location_identity(),
-            "resource_class": "local_evidence_integrity_authority",
-            "backend": "platform_keyring",
-            "accepted_runtime": acceptance,
-            "dynamic_self_validation": runtime,
-            "authenticated_descriptor_count": counts.descriptor_count,
-            "authenticated_proof_count": counts.proof_count,
-            "allowed_effect": "create_matching_filesystem_marker_only",
-            "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
-            "admission_authority": "operator_supplied",
-            "private_binding": "platform_keyring_only_non_exportable_through_cfctl",
-            "secret_or_private_values_exposed": false,
-            "execution_command": format!(
-                "cfctl auth evidence-key adopt {} --yes --json",
-                plan.plan_id
-            ),
-        }),
-    );
-    envelope.performed = true;
-    Ok(envelope)
 }
 
 fn adoption_plan_current(
@@ -398,7 +321,13 @@ fn adoption_plan_current(
         .current_adoption_plan_id()?
         .ok_or_else(|| CliError::Input("no adoption plan is discoverable".to_owned()))?;
     let selector = EvidenceKeyAdoptPlanSelector { plan_id };
-    adoption_plan_status_after_lock(store, manager, &selector, &lifecycle)
+    adoption_plan_status_after_lock(
+        store,
+        manager,
+        &selector,
+        &lifecycle,
+        "auth evidence-key adopt-plan current",
+    )
 }
 
 fn adoption_plan_status(
@@ -407,7 +336,13 @@ fn adoption_plan_status(
     selector: &EvidenceKeyAdoptPlanSelector,
 ) -> Result<ResultEnvelopeV2> {
     let lifecycle = store.lock_evidence_lifecycle()?;
-    adoption_plan_status_after_lock(store, manager, selector, &lifecycle)
+    adoption_plan_status_after_lock(
+        store,
+        manager,
+        selector,
+        &lifecycle,
+        "auth evidence-key adopt-plan status",
+    )
 }
 
 fn adoption_plan_status_after_lock(
@@ -415,6 +350,7 @@ fn adoption_plan_status_after_lock(
     manager: &EvidenceKeyManager,
     selector: &EvidenceKeyAdoptPlanSelector,
     lifecycle: &cfctl_storage::EvidenceLifecycleLock,
+    command: &'static str,
 ) -> Result<ResultEnvelopeV2> {
     let acceptance = manager.adoption_plan_acceptance(&selector.plan_id)?;
     let runtime = current_adoption_runtime_identity(&acceptance);
@@ -427,17 +363,29 @@ fn adoption_plan_status_after_lock(
         &runtime,
     )?;
     let plan = manager.adoption_plan_status(&selector.plan_id, &observation)?;
-    Ok(ResultEnvelopeV2::success(
-        "auth evidence-key adopt-plan status",
+    Ok(adoption_plan_status_envelope(
+        command,
+        manager.location_identity(),
+        plan,
+    ))
+}
+
+fn adoption_plan_status_envelope(
+    command: &'static str,
+    canonical_location_identity: &str,
+    plan: EvidenceKeyAdoptionPlanV1,
+) -> ResultEnvelopeV2 {
+    ResultEnvelopeV2::success(
+        command,
         json!({
             "plan": plan,
-            "canonical_location_identity": manager.location_identity(),
+            "canonical_location_identity": canonical_location_identity,
             "backend": "platform_keyring",
             "performed": false,
             "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
             "secret_or_private_values_exposed": false,
         }),
-    ))
+    )
 }
 
 fn adoption_plan_revoke(
@@ -468,232 +416,6 @@ fn adoption_plan_revoke(
         }),
     );
     envelope.performed = true;
-    Ok(envelope)
-}
-
-fn adopt(
-    store: &StateStore,
-    manager: &EvidenceKeyManager,
-    arguments: &EvidenceKeyAdoptArgs,
-) -> Result<ResultEnvelopeV2> {
-    adopt_with_runtime_provider_and_marker_write(
-        store,
-        manager,
-        arguments,
-        |acceptance, _stage| current_adoption_runtime_identity(acceptance),
-        |identity| store.initialize_evidence_root_identity(identity),
-        |_| Ok(()),
-    )
-}
-
-#[cfg(test)]
-fn adopt_with_marker_write(
-    store: &StateStore,
-    manager: &EvidenceKeyManager,
-    arguments: &EvidenceKeyAdoptArgs,
-    runtime: &EvidenceKeyAdoptionRuntimeIdentityV1,
-    write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
-) -> Result<ResultEnvelopeV2> {
-    adopt_with_runtime_provider_and_marker_write(
-        store,
-        manager,
-        arguments,
-        |_acceptance, _stage| runtime.clone(),
-        write_marker,
-        |_| Ok(()),
-    )
-}
-
-fn adopt_with_runtime_provider_and_marker_write(
-    store: &StateStore,
-    manager: &EvidenceKeyManager,
-    arguments: &EvidenceKeyAdoptArgs,
-    runtime_provider: impl FnMut(
-        &EvidenceKeyAdoptionAcceptanceV1,
-        AdoptionRuntimeEvaluationStage,
-    ) -> EvidenceKeyAdoptionRuntimeIdentityV1,
-    write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
-    stage_hook: impl FnMut(AdoptionExecutionStage) -> Result<()>,
-) -> Result<ResultEnvelopeV2> {
-    adopt_with_runtime_clock_provider_and_marker_write(
-        store,
-        manager,
-        arguments,
-        runtime_provider,
-        current_adoption_clock,
-        write_marker,
-        stage_hook,
-    )
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the lifecycle lock, durable crossing, marker, and completion sequence stays contiguous"
-)]
-fn adopt_with_runtime_clock_provider_and_marker_write(
-    store: &StateStore,
-    manager: &EvidenceKeyManager,
-    arguments: &EvidenceKeyAdoptArgs,
-    mut runtime_provider: impl FnMut(
-        &EvidenceKeyAdoptionAcceptanceV1,
-        AdoptionRuntimeEvaluationStage,
-    ) -> EvidenceKeyAdoptionRuntimeIdentityV1,
-    mut clock_provider: impl FnMut() -> Result<EvidenceKeyAdoptionClockV1>,
-    write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
-    mut stage_hook: impl FnMut(AdoptionExecutionStage) -> Result<()>,
-) -> Result<ResultEnvelopeV2> {
-    if !arguments.yes {
-        return Err(CliError::Input(
-            "evidence-key adoption requires --yes for the exact opaque plan identity".to_owned(),
-        ));
-    }
-    let lifecycle = store.lock_evidence_lifecycle()?;
-    stage_hook(AdoptionExecutionStage::LifecycleLockAcquired)?;
-    let acceptance = manager.adoption_plan_acceptance(&arguments.plan_id)?;
-    let prepare_runtime = runtime_provider(&acceptance, AdoptionRuntimeEvaluationStage::Prepare);
-    stage_hook(AdoptionExecutionStage::PrepareRuntimeEvaluated)?;
-    let marker = store.evidence_root_identity()?;
-    let marker_was_absent = marker.is_none();
-    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
-    let observation = adoption_observation_at(
-        marker.clone(),
-        counts.descriptor_count,
-        counts.proof_count,
-        &prepare_runtime,
-        clock_provider()?,
-    );
-    let before = manager.adoption_plan_status(&arguments.plan_id, &observation)?;
-    let status = manager.prepare_adoption(&arguments.plan_id, &observation)?;
-    stage_hook(AdoptionExecutionStage::PrepareAccepted)?;
-    let state_root_identity = status.state_root_identity.as_deref().ok_or_else(|| {
-        CliError::Input("adoption plan omitted its non-secret root binding".to_owned())
-    })?;
-    let marker_runtime = if marker_was_absent {
-        let runtime = runtime_provider(&acceptance, AdoptionRuntimeEvaluationStage::MarkerCrossing);
-        stage_hook(AdoptionExecutionStage::MarkerRuntimeEvaluated)?;
-        let marker_observation = adoption_observation_at(
-            marker.clone(),
-            counts.descriptor_count,
-            counts.proof_count,
-            &runtime,
-            clock_provider()?,
-        );
-        if manager.prepare_adoption(&arguments.plan_id, &marker_observation)? != status {
-            return Err(CliError::Input(
-                "adoption authority drifted before marker crossing".to_owned(),
-            ));
-        }
-        Some(runtime)
-    } else {
-        None
-    };
-    let marker_response_loss = if marker_was_absent {
-        write_marker(state_root_identity).err().map_or(Ok(None), |marker_error| {
-            match store.evidence_root_identity() {
-            Ok(Some(readback)) if readback == state_root_identity => Ok(Some(marker_error)),
-            Ok(None) => Err(CliError::Input(format!(
-                "adoption marker creation did not cross; the private plan remains prepared for an exact retry: {marker_error}"
-            ))),
-            Ok(Some(_)) => Err(CliError::Input(
-                "adoption marker readback conflicts; preserve both sides and stop".to_owned(),
-            )),
-            Err(readback_error) => Err(CliError::Input(format!(
-                "adoption marker state is indeterminate; preserve the private plan and do not create another: write={marker_error}; readback={readback_error}"
-            ))),
-        }
-        })?
-    } else {
-        None
-    };
-    if store.evidence_root_identity()?.as_deref() != Some(state_root_identity) {
-        return Err(CliError::Input(
-            "adoption marker failed exact readback; preserve the private plan".to_owned(),
-        ));
-    }
-    if marker_was_absent {
-        let crossing_observation = adoption_observation_at(
-            Some(state_root_identity.to_owned()),
-            counts.descriptor_count,
-            counts.proof_count,
-            marker_runtime.as_ref().ok_or_else(|| {
-                CliError::Input("adoption marker runtime evidence is unavailable".to_owned())
-            })?,
-            clock_provider()?,
-        );
-        if manager
-            .commit_adoption_marker_crossing(&arguments.plan_id, &crossing_observation)?
-            .state
-            != "marker_crossed"
-        {
-            return Err(CliError::Input(
-                "adoption marker crossing commitment failed exact projection".to_owned(),
-            ));
-        }
-    }
-    let readback = manager.status(Some(state_root_identity))?;
-    if readback != status {
-        return Err(CliError::Input(
-            "valid authority drifted after marker creation; preserve the plan and stop".to_owned(),
-        ));
-    }
-    stage_hook(AdoptionExecutionStage::MarkerCrossed)?;
-    if let Some(marker_error) = marker_response_loss {
-        return Err(CliError::Input(format!(
-            "the exact adoption marker crossed and its private commitment was sealed, but completion was interrupted; rerun the same adoption plan forward: {marker_error}"
-        )));
-    }
-    let completion_runtime =
-        runtime_provider(&acceptance, AdoptionRuntimeEvaluationStage::Completion);
-    stage_hook(AdoptionExecutionStage::CompletionRuntimeEvaluated)?;
-    let completed_observation = adoption_observation_at(
-        Some(state_root_identity.to_owned()),
-        counts.descriptor_count,
-        counts.proof_count,
-        &completion_runtime,
-        clock_provider()?,
-    );
-    let completed = manager.complete_adoption_plan(&arguments.plan_id, &completed_observation)?;
-    stage_hook(AdoptionExecutionStage::TerminalCompleted)?;
-    if completed.status != status || completed.state != "completed" {
-        return Err(CliError::Input(
-            "adoption completion receipt differs from the exact verified authority".to_owned(),
-        ));
-    }
-    let mut envelope = ResultEnvelopeV2::success(
-        "auth evidence-key adopt",
-        json!({
-            "receipt": {
-                "plan_id": completed.plan_id,
-                "canonical_location_identity": manager.location_identity(),
-                "resource_class": "local_evidence_integrity_authority",
-                "backend": "platform_keyring",
-                "runtime_identity": completion_runtime,
-                "marker_runtime_identity": marker_runtime,
-                "prepare_runtime_identity": prepare_runtime,
-                "accepted_runtime": completed.accepted_runtime,
-                "dynamic_self_validation": completed.runtime_validation,
-                "status": status,
-                "authenticated_descriptor_count": counts.descriptor_count,
-                "authenticated_proof_count": counts.proof_count,
-                "marker_transition": if marker_was_absent {
-                    "absent_to_exact_existing_root"
-                } else {
-                    "exact_existing_root_reconciled_forward"
-                },
-                "registry_transition": "unchanged_exact_bytes",
-                "provider_effect": "none",
-                "created_at": completed.created_at,
-                "expires_at": completed.expires_at,
-                "completed_at": completed.completed_at,
-                "state": completed.state,
-                "forward_only_semantics": "same private plan resumes after marker crossing; authority bytes are never replaced or removed",
-                "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
-            },
-            "historical_legacy_evidence": "preserved_and_nonqualifying",
-            "secret_or_private_values_exposed": false,
-        }),
-    );
-    envelope.performed = before.state != "completed";
     Ok(envelope)
 }
 

@@ -13,7 +13,7 @@ applies, and verification receipts separate.
 | The installed command and the checkout behave differently | Run `cfctl version --json` and `cfctl doctor --json`; invoke each candidate executable directly and compare its self-reported path, version, commit, and identity source. Reinstall only from an exact release asset whose checksum matches `SHA256SUMS`. | Do not repair the mismatch with a symlink, PATH shim, unverified binary, or release override. Unknown or dirty identity remains unhealthy. |
 | No profile is selected, or the governed fallback store is active | Run `cfctl auth profiles --json`, select one existing account-pinned profile with `cfctl auth use <profile> --json`, then rerun `cfctl auth status --json`. An active fallback store is authoritative by design; use the explicit repair command only when the operator intentionally wants to test or restore the platform keyring. | Never ask the operator to paste a token, OAuth callback, global key, or fallback file. Do not broaden permissions merely to make the error disappear. |
 | Evidence qualification reports an uninitialized or split platform authority | Run `cfctl auth evidence-key status --json`, then `cfctl auth evidence-key init-preview --json` before any first initialization. Initialize only when both the canonical state-root marker and direct platform registry are absent. Rotate explicitly; retire only an inactive generation after cfctl reports zero authenticated local artifacts. | Never use the credential fallback store for the evidence integrity key, recreate a missing half over existing state, or treat legacy unauthenticated proof rows as current qualification. |
-| The exact sole canonical evidence registry is valid but its marker is absent | Run `cfctl auth evidence-key adopt-preview --json`. Adoption is admissible only for direct platform custody with a valid registry and zero authenticated descriptors or proofs. Create its short-lived private intent with `cfctl auth evidence-key adopt-plan create --source-candidate-identity <accepted-source> --installed-artifact-identity sha256:<accepted-digest> --expected-architecture <accepted-architecture> --expected-running-cdhash <40-hex-cdhash> --expected-cdhash-algorithm <accepted-algorithm> --expected-cdhash-full-digest-provenance <accepted-provenance> --json`. These are explicit operator-accepted claims, not observed or qualified release facts. Discover a response-lost plan with `adopt-plan current`, inspect its immutable record with `adopt-plan status <plan-id>`, and revoke it only before marker crossing is durably committed. Then run `cfctl auth evidence-key adopt <plan-id> --yes --json`. The terminal receipt must say only that cfctl adopted the exact sole canonical valid authority and that original initialization lineage is not proven. | Never default or inherit an accepted identity; call this initialization or resume-init; derive expected identity from the running process or an installed pathname; replace or export the registry; expose a registry digest or secret-derived identity; infer signer, Gatekeeper, notarization, architecture, source equivalence, or historical lineage; or proceed after registry, runtime, artifact-count, backend, or marker drift. `crossing_committed` means the exact current plan crossed its private create-only authorization boundary before expiry; it blocks successors and only that plan may materialize or reconcile the marker forward. A matching marker without the exact crossing commitment is not executable. |
+| The exact sole canonical evidence registry is valid but its marker is absent | Run `cfctl auth evidence-key adopt-preview --json` for a strictly read-only classification. `adopt-plan current|status` remain read-only historical inspection and `adopt-plan revoke` may retire only a plan that never crossed. `adopt-plan create` and `adopt <plan-id> --yes` return `CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED`; they do not persist a plan, create the marker, publish a crossing seal, or complete adoption. Signed publication and installation may proceed independently. | Do not pass raw source, artifact, architecture, CDHash, algorithm, or provenance claims as adoption authority. Wait for a separately reviewed authenticated installed-identity receipt producer and consumer. Do not hand-create the marker, initialize a replacement authority, edit Keychain state, or treat historical plan inspection as an adoption outcome. |
 | The sole canonical evidence registry is malformed while the marker is absent | Run `cfctl auth evidence-key recover-preview --json`. Recovery is admissible only when the direct platform backend has no managed transition and local storage has zero authenticated descriptors or proofs. The preview is classification-only and read-only: it returns a byte count but no raw value, digest, secret-derived identity, quarantine identity, or execution handle. Create the protected private intent with `cfctl auth evidence-key recover-plan create --json`; inspect or revoke its random opaque ID with `recover-plan status|revoke` without another confirmation prompt. Only the protected quarantine-and-replacement transition requires `cfctl auth evidence-key recover <plan-id> --yes --json`. | Never print or export the registry, hand-edit Keychain, initialize over it, derive an execution identity from secret material, retire quarantine in the same transaction, restore malformed bytes after quarantine begins, or delete historical V1 evidence. A marker, authenticated artifact, unmanaged custody drift, or conflicting readback remains a hold; after a crossed quarantine transition, resume only the same private plan forward. |
 | Catalog sync, coverage, or a stored catalog fails | Run `cfctl catalog sync --json`, then `cfctl catalog coverage --json`. Preserve `previous_catalog` and the returned error code; a discarded invalid current catalog is evidence of safe replacement, not evidence that earlier plans are valid. | Never edit a catalog body or content hash, restore a stale snapshot as current, or reuse a plan whose catalog pin drifted. |
 | A capability or write is blocked | Run `cfctl guide <capability-id> --json` and follow the exact `next_action`. Report the capability ID and `blocking_gaps` when the guide cannot close the contract. | Never route around `CFCTL_CAPABILITY_BLOCKED` with raw HTTP, Wrangler, dashboard changes, a broader token, or hand-edited plan JSON. |
@@ -1684,51 +1684,27 @@ preview, apply, and post-change verification evidence.
   A valid sole canonical platform registry with a missing local marker is an
   adoption case, not initialization or resume-init. `adopt-preview` performs a
   read-only, body-free classification and requires direct platform custody and
-  zero authenticated artifacts. `adopt-plan create` requires fresh explicit
-  operator-accepted source-candidate, installed-artifact, architecture, 40-hex
-  CDHash, algorithm, and full-digest-provenance fields. It records those claims
-  immutably with the exact undisclosed registry bytes, non-secret status, absent
-  marker, artifact counts, wall deadline, boot/session discriminator, and typed
-  monotonic deadline; its public plan ID is random and opaque. Creation publishes
-  and exactly reads back that create-only immutable record before publishing the
-  canonical predecessor-bound allocating pointer. A crash after record creation
-  but before pointer publication leaves no discoverable allocation and permits a
-  fresh create. A legacy allocating pointer with no record is also treated as no
-  allocation and may be replaced only through exact compare-and-set, with the
-  interrupted pointer bound as the replacement's predecessor. A
-  record-backed allocating pointer remains `allocating_recoverable` only for the
-  identical admission; a different admission, conflicting record, or active
-  pointer without its record fails closed. ID-addressed status preserves expired
-  and terminal history. On macOS,
-  creation and execution use Security.framework dynamic `SecCode` validity
-  against exactly `cdhash H\"<accepted-40-hex>\"`; on Linux they compare a
-  descriptor-bound `/proc/self/exe` SHA-256 to the accepted installed-artifact
-  identity. The confirmed `adopt <plan-id> --yes` acquires the evidence-key
-  lifecycle lock before any native runtime evaluation, validates freshly for
-  prepare, validates again immediately before durably committing the missing-marker
-  transition, and
-  validates a third time immediately before terminal completion. A completion
-  mismatch or indeterminate result leaves the exact plan
-  at `marker_crossed` for forward-only reconciliation. Adoption writes only the
-  missing marker through the create-only API, proves the registry bytes are
-  unchanged, and emits an immutable terminal receipt. Before marker creation it
-  keeps ordinary evidence status and authentication blocked while the current
-  adoption is unsealed. It creates and exactly reads back the marker, then takes a
-  fresh boot, wall, and monotonic observation and publishes a private create-only
-  seal bound to that marker observation, current record, and pointer. If the
-  deadline passed before the post-marker observation, the unsealed marker remains
-  a fail-closed operator-recovery hold and cannot authorize evidence.
-  `crossing_committed` is forward-only and blocks successor
-  creation, and lets only the same plan materialize or reconcile the marker
-  regardless of later expiry or reboot. A matching marker without that exact
-  commitment is a conflict, not evidence of crossing. Historical
-  expired and terminal records remain ID-addressable, but cannot prepare,
-  inherit the authority-wide marker, or complete unless the current canonical
-  pointer still identifies and binds that exact record. The receipt
-  claims only that cfctl adopted the exact sole canonical valid authority and
-  that original initialization lineage is not proven; it does not prove signer,
-  Gatekeeper, notarization, architecture observation, installation, source
-  equivalence, or release lineage. No Cloudflare provider boundary is involved.
+  zero authenticated artifacts. `adopt-plan current` and ID-addressed
+  `adopt-plan status` preserve read-only historical inspection; receipt-less
+  records are non-executable. `adopt-plan revoke` remains available only for a
+  plan whose protected crossing never began.
+
+  `adopt-plan create` and `adopt <plan-id> --yes` are release HOLDs. Each returns
+  `CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED` before any private plan or
+  pointer write, marker creation, crossing-seal publication, or terminal event.
+  Raw caller-provided source-candidate, installed-artifact, architecture,
+  CDHash, algorithm, and provenance fields are no longer accepted by the command
+  grammar because they cannot authenticate independent review or installation.
+  Signed publication and installation may proceed independently; adoption must
+  wait for a separately reviewed authenticated installed-identity receipt
+  producer and consumer.
+
+  The preserved private state machine remains fail-closed for historical and
+  interrupted state. A record-backed `allocating` pointer may be inspected or
+  recovered only as allocation state; it cannot publish a crossing seal, project
+  `marker_crossed`, complete, or re-enable ordinary evidence authentication. A
+  matching marker without an exact active-plan seal is conflict, not evidence of
+  adoption. No adoption outcome or Cloudflare provider effect is claimed.
   A malformed sole canonical platform registry is not an initialization case:
   `cfctl auth evidence-key recover-preview --json` only classifies the state and
   reports its byte count and local artifact counts. It writes nothing and
