@@ -149,9 +149,9 @@ fn get_with(
     };
     match inventory.state {
         InventoryState::PreparingLegacy => get_unmanaged(adapter, service, key),
-        InventoryState::Deleting | InventoryState::DeletingLegacyV1 => Err(AuthError::SecretStore(
-            "platform keyring credential deletion is incomplete".to_owned(),
-        )),
+        InventoryState::Deleting | InventoryState::DeletingLegacyV1 => {
+            Err(AuthError::SecretStoreDeletionIncomplete)
+        }
         InventoryState::PublishedNeedsRootScrub
         | InventoryState::PublishedLegacyV1NeedsRootScrub => {
             read_generation(adapter, service, key, &inventory.primary).map(Some)

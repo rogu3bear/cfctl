@@ -754,23 +754,34 @@ fn reset(
                 .to_owned(),
         ));
     }
-    let status = manager.status(None)?;
-    let Some(discarded_state_root) = status.state_root_identity.clone() else {
-        return Err(CliError::Input(
-            "evidence key reset requires an existing platform authority; run `cfctl auth evidence-key init --json` instead"
-                .to_owned(),
-        ));
-    };
-    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
-    if counts.descriptor_count != 0 || counts.proof_count != 0 {
-        return Err(CliError::Input(format!(
-            "evidence key reset requires zero authenticated local artifacts; {} descriptors and {} proofs still depend on this authority and would become unverifiable",
-            counts.descriptor_count, counts.proof_count
-        )));
+    // A reset whose discard already crossed the managed deletion boundary is resumed
+    // forward with the same plan rather than re-decided. Its admissibility was proven
+    // before the crossing, the registry is already unreadable, and the only safe
+    // completion is the managed teardown.
+    match manager.status(None) {
+        Err(cfctl_auth::AuthError::SecretStoreDeletionIncomplete) => {
+            manager.complete_interrupted_registry_deletion()?;
+        }
+        Err(status_error) => return Err(status_error.into()),
+        Ok(status) => {
+            let Some(discarded_state_root) = status.state_root_identity.clone() else {
+                return Err(CliError::Input(
+                    "evidence key reset requires an existing platform authority; run `cfctl auth evidence-key init --json` instead"
+                        .to_owned(),
+                ));
+            };
+            let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+            if counts.descriptor_count != 0 || counts.proof_count != 0 {
+                return Err(CliError::Input(format!(
+                    "evidence key reset requires zero authenticated local artifacts; {} descriptors and {} proofs still depend on this authority and would become unverifiable",
+                    counts.descriptor_count, counts.proof_count
+                )));
+            }
+            // rollback_initialize admits only an exact fresh single-generation authority,
+            // so a rotated or in-use registry is refused here rather than destroyed.
+            manager.rollback_initialize(&discarded_state_root)?;
+        }
     }
-    // rollback_initialize admits only an exact fresh single-generation authority, so a
-    // rotated or in-use registry is refused here rather than silently destroyed.
-    manager.rollback_initialize(&discarded_state_root)?;
     let initialized = initialize_fresh_locked(store, manager, |state_root_identity| {
         store.initialize_evidence_root_identity(state_root_identity)
     })?;
@@ -1126,6 +1137,83 @@ mod tests {
             .expect("registry and marker agree");
         assert!(status.initialized);
         assert_eq!(status.state_root_identity.as_deref(), Some(marker.as_str()));
+    }
+
+    /// Models a managed keyring whose registry deletion crossed its inventory
+    /// transition and stopped: the value is unreadable, and only the managed teardown
+    /// can finish it.
+    #[derive(Default)]
+    struct ResumableDeletionSecretStore {
+        inner: MemorySecretStore,
+        deletion_crossed: AtomicBool,
+    }
+
+    impl ResumableDeletionSecretStore {
+        fn is_registry(key: &str) -> bool {
+            key.ends_with("/registry-v1")
+        }
+    }
+
+    impl SecretStore for ResumableDeletionSecretStore {
+        fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> cfctl_auth::Result<Option<String>> {
+            if Self::is_registry(key) && self.deletion_crossed.load(Ordering::Acquire) {
+                return Err(AuthError::SecretStoreDeletionIncomplete);
+            }
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> cfctl_auth::Result<()> {
+            if Self::is_registry(key) {
+                self.deletion_crossed.store(false, Ordering::Release);
+            }
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> cfctl_auth::Result<Option<SecretBackend>> {
+            Ok(self.inner.get(key)?.map(|_| SecretBackend::Memory))
+        }
+    }
+
+    #[test]
+    fn reset_resumes_a_discard_that_already_crossed_the_deletion_boundary() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let backend = Arc::new(ResumableDeletionSecretStore::default());
+        let manager = EvidenceKeyManager::new(
+            backend.clone(),
+            store.evidence_location_identity(),
+            SecretBackend::Memory,
+        )
+        .expect("resumable-deletion evidence manager");
+        manager
+            .initialize(&format!("sha256:{}", "a".repeat(64)))
+            .expect("an authority exists");
+        // A prior authorized reset crossed the managed deletion and stopped, so the
+        // registry is now unreadable rather than absent.
+        backend.deletion_crossed.store(true, Ordering::Release);
+        assert!(matches!(
+            manager.status(None),
+            Err(AuthError::SecretStoreDeletionIncomplete)
+        ));
+
+        let envelope = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect("reset resumes the same discard forward");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("fresh marker exists");
+        let fresh = manager
+            .status(Some(&marker))
+            .expect("status is readable again");
+        assert!(fresh.initialized);
+        assert_eq!(fresh.state_root_identity.as_deref(), Some(marker.as_str()));
+        status_command(&store, &manager).expect("the authority is no longer split");
     }
 
     fn stranded_authority(manager: &EvidenceKeyManager) -> String {

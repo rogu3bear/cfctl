@@ -609,6 +609,25 @@ impl EvidenceKeyManager {
         Ok(Some(intent.state_root_identity))
     }
 
+    /// Drive a registry deletion that already crossed its inventory transition to
+    /// completion.
+    ///
+    /// The managed keyring records the deletion before removing anything, so an
+    /// interrupted delete is resumable by design; the value is simply unreadable
+    /// until it finishes. Every ordinary entry point reads the registry before
+    /// writing, which makes that state unreachable without this explicit step.
+    /// Deleting through the managed teardown is the only safe completion: removing
+    /// the root item by hand orphans its chunk set.
+    pub fn complete_interrupted_registry_deletion(&self) -> Result<()> {
+        self.store.delete(&self.registry_key())?;
+        if self.load_registry()?.is_some() {
+            return Err(AuthError::SecretStore(
+                "resuming the interrupted registry deletion left a readable registry".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Retire the intent once its crossing is complete or abandoned.
     pub fn clear_initialization_intent(&self) -> Result<()> {
         let key = self.initialization_intent_key();

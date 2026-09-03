@@ -44,6 +44,13 @@ pub enum AuthError {
     Json(#[from] serde_json::Error),
     #[error("secret store failed: {0}")]
     SecretStore(String),
+    /// A managed platform-keyring deletion crossed its inventory transition and did
+    /// not finish. The value is unreadable, but the deletion is resumable forward and
+    /// must never be completed by hand.
+    #[error(
+        "platform keyring credential deletion is incomplete; it must be resumed forward, not hand-removed"
+    )]
+    SecretStoreDeletionIncomplete,
     #[error(transparent)]
     EvidenceKeyLifecycle(#[from] EvidenceKeyLifecycleError),
     #[error(transparent)]
