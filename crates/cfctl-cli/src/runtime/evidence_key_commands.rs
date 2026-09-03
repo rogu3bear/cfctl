@@ -1442,6 +1442,39 @@ mod tests {
     }
 
     #[test]
+    fn an_intent_whose_registry_never_materialized_does_not_block_initialization() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        // A crash after the intent but before the registry names an authority that was
+        // never created. Nothing can reference it, so a later initialization must be
+        // able to proceed rather than being stranded on stale bookkeeping.
+        manager
+            .publish_initialization_intent(&format!("sha256:{}", "9".repeat(64)))
+            .expect("an intent is published");
+        assert_eq!(
+            manager
+                .interrupted_initialization()
+                .expect("nothing to resume without a registry"),
+            None
+        );
+
+        let envelope = initialize(&store, &manager).expect("initialization proceeds");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("marker exists");
+        assert_ne!(
+            marker,
+            format!("sha256:{}", "9".repeat(64)),
+            "the abandoned identity must not be reused"
+        );
+        status_command(&store, &manager).expect("the authority is coherent");
+    }
+
+    #[test]
     fn a_completed_initialization_leaves_no_resumable_intent() {
         let root = tempfile::tempdir().expect("temporary storage root");
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");

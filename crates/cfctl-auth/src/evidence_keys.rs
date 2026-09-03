@@ -566,14 +566,11 @@ impl EvidenceKeyManager {
                     .to_owned(),
             ));
         }
-        if let Some(existing) = self.load_initialization_intent()?
-            && existing.state_root_identity != state_root_identity
-        {
-            return Err(AuthError::SecretStore(
-                "a different initialization intent is already published for this state location"
-                    .to_owned(),
-            ));
-        }
+        // Reaching here proves no registry exists, so any intent still published names
+        // an authority that was never created: a crash after the intent and before the
+        // registry. Nothing can reference that identity, so replacing it is safe and is
+        // the only way a later initialization can proceed. Refusing here would strand
+        // the state location on its own bookkeeping.
         self.save_initialization_intent(&EvidenceKeyInitializationIntentV1 {
             schema_version: INITIALIZATION_INTENT_SCHEMA_VERSION,
             location_identity: self.location_identity.clone(),
