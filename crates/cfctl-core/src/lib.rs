@@ -929,6 +929,34 @@ pub enum EffectClass {
     Unknown,
 }
 
+impl EffectClass {
+    /// Reports whether an operation of this effect class may only execute
+    /// against a qualifying evidence authority.
+    ///
+    /// The partition is reversibility, not approval. An effect that cannot be
+    /// replayed or undone must fail closed when it cannot be attested, because
+    /// the act would be unreconstructable afterward. A replayable effect may
+    /// proceed and record that it executed unattested.
+    ///
+    /// This is deliberately not the planner's approval partition
+    /// (`cfctl_planner`), which answers a different question: whether a human
+    /// must approve. The two agree everywhere except `Spend`, which the planner
+    /// gates on cost while this gates it on the fact that money already moved
+    /// cannot be recalled.
+    #[must_use]
+    pub const fn requires_attestation_to_execute(self) -> bool {
+        match self {
+            Self::ReadOnly | Self::DataWrite | Self::ReversibleWrite => false,
+            Self::Destructive
+            | Self::ExternalCommunication
+            | Self::IdentityOrOwnership
+            | Self::Spend
+            | Self::Irreversible
+            | Self::Unknown => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Maturity {
@@ -7855,6 +7883,64 @@ pub struct ErrorV1 {
     pub next_step: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationStateV1 {
+    /// The evidence authority qualified, so the operation's evidence records
+    /// are authenticated against it.
+    Attested,
+    /// The evidence authority did not qualify, and the operation's effect
+    /// class is replayable, so execution proceeded without an authenticated
+    /// record.
+    UnattestedReversibleEffect,
+}
+
+impl AttestationStateV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attested => "attested",
+            Self::UnattestedReversibleEffect => "unattested_reversible_effect",
+        }
+    }
+}
+
+/// Reports whether a provider boundary was crossed under a qualifying
+/// evidence authority.
+///
+/// This is telemetry, not a security control. It is written by the same
+/// installation whose evidence authority was unavailable, so it is
+/// unauthenticated and proves nothing against an adversary able to suppress
+/// evidence. It exists so an honest failure is visible rather than silent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestationStatusV1 {
+    pub schema_version: u8,
+    pub state: AttestationStateV1,
+    /// Why the authority did not qualify. Present only when `state` is
+    /// `UnattestedReversibleEffect`.
+    pub reason: Option<String>,
+}
+
+impl AttestationStatusV1 {
+    #[must_use]
+    pub const fn attested() -> Self {
+        Self {
+            schema_version: 1,
+            state: AttestationStateV1::Attested,
+            reason: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn unattested_reversible_effect(reason: String) -> Self {
+        Self {
+            schema_version: 1,
+            state: AttestationStateV1::UnattestedReversibleEffect,
+            reason: Some(reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultEnvelopeV2 {
     pub schema_version: u8,
@@ -7871,6 +7957,9 @@ pub struct ResultEnvelopeV2 {
     pub evidence: Vec<EvidenceV1>,
     pub result: Value,
     pub error: Option<ErrorV1>,
+    /// Set only where a provider boundary is crossed under the evidence gate.
+    /// `None` means attestation is not a concept for this command.
+    pub attestation: Option<AttestationStatusV1>,
 }
 
 impl ResultEnvelopeV2 {
@@ -7895,6 +7984,7 @@ impl ResultEnvelopeV2 {
             evidence: Vec::new(),
             result,
             error: None,
+            attestation: None,
         }
     }
 
@@ -7928,6 +8018,7 @@ impl ResultEnvelopeV2 {
                 message: message.to_owned(),
                 next_step: next_step.map(str::to_owned),
             }),
+            attestation: None,
         }
     }
 }

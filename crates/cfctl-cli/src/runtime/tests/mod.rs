@@ -71,18 +71,19 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
-    AsyncCollectionMutationContractV1, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
-    CreatedNestedResourceContractV1, CreatedResourceContractV1,
-    D1FullExportGovernedExecutionBindingV1, EffectClass, EntitlementProbeV1, EvidenceClass,
-    EvidenceV1, Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
-    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-    PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
-    R2PrivateFileUploadContractV1, ResponseBodyModeV1, ResponseContractV1, ResultEnvelopeV2,
-    RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
-    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
-    StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-    WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, WorkflowContractV1, WorkflowStepV1,
-    WorkspaceD1MigrationContractV1, WorkspaceD1PolicyProjectionContractV1, hash_value,
+    AsyncCollectionMutationContractV1, AttestationStateV1, AttestationStatusV1, CapabilityV1,
+    CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    CreatedResourceContractV1, D1FullExportGovernedExecutionBindingV1, EffectClass,
+    EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
+    Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2,
+    QuerySerializationV1, R2PrivateFileUploadContractV1, ResponseBodyModeV1, ResponseContractV1,
+    ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
+    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+    TransactionStageV1, VerificationState, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+    WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1,
+    WorkspaceD1PolicyProjectionContractV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore as StorageStateStore, StorageError};
 use chrono::{Duration as ChronoDuration, Utc};

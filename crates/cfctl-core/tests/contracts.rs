@@ -2,8 +2,9 @@
 
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
-    AsyncCollectionMutationContractV1, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1,
-    CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    AsyncCollectionMutationContractV1, AttestationStateV1, AttestationStatusV1,
+    CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, CostV1,
+    CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
     DeletedNestedResourceContractV1, DeploymentPlanSetChildV1, DeploymentPlanSetRepositoryV1,
     DeploymentPlanSetV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
@@ -3182,6 +3183,79 @@ fn evidence_and_envelopes_do_not_conflate_artifact_presence_with_verification() 
     assert!(envelope.ok);
     assert!(!envelope.performed);
     assert_eq!(envelope.verification.state.as_str(), "not_applicable");
+}
+
+#[test]
+fn an_envelope_without_a_boundary_crossing_claims_no_attestation() {
+    let envelope = ResultEnvelopeV2::success("catalog.search", json!({"matches": []}));
+    assert!(
+        envelope.attestation.is_none(),
+        "attestation is not a concept for a command that crosses no provider boundary"
+    );
+
+    let failed = ResultEnvelopeV2::failure("plans.run", "CFCTL_INPUT", "bad input", None);
+    assert!(
+        failed.attestation.is_none(),
+        "a result that never reached the boundary must not imply an attested crossing"
+    );
+}
+
+#[test]
+fn the_attestation_wire_contract_names_the_degraded_state_exactly() {
+    // `docs/v2-security.md` documents these exact strings. A rename here is a
+    // public contract break, not an internal refactor.
+    assert_eq!(AttestationStateV1::Attested.as_str(), "attested");
+    assert_eq!(
+        AttestationStateV1::UnattestedReversibleEffect.as_str(),
+        "unattested_reversible_effect"
+    );
+
+    let mut envelope = ResultEnvelopeV2::success("plans.run", json!({}));
+    envelope.attestation = Some(AttestationStatusV1::unattested_reversible_effect(
+        "evidence state-root identity is missing".to_owned(),
+    ));
+    let encoded = serde_json::to_value(&envelope).expect("envelope serializes");
+    assert_eq!(
+        encoded["attestation"],
+        json!({
+            "schema_version": 1,
+            "state": "unattested_reversible_effect",
+            "reason": "evidence state-root identity is missing",
+        }),
+        "the serialized state must equal the string the security contract publishes"
+    );
+
+    assert_eq!(
+        serde_json::to_value(AttestationStatusV1::attested()).expect("attested serializes"),
+        json!({"schema_version": 1, "state": "attested", "reason": Value::Null})
+    );
+}
+
+#[test]
+fn only_replayable_effects_may_execute_without_a_qualifying_evidence_authority() {
+    for effect in [
+        EffectClass::ReadOnly,
+        EffectClass::DataWrite,
+        EffectClass::ReversibleWrite,
+    ] {
+        assert!(
+            !effect.requires_attestation_to_execute(),
+            "{effect:?} is replayable, so losing the receipt does not lose the act"
+        );
+    }
+    for effect in [
+        EffectClass::Destructive,
+        EffectClass::ExternalCommunication,
+        EffectClass::IdentityOrOwnership,
+        EffectClass::Spend,
+        EffectClass::Irreversible,
+        EffectClass::Unknown,
+    ] {
+        assert!(
+            effect.requires_attestation_to_execute(),
+            "{effect:?} cannot be replayed or recalled, so it must not execute unattested"
+        );
+    }
 }
 
 #[test]

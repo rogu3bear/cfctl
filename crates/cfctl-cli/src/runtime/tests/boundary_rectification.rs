@@ -875,11 +875,31 @@ pub(super) async fn delegated_local_failure_after_consumption_does_not_claim_a_p
             token: "fixture-token".to_owned(),
         },
         &MemorySecretStore::default(),
-        LivePreconditionEvidence::default(),
+        ExecutionAdmission {
+            evidence: LivePreconditionEvidence::default(),
+            attestation: AttestationStatusV1::unattested_reversible_effect(
+                "fixture executes without a qualifying evidence authority".to_owned(),
+            ),
+        },
     )
     .await
     .expect("local delegated failure becomes a typed recovery envelope");
 
+    // A boundary crossing must report its own attestation even when the
+    // crossing failed locally: an unattested attempt is exactly the case a
+    // reader needs to be able to see.
+    let attestation = envelope
+        .attestation
+        .clone()
+        .expect("every executed plan reports whether its crossing was attested");
+    assert_eq!(
+        attestation.state,
+        AttestationStateV1::UnattestedReversibleEffect
+    );
+    assert_eq!(
+        attestation.reason.as_deref(),
+        Some("fixture executes without a qualifying evidence authority")
+    );
     assert!(!envelope.ok);
     assert!(!envelope.performed);
     assert_eq!(envelope.result["outcome"], "not_attempted");
