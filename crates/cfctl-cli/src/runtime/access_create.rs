@@ -2,7 +2,10 @@
 use super::access_ownership::access_application_collection_source_contract_supported;
 use super::cloudflare_api::BASE_URL as API_BASE_URL;
 use super::plan_secret::ACCESS_APP_LIST_CAPABILITY_ID;
-use super::prelude::*;
+use super::prelude::{
+    AuthCredential, CallInput, CapabilityV1, CatalogSnapshot, CliError, EvidenceClass, EvidenceV1,
+    Executor, PlanV1, Result, StateStore, Value, json,
+};
 use super::support::{capability_missing, http_client};
 use cfctl_core::hash_value;
 
@@ -109,7 +112,9 @@ pub(super) async fn validate_live(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use super::{PRECONDITION, pinned_absence_hash};
+    use cfctl_core::{CapabilityV1, PlanV1, hash_value};
+    use serde_json::json;
     #[test]
     fn owned_create_requires_pinned_absence_before_any_live_read() {
         let capability = CapabilityV1::new(

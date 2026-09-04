@@ -528,10 +528,16 @@ pub(super) fn history(store: &StateStore) -> Result<ResultEnvelopeV2> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use super::{TransitionPlan, activate, create_epoch, preview, snapshot};
+    use crate::{EvidenceKeyPrivateActivateArgs, profiles::ProfilesConfig};
+    use cfctl_auth::{EvidenceMacProvider as _, SecretStore as _};
     use cfctl_auth::{FileSecretStore, ProfileMetadata, SecretBackend};
     use cfctl_core::EvidenceClass;
+    use cfctl_core::{AdmissionPolicyBundleV1, ResultEnvelopeV2};
     use cfctl_storage::selected_runtime;
+    use cfctl_storage::{RuntimePaths, StateStore, open_private_control};
+    use serde_json::json;
+    use std::fs;
     use std::sync::Arc;
 
     fn setup() -> (tempfile::TempDir, StateStore) {
