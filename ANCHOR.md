@@ -61,8 +61,9 @@ The website explains the control plane; it is not a second control plane.
   readback visibly separate.
 - Do not call work complete while an available verification path has not
   passed.
-- Local proof is `cargo xtask verify`; release assembly is
-  `cargo xtask release`.
+- Local proof is `cargo xtask verify`. Unsigned release assembly is
+  `cargo xtask assemble`, which runs that proof first. `cargo xtask release` is
+  the signed superset and additionally requires the release trust roots.
 
 ## Ownership Boundaries
 
@@ -77,7 +78,7 @@ The website explains the control plane; it is not a second control plane.
 - `crates/cfctl-agent`: agent installation and handoff
 - `crates/cfctl-storage`: durable plans, locks, imports, and evidence
 - `crates/cfctl-cli`: orchestration and the public parser
-- `xtask`: repository verification and release assembly
+- `xtask`: repository verification, release assembly, signing, and publication
 
 Ownership moves only with consumer migration and proof that the previous owner
 no longer serves a live contract.

@@ -33,6 +33,13 @@ const MACOS_RELEASE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-
 const VERIFY_CROSS_TARGET: &str = "x86_64-unknown-linux-musl";
 const CARGO_AUDITABLE_VERSION: &str = "0.7.5";
 const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
+/// Local operator adapters. `LAYERS.md` keeps these gitignored so a clone
+/// inherits the constitution without an operator context, which also puts them
+/// outside `git ls-files` and therefore outside every tracked-file scan. Source
+/// contracts that guard doctrine must check them explicitly or leave a blind
+/// spot: the retired public domain survived in `AGENTS.md` for exactly that
+/// reason. Present-only — a clone legitimately has neither.
+const LOCAL_OPERATOR_ADAPTERS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
@@ -546,6 +553,21 @@ fn verify_public_domain_contract() -> Result<(), TaskError> {
             continue;
         };
         if contains_retired_public_domain(content) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} contains the retired public domain; cfctl.com is the only active public domain"
+            )));
+        }
+    }
+
+    // Gitignored adapters are invisible to `git ls-files`, so scan them by name.
+    for path in LOCAL_OPERATOR_ADAPTERS {
+        let absolute_path = repository_root.join(path);
+        if !absolute_path.is_file() {
+            continue;
+        }
+        let content = fs::read_to_string(&absolute_path)
+            .map_err(|source| io_error(&absolute_path, source))?;
+        if contains_retired_public_domain(&content) {
             return Err(TaskError::InvalidSourceContract(format!(
                 "{path} contains the retired public domain; cfctl.com is the only active public domain"
             )));
@@ -1538,7 +1560,6 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         "NORTH_STAR.md",
         "LAYERS.md",
     ];
-    let optional_local_guidance = ["AGENTS.md", "CLAUDE.md"];
     let stale_v1_guidance = [
         // Archived public verbs / auth lanes
         "./scripts/",
@@ -1567,7 +1588,7 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
     for path in required_guidance {
         verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
     }
-    for path in optional_local_guidance {
+    for path in LOCAL_OPERATOR_ADAPTERS {
         let absolute_path = repository_root.join(path);
         if absolute_path.is_file() {
             verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
