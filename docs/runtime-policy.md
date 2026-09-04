@@ -6,11 +6,12 @@ The policy engine, never an agent, classifies a plan as `auto_execute`,
 > Authority: this file is the runtime policy — it is authoritative for plan
 > classification (`auto_execute` / `approval_required` / `blocked`), approval
 > and standing-authority mechanics, and the adapter boundary. For the
-> credential-storage, secret-sink, catalog and journal hashing, redaction, and
-> per-capability safety invariants it references, `docs/v2-security.md` is
-> authoritative. The two documents overlap by design and must agree — defer to
-> the security contract on a secret, journal, or redaction detail, and to this
-> file on a classification or approval detail.
+> credential-storage, secret-sink, catalog and journal hashing, and redaction
+> invariants it references, `docs/v2-security.md` is authoritative;
+> `docs/capability-safety-contracts.md` owns what each governed capability
+> depends on. These documents overlap by design and must agree — defer to the
+> security contract on a secret, journal, or redaction detail, and to this file
+> on a classification or approval detail.
 
 ## Automatic execution
 
@@ -232,8 +233,9 @@ durable sink receipt; cfctl does not claim that a later read verified the value.
 The per-capability secret-sink exceptions and verifiers — the Access
 service-token creation/update/refresh contracts, OAuth client creation, and the
 two-phase OAuth client-secret rotation — are owned by
-[docs/v2-security.md](v2-security.md), which this file defers to for every
-secret, journal, or redaction detail.
+[docs/capability-safety-contracts.md](capability-safety-contracts.md). This file
+defers to [docs/v2-security.md](v2-security.md) for every secret, journal, or
+redaction detail.
 
 ## Adapter boundary
 
