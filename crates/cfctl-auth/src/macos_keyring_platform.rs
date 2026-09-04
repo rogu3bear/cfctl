@@ -576,6 +576,30 @@ fn validate_keychain_value(bytes: Vec<u8>) -> Result<String> {
     })
 }
 
+/// Suppress keychain dialogs when nothing in this context can answer one.
+///
+/// macOS raises an authorization dialog on its own and then waits. A caller with
+/// no terminal cannot answer it, so the operation blocks indefinitely on a prompt
+/// the operator may never see. Disabling interaction turns that invisible wait
+/// into `errSecInteractionNotAllowed`, which is reported as
+/// [`AuthError::SecretStoreAuthorizationRequired`]: an accurate, immediate answer
+/// instead of a hang.
+///
+/// An attended caller keeps the dialog, because there a person can approve it.
+///
+/// The returned guard re-enables interaction when dropped. Interaction is a
+/// process-wide setting, so these guards are deliberately held for one operation
+/// at a time and never nested.
+fn suppress_keychain_dialogs_when_unattended()
+-> Option<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() || std::io::stderr().is_terminal() {
+        return None;
+    }
+    security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok()
+}
+
 fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
     if value.contains(['\n', '\r']) {
         return Err(AuthError::SecretStore(
@@ -587,11 +611,13 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
             "platform keyring item exceeds the maximum logical byte bound".to_owned(),
         ));
     }
+    let _dialogs = suppress_keychain_dialogs_when_unattended();
     security_framework::passwords::set_generic_password(service, key, value.as_bytes())
         .map_err(classify_keychain_error)
 }
 
 fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
+    let _dialogs = suppress_keychain_dialogs_when_unattended();
     match security_framework::passwords::get_generic_password(service, key) {
         Ok(bytes) => validate_keychain_value(bytes).map(Some),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
@@ -636,6 +662,7 @@ pub(super) fn decode_security_stdout(mut bytes: Vec<u8>) -> Result<String> {
 }
 
 fn security_command_delete(service: &str, key: &str) -> Result<()> {
+    let _dialogs = suppress_keychain_dialogs_when_unattended();
     match security_framework::passwords::delete_generic_password(service, key) {
         Ok(()) => Ok(()),
         // Absence is the intended end state, so a missing item is success. The
