@@ -40,6 +40,105 @@ const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
 /// spot: the retired public domain survived in `AGENTS.md` for exactly that
 /// reason. Present-only — a clone legitimately has neither.
 const LOCAL_OPERATOR_ADAPTERS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// Every field permitted on `CapabilityV1`.
+///
+/// `CapabilityV1` is the single contract every catalog capability is expressed
+/// as, so a field added here is carried by all of them, forever, whether or not
+/// it applies. Widening it is a deliberate act: `verify` fails until this list
+/// is edited in the same change, which makes the addition something a reviewer
+/// sees rather than something that arrives quietly.
+const CAPABILITY_V1_FIELDS: [&str; 56] = [
+    "schema_version",
+    "id",
+    "title",
+    "description",
+    "authority_scope",
+    "product",
+    "source",
+    "method",
+    "path",
+    "account_scope",
+    "selectors",
+    "aliases",
+    "permissions",
+    "mutating",
+    "execution_supported",
+    "risk",
+    "effect",
+    "maturity",
+    "entitlement",
+    "cost",
+    "verification",
+    "rollback",
+    "created_resource",
+    "created_collection_resource",
+    "created_nested_resource",
+    "deleted_resource",
+    "deleted_nested_resource",
+    "updated_resource",
+    "same_path_read",
+    "async_collection_mutation",
+    "adapter_status",
+    "blocked_reason",
+    "request_schema",
+    "response_contract",
+    "analytics_query",
+    "d1_schema_introspection",
+    "mln_0142_post_import_schema",
+    "mln_0143_data_invariants",
+    "d1_full_export",
+    "d1_restore_exact_bookmark",
+    "workspace_d1_migration",
+    "workspace_d1_policy_projection",
+    "workspace_d1_reply_admission",
+    "workspace_reply_subdomain_ingress",
+    "workspace_d1_evidence",
+    "r2_private_file_upload",
+    "r2_private_object_digest",
+    "email_sending_dns_repair",
+    "email_routing_subdomain_dns",
+    "d1_approved_mln_import",
+    "d1_approved_mln_import_poll_resume",
+    "r2_log_retrieval",
+    "graphql",
+    "workflow",
+    "security_action",
+    "event_batch",
+];
+/// Fields on `CapabilityV1` that name one application rather than a provider
+/// capability.
+///
+/// `ANCHOR.md` reserves this repository for the cataloged path to live
+/// Cloudflare truth and leaves an application's own deployment policy with the
+/// application. These fields are that boundary already crossed, recorded here
+/// so the debt is counted rather than assumed.
+///
+/// **This list may shrink. It must never grow.** Every entry removed is one
+/// application contract that moved to the repository that owns it.
+const CAPABILITY_V1_APPLICATION_FIELDS: [&str; 10] = [
+    "mln_0142_post_import_schema",
+    "mln_0143_data_invariants",
+    "d1_approved_mln_import",
+    "d1_approved_mln_import_poll_resume",
+    "workspace_d1_migration",
+    "workspace_d1_policy_projection",
+    "workspace_d1_reply_admission",
+    "workspace_reply_subdomain_ingress",
+    "workspace_d1_evidence",
+    "email_routing_subdomain_dns",
+];
+/// Capability IDs permitted to carry `CapabilityAuthorityScopeV1::LegacyEmbedded`.
+///
+/// The variant was named `legacy` when it was created, which records that it was
+/// understood as transitional. Nothing has since carried `WorkspaceOwned`, so the
+/// transition has not started. This list keeps the set closed while it does.
+const LEGACY_EMBEDDED_CAPABILITY_IDS: [&str; 5] = [
+    "d1-import-approved-mln-migration",
+    "d1-import-approved-osint-research-migration",
+    "d1-resume-approved-mln-import-poll",
+    "mln-0142-post-import-schema",
+    "mln-0143-data-invariants",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
@@ -454,6 +553,107 @@ fn verify_security_contract() -> Result<(), TaskError> {
     Ok(())
 }
 
+/// Holds the surface of `CapabilityV1` and the application debt recorded on it.
+///
+/// Two separate guarantees. The field set must match `CAPABILITY_V1_FIELDS`
+/// exactly, so a new field cannot reach the universal contract without a
+/// reviewer seeing it. And every entry in `CAPABILITY_V1_APPLICATION_FIELDS`
+/// must still be a real field, so the debt inventory cannot drift away from the
+/// struct it describes — when an application contract is extracted, both lists
+/// shrink together or this fails.
+fn verify_capability_contract_surface() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    let path = repository_root.join("crates/cfctl-core/src/lib.rs");
+    let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+    check_capability_contract_surface(&content)
+}
+
+/// Extracts the declared field names of `CapabilityV1` from crate source.
+fn capability_v1_declared_fields(content: &str) -> Result<Vec<&str>, TaskError> {
+    let body = content
+        .split_once("pub struct CapabilityV1 {")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract(
+                "crates/cfctl-core/src/lib.rs does not declare `pub struct CapabilityV1`"
+                    .to_owned(),
+            )
+        })?;
+    Ok(body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub "))
+        .filter_map(|rest| rest.split_once(':'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect())
+}
+
+/// The decision half, separated from file IO so it can be tested against
+/// synthetic sources. A gate that has only ever been run against a passing
+/// input has not been shown to fail.
+fn check_capability_contract_surface(content: &str) -> Result<(), TaskError> {
+    let declared = capability_v1_declared_fields(content)?;
+
+    for field in &declared {
+        if !CAPABILITY_V1_FIELDS.contains(field) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "CapabilityV1 declares `{field}`, which is not in CAPABILITY_V1_FIELDS. Every \
+                 catalog capability carries this field. Add it to the list in the same change if \
+                 the universal contract genuinely needs it."
+            )));
+        }
+    }
+    for field in CAPABILITY_V1_FIELDS {
+        if !declared.contains(&field) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "CAPABILITY_V1_FIELDS lists `{field}`, which CapabilityV1 no longer declares. \
+                 Remove it from the list, and from CAPABILITY_V1_APPLICATION_FIELDS if present."
+            )));
+        }
+    }
+    for field in CAPABILITY_V1_APPLICATION_FIELDS {
+        if !declared.contains(&field) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "CAPABILITY_V1_APPLICATION_FIELDS lists `{field}`, which CapabilityV1 no longer \
+                 declares. Extraction removed it: drop it from both lists."
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_legacy_embedded_scope_is_closed() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    let path = repository_root.join("crates/cfctl-catalog/src/lib.rs");
+    let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+    check_legacy_embedded_scope_is_closed(&content)
+}
+
+fn check_legacy_embedded_scope_is_closed(content: &str) -> Result<(), TaskError> {
+    let assignments = content
+        .matches("authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded)")
+        .count();
+    let permitted = LEGACY_EMBEDDED_CAPABILITY_IDS.len();
+    if assignments > permitted {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "crates/cfctl-catalog/src/lib.rs assigns LegacyEmbedded {assignments} times but only \
+             {permitted} capabilities are permitted to carry it. An application contract belongs \
+             to the repository that owns it; extend LEGACY_EMBEDDED_CAPABILITY_IDS only with a \
+             stated reason."
+        )));
+    }
+    for id in LEGACY_EMBEDDED_CAPABILITY_IDS {
+        if !content.contains(&format!("\"{id}\"")) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "LEGACY_EMBEDDED_CAPABILITY_IDS lists `{id}`, which crates/cfctl-catalog no longer \
+                 declares. If it moved to a workspace-owned pack, drop it from the list."
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_source_contract() -> Result<(), TaskError> {
     run(
         "sh",
@@ -476,6 +676,8 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_v1_cutover_contract()?;
     verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
+    verify_capability_contract_surface()?;
+    verify_legacy_embedded_scope_is_closed()?;
     verify_documented_contracts()
 }
 
@@ -4952,5 +5154,118 @@ mod tests {
         assert!(!preview_run.status.success());
         assert!(String::from_utf8_lossy(&preview_run.stderr).contains("unsigned assembly"));
         assert!(render_linux_installer_text(template, "bad", "bad", Some(("", "issuer"))).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod capability_surface_tests {
+    use super::{
+        CAPABILITY_V1_APPLICATION_FIELDS, CAPABILITY_V1_FIELDS, LEGACY_EMBEDDED_CAPABILITY_IDS,
+        capability_v1_declared_fields, check_capability_contract_surface,
+        check_legacy_embedded_scope_is_closed, repository_root,
+    };
+    use std::fs;
+
+    fn core_source() -> String {
+        let path = repository_root()
+            .expect("repository root")
+            .join("crates/cfctl-core/src/lib.rs");
+        fs::read_to_string(path).expect("core source reads")
+    }
+
+    fn catalog_source() -> String {
+        let path = repository_root()
+            .expect("repository root")
+            .join("crates/cfctl-catalog/src/lib.rs");
+        fs::read_to_string(path).expect("catalog source reads")
+    }
+
+    #[test]
+    fn the_current_contract_surface_passes() {
+        check_capability_contract_surface(&core_source())
+            .expect("the committed CapabilityV1 matches CAPABILITY_V1_FIELDS");
+        check_legacy_embedded_scope_is_closed(&catalog_source())
+            .expect("the committed LegacyEmbedded assignments stay within the permitted set");
+    }
+
+    #[test]
+    fn the_parser_finds_every_declared_field() {
+        let source = core_source();
+        let declared = capability_v1_declared_fields(&source).expect("fields parse");
+        assert_eq!(
+            declared.len(),
+            CAPABILITY_V1_FIELDS.len(),
+            "parser and allowlist disagree on how many fields CapabilityV1 has"
+        );
+    }
+
+    #[test]
+    fn the_application_debt_list_describes_real_fields() {
+        let source = core_source();
+        let declared = capability_v1_declared_fields(&source).expect("fields parse");
+        for field in CAPABILITY_V1_APPLICATION_FIELDS {
+            assert!(
+                declared.contains(&field),
+                "application-field inventory names `{field}`, which CapabilityV1 does not declare"
+            );
+            assert!(
+                CAPABILITY_V1_FIELDS.contains(&field),
+                "application-field inventory names `{field}`, which the allowlist omits"
+            );
+        }
+    }
+
+    // The gates below are the point of the exercise: each must reject, not
+    // merely accept. A check only ever run against passing input has not been
+    // shown to do anything.
+
+    #[test]
+    fn a_new_field_is_rejected() {
+        let tampered = core_source().replace(
+            "pub struct CapabilityV1 {",
+            "pub struct CapabilityV1 {\n    pub mln_0144_some_new_migration: Option<String>,",
+        );
+        let error = check_capability_contract_surface(&tampered)
+            .expect_err("an unlisted field must fail the contract");
+        assert!(
+            error.to_string().contains("mln_0144_some_new_migration"),
+            "the refusal must name the field that caused it: {error}"
+        );
+    }
+
+    #[test]
+    fn a_removed_field_is_rejected_until_both_lists_shrink() {
+        // Extraction deletes the field. Until both lists follow, the contract
+        // must say so rather than silently accept a smaller struct.
+        let field = CAPABILITY_V1_APPLICATION_FIELDS[0];
+        let needle = format!("pub {field}:");
+        let tampered: String = core_source()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(&needle))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = check_capability_contract_surface(&tampered)
+            .expect_err("a field removed from the struct must fail until the lists follow");
+        assert!(
+            error.to_string().contains(field),
+            "the refusal must name the extracted field: {error}"
+        );
+    }
+
+    #[test]
+    fn a_sixth_legacy_embedded_assignment_is_rejected() {
+        let mut tampered = catalog_source();
+        tampered.push_str(
+            "\nfn hypothetical() { capability.authority_scope = \
+             Some(CapabilityAuthorityScopeV1::LegacyEmbedded); }\n",
+        );
+        let error = check_legacy_embedded_scope_is_closed(&tampered)
+            .expect_err("a sixth LegacyEmbedded assignment must fail the contract");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}", LEGACY_EMBEDDED_CAPABILITY_IDS.len() + 1)),
+            "the refusal must report the observed count: {rendered}"
+        );
     }
 }
