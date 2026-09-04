@@ -775,7 +775,18 @@ fn legacy_unbound_operational_proof_is_body_readable_but_nonqualifying() {
     )
     .expect("legacy index row writes");
 
-    assert!(store.list_operational_proofs().is_err());
+    // A legacy unbound row is excluded from the listing rather than denying
+    // it. Exclusion is the security property: a row never returned can never
+    // satisfy a caller's filter, and the nonqualifying classification below is
+    // preserved. Denying instead made every governed lookup impossible on any
+    // store carrying legacy history.
+    assert!(
+        store
+            .list_operational_proofs()
+            .expect("a legacy unbound row must not deny the listing")
+            .is_empty(),
+        "a legacy unbound row must never appear among listed proofs"
+    );
     let page = store
         .list_recent_operational_proofs(10)
         .expect("legacy history is classified without qualifying");

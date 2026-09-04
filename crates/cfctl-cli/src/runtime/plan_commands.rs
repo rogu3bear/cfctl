@@ -389,10 +389,12 @@ pub(super) fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result
 /// credential, or the provider is touched.
 ///
 /// Only a non-qualifying authority consults the plan, and only to read its
-/// effect class. An effect that cannot be replayed keeps the original
+/// classification. An operation that cannot be replayed keeps the original
 /// refusal, because performing it without a receipt leaves nothing to
-/// reconstruct afterward. A plan that cannot be read keeps the refusal too: an
-/// unreadable plan cannot demonstrate that its effect is reversible.
+/// reconstruct afterward. Both `effect` and `risk` are consulted and either is
+/// sufficient, since the catalog carries capabilities that are replayable by
+/// effect and irreversible by risk. A plan that cannot be read keeps the
+/// refusal too: an unreadable plan cannot demonstrate that it is reversible.
 pub(super) fn admit_execution_attestation(
     store: &StateStore,
     operation_id: &str,
@@ -403,7 +405,7 @@ pub(super) fn admit_execution_attestation(
     let Ok(plan) = load_validated_plan(store, operation_id) else {
         return Err(CliError::Storage(refusal));
     };
-    if plan.capability.effect.requires_attestation_to_execute() {
+    if plan.capability.requires_attestation_to_execute() {
         return Err(CliError::Storage(refusal));
     }
     Ok(AttestationStatusV1::unattested_reversible_effect(

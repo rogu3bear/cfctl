@@ -3232,6 +3232,83 @@ fn the_attestation_wire_contract_names_the_degraded_state_exactly() {
 }
 
 #[test]
+fn a_capability_irreversible_by_risk_may_not_execute_unattested_however_it_is_effected() {
+    // d1-import-database is DataWrite by effect and Irreversible by risk.
+    // Reading effect alone would let a production database import proceed
+    // without a receipt. Thirteen mutating catalog capabilities share this
+    // shape; either classification must be sufficient to force attestation.
+    let mut capability = CapabilityV1::new(
+        "d1-import-database",
+        "Import a D1 database",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.mutating = true;
+    capability.effect = EffectClass::DataWrite;
+    capability.risk = RiskClass::Irreversible;
+
+    assert!(
+        !capability.effect.requires_attestation_to_execute(),
+        "the effect half alone is permissive here, which is exactly the trap"
+    );
+    assert!(
+        capability.risk.requires_attestation_to_execute(),
+        "the risk half is what knows the act cannot be recalled"
+    );
+    assert!(
+        capability.requires_attestation_to_execute(),
+        "an operation irreversible by either classification must fail closed"
+    );
+}
+
+#[test]
+fn a_capability_replayable_by_both_classifications_may_degrade() {
+    let mut capability = CapabilityV1::new(
+        "dns.records.update",
+        "Update DNS record",
+        "PUT",
+        "/zones/{zone_id}/dns_records/{record_id}",
+    );
+    capability.mutating = true;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.risk = RiskClass::ScopedWrite;
+
+    assert!(
+        !capability.requires_attestation_to_execute(),
+        "a scoped reversible write stays on the degrade lane"
+    );
+}
+
+#[test]
+fn only_replayable_risks_may_execute_without_a_qualifying_evidence_authority() {
+    for risk in [
+        RiskClass::Read,
+        RiskClass::Recovery,
+        RiskClass::ScopedWrite,
+        RiskClass::CrossConfig,
+    ] {
+        assert!(
+            !risk.requires_attestation_to_execute(),
+            "{risk:?} is recoverable, so losing the receipt does not lose the act"
+        );
+    }
+    for risk in [
+        RiskClass::Destructive,
+        RiskClass::SecretSensitive,
+        RiskClass::ExternalCommunication,
+        RiskClass::IdentityOrOwnership,
+        RiskClass::Spend,
+        RiskClass::Irreversible,
+        RiskClass::Unknown,
+    ] {
+        assert!(
+            risk.requires_attestation_to_execute(),
+            "{risk:?} cannot be replayed or recalled, so it must not execute unattested"
+        );
+    }
+}
+
+#[test]
 fn only_replayable_effects_may_execute_without_a_qualifying_evidence_authority() {
     for effect in [
         EffectClass::ReadOnly,
