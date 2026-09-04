@@ -552,6 +552,60 @@ const fn is_ownership_conflict(code: i32) -> bool {
     code == ERR_SEC_INVALID_OWNER_EDIT
 }
 
+/// Prefix for the journal that carries a value across an ownership migration.
+///
+/// The superseded subprocess adapter never wrote under this prefix, so cfctl
+/// always creates these items fresh and owns them. That is what makes the
+/// migration journallable at all: the journal write cannot itself hit an
+/// ownership conflict.
+const OWNERSHIP_MIGRATION_KEY_PREFIX: &str = "__cfctl_internal__/ownership-migration/v1";
+
+fn ownership_migration_key(key: &str) -> String {
+    format!("{OWNERSHIP_MIGRATION_KEY_PREFIX}/{key}")
+}
+
+/// Choose which stored copy answers a read.
+///
+/// The primary wins whenever it exists. The journal answers only when the
+/// primary is absent, which is exactly the window where a migration deleted the
+/// superseded item and had not yet republished it.
+fn resolve_stored_value(primary: Option<Vec<u8>>, journal: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    primary.or(journal)
+}
+
+/// Replace an item owned by another application with one this tool owns.
+///
+/// The value is journalled before the superseded item is deleted, so no
+/// interruption can leave it recorded nowhere:
+///
+/// - failing at the journal changes nothing;
+/// - stopping after the delete leaves the value in the journal, where
+///   [`security_command_get`] finds it and the next write republishes it;
+/// - stopping after the republish leaves an inert journal that the primary
+///   shadows on every read.
+fn migrate_item_ownership(service: &str, key: &str, value: &str) -> Result<()> {
+    let journal = ownership_migration_key(key);
+    security_framework::passwords::set_generic_password(service, &journal, value.as_bytes())
+        .map_err(classify_keychain_error)?;
+    security_framework::passwords::delete_generic_password(service, key)
+        .map_err(classify_keychain_error)?;
+    security_framework::passwords::set_generic_password(service, key, value.as_bytes())
+        .map_err(classify_keychain_error)?;
+    // The value is durable under its own key now, so failing to retire the
+    // journal leaves only state the primary already shadows.
+    let _retired = security_framework::passwords::delete_generic_password(service, &journal);
+    Ok(())
+}
+
+/// Read one item, tolerating an interrupted ownership migration.
+fn read_item(service: &str, key: &str) -> Result<Option<Vec<u8>>> {
+    match security_framework::passwords::get_generic_password(service, key) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+        Err(error) => Err(classify_keychain_error(error)),
+    }
+}
+
 fn classify_keychain_error(error: security_framework::base::Error) -> AuthError {
     match error.code() {
         ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => {
@@ -631,10 +685,7 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
         // first write. Replacing the item in place is the only forward path, and it
         // is confined to cfctl's own service and key namespace.
         Err(error) if is_ownership_conflict(error.code()) => {
-            security_framework::passwords::delete_generic_password(service, key)
-                .map_err(classify_keychain_error)?;
-            security_framework::passwords::set_generic_password(service, key, value.as_bytes())
-                .map_err(classify_keychain_error)
+            migrate_item_ownership(service, key, value)
         }
         Err(error) => Err(classify_keychain_error(error)),
     }
@@ -642,10 +693,18 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
 
 fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
     let _dialogs = suppress_keychain_dialogs_when_unattended();
-    match security_framework::passwords::get_generic_password(service, key) {
-        Ok(bytes) => validate_keychain_value(bytes).map(Some),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-        Err(error) => Err(classify_keychain_error(error)),
+    let primary = read_item(service, key)?;
+    // Consult the migration journal only when the primary is absent. A pending
+    // crossing is an answer, not a failure: an interrupted ownership migration
+    // stays invisible to callers instead of reading as a missing credential.
+    let journal = if primary.is_some() {
+        None
+    } else {
+        read_item(service, &ownership_migration_key(key))?
+    };
+    match resolve_stored_value(primary, journal) {
+        Some(bytes) => validate_keychain_value(bytes).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -699,6 +758,40 @@ fn security_command_delete(service: &str, key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+
+    #[test]
+    fn an_interrupted_ownership_migration_still_answers_reads() {
+        let primary = b"primary".to_vec();
+        let journal = b"journal".to_vec();
+
+        // The primary always wins while it exists, so a stale journal left by an
+        // interruption after republication can never shadow the live value.
+        assert_eq!(
+            super::resolve_stored_value(Some(primary.clone()), Some(journal.clone())),
+            Some(primary.clone())
+        );
+        assert_eq!(
+            super::resolve_stored_value(Some(primary.clone()), None),
+            Some(primary)
+        );
+        // The window that used to lose the value: deleted, not yet republished.
+        assert_eq!(
+            super::resolve_stored_value(None, Some(journal.clone())),
+            Some(journal)
+        );
+        assert_eq!(super::resolve_stored_value(None, None), None);
+    }
+
+    #[test]
+    fn the_migration_journal_cannot_collide_with_the_item_it_carries() {
+        let key = "evidence-integrity/location/sha256:abc/registry-v1";
+        let journal = super::ownership_migration_key(key);
+        assert_ne!(journal, key);
+        assert!(journal.starts_with(super::OWNERSHIP_MIGRATION_KEY_PREFIX));
+        assert!(journal.ends_with(key));
+        // Nesting must terminate, so a journal key never derives another journal.
+        assert_ne!(super::ownership_migration_key(&journal), journal);
+    }
 
     #[test]
     fn only_an_ownership_conflict_replaces_an_existing_item() {
