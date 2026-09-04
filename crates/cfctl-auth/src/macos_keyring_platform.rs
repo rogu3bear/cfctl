@@ -842,6 +842,18 @@ mod tests {
     const GETCONF_HELPER_EXIT_RECEIPT_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_EXIT_RECEIPT";
     const GETCONF_HELPER_EXE_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_EXE";
 
+    /// Publishes a helper receipt so the path never exists while incomplete.
+    ///
+    /// `fs::write` creates and then fills the file, so a watcher polling for
+    /// existence can observe the empty window between the two. Staging beside
+    /// the receipt and renaming makes the path appear only once it is whole,
+    /// which is what `wait_for_path` already assumes.
+    fn publish_receipt(receipt: &Path, contents: &str) {
+        let staging = receipt.with_extension("partial");
+        fs::write(&staging, contents.as_bytes()).expect("stage helper receipt");
+        fs::rename(&staging, receipt).expect("publish helper receipt");
+    }
+
     fn wait_for_path(path: &Path, label: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !path.exists() {
@@ -890,7 +902,7 @@ mod tests {
                 }
             }
             drop(stdout);
-            fs::write(receipt, b"all-output-consumed").expect("publish oversize receipt");
+            publish_receipt(&receipt, "all-output-consumed");
             return;
         }
         if mode == "fork-holder" {
@@ -913,11 +925,11 @@ mod tests {
                 .status()
                 .expect("launch inherited-stdout descendant");
             assert!(launcher.success(), "descendant launcher failed");
-            fs::write(exit_receipt, b"exited").expect("publish fork-holder exit receipt");
+            publish_receipt(&exit_receipt, "exited");
             return;
         }
         assert!(mode == "hang" || mode == "descendant");
-        fs::write(receipt, std::process::id().to_string()).expect("publish helper pid");
+        publish_receipt(&receipt, &std::process::id().to_string());
         loop {
             thread::sleep(Duration::from_mins(1));
         }
