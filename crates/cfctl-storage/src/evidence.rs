@@ -406,7 +406,9 @@ impl StateStore {
             {
                 continue;
             }
-            proofs.push(read_operational_proof_index(self, &name)?);
+            if let Some(proof) = read_listable_operational_proof_index(self, &name)? {
+                proofs.push(proof);
+            }
         }
         proofs.sort_by_key(|proof| proof.observed_at);
         Ok(proofs)
@@ -1648,6 +1650,42 @@ fn validate_proof_index_filename(path: &Path) -> Result<()> {
 
 fn read_operational_proof_index(store: &StateStore, name: &str) -> Result<OperationalProofV1> {
     Ok(read_authenticated_operational_proof_index(store, name)?.payload)
+}
+
+/// Reads one proof for listing, skipping rows that are nonqualifying by
+/// construction instead of failing the whole listing.
+///
+/// A legacy V1 row, an unsupported envelope version, and a row bound to a
+/// superseded state root can never satisfy a caller's filter: every caller
+/// selects on an authenticated governed-execution binding that such a row does
+/// not carry. Propagating them denied every proof lookup on any installation
+/// holding historical rows — a store with 9,390 legacy proofs and 15 qualifying
+/// ones could never validate a D1 recovery anchor — while withholding nothing
+/// from an adversary.
+///
+/// Skipping cannot manufacture a match. A corrupted qualifying proof is skipped
+/// too, which lowers the match count and makes callers fail closed, so the
+/// error direction stays safe. Tamper signals still propagate: a filename
+/// digest that disagrees with the payload bytes, a failed MAC, a different
+/// state root is benign but a rewritten one is not, and every structural
+/// validation inside the authenticated reader is unchanged.
+fn read_listable_operational_proof_index(
+    store: &StateStore,
+    name: &str,
+) -> Result<Option<OperationalProofV1>> {
+    let path = store.paths.data_dir.join("evidence-index").join(name);
+    validate_proof_index_filename(&path)?;
+    let encoded = read_required_capability_file(&store.evidence_directories.proofs, name, &path)?;
+    let Ok(envelope) = serde_json::from_slice::<AuthenticatedOperationalProofV2>(&encoded) else {
+        return Ok(None);
+    };
+    if envelope.storage_schema_version != 2 {
+        return Ok(None);
+    }
+    if envelope.state_root_identity != store.require_evidence_root_identity()? {
+        return Ok(None);
+    }
+    read_authenticated_operational_proof_index(store, name).map(|proof| Some(proof.payload))
 }
 
 fn read_authenticated_operational_proof_index(

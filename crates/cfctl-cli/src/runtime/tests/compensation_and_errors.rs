@@ -941,9 +941,17 @@ pub(super) fn live_read_availability_distinguishes_empty_data_from_denied_access
     );
 }
 
-/// Builds a stored plan whose capability carries `effect`, in a store that has
-/// no evidence authority at all.
-fn plan_awaiting_attestation(root: &Path, effect: EffectClass) -> (StorageStateStore, String) {
+/// Builds a stored plan carrying both classifications, in a store that has no
+/// evidence authority at all.
+///
+/// Both must be set explicitly. `CapabilityV1::new` defaults a mutating
+/// capability to `RiskClass::Unknown`, so a fixture that sets only `effect`
+/// silently tests an unclassified capability rather than the one it names.
+fn plan_awaiting_attestation(
+    root: &Path,
+    effect: EffectClass,
+    risk: RiskClass,
+) -> (StorageStateStore, String) {
     let store = StorageStateStore::open(RuntimePaths::from_root(root)).expect("storage opens");
     let mut capability = CapabilityV1::new(
         "dns.records.update",
@@ -953,6 +961,7 @@ fn plan_awaiting_attestation(root: &Path, effect: EffectClass) -> (StorageStateS
     );
     capability.mutating = true;
     capability.effect = effect;
+    capability.risk = risk;
     let plan = PlanV1::draft(
         "profile-a",
         "account-a",
@@ -977,7 +986,8 @@ pub(super) fn effects_that_cannot_be_replayed_refuse_without_an_evidence_authori
         EffectClass::Unknown,
     ] {
         let root = tempfile::tempdir().expect("temporary storage root");
-        let (store, operation_id) = plan_awaiting_attestation(root.path(), effect);
+        let (store, operation_id) =
+            plan_awaiting_attestation(root.path(), effect, RiskClass::ScopedWrite);
         let error = admit_execution_attestation(&store, &operation_id)
             .expect_err("an unattestable effect must not execute unattested");
         assert!(
@@ -997,7 +1007,8 @@ pub(super) fn replayable_effects_proceed_unattested_and_record_why() {
         EffectClass::ReversibleWrite,
     ] {
         let root = tempfile::tempdir().expect("temporary storage root");
-        let (store, operation_id) = plan_awaiting_attestation(root.path(), effect);
+        let (store, operation_id) =
+            plan_awaiting_attestation(root.path(), effect, RiskClass::ScopedWrite);
         let attestation = admit_execution_attestation(&store, &operation_id)
             .expect("a replayable effect degrades instead of refusing");
         assert_eq!(
@@ -1062,5 +1073,46 @@ pub(super) fn a_qualifying_authority_admits_every_effect_as_attested() {
     assert!(
         attestation.reason.is_none(),
         "an attested admission has no degradation to explain"
+    );
+}
+
+#[test]
+pub(super) fn a_replayable_effect_carrying_a_severe_risk_still_refuses() {
+    // The shape that matters in the live catalog: d1-import-database is
+    // DataWrite by effect and Irreversible by risk. Keying the gate on effect
+    // alone would let a production database import proceed unattested.
+    for risk in [
+        RiskClass::Irreversible,
+        RiskClass::Destructive,
+        RiskClass::SecretSensitive,
+        RiskClass::IdentityOrOwnership,
+        RiskClass::ExternalCommunication,
+        RiskClass::Spend,
+    ] {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let (store, operation_id) =
+            plan_awaiting_attestation(root.path(), EffectClass::DataWrite, risk);
+        let error = admit_execution_attestation(&store, &operation_id)
+            .expect_err("a severe risk must refuse even when the effect class would degrade");
+        assert!(
+            error
+                .to_string()
+                .contains("evidence state-root identity is missing"),
+            "risk {risk:?} must keep the evidence refusal despite a DataWrite effect: {error}"
+        );
+    }
+}
+
+#[test]
+pub(super) fn an_unclassified_capability_refuses_rather_than_degrading() {
+    // CapabilityV1::new defaults a mutating capability to Unknown on both
+    // axes. An operation that cannot state what it does must not be assumed
+    // replayable.
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let (store, operation_id) =
+        plan_awaiting_attestation(root.path(), EffectClass::Unknown, RiskClass::Unknown);
+    assert!(
+        admit_execution_attestation(&store, &operation_id).is_err(),
+        "an unclassified capability must fail closed"
     );
 }

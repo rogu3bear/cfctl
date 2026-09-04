@@ -249,10 +249,10 @@ may be attached elsewhere only through an explicit operator action. Presence
 of an artifact does not mean an action was performed or verified.
 
 Execution additionally gates on the evidence authority, and that gate splits by
-reversibility rather than by the approval partition above. An effect that cannot
-be replayed or recalled refuses when it cannot be attested; a replayable one
-executes and reports `attestation.state=unattested_reversible_effect`. The two
-partitions agree everywhere except `Spend`, which is approval-gated here on cost
-and attestation-gated there on the fact that money already moved cannot be
-recalled. `docs/v2-security.md` is authoritative for that gate, including why the
+reversibility rather than by the approval partition above. It reads both the
+`effect` and the `risk` classification and either one is sufficient to refuse,
+because the catalog carries capabilities that are replayable by effect and
+irreversible by risk. An operation that cannot be replayed or recalled refuses
+when it cannot be attested; one replayable on both axes executes and reports
+`attestation.state=unattested_reversible_effect`. `docs/v2-security.md` is authoritative for that gate, including why the
 attestation marker is telemetry rather than a control.

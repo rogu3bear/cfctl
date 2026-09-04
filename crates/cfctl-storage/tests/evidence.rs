@@ -637,7 +637,20 @@ fn coordinated_descriptor_and_proof_rewrite_cannot_manufacture_live_read_authori
     )
     .expect("attacker writes a recomputed content-addressed proof row");
     assert!(store.load_operational_proof(&proof_hash(&forged)).is_err());
-    assert!(store.list_operational_proofs().is_err());
+    // The forged row is raw V1, so the listing excludes it rather than
+    // refusing to operate. Exclusion is what denies the attacker: a row never
+    // returned can never satisfy a caller's filter, and the direct load above
+    // still fails closed. Refusing would instead let anyone able to write one
+    // file into evidence-index disable every governed lookup — a denial the
+    // attacker gains from. A rehashed *authenticated* envelope still errors;
+    // see the assertion below in the rehash test.
+    assert!(
+        store
+            .list_operational_proofs()
+            .expect("a planted raw V1 row must not deny the listing")
+            .is_empty(),
+        "a forged raw V1 row must never appear among listed proofs"
+    );
     let page = store
         .list_recent_operational_proofs(10)
         .expect("recent projection preserves raw V1 classification");
@@ -786,7 +799,16 @@ fn legacy_body_and_plain_proof_remain_readable_only_at_the_body_audit_boundary()
             .load_operational_proof(&proof_hash(&legacy_proof))
             .is_err()
     );
-    assert!(store.list_operational_proofs().is_err());
+    // Ordinary legacy history must not deny the listing. Real installations
+    // carry thousands of these rows, and refusing on them made every governed
+    // proof lookup impossible on any store old enough to have them.
+    assert!(
+        store
+            .list_operational_proofs()
+            .expect("legacy history must not deny the listing")
+            .is_empty(),
+        "a nonqualifying legacy row must never appear among listed proofs"
+    );
     let page = store
         .list_recent_operational_proofs(10)
         .expect("recent projection preserves raw V1 classification");
@@ -1261,5 +1283,75 @@ fn exact_resource_locks_serialize_only_their_owned_targets() {
         store
             .lock_email_routing_catch_all(&account, "not-a-zone-id")
             .is_err()
+    );
+}
+
+#[test]
+fn legacy_rows_do_not_deny_the_whole_operational_proof_listing() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = authenticated_store(paths.clone());
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let qualifying = proof(evidence);
+    store
+        .record_operational_proof(&qualifying)
+        .expect("qualifying proof records");
+
+    // A raw V1 row, exactly as older cfctl versions wrote it: no storage-v2
+    // authentication envelope. Real installations accumulate thousands.
+    let legacy_dir = paths.data_dir.join("evidence-index");
+    fs::write(
+        legacy_dir.join(format!("{}.json", "c".repeat(64))),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "observed_at": "2026-01-01T00:00:00Z",
+            "capability_id": "zones-list",
+        }))
+        .expect("legacy row encodes"),
+    )
+    .expect("legacy row is written");
+
+    let listed = store
+        .list_operational_proofs()
+        .expect("a legacy row must not deny the listing");
+
+    assert_eq!(
+        listed.len(),
+        1,
+        "the qualifying proof must survive alongside a nonqualifying legacy row"
+    );
+    assert_eq!(listed[0].capability_id, qualifying.capability_id);
+}
+
+#[test]
+fn a_rewritten_qualifying_proof_still_fails_the_listing_closed() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = authenticated_store(paths.clone());
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let recorded = proof(evidence);
+    store
+        .record_operational_proof(&recorded)
+        .expect("qualifying proof records");
+
+    // Tamper with the authenticated payload in place. Skipping nonqualifying
+    // rows must not become a way to launder a rewritten one.
+    let path = proof_path(&paths, &recorded);
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("envelope reads")).expect("envelope parses");
+    envelope["payload"]["capability_id"] = json!("zones-delete");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&envelope).expect("re-encodes"),
+    )
+    .expect("tampered envelope is written");
+
+    assert!(
+        store.list_operational_proofs().is_err(),
+        "a rewritten authenticated proof must still fail the listing rather than be skipped"
     );
 }

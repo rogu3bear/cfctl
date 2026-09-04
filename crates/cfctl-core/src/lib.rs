@@ -930,24 +930,39 @@ pub enum EffectClass {
 }
 
 impl EffectClass {
-    /// Reports whether an operation of this effect class may only execute
-    /// against a qualifying evidence authority.
+    /// Reports whether this effect class alone forces attestation.
     ///
-    /// The partition is reversibility, not approval. An effect that cannot be
-    /// replayed or undone must fail closed when it cannot be attested, because
-    /// the act would be unreconstructable afterward. A replayable effect may
-    /// proceed and record that it executed unattested.
-    ///
-    /// This is deliberately not the planner's approval partition
-    /// (`cfctl_planner`), which answers a different question: whether a human
-    /// must approve. The two agree everywhere except `Spend`, which the planner
-    /// gates on cost while this gates it on the fact that money already moved
-    /// cannot be recalled.
+    /// This is one half of the decision. A capability also carries a
+    /// [`RiskClass`], and the two disagree: `d1-import-database` is
+    /// `effect: DataWrite` but `risk: Irreversible`. Consult
+    /// [`CapabilityV1::requires_attestation_to_execute`] rather than this
+    /// method, which cannot see that.
     #[must_use]
     pub const fn requires_attestation_to_execute(self) -> bool {
         match self {
             Self::ReadOnly | Self::DataWrite | Self::ReversibleWrite => false,
             Self::Destructive
+            | Self::ExternalCommunication
+            | Self::IdentityOrOwnership
+            | Self::Spend
+            | Self::Irreversible
+            | Self::Unknown => true,
+        }
+    }
+}
+
+impl RiskClass {
+    /// Reports whether this risk class alone forces attestation.
+    ///
+    /// `SecretSensitive` is strict because disclosed material cannot be
+    /// undisclosed, and `Unknown` is strict because an unclassified operation
+    /// cannot demonstrate that it is replayable.
+    #[must_use]
+    pub const fn requires_attestation_to_execute(self) -> bool {
+        match self {
+            Self::Read | Self::Recovery | Self::ScopedWrite | Self::CrossConfig => false,
+            Self::Destructive
+            | Self::SecretSensitive
             | Self::ExternalCommunication
             | Self::IdentityOrOwnership
             | Self::Spend
@@ -2458,6 +2473,27 @@ pub const WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID: &str = "worker-deployment-plan";
 pub const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
 
 impl CapabilityV1 {
+    /// Reports whether this capability may only execute against a qualifying
+    /// evidence authority.
+    ///
+    /// The partition is reversibility, not approval. An operation that cannot
+    /// be replayed or recalled must fail closed when it cannot be attested,
+    /// because the act would be unreconstructable afterward. A replayable one
+    /// may proceed and record that it executed unattested.
+    ///
+    /// **Both classifications are consulted, and either one is sufficient.**
+    /// `effect` and `risk` genuinely disagree in the catalog:
+    /// `d1-import-database` is `DataWrite` by effect and `Irreversible` by
+    /// risk, and reading effect alone would let a production database import
+    /// proceed unattested. Thirteen mutating capabilities share that shape.
+    ///
+    /// This is deliberately not the planner's approval partition
+    /// (`cfctl_planner`), which answers whether a human must approve.
+    #[must_use]
+    pub const fn requires_attestation_to_execute(&self) -> bool {
+        self.effect.requires_attestation_to_execute() || self.risk.requires_attestation_to_execute()
+    }
+
     #[must_use]
     pub fn new(id: &str, title: &str, method: &str, path: &str) -> Self {
         let normalized_method = method.to_ascii_uppercase();
