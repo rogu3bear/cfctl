@@ -540,6 +540,17 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_AUTH_FAILED: i32 = -25293;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+const ERR_SEC_INVALID_OWNER_EDIT: i32 = -25244;
+
+/// Whether a status means the item exists but belongs to another application.
+///
+/// Items this tool wrote through the superseded subprocess adapter are owned by
+/// `/usr/bin/security`, and macOS does not let an update reassign ownership.
+/// Inside cfctl's own service and key namespace such an item is this tool's own
+/// superseded state, so it is replaced rather than treated as a foreign secret.
+const fn is_ownership_conflict(code: i32) -> bool {
+    code == ERR_SEC_INVALID_OWNER_EDIT
+}
 
 fn classify_keychain_error(error: security_framework::base::Error) -> AuthError {
     match error.code() {
@@ -612,8 +623,21 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
         ));
     }
     let _dialogs = suppress_keychain_dialogs_when_unattended();
-    security_framework::passwords::set_generic_password(service, key, value.as_bytes())
-        .map_err(classify_keychain_error)
+    match security_framework::passwords::set_generic_password(service, key, value.as_bytes()) {
+        Ok(()) => Ok(()),
+        // Ownership migration. An item written by the superseded subprocess adapter
+        // is owned by /usr/bin/security, and no update can take that ownership, so
+        // every installation upgrading to the native adapter would otherwise fail its
+        // first write. Replacing the item in place is the only forward path, and it
+        // is confined to cfctl's own service and key namespace.
+        Err(error) if is_ownership_conflict(error.code()) => {
+            security_framework::passwords::delete_generic_password(service, key)
+                .map_err(classify_keychain_error)?;
+            security_framework::passwords::set_generic_password(service, key, value.as_bytes())
+                .map_err(classify_keychain_error)
+        }
+        Err(error) => Err(classify_keychain_error(error)),
+    }
 }
 
 fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
@@ -675,6 +699,31 @@ fn security_command_delete(service: &str, key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+
+    #[test]
+    fn only_an_ownership_conflict_replaces_an_existing_item() {
+        // An item owned by the superseded subprocess adapter is replaced, because
+        // ownership cannot be reassigned by an update.
+        assert!(super::is_ownership_conflict(
+            super::ERR_SEC_INVALID_OWNER_EDIT
+        ));
+        // Nothing else may be. Absence, cancellation, failed authentication, and
+        // disallowed interaction each have their own disposition, and destroying an
+        // item on any of them would discard state the caller never asked to replace.
+        for code in [
+            super::ERR_SEC_ITEM_NOT_FOUND,
+            super::ERR_SEC_USER_CANCELED,
+            super::ERR_SEC_AUTH_FAILED,
+            super::ERR_SEC_INTERACTION_NOT_ALLOWED,
+            0,
+            -1,
+        ] {
+            assert!(
+                !super::is_ownership_conflict(code),
+                "status {code} must not destroy an existing item"
+            );
+        }
+    }
 
     use std::{
         fs,
