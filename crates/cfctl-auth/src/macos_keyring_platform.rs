@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{Read as _, Write as _},
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -530,21 +530,139 @@ fn set_handle_mode(file: &fs::File, mode: u32) -> Result<()> {
         .map_err(|error| AuthError::SecretStore(error.to_string()))
 }
 
-pub(super) fn security_write_arguments(service: &str, key: &str) -> Vec<String> {
-    [
-        "add-generic-password",
-        "-U",
-        "-a",
-        key,
-        "-s",
-        service,
-        "-T",
-        "/usr/bin/security",
-        "-w",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+/// Apple status codes this adapter classifies rather than passes through.
+///
+/// `errSecItemNotFound` is absence, not failure. `errSecUserCanceled`,
+/// `errSecAuthFailed`, and `errSecInteractionNotAllowed` all mean the store is
+/// present and answering but is withholding this operation until an operator
+/// authorizes it, which is a different disposition from an unavailable backend.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+const ERR_SEC_USER_CANCELED: i32 = -128;
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+const ERR_SEC_INVALID_OWNER_EDIT: i32 = -25244;
+
+/// Whether a status means the item exists but belongs to another application.
+///
+/// Items this tool wrote through the superseded subprocess adapter are owned by
+/// `/usr/bin/security`, and macOS does not let an update reassign ownership.
+/// Inside cfctl's own service and key namespace such an item is this tool's own
+/// superseded state, so it is replaced rather than treated as a foreign secret.
+const fn is_ownership_conflict(code: i32) -> bool {
+    code == ERR_SEC_INVALID_OWNER_EDIT
+}
+
+/// Prefix for the journal that carries a value across an ownership migration.
+///
+/// The superseded subprocess adapter never wrote under this prefix, so cfctl
+/// always creates these items fresh and owns them. That is what makes the
+/// migration journallable at all: the journal write cannot itself hit an
+/// ownership conflict.
+const OWNERSHIP_MIGRATION_KEY_PREFIX: &str = "__cfctl_internal__/ownership-migration/v1";
+
+fn ownership_migration_key(key: &str) -> String {
+    format!("{OWNERSHIP_MIGRATION_KEY_PREFIX}/{key}")
+}
+
+/// Choose which stored copy answers a read.
+///
+/// The primary wins whenever it exists. The journal answers only when the
+/// primary is absent, which is exactly the window where a migration deleted the
+/// superseded item and had not yet republished it.
+fn resolve_stored_value(primary: Option<Vec<u8>>, journal: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    primary.or(journal)
+}
+
+/// Replace an item owned by another application with one this tool owns.
+///
+/// The value is journalled before the superseded item is deleted, so no
+/// interruption can leave it recorded nowhere:
+///
+/// - failing at the journal changes nothing;
+/// - stopping after the delete leaves the value in the journal, where
+///   [`security_command_get`] finds it and the next write republishes it;
+/// - stopping after the republish leaves an inert journal that the primary
+///   shadows on every read.
+fn migrate_item_ownership(service: &str, key: &str, value: &str) -> Result<()> {
+    let journal = ownership_migration_key(key);
+    security_framework::passwords::set_generic_password(service, &journal, value.as_bytes())
+        .map_err(classify_keychain_error)?;
+    security_framework::passwords::delete_generic_password(service, key)
+        .map_err(classify_keychain_error)?;
+    security_framework::passwords::set_generic_password(service, key, value.as_bytes())
+        .map_err(classify_keychain_error)?;
+    // The value is durable under its own key now, so failing to retire the
+    // journal leaves only state the primary already shadows.
+    let _retired = security_framework::passwords::delete_generic_password(service, &journal);
+    Ok(())
+}
+
+/// Read one item, tolerating an interrupted ownership migration.
+fn read_item(service: &str, key: &str) -> Result<Option<Vec<u8>>> {
+    match security_framework::passwords::get_generic_password(service, key) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+        Err(error) => Err(classify_keychain_error(error)),
+    }
+}
+
+fn classify_keychain_error(error: security_framework::base::Error) -> AuthError {
+    match error.code() {
+        ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => {
+            AuthError::SecretStoreAuthorizationRequired
+        }
+        code => AuthError::SecretStore(format!(
+            "platform keyring operation failed with status {code}{}",
+            error
+                .message()
+                .map_or_else(String::new, |message| format!(": {message}"))
+        )),
+    }
+}
+
+/// Validate one value crossing the platform boundary.
+///
+/// The bounds and the line-break rule are contract, not framing: they bound what
+/// this store will hold and keep a value from spanning what any line-oriented
+/// consumer would treat as two.
+fn validate_keychain_value(bytes: Vec<u8>) -> Result<String> {
+    if bytes.len() > MAX_LOGICAL_CREDENTIAL_BYTES {
+        return Err(AuthError::SecretStore(
+            "platform keyring item exceeds the maximum logical byte bound".to_owned(),
+        ));
+    }
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err(AuthError::SecretStore(
+            "platform keyring credential contains an unexpected line break".to_owned(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        AuthError::SecretStore("platform keyring credential is not valid UTF-8".to_owned())
+    })
+}
+
+/// Suppress keychain dialogs when nothing in this context can answer one.
+///
+/// macOS raises an authorization dialog on its own and then waits. A caller with
+/// no terminal cannot answer it, so the operation blocks indefinitely on a prompt
+/// the operator may never see. Disabling interaction turns that invisible wait
+/// into `errSecInteractionNotAllowed`, which is reported as
+/// [`AuthError::SecretStoreAuthorizationRequired`]: an accurate, immediate answer
+/// instead of a hang.
+///
+/// An attended caller keeps the dialog, because there a person can approve it.
+///
+/// The returned guard re-enables interaction when dropped. Interaction is a
+/// process-wide setting, so these guards are deliberately held for one operation
+/// at a time and never nested.
+fn suppress_keychain_dialogs_when_unattended()
+-> Option<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() || std::io::stderr().is_terminal() {
+        return None;
+    }
+    security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok()
 }
 
 fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
@@ -553,75 +671,49 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
             "macOS Keychain credentials cannot contain line breaks".to_owned(),
         ));
     }
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(security_write_arguments(service, key))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            AuthError::SecretStore(
-                "platform keyring credential write produced no input sink".to_owned(),
-            )
-        })?;
-        stdin
-            .write_all(value.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.write_all(value.as_bytes()))
-            .and_then(|()| stdin.write_all(b"\n"))
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+    if value.len() > MAX_LOGICAL_CREDENTIAL_BYTES {
+        return Err(AuthError::SecretStore(
+            "platform keyring item exceeds the maximum logical byte bound".to_owned(),
+        ));
     }
-    drop(child.stdin.take());
-    let status = wait_for_child(&mut child)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AuthError::SecretStore(format!(
-            "platform keyring credential write failed with exit status {status}"
-        )))
+    let _dialogs = suppress_keychain_dialogs_when_unattended();
+    match security_framework::passwords::set_generic_password(service, key, value.as_bytes()) {
+        Ok(()) => Ok(()),
+        // Ownership migration. An item written by the superseded subprocess adapter
+        // is owned by /usr/bin/security, and no update can take that ownership, so
+        // every installation upgrading to the native adapter would otherwise fail its
+        // first write. Replacing the item in place is the only forward path, and it
+        // is confined to cfctl's own service and key namespace.
+        Err(error) if is_ownership_conflict(error.code()) => {
+            migrate_item_ownership(service, key, value)
+        }
+        Err(error) => Err(classify_keychain_error(error)),
     }
 }
 
 fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", service, "-a", key, "-w"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        AuthError::SecretStore("platform keyring credential read produced no sink".to_owned())
-    })?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take((MAX_SECURITY_STDOUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let status_result = wait_for_child(&mut child);
-    let bytes = reader
-        .join()
-        .map_err(|_| AuthError::SecretStore("platform keyring output reader failed".to_owned()))?
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let status = status_result?;
-    if status.code() == Some(44) {
-        return Ok(None);
+    let _dialogs = suppress_keychain_dialogs_when_unattended();
+    let primary = read_item(service, key)?;
+    // Consult the migration journal only when the primary is absent. A pending
+    // crossing is an answer, not a failure: an interrupted ownership migration
+    // stays invisible to callers instead of reading as a missing credential.
+    let journal = if primary.is_some() {
+        None
+    } else {
+        read_item(service, &ownership_migration_key(key))?
+    };
+    match resolve_stored_value(primary, journal) {
+        Some(bytes) => validate_keychain_value(bytes).map(Some),
+        None => Ok(None),
     }
-    if !status.success() {
-        return Err(AuthError::SecretStore(format!(
-            "platform keyring credential read failed with exit status {status}"
-        )));
-    }
-    decode_security_stdout(bytes).map(Some)
 }
 
+#[cfg(test)]
 const MAX_SECURITY_FRAME_BYTES: usize = 2;
+#[cfg(test)]
 const MAX_SECURITY_STDOUT_BYTES: usize = MAX_LOGICAL_CREDENTIAL_BYTES + MAX_SECURITY_FRAME_BYTES;
 
+#[cfg(test)]
 pub(super) fn decode_security_stdout(mut bytes: Vec<u8>) -> Result<String> {
     if bytes.len() > MAX_SECURITY_STDOUT_BYTES {
         return Err(AuthError::SecretStore(
@@ -653,47 +745,78 @@ pub(super) fn decode_security_stdout(mut bytes: Vec<u8>) -> Result<String> {
 }
 
 fn security_command_delete(service: &str, key: &str) -> Result<()> {
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", service, "-a", key])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-    let status = wait_for_child(&mut child)?;
-    if status.success() || status.code() == Some(44) {
-        Ok(())
-    } else {
-        Err(AuthError::SecretStore(format!(
-            "platform keyring credential deletion failed with exit status {status}"
-        )))
-    }
-}
-
-fn wait_for_child(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child
-            .try_wait()
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?
-        {
-            Some(status) => return Ok(status),
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AuthError::SecretStore(
-                    "platform keyring operation timed out after 5 seconds; unlock the login keychain and retry"
-                        .to_owned(),
-                ));
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(25)),
-        }
+    let _dialogs = suppress_keychain_dialogs_when_unattended();
+    match security_framework::passwords::delete_generic_password(service, key) {
+        Ok(()) => Ok(()),
+        // Absence is the intended end state, so a missing item is success. The
+        // subprocess adapter expressed the same tolerance as exit status 44.
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+        Err(error) => Err(classify_keychain_error(error)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+
+    #[test]
+    fn an_interrupted_ownership_migration_still_answers_reads() {
+        let primary = b"primary".to_vec();
+        let journal = b"journal".to_vec();
+
+        // The primary always wins while it exists, so a stale journal left by an
+        // interruption after republication can never shadow the live value.
+        assert_eq!(
+            super::resolve_stored_value(Some(primary.clone()), Some(journal.clone())),
+            Some(primary.clone())
+        );
+        assert_eq!(
+            super::resolve_stored_value(Some(primary.clone()), None),
+            Some(primary)
+        );
+        // The window that used to lose the value: deleted, not yet republished.
+        assert_eq!(
+            super::resolve_stored_value(None, Some(journal.clone())),
+            Some(journal)
+        );
+        assert_eq!(super::resolve_stored_value(None, None), None);
+    }
+
+    #[test]
+    fn the_migration_journal_cannot_collide_with_the_item_it_carries() {
+        let key = "evidence-integrity/location/sha256:abc/registry-v1";
+        let journal = super::ownership_migration_key(key);
+        assert_ne!(journal, key);
+        assert!(journal.starts_with(super::OWNERSHIP_MIGRATION_KEY_PREFIX));
+        assert!(journal.ends_with(key));
+        // Nesting must terminate, so a journal key never derives another journal.
+        assert_ne!(super::ownership_migration_key(&journal), journal);
+    }
+
+    #[test]
+    fn only_an_ownership_conflict_replaces_an_existing_item() {
+        // An item owned by the superseded subprocess adapter is replaced, because
+        // ownership cannot be reassigned by an update.
+        assert!(super::is_ownership_conflict(
+            super::ERR_SEC_INVALID_OWNER_EDIT
+        ));
+        // Nothing else may be. Absence, cancellation, failed authentication, and
+        // disallowed interaction each have their own disposition, and destroying an
+        // item on any of them would discard state the caller never asked to replace.
+        for code in [
+            super::ERR_SEC_ITEM_NOT_FOUND,
+            super::ERR_SEC_USER_CANCELED,
+            super::ERR_SEC_AUTH_FAILED,
+            super::ERR_SEC_INTERACTION_NOT_ALLOWED,
+            0,
+            -1,
+        ] {
+            assert!(
+                !super::is_ownership_conflict(code),
+                "status {code} must not destroy an existing item"
+            );
+        }
+    }
 
     use std::{
         fs,
@@ -718,6 +841,18 @@ mod tests {
     const GETCONF_HELPER_RECEIPT_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_RECEIPT";
     const GETCONF_HELPER_EXIT_RECEIPT_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_EXIT_RECEIPT";
     const GETCONF_HELPER_EXE_ENV: &str = "CFCTL_TEST_GETCONF_HELPER_EXE";
+
+    /// Publishes a helper receipt so the path never exists while incomplete.
+    ///
+    /// `fs::write` creates and then fills the file, so a watcher polling for
+    /// existence can observe the empty window between the two. Staging beside
+    /// the receipt and renaming makes the path appear only once it is whole,
+    /// which is what `wait_for_path` already assumes.
+    fn publish_receipt(receipt: &Path, contents: &str) {
+        let staging = receipt.with_extension("partial");
+        fs::write(&staging, contents.as_bytes()).expect("stage helper receipt");
+        fs::rename(&staging, receipt).expect("publish helper receipt");
+    }
 
     fn wait_for_path(path: &Path, label: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -767,7 +902,7 @@ mod tests {
                 }
             }
             drop(stdout);
-            fs::write(receipt, b"all-output-consumed").expect("publish oversize receipt");
+            publish_receipt(&receipt, "all-output-consumed");
             return;
         }
         if mode == "fork-holder" {
@@ -790,11 +925,11 @@ mod tests {
                 .status()
                 .expect("launch inherited-stdout descendant");
             assert!(launcher.success(), "descendant launcher failed");
-            fs::write(exit_receipt, b"exited").expect("publish fork-holder exit receipt");
+            publish_receipt(&exit_receipt, "exited");
             return;
         }
         assert!(mode == "hang" || mode == "descendant");
-        fs::write(receipt, std::process::id().to_string()).expect("publish helper pid");
+        publish_receipt(&receipt, &std::process::id().to_string());
         loop {
             thread::sleep(Duration::from_mins(1));
         }

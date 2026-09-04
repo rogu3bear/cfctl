@@ -106,6 +106,12 @@ pub struct EvidenceKeyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EvidenceKeyCommand {
+    /// Preview marker-only adoption of one exact valid platform authority.
+    AdoptPreview,
+    /// Inspect adoption history; creation is held pending authenticated receipt support.
+    AdoptPlan(EvidenceKeyAdoptPlanArgs),
+    /// Held pending authenticated installed-identity receipt support.
+    Adopt(EvidenceKeyAdoptArgs),
     /// Preview the exact non-secret initialization transition without creating a key.
     InitPreview,
     /// Initialize one platform-held evidence authority for this canonical state root.
@@ -122,6 +128,47 @@ pub enum EvidenceKeyCommand {
     RecoverPlan(EvidenceKeyRecoverPlanArgs),
     /// Execute or resume one exact private malformed-registry recovery plan.
     Recover(EvidenceKeyRecoverArgs),
+    /// Discard one unattributable, unused platform authority and initialize a fresh one.
+    Reset(EvidenceKeyResetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyResetArgs {
+    /// Confirm discarding the existing platform authority.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptArgs {
+    /// Opaque random identity returned by adopt-plan create.
+    pub plan_id: String,
+    /// Confirm the protected marker-only transition.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptPlanArgs {
+    #[command(subcommand)]
+    pub command: EvidenceKeyAdoptPlanCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvidenceKeyAdoptPlanCommand {
+    /// Held pending authenticated installed-identity receipt support.
+    Create,
+    /// Inspect the current recoverable adoption plan without guessing its identity.
+    Current,
+    /// Inspect public lifecycle state for one opaque adoption plan.
+    Status(EvidenceKeyAdoptPlanSelector),
+    /// Revoke one unused adoption plan before its marker transition begins.
+    Revoke(EvidenceKeyAdoptPlanSelector),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyAdoptPlanSelector {
+    pub plan_id: String,
 }
 
 #[derive(Debug, Args)]

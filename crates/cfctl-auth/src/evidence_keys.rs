@@ -9,9 +9,20 @@ use uuid::Uuid;
 
 use crate::{AuthError, KeyringSecretStore, Result, SecretBackend, SecretStore};
 
+mod adoption;
+mod adoption_error;
+pub use adoption::{
+    EVIDENCE_KEY_ADOPTION_PLAN_RECORD_VERSION, EVIDENCE_KEY_ADOPTION_PROTOCOL_ID,
+    EVIDENCE_KEY_ADOPTION_TERMINAL_VERSION, EvidenceKeyAdoptionAcceptanceV1,
+    EvidenceKeyAdoptionClockV1, EvidenceKeyAdoptionObservationV1, EvidenceKeyAdoptionPlanV1,
+    EvidenceKeyAdoptionRuntimeIdentityV1, platform_adoption_monotonic_ns,
+};
+pub use adoption_error::EvidenceKeyAdoptionError;
+
 pub const EVIDENCE_HMAC_ALGORITHM: &str = "hmac-sha256";
 const REGISTRY_SCHEMA_VERSION: u8 = 1;
 const RECOVERY_INTENT_SCHEMA_VERSION: u8 = 1;
+const INITIALIZATION_INTENT_SCHEMA_VERSION: u8 = 1;
 const RECOVERY_PLAN_TTL_MINUTES: i64 = 15;
 const REGISTRY_KEY_PREFIX: &str = "evidence-integrity/location";
 const MAC_DOMAIN_PREFIX: &[u8] = b"cfctl-evidence-authentication-v1\0";
@@ -140,6 +151,27 @@ enum RecoveryIntentStateV1 {
     ReplacementPublished,
     Completed,
     Revoked,
+}
+
+/// Durable record that an initialization committed to an exact state-root
+/// identity *before* the platform registry for it existed.
+///
+/// Evidence-key initialization crosses two independent custody domains: the
+/// platform registry and the filesystem marker. No transaction spans both, so
+/// process death between them strands a valid registry with no marker. This
+/// intent makes that crossing resumable: a registry whose identity was
+/// published here is known to be this installation's own interrupted
+/// initialization, not an authority of unknown provenance.
+///
+/// It carries no key material. The state-root identity is the same non-secret
+/// value the filesystem marker holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceKeyInitializationIntentV1 {
+    schema_version: u8,
+    location_identity: String,
+    state_root_identity: String,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +552,94 @@ impl EvidenceKeyManager {
         self.commit_registry_transition("rotation", &before, &intended_after)
     }
 
+    /// Publish the intent to create `state_root_identity` before its registry exists.
+    ///
+    /// Ordering is the whole contract. The identity must be durable *before* the
+    /// authority it names, so a registry later found without its marker can be
+    /// attributed to this installation's own interrupted crossing rather than
+    /// treated as an authority of unknown provenance.
+    pub fn publish_initialization_intent(&self, state_root_identity: &str) -> Result<()> {
+        validate_identity("evidence state root", state_root_identity)?;
+        if self.load_registry()?.is_some() {
+            return Err(AuthError::SecretStore(
+                "an initialization intent cannot be published for a state location that already holds an evidence authority"
+                    .to_owned(),
+            ));
+        }
+        // Reaching here proves no registry exists, so any intent still published names
+        // an authority that was never created: a crash after the intent and before the
+        // registry. Nothing can reference that identity, so replacing it is safe and is
+        // the only way a later initialization can proceed. Refusing here would strand
+        // the state location on its own bookkeeping.
+        self.save_initialization_intent(&EvidenceKeyInitializationIntentV1 {
+            schema_version: INITIALIZATION_INTENT_SCHEMA_VERSION,
+            location_identity: self.location_identity.clone(),
+            state_root_identity: state_root_identity.to_owned(),
+            created_at: Utc::now(),
+        })
+    }
+
+    /// Report the state root of an initialization this installation began and did
+    /// not finish, when the registry it names is the one actually present.
+    ///
+    /// `None` means there is nothing to resume. An intent that disagrees with the
+    /// registry is a conflict and fails closed; it is never resolved by guessing.
+    pub fn interrupted_initialization(&self) -> Result<Option<String>> {
+        let Some(intent) = self.load_initialization_intent()? else {
+            return Ok(None);
+        };
+        let Some(registry) = self.load_registry()? else {
+            return Ok(None);
+        };
+        if registry.state_root_identity != intent.state_root_identity {
+            return Err(AuthError::SecretStore(
+                "the published initialization intent names a different state root than the platform registry; resolve this conflict before initializing"
+                    .to_owned(),
+            ));
+        }
+        if registry.generations.len() != 1 {
+            return Err(AuthError::SecretStore(
+                "the platform registry named by the initialization intent is not a fresh single-generation authority"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(intent.state_root_identity))
+    }
+
+    /// Drive a registry deletion that already crossed its inventory transition to
+    /// completion.
+    ///
+    /// The managed keyring records the deletion before removing anything, so an
+    /// interrupted delete is resumable by design; the value is simply unreadable
+    /// until it finishes. Every ordinary entry point reads the registry before
+    /// writing, which makes that state unreachable without this explicit step.
+    /// Deleting through the managed teardown is the only safe completion: removing
+    /// the root item by hand orphans its chunk set.
+    pub fn complete_interrupted_registry_deletion(&self) -> Result<()> {
+        self.store.delete(&self.registry_key())?;
+        if self.load_registry()?.is_some() {
+            return Err(AuthError::SecretStore(
+                "resuming the interrupted registry deletion left a readable registry".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retire the intent once its crossing is complete or abandoned.
+    pub fn clear_initialization_intent(&self) -> Result<()> {
+        let key = self.initialization_intent_key();
+        if self.store.get(&key)?.is_none() {
+            return Ok(());
+        }
+        self.store.delete(&key)?;
+        if self.store.get(&key)?.is_some() {
+            return Err(AuthError::SecretStore(
+                "the initialization intent was not removed from private custody".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn rollback_initialize(&self, state_root_identity: &str) -> Result<()> {
         let Some(registry) = self.load_registry()? else {
             return Ok(());
@@ -536,7 +656,7 @@ impl EvidenceKeyManager {
                 "fresh evidence authority rollback did not remove the platform registry".to_owned(),
             ));
         }
-        Ok(())
+        self.clear_initialization_intent()
     }
 
     pub fn retire(
@@ -570,6 +690,56 @@ impl EvidenceKeyManager {
             "{REGISTRY_KEY_PREFIX}/{}/registry-v1",
             self.location_identity
         )
+    }
+
+    fn initialization_intent_key(&self) -> String {
+        format!(
+            "{REGISTRY_KEY_PREFIX}/{}/initialization-intent-v1",
+            self.location_identity
+        )
+    }
+
+    fn save_initialization_intent(&self, intent: &EvidenceKeyInitializationIntentV1) -> Result<()> {
+        let key = self.initialization_intent_key();
+        let encoded = serde_json::to_string(intent)?;
+        self.store.put(&key, &encoded)?;
+        if self.store.locate(&key)? != Some(self.required_backend) {
+            return Err(AuthError::SecretStore(
+                "the initialization intent was not stored in the required backend".to_owned(),
+            ));
+        }
+        let readback = self.store.get(&key)?.ok_or_else(|| {
+            AuthError::SecretStore("initialization intent readback is missing".to_owned())
+        })?;
+        let readback: EvidenceKeyInitializationIntentV1 = serde_json::from_str(&readback)?;
+        if readback != *intent {
+            return Err(AuthError::SecretStore(
+                "initialization intent readback differs from the intended state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_initialization_intent(&self) -> Result<Option<EvidenceKeyInitializationIntentV1>> {
+        let key = self.initialization_intent_key();
+        let Some(encoded) = self.store.get(&key)? else {
+            return Ok(None);
+        };
+        if self.store.locate(&key)? != Some(self.required_backend) {
+            return Err(AuthError::SecretStore(
+                "the initialization intent must remain in the required backend".to_owned(),
+            ));
+        }
+        let intent: EvidenceKeyInitializationIntentV1 = serde_json::from_str(&encoded)?;
+        if intent.schema_version != INITIALIZATION_INTENT_SCHEMA_VERSION
+            || intent.location_identity != self.location_identity
+        {
+            return Err(AuthError::SecretStore(
+                "the initialization intent does not bind this exact state location".to_owned(),
+            ));
+        }
+        validate_identity("evidence state root", &intent.state_root_identity)?;
+        Ok(Some(intent))
     }
 
     fn recovery_intent_key(&self, plan_id: &str) -> Result<String> {
@@ -830,14 +1000,8 @@ impl EvidenceKeyManager {
             backend: Some(self.required_backend),
         }
     }
-}
 
-impl EvidenceMacProvider for EvidenceKeyManager {
-    fn location_identity(&self) -> &str {
-        &self.location_identity
-    }
-
-    fn status(&self, state_root_identity: Option<&str>) -> Result<EvidenceKeyStatusV1> {
+    fn status_unchecked(&self, state_root_identity: Option<&str>) -> Result<EvidenceKeyStatusV1> {
         let key = self.registry_key();
         let backend = self.store.locate(&key)?;
         let Some(registry) = self.load_registry()? else {
@@ -861,12 +1025,33 @@ impl EvidenceMacProvider for EvidenceKeyManager {
         Ok(status)
     }
 
+    fn require_sealed_adoption_crossing(&self) -> Result<()> {
+        if !self.adoption_crossing_is_sealed_or_absent()? {
+            return Err(AuthError::SecretStore(
+                "evidence authority is blocked by an incomplete adoption crossing".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl EvidenceMacProvider for EvidenceKeyManager {
+    fn location_identity(&self) -> &str {
+        &self.location_identity
+    }
+
+    fn status(&self, state_root_identity: Option<&str>) -> Result<EvidenceKeyStatusV1> {
+        self.require_sealed_adoption_crossing()?;
+        self.status_unchecked(state_root_identity)
+    }
+
     fn authenticate(
         &self,
         state_root_identity: &str,
         domain: &str,
         payload: &[u8],
     ) -> Result<EvidenceAuthenticationV1> {
+        self.require_sealed_adoption_crossing()?;
         let registry = self.require_registry(state_root_identity)?;
         let generation_id = registry.active_generation_id;
         let key = registry.generations.get(&generation_id).ok_or_else(|| {

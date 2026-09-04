@@ -57,6 +57,7 @@ use super::{
 };
 use crate::build_identity::current_build_info;
 use cfctl_cloudflare::validate_request_contract;
+use cfctl_core::AttestationStatusV1;
 use cfctl_core::hash_value;
 
 pub(super) async fn plans_command(
@@ -379,6 +380,37 @@ pub(super) fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result
     Ok(envelope)
 }
 
+/// Admits plan execution against the evidence gate, keyed to the plan's
+/// effect class.
+///
+/// The qualifying path is checked first and unconditionally, so a healthy
+/// installation reaches the provider boundary through exactly the same
+/// ordering as before: the authority is proven before the plan record, the
+/// credential, or the provider is touched.
+///
+/// Only a non-qualifying authority consults the plan, and only to read its
+/// effect class. An effect that cannot be replayed keeps the original
+/// refusal, because performing it without a receipt leaves nothing to
+/// reconstruct afterward. A plan that cannot be read keeps the refusal too: an
+/// unreadable plan cannot demonstrate that its effect is reversible.
+pub(super) fn admit_execution_attestation(
+    store: &StateStore,
+    operation_id: &str,
+) -> Result<AttestationStatusV1> {
+    let Err(refusal) = store.require_qualifying_evidence_authority() else {
+        return Ok(AttestationStatusV1::attested());
+    };
+    let Ok(plan) = load_validated_plan(store, operation_id) else {
+        return Err(CliError::Storage(refusal));
+    };
+    if plan.capability.effect.requires_attestation_to_execute() {
+        return Err(CliError::Storage(refusal));
+    }
+    Ok(AttestationStatusV1::unattested_reversible_effect(
+        refusal.to_string(),
+    ))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "execution revalidates capability-specific immutable authority before dispatch"
@@ -388,7 +420,7 @@ pub(super) async fn run_plan(
     selector: &PlanSelector,
 ) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&selector.operation_id)?;
-    store.require_qualifying_evidence_authority()?;
+    let attestation = admit_execution_attestation(store, &selector.operation_id)?;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
     ensure_plan_execution_contract(store, &plan)?;
@@ -519,7 +551,7 @@ pub(super) async fn run_plan(
         &execution_input,
         &credential,
         &secrets,
-        live_precondition_evidence,
+        ExecutionAdmission::new(live_precondition_evidence, attestation),
     ))
     .await
 }
@@ -539,7 +571,7 @@ pub(super) async fn run_plan_under_standing_authority(
     // preflight; the authority lock is acquired only for the synchronous
     // admission critical section below and is released before network I/O.
     let _plan_lock = store.lock_plan(operation_id)?;
-    store.require_qualifying_evidence_authority()?;
+    let attestation = admit_execution_attestation(store, operation_id)?;
     let authority_snapshot = store.load_authority(authority_id)?;
     store.bind_plan_authority_hash(operation_id, &authority_snapshot.content_hash)?;
     let catalog = ensure_catalog(store).await?;
@@ -623,7 +655,7 @@ pub(super) async fn run_plan_under_standing_authority(
         &execution_input,
         &credential,
         &secrets,
-        live_precondition_evidence,
+        ExecutionAdmission::new(live_precondition_evidence, attestation),
     ))
     .await?;
     envelope.evidence.push(standing_evidence);
@@ -959,6 +991,25 @@ pub(super) fn recover_standing_lineage(
     Ok(evidence)
 }
 
+/// What the pre-crossing admission established, carried into the executor as
+/// one value because both fields describe the crossing rather than the request.
+pub(super) struct ExecutionAdmission {
+    pub(super) evidence: LivePreconditionEvidence,
+    pub(super) attestation: AttestationStatusV1,
+}
+
+impl ExecutionAdmission {
+    pub(super) const fn new(
+        evidence: LivePreconditionEvidence,
+        attestation: AttestationStatusV1,
+    ) -> Self {
+        Self {
+            evidence,
+            attestation,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct LivePreconditionEvidence {
     pub(super) zone_account: Option<EvidenceV1>,
@@ -1090,7 +1141,40 @@ pub(super) fn validate_live_plan_precondition_evidence<'a>(
     })
 }
 
+/// Executes a consumed plan and stamps the admission that let it reach the
+/// provider boundary onto the resulting envelope.
+///
+/// `attestation` is a required parameter rather than a field the callers
+/// remember to set, so an execution lane cannot cross a provider boundary
+/// without saying, in its own result, whether the crossing was attested.
 pub(super) async fn execute_consumed_plan(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+    admission: ExecutionAdmission,
+) -> Result<ResultEnvelopeV2> {
+    let ExecutionAdmission {
+        evidence,
+        attestation,
+    } = admission;
+    let mut envelope = Box::pin(execute_consumed_plan_inner(
+        store,
+        catalog,
+        plan,
+        execution_input,
+        credential,
+        secrets,
+        evidence,
+    ))
+    .await?;
+    envelope.attestation = Some(attestation);
+    Ok(envelope)
+}
+
+async fn execute_consumed_plan_inner(
     store: &StateStore,
     catalog: &CatalogSnapshot,
     plan: &mut PlanV1,

@@ -940,3 +940,127 @@ pub(super) fn live_read_availability_distinguishes_empty_data_from_denied_access
         json!(["Account Analytics Read"])
     );
 }
+
+/// Builds a stored plan whose capability carries `effect`, in a store that has
+/// no evidence authority at all.
+fn plan_awaiting_attestation(root: &Path, effect: EffectClass) -> (StorageStateStore, String) {
+    let store = StorageStateStore::open(RuntimePaths::from_root(root)).expect("storage opens");
+    let mut capability = CapabilityV1::new(
+        "dns.records.update",
+        "Update DNS record",
+        "PUT",
+        "/zones/{zone_id}/dns_records/{record_id}",
+    );
+    capability.mutating = true;
+    capability.effect = effect;
+    let plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "catalog-sha",
+        capability,
+        json!({}),
+    )
+    .expect("plan drafts");
+    let operation_id = plan.operation_id.clone();
+    store.save_plan(&plan).expect("plan persists");
+    (store, operation_id)
+}
+
+#[test]
+pub(super) fn effects_that_cannot_be_replayed_refuse_without_an_evidence_authority() {
+    for effect in [
+        EffectClass::Destructive,
+        EffectClass::ExternalCommunication,
+        EffectClass::IdentityOrOwnership,
+        EffectClass::Spend,
+        EffectClass::Irreversible,
+        EffectClass::Unknown,
+    ] {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let (store, operation_id) = plan_awaiting_attestation(root.path(), effect);
+        let error = admit_execution_attestation(&store, &operation_id)
+            .expect_err("an unattestable effect must not execute unattested");
+        assert!(
+            error
+                .to_string()
+                .contains("evidence state-root identity is missing"),
+            "{effect:?} must keep the original evidence refusal: {error}"
+        );
+    }
+}
+
+#[test]
+pub(super) fn replayable_effects_proceed_unattested_and_record_why() {
+    for effect in [
+        EffectClass::ReadOnly,
+        EffectClass::DataWrite,
+        EffectClass::ReversibleWrite,
+    ] {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let (store, operation_id) = plan_awaiting_attestation(root.path(), effect);
+        let attestation = admit_execution_attestation(&store, &operation_id)
+            .expect("a replayable effect degrades instead of refusing");
+        assert_eq!(
+            attestation.state,
+            AttestationStateV1::UnattestedReversibleEffect,
+            "{effect:?} must be admitted as explicitly unattested"
+        );
+        assert!(
+            attestation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("evidence state-root identity is missing")),
+            "the degraded admission must carry the reason the authority did not qualify: {attestation:?}"
+        );
+    }
+}
+
+#[test]
+pub(super) fn a_plan_that_cannot_be_read_keeps_the_evidence_refusal() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store =
+        StorageStateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+
+    let error = admit_execution_attestation(&store, "00000000-0000-4000-8000-000000000001")
+        .expect_err("an unreadable plan cannot demonstrate that its effect is reversible");
+
+    assert!(
+        error
+            .to_string()
+            .contains("evidence state-root identity is missing"),
+        "the evidence refusal must survive an unreadable plan rather than becoming a plan error: {error}"
+    );
+}
+
+#[test]
+pub(super) fn a_qualifying_authority_admits_every_effect_as_attested() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store =
+        StateStore::open(RuntimePaths::from_root(root.path())).expect("authenticated store");
+    let mut capability = CapabilityV1::new(
+        "dns.records.delete",
+        "Delete DNS record",
+        "DELETE",
+        "/zones/{zone_id}/dns_records/{record_id}",
+    );
+    capability.mutating = true;
+    capability.effect = EffectClass::Destructive;
+    let plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "catalog-sha",
+        capability,
+        json!({}),
+    )
+    .expect("plan drafts");
+    store.save_plan(&plan).expect("plan persists");
+
+    let attestation =
+        admit_execution_attestation(&store, &plan.operation_id).expect("qualifying authority");
+
+    assert_eq!(attestation.state, AttestationStateV1::Attested);
+    assert!(
+        attestation.reason.is_none(),
+        "an attested admission has no degradation to explain"
+    );
+}

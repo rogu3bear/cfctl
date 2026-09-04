@@ -380,6 +380,7 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
                 next_step.to_owned(),
             ));
         }
+        E::EvidenceKeyAdoption(adoption) => return Some(adoption_guidance(adoption)),
         E::SecretStore(_) => {
             "The secret backend is unavailable. Run `cfctl doctor --json` to inspect the credential store."
                 .to_owned()
@@ -387,6 +388,37 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
         _ => return None,
     };
     Some((CODE, step))
+}
+
+fn adoption_guidance(error: &cfctl_auth::EvidenceKeyAdoptionError) -> (&'static str, String) {
+    use cfctl_auth::EvidenceKeyAdoptionError as E;
+    let (code, next_step) = match error {
+        E::InstalledIdentityReceiptRequired => (
+            "CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED",
+            "Signed publication and installation may proceed independently, but do not run `cfctl auth evidence-key adopt-plan create` or `cfctl auth evidence-key adopt`. Those protected operations remain unavailable until authenticated, independently reviewed installed-identity receipt support lands.",
+        ),
+        E::PlanExpired { .. } => (
+            "CFCTL_AUTH_ADOPTION_PLAN_EXPIRED",
+            "Do not retry execution. Inspect `cfctl auth evidence-key adopt-plan current --json`; create a successor only if the exact read-only state confirms no marker crossing, otherwise preserve the state for recovery.",
+        ),
+        E::RuntimeIdentityConflict { .. } => (
+            "CFCTL_AUTH_ADOPTION_RUNTIME_CONFLICT",
+            "Do not create a successor or cross the marker. Restore the exact admitted runtime identity, then inspect the same plan with `cfctl auth evidence-key adopt-plan status <plan-id> --json`.",
+        ),
+        E::CrossingIncomplete { .. } => (
+            "CFCTL_AUTH_ADOPTION_CROSSING_INCOMPLETE",
+            "Do not replay marker creation and do not create a successor. Preserve the state and inspect the exact current plan with `cfctl auth evidence-key adopt-plan current --json`.",
+        ),
+        E::ResponseLossUnchanged { .. } => (
+            "CFCTL_AUTH_ADOPTION_RESPONSE_LOSS",
+            "Exact readback did not prove a protected crossing. Inspect the same plan with `cfctl auth evidence-key adopt-plan status <plan-id> --json`; retry only that same plan if its state remains prepared.",
+        ),
+        E::SamePlanReconciliationRequired { .. } => (
+            "CFCTL_AUTH_ADOPTION_SAME_PLAN_RECONCILIATION_REQUIRED",
+            "Do not create a successor and do not replay a different plan. Inspect and resume only the same plan with `cfctl auth evidence-key adopt-plan status <plan-id> --json`.",
+        ),
+    };
+    (code, next_step.to_owned())
 }
 
 /// Map a non-2xx live Cloudflare read status to a stable code and a specific
@@ -547,4 +579,72 @@ pub(super) fn live_read_failure_guidance_for_response(
         );
     }
     live_read_failure_guidance(response.status)
+}
+
+#[cfg(test)]
+mod adoption_error_tests {
+    #![allow(clippy::expect_used)]
+
+    use cfctl_auth::{AuthError, EvidenceKeyAdoptionError};
+
+    use super::CliError;
+
+    fn contract(error: EvidenceKeyAdoptionError) -> (&'static str, String) {
+        let error = CliError::from(AuthError::from(error));
+        (
+            error.code(),
+            error.next_step().expect("adoption errors carry guidance"),
+        )
+    }
+
+    #[test]
+    fn adoption_errors_have_stable_codes_and_state_sensitive_retry_guidance() {
+        let (code, step) = contract(EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired);
+        assert_eq!(code, "CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED");
+        assert!(step.contains("Signed publication and installation may proceed"));
+        assert!(step.contains("remain unavailable"));
+
+        let plan_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        let cases = [
+            (
+                EvidenceKeyAdoptionError::PlanExpired {
+                    plan_id: plan_id.clone(),
+                },
+                "CFCTL_AUTH_ADOPTION_PLAN_EXPIRED",
+                "Do not retry execution",
+            ),
+            (
+                EvidenceKeyAdoptionError::RuntimeIdentityConflict {
+                    plan_id: plan_id.clone(),
+                },
+                "CFCTL_AUTH_ADOPTION_RUNTIME_CONFLICT",
+                "Restore the exact admitted runtime identity",
+            ),
+            (
+                EvidenceKeyAdoptionError::CrossingIncomplete {
+                    plan_id: plan_id.clone(),
+                },
+                "CFCTL_AUTH_ADOPTION_CROSSING_INCOMPLETE",
+                "Do not replay marker creation",
+            ),
+            (
+                EvidenceKeyAdoptionError::ResponseLossUnchanged {
+                    plan_id: plan_id.clone(),
+                },
+                "CFCTL_AUTH_ADOPTION_RESPONSE_LOSS",
+                "retry only that same plan if its state remains prepared",
+            ),
+            (
+                EvidenceKeyAdoptionError::SamePlanReconciliationRequired { plan_id },
+                "CFCTL_AUTH_ADOPTION_SAME_PLAN_RECONCILIATION_REQUIRED",
+                "resume only the same plan",
+            ),
+        ];
+        for (error, expected_code, expected_instruction) in cases {
+            let (actual_code, next_step) = contract(error);
+            assert_eq!(actual_code, expected_code);
+            assert!(next_step.contains(expected_instruction), "{next_step}");
+            assert!(!next_step.contains("doctor"));
+        }
+    }
 }

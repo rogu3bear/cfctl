@@ -25,9 +25,11 @@ uuid.workspace = true
 cap-std.workspace = true
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 rustix.workspace = true
+security-framework.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -125,7 +125,8 @@ maintain a second command registry.
 
 Open-ended intent remains available as `cfctl "<natural-language request>"`.
 Existing v2 paths remain compatible; the command map includes newer paths such
-as `auth evidence-key init-preview`, `auth evidence-key recover-preview`,
+as `auth evidence-key init-preview`, `auth evidence-key adopt-preview`,
+`auth evidence-key adopt-plan create`, `auth evidence-key recover-preview`,
 `auth evidence-key recover-plan create`,
 `auth repair-keychain-access`,
 `keys renew-analytics-profile`, and
@@ -158,6 +159,54 @@ never falls back to a file: inspect the exact initialization transition with
 authenticated local artifact still depends on it. The preview discloses
 backend, custody, state-root transition, verification-generation behavior, and
 recovery semantics without creating a key or exposing key bytes.
+
+Initialization crosses two independent custody domains: the platform registry
+and the filesystem state-root marker. No transaction spans both, so `init`
+publishes a private initialization intent naming the exact state root before
+creating the authority, and retires that intent only after the marker reads
+back. If the process dies between the two writes, the next `init` recognizes
+the registry as this installation's own interrupted crossing and resumes it
+forward by creating only the missing marker, preserving the exact authority and
+its generation. Resumption requires the published intent to name the registry
+that is actually present and requires zero authenticated local artifacts; an
+intent that disagrees with the registry fails closed rather than being
+reconciled by inference. A valid registry with no such intent is not
+resumable — it is an authority of unknown provenance, and remains an adoption
+question rather than an initialization one.
+
+If the exact sole canonical platform registry is already valid while its local
+marker and all authenticated storage-v2 artifacts are absent, use
+`adopt-preview` for a strictly read-only classification. `adopt-plan current`
+and `adopt-plan status` remain read-only so historical records can be inspected,
+and `adopt-plan revoke` remains limited to a plan that has not crossed.
+
+`adopt-plan create` and `adopt <plan-id> --yes` are intentionally unavailable
+in this release. Both fail with
+`CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED` before plan persistence,
+filesystem-marker creation, private crossing-seal publication, or terminal
+completion. Signed publication and installation may proceed independently, but
+adoption must wait for a separately reviewed producer and consumer for an
+authenticated installed-identity receipt. The CLI accepts no raw source,
+artifact, architecture, CDHash, algorithm, or provenance flags as authority.
+
+Receipt-less historical plan records remain readable but non-executable. The
+preserved state machine also rejects a record-backed `allocating` pointer as
+crossing authority: it cannot publish a seal, project `marker_crossed`, complete,
+or enable ordinary evidence authentication. This release claims no adoption
+outcome.
+
+A valid registry that cannot be resumed and cannot be adopted is not a dead end.
+`auth evidence-key reset --yes` discards it and initializes a fresh authority.
+Adoption *inherits* an existing authority, which is why it must authenticate the
+identity of the code asking; reset inherits nothing, claims no lineage, and
+produces exactly what a clean host produces, so it requires no installed-identity
+receipt. It is admissible only when the state-root marker is absent, the registry
+is a fresh single-generation authority in direct platform custody, and zero
+authenticated descriptors and proofs exist. That last condition is the point: an
+authority nothing depends on can be discarded without losing anything, and reset
+refuses rather than orphaning a single authenticated artifact. The discarded
+registry is removed through the managed platform-keyring teardown, never by hand.
+
 If the sole canonical platform registry is malformed while the filesystem
 marker and authenticated storage-v2 artifacts are absent, use
 `recover-preview` for a strictly read-only classification and byte count. It

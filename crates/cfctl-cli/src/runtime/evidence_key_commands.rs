@@ -4,14 +4,51 @@ use super::prelude::{
     EvidenceKeyStatusV1, EvidenceMacProvider as _, Result, ResultEnvelopeV2, Sha256, StateStore,
     Uuid, json,
 };
+use crate::{EvidenceKeyAdoptPlanCommand, EvidenceKeyAdoptPlanSelector};
+use cfctl_auth::{
+    EVIDENCE_KEY_ADOPTION_PROTOCOL_ID, EvidenceKeyAdoptionAcceptanceV1, EvidenceKeyAdoptionClockV1,
+    EvidenceKeyAdoptionError, EvidenceKeyAdoptionObservationV1, EvidenceKeyAdoptionPlanV1,
+    EvidenceKeyAdoptionRuntimeIdentityV1,
+};
 use sha2::Digest as _;
+
+const ADOPTION_LINEAGE_BOUNDARY: &str = "adopted the exact sole canonical valid authority; original initialization lineage is not proven";
 
 pub(super) fn evidence_key_command(
     store: &StateStore,
     command: EvidenceKeyCommand,
 ) -> Result<ResultEnvelopeV2> {
+    if matches!(
+        command,
+        EvidenceKeyCommand::AdoptPlan(crate::EvidenceKeyAdoptPlanArgs {
+            command: EvidenceKeyAdoptPlanCommand::Create,
+        }) | EvidenceKeyCommand::Adopt(_)
+    ) {
+        return Err(cfctl_auth::AuthError::from(
+            EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+        )
+        .into());
+    }
     let manager = store.platform_evidence_key_manager()?;
     match command {
+        EvidenceKeyCommand::AdoptPreview => adoption_preview(store, &manager),
+        EvidenceKeyCommand::AdoptPlan(arguments) => match arguments.command {
+            EvidenceKeyAdoptPlanCommand::Create => Err(cfctl_auth::AuthError::from(
+                EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+            )
+            .into()),
+            EvidenceKeyAdoptPlanCommand::Current => adoption_plan_current(store, &manager),
+            EvidenceKeyAdoptPlanCommand::Status(selector) => {
+                adoption_plan_status(store, &manager, &selector)
+            }
+            EvidenceKeyAdoptPlanCommand::Revoke(selector) => {
+                adoption_plan_revoke(store, &manager, &selector)
+            }
+        },
+        EvidenceKeyCommand::Adopt(_) => Err(cfctl_auth::AuthError::from(
+            EvidenceKeyAdoptionError::InstalledIdentityReceiptRequired,
+        )
+        .into()),
         EvidenceKeyCommand::InitPreview => initialization_preview(store, &manager),
         EvidenceKeyCommand::Init => initialize(store, &manager),
         EvidenceKeyCommand::Status => status(store, &manager),
@@ -28,7 +65,359 @@ pub(super) fn evidence_key_command(
             }
         },
         EvidenceKeyCommand::Recover(arguments) => recover(store, &manager, &arguments),
+        EvidenceKeyCommand::Reset(arguments) => reset(store, &manager, &arguments),
     }
+}
+
+fn runtime_result(
+    acceptance: &EvidenceKeyAdoptionAcceptanceV1,
+    provider: &str,
+    validation: &str,
+) -> EvidenceKeyAdoptionRuntimeIdentityV1 {
+    EvidenceKeyAdoptionRuntimeIdentityV1 {
+        validation_provider: provider.to_owned(),
+        requirement_text: acceptance.requirement_text.clone(),
+        requirement_sha256: acceptance.requirement_sha256.clone(),
+        dynamic_self_validation: validation.to_owned(),
+        protocol_identity: EVIDENCE_KEY_ADOPTION_PROTOCOL_ID.to_owned(),
+    }
+}
+
+fn classify_native_self_validation(
+    requirement_parsed: bool,
+    self_code_available: bool,
+    requirement_satisfied: bool,
+) -> &'static str {
+    if !requirement_parsed || !self_code_available {
+        "indeterminate"
+    } else if requirement_satisfied {
+        "satisfied"
+    } else {
+        "not_satisfied"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_adoption_runtime_identity(
+    acceptance: &EvidenceKeyAdoptionAcceptanceV1,
+) -> EvidenceKeyAdoptionRuntimeIdentityV1 {
+    use security_framework::os::macos::code_signing::{Flags, SecCode, SecRequirement};
+
+    let Ok(requirement) = acceptance.requirement_text.parse::<SecRequirement>() else {
+        return runtime_result(
+            acceptance,
+            "macos_security_framework_dynamic_seccode",
+            classify_native_self_validation(false, false, false),
+        );
+    };
+    let Ok(code) = SecCode::for_self(Flags::NONE) else {
+        return runtime_result(
+            acceptance,
+            "macos_security_framework_dynamic_seccode",
+            classify_native_self_validation(true, false, false),
+        );
+    };
+    let validation = classify_native_self_validation(
+        true,
+        true,
+        code.check_validity(Flags::NONE, &requirement).is_ok(),
+    );
+    runtime_result(
+        acceptance,
+        "macos_security_framework_dynamic_seccode",
+        validation,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn current_adoption_runtime_identity(
+    acceptance: &EvidenceKeyAdoptionAcceptanceV1,
+) -> EvidenceKeyAdoptionRuntimeIdentityV1 {
+    use std::io::Read as _;
+
+    let validation = (|| -> std::io::Result<bool> {
+        let mut executable = std::fs::File::open("/proc/self/exe")?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 32 * 1024];
+        loop {
+            let count = executable.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(format!("sha256:{}", hex::encode(digest.finalize()))
+            == acceptance.installed_artifact_identity)
+    })();
+    runtime_result(
+        acceptance,
+        "linux_proc_self_exe_descriptor_sha256",
+        match validation {
+            Ok(true) => "satisfied",
+            Ok(false) => "not_satisfied",
+            Err(_) => "indeterminate",
+        },
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_adoption_runtime_identity(
+    acceptance: &EvidenceKeyAdoptionAcceptanceV1,
+) -> EvidenceKeyAdoptionRuntimeIdentityV1 {
+    runtime_result(acceptance, "unsupported", "indeterminate")
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the test seam is infallible while production platform clock acquisition fails closed"
+)]
+fn current_adoption_clock() -> Result<EvidenceKeyAdoptionClockV1> {
+    #[cfg(test)]
+    return Ok(EvidenceKeyAdoptionClockV1 {
+        boot_identity: "test-boot-session".to_owned(),
+        monotonic_ns: 1_000_000_000,
+        wall_at: chrono::Utc::now(),
+    });
+    #[cfg(not(test))]
+    Ok(EvidenceKeyAdoptionClockV1 {
+        boot_identity: platform_boot_identity()?,
+        monotonic_ns: cfctl_auth::platform_adoption_monotonic_ns()?,
+        wall_at: chrono::Utc::now(),
+    })
+}
+
+fn parse_macos_boot_time(raw: &[u8]) -> Result<String> {
+    let bytes: &[u8; 16] = raw.try_into().map_err(|_| {
+        CliError::Input("kern.boottime returned an unexpected structure length".to_owned())
+    })?;
+    let seconds = i64::from_ne_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let microseconds = i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if seconds <= 0 || !(0..1_000_000).contains(&microseconds) {
+        return Err(CliError::Input(
+            "kern.boottime returned an invalid calendar tripwire".to_owned(),
+        ));
+    }
+    Ok(format!("macos-kern-boottime:{seconds}.{microseconds:06}"))
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn platform_boot_identity() -> Result<String> {
+    use sysctl::{Ctl, CtlValue, Sysctl as _};
+
+    let value = Ctl::new("kern.boottime")
+        .and_then(|control| control.value())
+        .map_err(|_| CliError::Input("kern.boottime is unavailable".to_owned()))?;
+    let CtlValue::Struct(raw) = value else {
+        return Err(CliError::Input(
+            "kern.boottime returned a non-structure value".to_owned(),
+        ));
+    };
+    parse_macos_boot_time(&raw)
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn platform_boot_identity() -> Result<String> {
+    use std::io::Read as _;
+
+    let mut boot = String::new();
+    std::fs::File::open("/proc/sys/kernel/random/boot_id")
+        .and_then(|mut file| file.read_to_string(&mut boot))
+        .map_err(|_| CliError::Input("Linux boot identity is unavailable".to_owned()))?;
+    let canonical = boot.trim();
+    let parsed = Uuid::parse_str(canonical)
+        .map_err(|_| CliError::Input("Linux boot identity is malformed".to_owned()))?;
+    if parsed.to_string() != canonical {
+        return Err(CliError::Input(
+            "Linux boot identity is not canonical".to_owned(),
+        ));
+    }
+    Ok(format!("linux-boot-id:{canonical}"))
+}
+
+#[cfg(all(not(test), not(any(target_os = "macos", target_os = "linux"))))]
+fn platform_boot_identity() -> Result<String> {
+    Err(CliError::Input(
+        "supported boot-session discriminator is unavailable".to_owned(),
+    ))
+}
+
+fn adoption_observation(
+    marker: Option<String>,
+    descriptor_count: usize,
+    proof_count: usize,
+    runtime: &EvidenceKeyAdoptionRuntimeIdentityV1,
+) -> Result<EvidenceKeyAdoptionObservationV1> {
+    Ok(adoption_observation_at(
+        marker,
+        descriptor_count,
+        proof_count,
+        runtime,
+        current_adoption_clock()?,
+    ))
+}
+
+fn adoption_observation_at(
+    marker: Option<String>,
+    descriptor_count: usize,
+    proof_count: usize,
+    runtime: &EvidenceKeyAdoptionRuntimeIdentityV1,
+    clock: EvidenceKeyAdoptionClockV1,
+) -> EvidenceKeyAdoptionObservationV1 {
+    EvidenceKeyAdoptionObservationV1 {
+        marker_identity: marker,
+        authenticated_descriptor_count: descriptor_count,
+        authenticated_proof_count: proof_count,
+        runtime: runtime.clone(),
+        clock,
+    }
+}
+
+fn adoption_preview(store: &StateStore, manager: &EvidenceKeyManager) -> Result<ResultEnvelopeV2> {
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    let marker = store.evidence_root_identity()?;
+    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+    let runtime = EvidenceKeyAdoptionRuntimeIdentityV1 {
+        validation_provider: "not_evaluated_for_preview".to_owned(),
+        requirement_text: String::new(),
+        requirement_sha256: format!("sha256:{}", hex::encode(Sha256::digest([]))),
+        dynamic_self_validation: "indeterminate".to_owned(),
+        protocol_identity: EVIDENCE_KEY_ADOPTION_PROTOCOL_ID.to_owned(),
+    };
+    let observation = adoption_observation(
+        marker.clone(),
+        counts.descriptor_count,
+        counts.proof_count,
+        &runtime,
+    )?;
+    let status = manager.adoption_preview(&observation)?;
+    Ok(ResultEnvelopeV2::success(
+        "auth evidence-key adopt-preview",
+        json!({
+            "performed": false,
+            "preview": {
+                "canonical_location_identity": manager.location_identity(),
+                "resource_class": "local_evidence_integrity_authority",
+                "backend": "platform_keyring",
+                "status": status,
+                "marker_present": marker.is_some(),
+                "authenticated_descriptor_count": counts.descriptor_count,
+                "authenticated_proof_count": counts.proof_count,
+                "allowed_effect": "create_matching_filesystem_marker_only",
+                "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
+            },
+            "secret_or_private_values_exposed": false,
+            "next_action": "Preserve this read-only classification. Signed publication and installation may proceed independently, but adoption plan creation and marker crossing remain unavailable until authenticated, independently reviewed installed-identity receipt support lands.",
+        }),
+    ))
+}
+
+fn adoption_plan_current(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+) -> Result<ResultEnvelopeV2> {
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    let plan_id = manager
+        .current_adoption_plan_id()?
+        .ok_or_else(|| CliError::Input("no adoption plan is discoverable".to_owned()))?;
+    let selector = EvidenceKeyAdoptPlanSelector { plan_id };
+    adoption_plan_status_after_lock(
+        store,
+        manager,
+        &selector,
+        &lifecycle,
+        "auth evidence-key adopt-plan current",
+    )
+}
+
+fn adoption_plan_status(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    selector: &EvidenceKeyAdoptPlanSelector,
+) -> Result<ResultEnvelopeV2> {
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    adoption_plan_status_after_lock(
+        store,
+        manager,
+        selector,
+        &lifecycle,
+        "auth evidence-key adopt-plan status",
+    )
+}
+
+fn adoption_plan_status_after_lock(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    selector: &EvidenceKeyAdoptPlanSelector,
+    lifecycle: &cfctl_storage::EvidenceLifecycleLock,
+    command: &'static str,
+) -> Result<ResultEnvelopeV2> {
+    let acceptance = manager.adoption_plan_acceptance(&selector.plan_id)?;
+    let runtime = current_adoption_runtime_identity(&acceptance);
+    let marker = store.evidence_root_identity()?;
+    let counts = store.authenticated_evidence_artifact_counts(lifecycle)?;
+    let observation = adoption_observation(
+        marker,
+        counts.descriptor_count,
+        counts.proof_count,
+        &runtime,
+    )?;
+    let plan = manager.adoption_plan_status(&selector.plan_id, &observation)?;
+    Ok(adoption_plan_status_envelope(
+        command,
+        manager.location_identity(),
+        plan,
+    ))
+}
+
+fn adoption_plan_status_envelope(
+    command: &'static str,
+    canonical_location_identity: &str,
+    plan: EvidenceKeyAdoptionPlanV1,
+) -> ResultEnvelopeV2 {
+    ResultEnvelopeV2::success(
+        command,
+        json!({
+            "plan": plan,
+            "canonical_location_identity": canonical_location_identity,
+            "backend": "platform_keyring",
+            "performed": false,
+            "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
+            "secret_or_private_values_exposed": false,
+        }),
+    )
+}
+
+fn adoption_plan_revoke(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    selector: &EvidenceKeyAdoptPlanSelector,
+) -> Result<ResultEnvelopeV2> {
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    let acceptance = manager.adoption_plan_acceptance(&selector.plan_id)?;
+    let runtime = current_adoption_runtime_identity(&acceptance);
+    let marker = store.evidence_root_identity()?;
+    let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+    let observation = adoption_observation(
+        marker,
+        counts.descriptor_count,
+        counts.proof_count,
+        &runtime,
+    )?;
+    let plan = manager.revoke_adoption_plan(&selector.plan_id, &observation)?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "auth evidence-key adopt-plan revoke",
+        json!({
+            "plan": plan,
+            "canonical_location_identity": manager.location_identity(),
+            "backend": "platform_keyring",
+            "lineage_boundary": ADOPTION_LINEAGE_BOUNDARY,
+            "secret_or_private_values_exposed": false,
+        }),
+    );
+    envelope.performed = true;
+    Ok(envelope)
 }
 
 fn recovery_preview(store: &StateStore, manager: &EvidenceKeyManager) -> Result<ResultEnvelopeV2> {
@@ -225,19 +614,70 @@ fn initialize_with_marker_write(
     manager: &EvidenceKeyManager,
     write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
 ) -> Result<ResultEnvelopeV2> {
-    let _lifecycle = store.lock_evidence_lifecycle()?;
+    let lifecycle = store.lock_evidence_lifecycle()?;
     let marker = store.evidence_root_identity()?;
     let status = manager.status(marker.as_deref())?;
+    // A registry with no marker is only resumable when this installation published
+    // the intent that names it, and nothing has been authenticated under it yet.
+    // Anything else is an authority of unknown provenance and remains an adoption
+    // question, not an initialization one.
+    if marker.is_none() && status.initialized {
+        let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+        if counts.descriptor_count == 0
+            && counts.proof_count == 0
+            && let Some(interrupted_root) = manager.interrupted_initialization()?
+        {
+            write_marker(&interrupted_root).map_err(|marker_error| {
+                CliError::Input(format!(
+                    "an interrupted evidence-key initialization was identified, but resuming its marker did not cross; the exact platform authority was preserved and the same initialization may be resumed again: {marker_error}"
+                ))
+            })?;
+            let resumed = store
+                .evidence_root_identity()?
+                .filter(|resumed| *resumed == interrupted_root)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "the resumed evidence-root marker did not read back as the exact interrupted state root; the platform authority was preserved. Inspect `cfctl auth evidence-key status --json`"
+                            .to_owned(),
+                    )
+                })?;
+            manager.clear_initialization_intent()?;
+            let resumed_status = manager.status(Some(&resumed))?;
+            return Ok(status_envelope(
+                "auth evidence-key init",
+                resumed_status,
+                "An interrupted initialization was resumed forward. The exact platform authority was preserved and only its missing state-root marker was created.",
+            ));
+        }
+    }
     if marker.is_some() || status.initialized {
         return Err(CliError::Input(
             "evidence key initialization requires both the state-root marker and platform authority to be absent; inspect `cfctl auth evidence-key status --json`"
                 .to_owned(),
         ));
     }
+    let initialized = initialize_fresh_locked(store, manager, write_marker)?;
+    Ok(status_envelope(
+        "auth evidence-key init",
+        initialized,
+        "The platform-held evidence authority is initialized for this exact canonical state root.",
+    ))
+}
+
+/// Create one fresh authority and its marker while the lifecycle lock is already held.
+///
+/// Callers own the admissibility decision; this owns only the ordered crossing and
+/// its compensation.
+fn initialize_fresh_locked(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    write_marker: impl FnOnce(&str) -> cfctl_storage::Result<()>,
+) -> Result<EvidenceKeyStatusV1> {
     let state_root_identity = format!(
         "sha256:{}",
         hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()))
     );
+    manager.publish_initialization_intent(&state_root_identity)?;
     let initialized = match manager.initialize(&state_root_identity) {
         Ok(initialized) => initialized,
         Err(initialization_error) => match manager.status(None) {
@@ -278,10 +718,77 @@ fn initialize_with_marker_write(
             ))),
         };
     }
+    manager.clear_initialization_intent()?;
+    Ok(initialized)
+}
+
+/// Discard one unattributable, unused platform authority and initialize a fresh one.
+///
+/// Adoption *inherits* an existing authority, which is why it must authenticate the
+/// identity of the code asking. Reset inherits nothing: it destroys an authority that
+/// has authenticated no local artifact and creates a new one, exactly as a clean host
+/// would. It claims no lineage, so it needs no installed-identity receipt.
+///
+/// Admissible only for an absent marker, an existing fresh single-generation registry
+/// in direct platform custody, and zero authenticated descriptors and proofs.
+///
+/// Consumer: operators stranded by an initialization that crossed before
+/// `initialization-intent-v1` existed, and so cannot be resumed. Failure mode: refuses
+/// rather than discarding anything an artifact still depends on. Retire this surface
+/// once no supported release can produce an intent-less split.
+fn reset(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+    arguments: &crate::EvidenceKeyResetArgs,
+) -> Result<ResultEnvelopeV2> {
+    if !arguments.yes {
+        return Err(CliError::Input(
+            "evidence key reset permanently discards the existing platform authority; rerun with --yes to confirm"
+                .to_owned(),
+        ));
+    }
+    let lifecycle = store.lock_evidence_lifecycle()?;
+    if store.evidence_root_identity()?.is_some() {
+        return Err(CliError::Input(
+            "evidence key reset requires the state-root marker to be absent; a complete authority is rotated or retired, never reset"
+                .to_owned(),
+        ));
+    }
+    // A reset whose discard already crossed the managed deletion boundary is resumed
+    // forward with the same plan rather than re-decided. Its admissibility was proven
+    // before the crossing, the registry is already unreadable, and the only safe
+    // completion is the managed teardown.
+    match manager.status(None) {
+        Err(cfctl_auth::AuthError::SecretStoreDeletionIncomplete) => {
+            manager.complete_interrupted_registry_deletion()?;
+        }
+        Err(status_error) => return Err(status_error.into()),
+        Ok(status) => {
+            let Some(discarded_state_root) = status.state_root_identity.clone() else {
+                return Err(CliError::Input(
+                    "evidence key reset requires an existing platform authority; run `cfctl auth evidence-key init --json` instead"
+                        .to_owned(),
+                ));
+            };
+            let counts = store.authenticated_evidence_artifact_counts(&lifecycle)?;
+            if counts.descriptor_count != 0 || counts.proof_count != 0 {
+                return Err(CliError::Input(format!(
+                    "evidence key reset requires zero authenticated local artifacts; {} descriptors and {} proofs still depend on this authority and would become unverifiable",
+                    counts.descriptor_count, counts.proof_count
+                )));
+            }
+            // rollback_initialize admits only an exact fresh single-generation authority,
+            // so a rotated or in-use registry is refused here rather than destroyed.
+            manager.rollback_initialize(&discarded_state_root)?;
+        }
+    }
+    let initialized = initialize_fresh_locked(store, manager, |state_root_identity| {
+        store.initialize_evidence_root_identity(state_root_identity)
+    })?;
     Ok(status_envelope(
-        "auth evidence-key init",
+        "auth evidence-key reset",
         initialized,
-        "The platform-held evidence authority is initialized for this exact canonical state root.",
+        "The prior unattributable platform authority was discarded and a fresh authority was initialized for a new canonical state root. No lineage, adoption outcome, or continuity with the discarded authority is claimed.",
     ))
 }
 
@@ -401,7 +908,7 @@ fn status_envelope(
 mod tests {
     use std::sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::thread;
 
@@ -414,7 +921,7 @@ mod tests {
     use super::{
         EvidenceKeyManager, StateStore, initialization_preview, initialize,
         initialize_with_marker_write, recover, recovery_plan_create, recovery_plan_status,
-        recovery_preview,
+        recovery_preview, reset, status as status_command,
     };
     use crate::{EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanSelector};
 
@@ -430,18 +937,28 @@ mod tests {
     #[derive(Default)]
     struct PlatformMemorySecretStore {
         inner: MemorySecretStore,
+        put_attempts: AtomicUsize,
+        delete_attempts: AtomicUsize,
+        fail_next_get: AtomicBool,
     }
 
     impl SecretStore for PlatformMemorySecretStore {
         fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {
+            self.put_attempts.fetch_add(1, Ordering::AcqRel);
             self.inner.put(key, value)
         }
 
         fn get(&self, key: &str) -> cfctl_auth::Result<Option<String>> {
+            if self.fail_next_get.swap(false, Ordering::AcqRel) {
+                return Err(AuthError::SecretStore(
+                    "injected indeterminate platform read".to_owned(),
+                ));
+            }
             self.inner.get(key)
         }
 
         fn delete(&self, key: &str) -> cfctl_auth::Result<()> {
+            self.delete_attempts.fetch_add(1, Ordering::AcqRel);
             self.inner.delete(key)
         }
 
@@ -572,7 +1089,11 @@ mod tests {
     impl SecretStore for PutThenLocateFailsOnceSecretStore {
         fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {
             self.inner.put(key, value)?;
-            self.fail_next_locate.store(true, Ordering::Release);
+            // Arm only on the registry write this fixture is named for. Initialization
+            // publishes its intent first, and that write must not consume the fault.
+            if key.ends_with("/registry-v1") {
+                self.fail_next_locate.store(true, Ordering::Release);
+            }
             Ok(())
         }
 
@@ -616,6 +1137,358 @@ mod tests {
             .expect("registry and marker agree");
         assert!(status.initialized);
         assert_eq!(status.state_root_identity.as_deref(), Some(marker.as_str()));
+    }
+
+    /// Models a managed keyring whose registry deletion crossed its inventory
+    /// transition and stopped: the value is unreadable, and only the managed teardown
+    /// can finish it.
+    #[derive(Default)]
+    struct ResumableDeletionSecretStore {
+        inner: MemorySecretStore,
+        deletion_crossed: AtomicBool,
+    }
+
+    impl ResumableDeletionSecretStore {
+        fn is_registry(key: &str) -> bool {
+            key.ends_with("/registry-v1")
+        }
+    }
+
+    impl SecretStore for ResumableDeletionSecretStore {
+        fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> cfctl_auth::Result<Option<String>> {
+            if Self::is_registry(key) && self.deletion_crossed.load(Ordering::Acquire) {
+                return Err(AuthError::SecretStoreDeletionIncomplete);
+            }
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> cfctl_auth::Result<()> {
+            if Self::is_registry(key) {
+                self.deletion_crossed.store(false, Ordering::Release);
+            }
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> cfctl_auth::Result<Option<SecretBackend>> {
+            Ok(self.inner.get(key)?.map(|_| SecretBackend::Memory))
+        }
+    }
+
+    #[test]
+    fn reset_resumes_a_discard_that_already_crossed_the_deletion_boundary() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let backend = Arc::new(ResumableDeletionSecretStore::default());
+        let manager = EvidenceKeyManager::new(
+            backend.clone(),
+            store.evidence_location_identity(),
+            SecretBackend::Memory,
+        )
+        .expect("resumable-deletion evidence manager");
+        manager
+            .initialize(&format!("sha256:{}", "a".repeat(64)))
+            .expect("an authority exists");
+        // A prior authorized reset crossed the managed deletion and stopped, so the
+        // registry is now unreadable rather than absent.
+        backend.deletion_crossed.store(true, Ordering::Release);
+        assert!(matches!(
+            manager.status(None),
+            Err(AuthError::SecretStoreDeletionIncomplete)
+        ));
+
+        let envelope = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect("reset resumes the same discard forward");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("fresh marker exists");
+        let fresh = manager
+            .status(Some(&marker))
+            .expect("status is readable again");
+        assert!(fresh.initialized);
+        assert_eq!(fresh.state_root_identity.as_deref(), Some(marker.as_str()));
+        status_command(&store, &manager).expect("the authority is no longer split");
+    }
+
+    fn stranded_authority(manager: &EvidenceKeyManager) -> String {
+        let stranded = format!("sha256:{}", "e".repeat(64));
+        manager
+            .initialize(&stranded)
+            .expect("an unattributable authority exists");
+        stranded
+    }
+
+    #[test]
+    fn reset_discards_an_unattributable_authority_and_initializes_a_fresh_one() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        let discarded = stranded_authority(&manager);
+        initialize(&store, &manager).expect_err("precondition: the strand is not resumable");
+
+        let envelope = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect("reset discards and reinitializes");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("fresh marker exists");
+        assert_ne!(
+            marker, discarded,
+            "reset must mint a new state root, never resurrect the discarded one"
+        );
+        let fresh = manager.status(Some(&marker)).expect("status");
+        assert!(fresh.initialized);
+        assert_eq!(fresh.state_root_identity.as_deref(), Some(marker.as_str()));
+        // The split is gone: ordinary status now answers instead of failing closed.
+        status_command(&store, &manager).expect("a reset authority is no longer split");
+    }
+
+    #[test]
+    fn reset_requires_explicit_confirmation() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        let discarded = stranded_authority(&manager);
+
+        let error = reset(
+            &store,
+            &manager,
+            &crate::EvidenceKeyResetArgs { yes: false },
+        )
+        .expect_err("an unconfirmed reset discards nothing");
+
+        assert!(error.to_string().contains("--yes"));
+        assert_eq!(
+            manager
+                .status(None)
+                .expect("status")
+                .state_root_identity
+                .as_deref(),
+            Some(discarded.as_str()),
+            "the authority must survive an unconfirmed reset"
+        );
+    }
+
+    #[test]
+    fn reset_refuses_when_authenticated_artifacts_still_depend_on_the_authority() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        let discarded = stranded_authority(&manager);
+        // One authenticated storage-v2 candidate is enough: discarding the authority
+        // would make it permanently unverifiable.
+        std::fs::write(
+            store
+                .paths()
+                .data_dir
+                .join("evidence-descriptors")
+                .join(format!("{}.json", "f".repeat(64))),
+            br#"{"storage_schema_version":2,"authentication":{}}"#,
+        )
+        .expect("candidate descriptor is written");
+
+        let error = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect_err("a depended-upon authority is never discarded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("zero authenticated local artifacts")
+        );
+        assert_eq!(
+            manager
+                .status(None)
+                .expect("status")
+                .state_root_identity
+                .as_deref(),
+            Some(discarded.as_str()),
+            "the authority must survive a refused reset"
+        );
+    }
+
+    #[test]
+    fn reset_refuses_a_complete_authority() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        initialize(&store, &manager).expect("a complete authority exists");
+
+        let error = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect_err("a complete authority is rotated or retired, never reset");
+
+        assert!(error.to_string().contains("marker to be absent"));
+    }
+
+    #[test]
+    fn reset_refuses_when_there_is_no_authority_to_discard() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        let error = reset(&store, &manager, &crate::EvidenceKeyResetArgs { yes: true })
+            .expect_err("there is nothing to discard");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an existing platform authority")
+        );
+    }
+
+    #[test]
+    fn interrupted_initialization_resumes_the_same_authority_forward() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        // Initialization crosses the platform registry and the filesystem marker in
+        // that order. Model process death between them: the intent and the registry
+        // exist, the marker never does, and no compensation code runs.
+        let state_root_identity = format!("sha256:{}", "a".repeat(64));
+        manager
+            .publish_initialization_intent(&state_root_identity)
+            .expect("intent publishes before the authority it names");
+        let crossed = manager
+            .initialize(&state_root_identity)
+            .expect("platform authority crosses");
+        assert_eq!(
+            store.evidence_root_identity().expect("marker readback"),
+            None
+        );
+
+        let envelope = initialize(&store, &manager).expect("interrupted initialization resumes");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("resumed marker exists");
+        assert_eq!(marker, state_root_identity);
+        let status = manager.status(Some(&marker)).expect("status");
+        assert!(status.initialized);
+        // Resumption finishes the original crossing; it must not mint a replacement.
+        assert_eq!(
+            status.active_generation_id, crossed.active_generation_id,
+            "resume must preserve the exact interrupted authority"
+        );
+        // The intent is retired, so the resumed authority is now an ordinary one.
+        let error = initialize(&store, &manager).expect_err("a complete authority blocks init");
+        assert!(
+            error.to_string().contains(
+                "requires both the state-root marker and platform authority to be absent"
+            )
+        );
+    }
+
+    #[test]
+    fn a_registry_without_a_published_intent_is_not_resumable() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        // An authority this installation cannot attribute to its own interrupted
+        // crossing stays an adoption question. Resumption must not become a
+        // receipt-free path to inheriting an unattributable signing authority.
+        let state_root_identity = format!("sha256:{}", "b".repeat(64));
+        manager
+            .initialize(&state_root_identity)
+            .expect("an unattributable authority exists");
+
+        let error =
+            initialize(&store, &manager).expect_err("unattributable authority fails closed");
+
+        assert!(
+            error.to_string().contains(
+                "requires both the state-root marker and platform authority to be absent"
+            )
+        );
+        assert_eq!(
+            store.evidence_root_identity().expect("marker readback"),
+            None,
+            "a failed resume must not create a marker"
+        );
+    }
+
+    #[test]
+    fn an_intent_that_disagrees_with_the_registry_fails_closed() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        let intended = format!("sha256:{}", "c".repeat(64));
+        let actual = format!("sha256:{}", "d".repeat(64));
+        manager
+            .publish_initialization_intent(&intended)
+            .expect("intent publishes");
+        manager
+            .initialize(&actual)
+            .expect("a different authority crosses");
+
+        let error = initialize(&store, &manager).expect_err("disagreement is never guessed away");
+
+        assert!(error.to_string().contains("different state root"));
+        assert_eq!(
+            store.evidence_root_identity().expect("marker readback"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_intent_whose_registry_never_materialized_does_not_block_initialization() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+        // A crash after the intent but before the registry names an authority that was
+        // never created. Nothing can reference it, so a later initialization must be
+        // able to proceed rather than being stranded on stale bookkeeping.
+        manager
+            .publish_initialization_intent(&format!("sha256:{}", "9".repeat(64)))
+            .expect("an intent is published");
+        assert_eq!(
+            manager
+                .interrupted_initialization()
+                .expect("nothing to resume without a registry"),
+            None
+        );
+
+        let envelope = initialize(&store, &manager).expect("initialization proceeds");
+
+        assert!(envelope.ok);
+        let marker = store
+            .evidence_root_identity()
+            .expect("marker readback")
+            .expect("marker exists");
+        assert_ne!(
+            marker,
+            format!("sha256:{}", "9".repeat(64)),
+            "the abandoned identity must not be reused"
+        );
+        status_command(&store, &manager).expect("the authority is coherent");
+    }
+
+    #[test]
+    fn a_completed_initialization_leaves_no_resumable_intent() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let manager = memory_manager(&store);
+
+        initialize(&store, &manager).expect("initialization succeeds");
+
+        assert_eq!(
+            manager
+                .interrupted_initialization()
+                .expect("intent inspection"),
+            None,
+            "a completed crossing must retire its intent"
+        );
     }
 
     #[test]
@@ -713,3 +1586,7 @@ mod tests {
         assert_eq!(status.state_root_identity.as_deref(), Some(marker.as_str()));
     }
 }
+
+#[cfg(test)]
+#[path = "evidence_key_adoption_tests.rs"]
+mod adoption_rework_tests;

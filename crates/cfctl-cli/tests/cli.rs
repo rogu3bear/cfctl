@@ -371,10 +371,15 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one parser contract enumerates the complete evidence-key lifecycle and exact confirmations"
+)]
 fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmation() {
     use cfctl_cli::{AuthCommand, Command, EvidenceKeyCommand};
 
     for action in [
+        "adopt-preview",
         "init-preview",
         "init",
         "status",
@@ -390,6 +395,9 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             panic!("evidence-key command");
         };
         let parsed = match group.command {
+            EvidenceKeyCommand::AdoptPreview => "adopt-preview",
+            EvidenceKeyCommand::AdoptPlan(_) => "adopt-plan",
+            EvidenceKeyCommand::Adopt(_) => "adopt",
             EvidenceKeyCommand::InitPreview => "init-preview",
             EvidenceKeyCommand::Init => "init",
             EvidenceKeyCommand::Status => "status",
@@ -398,6 +406,7 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             EvidenceKeyCommand::RecoverPreview => "recover-preview",
             EvidenceKeyCommand::RecoverPlan(_) => "recover-plan",
             EvidenceKeyCommand::Recover(_) => "recover",
+            EvidenceKeyCommand::Reset(_) => "reset",
         };
         assert_eq!(parsed, action);
     }
@@ -421,6 +430,28 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         panic!("retire command");
     };
     assert!(retire.yes);
+
+    // Reset discards an authority, so confirmation is part of its parser contract and
+    // must never default to true.
+    for (arguments, expected) in [
+        (vec!["cfctl", "auth", "evidence-key", "reset"], false),
+        (
+            vec!["cfctl", "auth", "evidence-key", "reset", "--yes"],
+            true,
+        ),
+    ] {
+        let cli = Cli::try_parse_from(arguments).expect("evidence-key reset parses");
+        let Some(Command::Auth(arguments)) = cli.command else {
+            panic!("auth command");
+        };
+        let AuthCommand::EvidenceKey(group) = arguments.command else {
+            panic!("evidence-key command");
+        };
+        let EvidenceKeyCommand::Reset(reset) = group.command else {
+            panic!("reset command");
+        };
+        assert_eq!(reset.yes, expected);
+    }
 
     let plan_id = "7ff2b63e-f412-4a73-978a-e88b86ef5327";
     for action in ["status", "revoke"] {
@@ -449,6 +480,117 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
         panic!("recover command");
     };
     assert!(recover.yes);
+
+    for action in ["current", "status", "revoke"] {
+        if action == "current" {
+            Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt-plan", action])
+                .expect("current adoption plan parses without an ID");
+            continue;
+        }
+        Cli::try_parse_from([
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "adopt-plan",
+            action,
+            plan_id,
+        ])
+        .expect("adoption-plan lifecycle action parses");
+    }
+    Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt-plan", "create"])
+        .expect("disabled adoption-plan creation remains an explicit command surface");
+    assert!(
+        Cli::try_parse_from([
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "adopt-plan",
+            "create",
+            "--source-candidate-identity",
+            "git:0123456789abcdef0123456789abcdef01234567",
+        ])
+        .is_err(),
+        "raw caller identity claims are not accepted as adoption authority"
+    );
+    let cli = Cli::try_parse_from(["cfctl", "auth", "evidence-key", "adopt", plan_id, "--yes"])
+        .expect("evidence-key adopt parses");
+    let Some(Command::Auth(arguments)) = cli.command else {
+        panic!("auth command");
+    };
+    let AuthCommand::EvidenceKey(group) = arguments.command else {
+        panic!("evidence-key command");
+    };
+    let EvidenceKeyCommand::Adopt(adopt) = group.command else {
+        panic!("adopt command");
+    };
+    assert!(adopt.yes);
+}
+
+#[test]
+fn receipt_free_adoption_commands_emit_exact_fail_closed_envelopes() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    for (arguments, command) in [
+        (
+            vec!["auth", "evidence-key", "adopt-plan", "create", "--json"],
+            "auth evidence-key adopt-plan create",
+        ),
+        (
+            vec![
+                "auth",
+                "evidence-key",
+                "adopt",
+                "00000000-0000-4000-8000-000000000001",
+                "--yes",
+                "--json",
+            ],
+            "auth evidence-key adopt",
+        ),
+    ] {
+        let output = ProcessCommand::new(binary)
+            .env("CFCTL_HOME", runtime.path())
+            .args(arguments)
+            .output()
+            .expect("execute disabled adoption command");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("failure envelope JSON");
+        assert_eq!(envelope["command"], command);
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["performed"], false);
+        assert_eq!(
+            envelope["error"]["code"],
+            "CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED"
+        );
+        let next_step = envelope["error"]["next_step"]
+            .as_str()
+            .expect("precise next step");
+        assert!(next_step.contains("Signed publication and installation may proceed"));
+        assert!(next_step.contains("remain unavailable"));
+        assert!(!next_step.contains("doctor"));
+    }
+
+    let help = ProcessCommand::new(binary)
+        .args(["auth", "evidence-key", "adopt-plan", "create", "--help"])
+        .output()
+        .expect("render disabled create help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("UTF-8 help");
+    for removed in [
+        "--source-candidate-identity",
+        "--installed-artifact-identity",
+        "--expected-architecture",
+        "--expected-running-cdhash",
+        "--expected-cdhash-algorithm",
+        "--expected-cdhash-full-digest-provenance",
+    ] {
+        assert!(
+            !help.contains(removed),
+            "raw authority flag survived: {removed}"
+        );
+    }
+    assert!(help.contains("authenticated installed-identity receipt support"));
 }
 
 #[test]
