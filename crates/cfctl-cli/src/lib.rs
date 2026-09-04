@@ -1079,3 +1079,106 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
     }
     Ok((key.to_owned(), value.to_owned()))
 }
+
+#[cfg(test)]
+mod invocation_routing_tests {
+    use super::{InvocationMode, classify_invocation};
+
+    fn classify(arguments: &[&str]) -> InvocationMode {
+        classify_invocation(arguments.iter().copied())
+    }
+
+    fn reaches_the_parser(arguments: &[&str]) -> bool {
+        classify(arguments) == InvocationMode::Deterministic
+    }
+
+    #[test]
+    fn an_empty_invocation_reaches_the_parser() {
+        assert!(reaches_the_parser(&["cfctl"]));
+        assert!(reaches_the_parser(&["cfctl", "--json"]));
+    }
+
+    #[test]
+    fn a_leading_flag_reaches_the_parser() {
+        for flag in ["--help", "-h", "--version", "-V"] {
+            assert!(reaches_the_parser(&["cfctl", flag]), "{flag}");
+        }
+    }
+
+    #[test]
+    fn a_known_subcommand_reaches_the_parser() {
+        for verb in ["doctor", "plans", "catalog", "auth", "keys", "help"] {
+            assert!(reaches_the_parser(&["cfctl", verb]), "{verb}");
+            assert!(
+                reaches_the_parser(&["cfctl", verb, "status"]),
+                "{verb} status"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mistyped_subcommand_reaches_the_parser_instead_of_the_agent() {
+        // A bare unknown token is a typo, not intent: it must fail closed with
+        // clap's unrecognized-subcommand error rather than launch an agent.
+        for typo in ["not-a-real-verb", "doctr", "planz"] {
+            assert!(reaches_the_parser(&["cfctl", typo]), "{typo}");
+            assert!(
+                reaches_the_parser(&["cfctl", typo, "--json"]),
+                "{typo} --json"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_v1_command_shape_reaches_the_parser() {
+        // RETIRED_V1_PUBLIC_VERBS exists so a stale multi-token v1 command
+        // fails closed instead of being read as natural-language intent.
+        for shape in [
+            &["verify", "dns.record"][..],
+            &["can", "dns.record", "delete"][..],
+            &["list", "d1.database"][..],
+            &["token", "mint"][..],
+            &["audit", "trust"][..],
+            &["surfaces", "list"][..],
+            &["hostname", "apply", "example.com"][..],
+        ] {
+            let arguments: Vec<&str> = std::iter::once("cfctl")
+                .chain(shape.iter().copied())
+                .collect();
+            assert!(reaches_the_parser(&arguments), "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn a_retired_verb_used_as_prose_is_still_intent() {
+        // The surface list is what separates `cfctl verify dns.record` (a dead
+        // v1 command) from `verify my dns records` (a request). Without it the
+        // whole retired-verb boundary would swallow ordinary English.
+        assert_eq!(
+            classify(&["cfctl", "verify", "my", "dns", "records"]),
+            InvocationMode::NaturalLanguage("verify my dns records".to_owned())
+        );
+    }
+
+    #[test]
+    fn multi_word_input_is_routed_to_the_agent_lane() {
+        let expected = InvocationMode::NaturalLanguage("make me a dns record".to_owned());
+        assert_eq!(
+            classify(&["cfctl", "make", "me", "a", "dns", "record"]),
+            expected
+        );
+        assert_eq!(classify(&["cfctl", "make me a dns record"]), expected);
+    }
+
+    #[test]
+    fn the_json_flag_never_changes_routing() {
+        assert_eq!(
+            classify(&["cfctl", "--json", "make", "me", "a", "record"]),
+            classify(&["cfctl", "make", "me", "a", "record"])
+        );
+        assert_eq!(
+            classify(&["cfctl", "make", "me", "a", "record", "--json"]),
+            classify(&["cfctl", "make", "me", "a", "record"])
+        );
+    }
+}

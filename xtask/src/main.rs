@@ -41,6 +41,63 @@ const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
 /// reason. Present-only — a clone legitimately has neither.
 const LOCAL_OPERATOR_ADAPTERS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
+/// The gitignored documents that are agent-facing without being adapters: an
+/// evidentiary sidecar and a live-estate map, both of which tell an agent to
+/// read them to orient. They share the adapters' blind spot — outside
+/// `git ls-files`, so outside every tracked-file scan — but carry no command
+/// map and no authority (`LAYERS.md`), only observations that go stale.
+/// Present-only, like the adapters.
+const LOCAL_AGENT_FACING_NOTES: [&str; 2] = ["NUANCE.md", "WEB.md"];
+
+/// Every gitignored document a doctrine gate must open by name because no
+/// tracked-file scan will reach it. `verify_gitignored_guidance_is_scanned`
+/// holds this set equal to what `.gitignore` actually hides.
+fn local_unscanned_guidance() -> impl Iterator<Item = &'static str> {
+    LOCAL_OPERATOR_ADAPTERS
+        .into_iter()
+        .chain(LOCAL_AGENT_FACING_NOTES)
+}
+
+/// Exact `.md` filenames a `.gitignore` hides. A glob or a path-scoped entry is
+/// not a name a gate can open by hand, so only bare filenames count here.
+fn gitignored_markdown_names(gitignore: &str) -> Vec<&str> {
+    gitignore
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
+        .filter(|line| {
+            !line.contains(['*', '?', '[', '/'])
+                && Path::new(line)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        })
+        .collect()
+}
+
+/// Gitignoring a document removes it from every tracked-file scan at once. That
+/// is how the retired public domain survived in `AGENTS.md`: the gates were
+/// reading `git ls-files`, and the file was not in it. A new gitignored
+/// document must therefore join the by-name set or fail this contract, so the
+/// blind spot cannot be reopened by editing `.gitignore` alone.
+fn check_gitignored_guidance_is_scanned(gitignore: &str) -> Result<(), TaskError> {
+    for name in gitignored_markdown_names(gitignore) {
+        if !local_unscanned_guidance().any(|scanned| scanned == name) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{name} is gitignored, so no tracked-file scan reaches it; add it to \
+                 LOCAL_OPERATOR_ADAPTERS or LOCAL_AGENT_FACING_NOTES so the doctrine \
+                 gates open it by name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_gitignored_guidance_is_scanned() -> Result<(), TaskError> {
+    let path = repository_root()?.join(".gitignore");
+    let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+    check_gitignored_guidance_is_scanned(&content)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
 struct Arguments {
@@ -559,8 +616,8 @@ fn verify_public_domain_contract() -> Result<(), TaskError> {
         }
     }
 
-    // Gitignored adapters are invisible to `git ls-files`, so scan them by name.
-    for path in LOCAL_OPERATOR_ADAPTERS {
+    // Gitignored guidance is invisible to `git ls-files`, so scan it by name.
+    for path in local_unscanned_guidance() {
         let absolute_path = repository_root.join(path);
         if !absolute_path.is_file() {
             continue;
@@ -881,7 +938,8 @@ fn verify_v1_cutover_contract() -> Result<(), TaskError> {
     verify_v1_quarantine_manifest()?;
     verify_quarantine_code_consumers()?;
     verify_tracked_cfctl_command_references()?;
-    verify_active_guidance_has_no_v1_commands()
+    verify_active_guidance_has_no_v1_commands()?;
+    verify_gitignored_guidance_is_scanned()
 }
 
 fn repository_root() -> Result<&'static Path, TaskError> {
@@ -1548,8 +1606,9 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         })?;
     // First-load agent doctrine must not re-teach archived v1 verbs or layout.
     // Historical material below compat/v1 is governed by the quarantine manifest instead.
-    // Tracked public guidance and constitutional doctrine are always required. Local
-    // operator adapters are gitignored but, when present, must stay v2-aligned.
+    // Tracked public guidance and constitutional doctrine are always required. The
+    // gitignored adapters and the evidentiary sidecar are present-only, but when
+    // present they are agent-facing and must stay v2-aligned too.
     let required_guidance = [
         "CFCTL_PROMPT.md",
         "docs/agent-landing.md",
@@ -1588,7 +1647,7 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
     for path in required_guidance {
         verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
     }
-    for path in LOCAL_OPERATOR_ADAPTERS {
+    for path in local_unscanned_guidance() {
         let absolute_path = repository_root.join(path);
         if absolute_path.is_file() {
             verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
@@ -3677,11 +3736,11 @@ mod tests {
 
     use super::{
         PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, bind_new_uploaded_asset,
-        classify_pre_push_registration, collect_workflow_paths, contains_retired_public_domain,
-        expected_signed_release_file_names, extract_cfctl_command_references,
-        extract_cfctl_command_refs, extract_prose_command_refs, is_canonical_github_origin,
-        is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_full_git_object_id,
-        is_linux_musl, parse_bound_draft_release, parse_release_trust_roots,
+        check_gitignored_guidance_is_scanned, classify_pre_push_registration,
+        collect_workflow_paths, contains_retired_public_domain, expected_signed_release_file_names,
+        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
+        is_canonical_github_origin, is_declared_quarantine_path, is_forbidden_quarantine_consumer,
+        is_full_git_object_id, is_linux_musl, parse_bound_draft_release, parse_release_trust_roots,
         parse_remote_tag_commit, release_build_driver, release_build_subcommand,
         release_tag_is_exact_version, render_linux_installer_text, repository_root,
         security_proof_commands, validate_bootstrap_contract, validate_bound_draft_release,
@@ -4952,5 +5011,44 @@ mod tests {
         assert!(!preview_run.status.success());
         assert!(String::from_utf8_lossy(&preview_run.stderr).contains("unsigned assembly"));
         assert!(render_linux_installer_text(template, "bad", "bad", Some(("", "issuer"))).is_err());
+    }
+
+    #[test]
+    fn gitignored_markdown_names_reads_only_openable_filenames() {
+        let gitignore = "\
+# comment .md
+AGENTS.md
+   NUANCE.md   
+*.local.md
+docs/private/notes.md
+!KEEP.md
+target/
+WEB.md
+";
+        assert_eq!(
+            super::gitignored_markdown_names(gitignore),
+            vec!["AGENTS.md", "NUANCE.md", "WEB.md"]
+        );
+    }
+
+    #[test]
+    fn a_gitignored_document_outside_the_scanned_set_is_rejected() {
+        let error = check_gitignored_guidance_is_scanned("AGENTS.md\nPRIVATE_NOTES.md\n")
+            .expect_err("a gitignored document no gate opens must fail the contract");
+        let message = error.to_string();
+        assert!(message.contains("PRIVATE_NOTES.md"), "{message}");
+        assert!(
+            message.contains("no tracked-file scan reaches it"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_scanned_set_covers_the_repository_gitignore() {
+        let repository_root = super::repository_root().expect("repository root");
+        let gitignore =
+            fs::read_to_string(repository_root.join(".gitignore")).expect("read .gitignore");
+        check_gitignored_guidance_is_scanned(&gitignore)
+            .expect("every gitignored document must be opened by name by some doctrine gate");
     }
 }
