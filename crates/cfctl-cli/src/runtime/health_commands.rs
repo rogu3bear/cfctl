@@ -9,7 +9,9 @@ use super::support::catalog_is_stale;
 use super::support::home_directory;
 use super::support::http_client;
 use crate::build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build};
+use crate::telemetry_product::OPERATIONAL_PROOF_PROJECTION_LIMIT;
 use cfctl_agent::inspect_agent;
+use cfctl_core::StandingAuthorityStatus;
 
 pub(super) fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
     let secrets = platform_secrets(store);
@@ -33,15 +35,60 @@ pub(super) fn platform_secret_store_health(store: &StateStore) -> Result<Value> 
     }))
 }
 
+/// Reports whether authenticated evidence can currently be produced.
+///
+/// Deliberately does not call `require_qualifying_evidence_authority`. That
+/// probe reaches the platform keyring, and `doctor` is run constantly and must
+/// never raise an interactive prompt or fail because one is unanswerable. The
+/// bounded proof projection already degrades safely — rows it cannot
+/// authenticate are counted as candidate failures rather than erroring — so the
+/// same classification serves as the signal.
+///
+/// Zero retained rows alongside candidate failures is the state a reinstall
+/// leaves behind: each build has a new code identity, the platform ACL does not
+/// carry over, and nothing else surfaces it.
+fn evidence_authority_health(store: &StateStore) -> Result<Value> {
+    let page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
+    let retained = page.proofs.len();
+    let failures = page.failures.len();
+    let qualifying = failures == 0 && (retained > 0 || page.total_count == 0);
+    Ok(json!({
+        "qualifying": qualifying,
+        "retained_count": retained,
+        "candidate_failure_count": failures,
+        "legacy_nonqualifying_count": page.legacy_nonqualifying_count,
+        "total_index_rows": page.total_count,
+        // Three distinct states, and the empty one is not a failure. A clean
+        // install has produced nothing yet; that is healthy. Rows that exist
+        // but will not verify is the state a reinstall leaves behind.
+        "detail": if page.total_count == 0 {
+            "no authenticated evidence has been produced yet"
+        } else if failures > 0 {
+            "authenticated rows exist but cannot be verified; the platform authority is unreadable by this build. Re-authorize in an interactive session."
+        } else {
+            "authenticated evidence can be produced and read back"
+        },
+    }))
+}
+
 fn standing_authorities_health(store: &StateStore) -> Result<Value> {
     let now = Utc::now();
     let authorities: Vec<Value> = store
         .list_authorities()?
         .iter()
         .map(|authority| {
+            // `status` is the stored lifecycle field; it does not observe the
+            // clock. An authority whose TTL has passed is refused at admission
+            // by `ensure_operational_at`, but reported here it read `active`
+            // with an expiry already in the past — the health surface answering
+            // "which grants are live?" with the one answer it must not give.
+            let expired = now > authority.expires_at;
             json!({
                 "authority_id": authority.authority_id,
                 "status": authority.status.as_str(),
+                "expired": expired,
+                "admissible": !expired
+                    && authority.status == StandingAuthorityStatus::Active,
                 "account_id": authority.account_id,
                 "zone_id": authority.zone_id,
                 "bound_resources": authority.allowed_token_resources(),
@@ -138,6 +185,7 @@ pub(super) fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": platform_secret_store_health(store)?,
             "standing_authorities": standing_authorities_health(store)?,
+            "evidence_authority": evidence_authority_health(store)?,
             "instruction_drift": instruction_drift,
             "agents": agents,
             "public_oauth": "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
