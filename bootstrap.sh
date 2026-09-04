@@ -63,6 +63,36 @@ if [ "$skip_agent_sync" = false ]; then
 fi
 "$binary" agents doctor
 "$binary" doctor
+
+# A new build cannot read the previous build's platform evidence authority: the
+# integrity key is held by the platform credential store with no file fallback,
+# and every build has a different code identity, so the access control does not
+# carry over. Nothing else surfaces this. The install looks clean, `doctor`
+# reports healthy, and the first governed apply that needs an authenticated
+# receipt is where it shows up.
+#
+# This is the interactive session the operator is already in, so ask here.
+evidence_qualifying=$("$binary" doctor --json 2>/dev/null \
+  | tr ',' '\n' | grep '"qualifying"' | head -1)
+case "$evidence_qualifying" in
+  *true*) ;;
+  *)
+    echo "evidence authority is unreadable by this build; re-authorizing" >&2
+    if "$binary" auth evidence-key status --json >/dev/null 2>&1; then
+      echo "evidence authority re-authorized"
+    else
+      echo "" >&2
+      echo "cfctl is installed, but it cannot read the evidence integrity key." >&2
+      echo "Authenticated evidence cannot be written until it can, so operations" >&2
+      echo "that are irreversible on either their effect or their risk will refuse." >&2
+      echo "" >&2
+      echo "Approve the platform prompt for this command in an interactive terminal:" >&2
+      echo "  cfctl auth evidence-key status --json" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 echo "installed $install_root/bin/cfctl"
 echo "next: cfctl catalog sync"
 echo "then: cfctl auth import-api-token --account <account-id> --stdin"
