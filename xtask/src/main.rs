@@ -269,11 +269,11 @@ fn verify_site() -> Result<(), TaskError> {
 
     let mut live_verifier = Command::new("bun");
     live_verifier
-        .args(["test", "./scripts/verify-live-site.test.mjs"])
+        .args(["test", "./scripts/"])
         .current_dir(&root);
     run_command(
         &mut live_verifier,
-        "bun test ./scripts/verify-live-site.test.mjs (site)",
+        "bun test site asset and live verification contracts (site)",
     )?;
 
     let mut edge = Command::new("bash");
@@ -1696,7 +1696,7 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
     for (path, required) in [
         (
             "README.md",
-            "v1.3.0 must not be published unless its two macOS binaries",
+            "Prebuilt v1.3.0 artifacts must not be published unless its two macOS binaries",
         ),
         (
             "QUICKSTART.md",
@@ -1704,11 +1704,11 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
         ),
         (
             "SECURITY.md",
-            "v1.3.0 must not be published unless both macOS binaries",
+            "Prebuilt v1.3.0 artifacts must not be published unless both macOS binaries",
         ),
         (
             "CONTRIBUTING.md",
-            "The v1.3.0 operator posture requires the identity-bearing lane.",
+            "The prebuilt v1.3.0 operator posture requires the identity-bearing lane.",
         ),
         ("CONTRIBUTING.md", "create `v1.3.0` as a new annotated tag"),
         (
@@ -1717,7 +1717,7 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
         ),
         (
             "site/docs/LAUNCH_CHECKLIST.md",
-            "The v1.3.0 CLI posture requires signed and notarized publication",
+            "The prebuilt v1.3.0 CLI posture requires signed and notarized publication",
         ),
         (
             "SECURITY.md",

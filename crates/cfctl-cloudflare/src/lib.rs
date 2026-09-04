@@ -1,4 +1,9 @@
 //! Typed Cloudflare request construction and governed execution.
+mod access_create;
+pub use access_create::{
+    access_application_host_overlap, access_create_collection_receipt,
+    validate_owned_access_create_input,
+};
 
 use std::{
     collections::BTreeSet,
@@ -6309,94 +6314,6 @@ impl Executor {
         })
     }
 
-    async fn verify_created_resource(
-        &self,
-        plan: &PlanV1,
-        apply_response: &CloudflareResponseV1,
-        input: &CallInput,
-        credential: &AuthCredential,
-    ) -> Result<OperationVerificationV1> {
-        let target = plan.capability.created_resource.as_ref().ok_or_else(|| {
-            CloudflareError::MissingVerificationTarget(
-                "the hash-bound created-resource contract is absent".to_owned(),
-            )
-        })?;
-        let planned = input
-            .body
-            .as_ref()
-            .and_then(Value::as_object)
-            .filter(|body| !body.is_empty())
-            .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget(
-                    "planned create body is absent, empty, or not an object".to_owned(),
-                )
-            })?;
-        let resource_id = apply_response
-            .result
-            .pointer(&target.response_result_identity_pointer)
-            .and_then(resource_identity_value)
-            .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget(
-                    "the successful creation response has no non-empty string or integer schema-proven identity"
-                        .to_owned(),
-                )
-            })?;
-        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
-            CloudflareError::MissingVerificationTarget(
-                "planned create selectors are not an object".to_owned(),
-            )
-        })?;
-        selectors.insert(target.identity_selector.clone(), resource_id.clone());
-        let mut details = CapabilityV1::new(
-            &target.read_capability_id,
-            "Created resource verification readback",
-            "GET",
-            &target.detail_path,
-        );
-        details.selectors.clone_from(&plan.capability.selectors);
-        let request = self.builder.build(
-            &details,
-            &CallInput {
-                selectors: Value::Object(selectors),
-                query: Value::Object(serde_json::Map::new()),
-                body: None,
-                ..CallInput::default()
-            },
-        )?;
-        let readback = self.send(&request, credential).await?;
-        let readback_identity = readback
-            .result
-            .pointer(&target.response_result_identity_pointer)
-            .and_then(resource_identity_value);
-        let mut mismatches =
-            mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
-        extend_r2_bucket_create_mismatches(plan, input, &readback.result, &mut mismatches);
-        let passed = apply_response.success
-            && readback.success
-            && readback_identity.as_ref() == Some(&resource_id)
-            && mismatches.is_empty();
-        let basis = if passed {
-            "the exact created-resource readback matched the returned identity and every planned field"
-                .to_owned()
-        } else {
-            format!(
-                "created resource was not proven (apply success={}, readback HTTP {}, readback success={}, identity match={}, fields={})",
-                apply_response.success,
-                readback.status,
-                readback.success,
-                readback_identity.as_ref() == Some(&resource_id),
-                render_field_names(&mismatches)
-            )
-        };
-        Ok(OperationVerificationV1 {
-            strategy: plan.capability.verification.strategy.clone(),
-            passed,
-            basis,
-            readback,
-            correlated_resource_id: None,
-        })
-    }
-
     #[expect(
         clippy::too_many_lines,
         reason = "bounded polling keeps exact deployment identity, terminal state, and failure evidence in one verification transaction"
@@ -12525,6 +12442,9 @@ fn validate_same_path_update_target(capability: &CapabilityV1, input: &CallInput
 }
 
 fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    if capability.id == access_create::OWNED_CREATE_ID {
+        validate_owned_access_create_input(input)?;
+    }
     let target = capability.created_resource.as_ref().ok_or_else(|| {
         CloudflareError::MissingVerificationTarget(
             "the hash-bound created-resource contract is absent".to_owned(),

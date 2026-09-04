@@ -1,5 +1,9 @@
 //! Platform-local persistence for plans, evidence, catalogs, and registered roots.
 
+mod private_runtime;
+pub use private_runtime::*;
+mod private_files;
+pub use private_files::{PrivateDirectory, PrivateFileSecretStore};
 mod evidence;
 mod observations;
 
@@ -18,7 +22,7 @@ use std::{
 };
 
 use cap_std::fs::Dir;
-use cfctl_auth::{EvidenceKeyManager, EvidenceMacProvider};
+use cfctl_auth::EvidenceMacProvider;
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, DeploymentPlanSetV1,
     OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, redact_json,
@@ -28,7 +32,6 @@ use cfctl_workspace::{
     WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
 };
 use chrono::{DateTime, Utc};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -140,6 +143,13 @@ pub enum StorageError {
     },
     #[error("Email Routing catch-all target `{account_id}/{zone_id}` is already locked")]
     EmailRoutingCatchAllLocked { account_id: String, zone_id: String },
+    #[error(
+        "operation `{operation_id}` belongs to preserved historical state at {archive}; inspect `cfctl auth evidence-key private-history`; historical approvals cannot run in the new runtime"
+    )]
+    ArchivedOperation {
+        operation_id: String,
+        archive: String,
+    },
     #[error("system clock is before the Unix epoch")]
     Clock,
     #[error("operational proof is invalid: {0}")]
@@ -158,23 +168,6 @@ pub struct RuntimePaths {
 }
 
 impl RuntimePaths {
-    pub fn discover() -> Result<Self> {
-        if let Some(root) = std::env::var_os("CFCTL_HOME") {
-            let root = PathBuf::from(root);
-            if !root.is_absolute() {
-                return Err(StorageError::InvalidRuntimeRoot(root.display().to_string()));
-            }
-            return Ok(Self::from_root(&root));
-        }
-        let project = ProjectDirs::from("io", "cfctl", "cfctl")
-            .ok_or(StorageError::PlatformDirectoriesUnavailable)?;
-        Ok(Self {
-            config_dir: project.config_dir().to_path_buf(),
-            data_dir: project.data_dir().to_path_buf(),
-            cache_dir: project.cache_dir().to_path_buf(),
-        })
-    }
-
     #[must_use]
     pub fn from_root(root: &Path) -> Self {
         Self {
@@ -208,6 +201,7 @@ pub struct StateStore {
     evidence_directories: Arc<EvidenceDirectoryCapabilities>,
     evidence_authenticator: Option<Arc<dyn EvidenceMacProvider>>,
     observation_attestation: Option<cfctl_core::AttestationStatusV1>,
+    private_origin: Option<ArchivedRuntimeV1>,
 }
 
 impl std::fmt::Debug for StateStore {
@@ -338,6 +332,7 @@ const PLAN_V2_ACTIVATED_AT: &str = "2026-07-22T00:00:00Z";
 
 impl StateStore {
     pub fn open(paths: RuntimePaths) -> Result<Self> {
+        let private_origin = private_runtime_origin(&paths)?;
         for path in [
             &paths.config_dir,
             &paths.data_dir,
@@ -364,6 +359,7 @@ impl StateStore {
             evidence_directories,
             evidence_authenticator: None,
             observation_attestation: None,
+            private_origin,
         })
     }
 
@@ -446,11 +442,6 @@ impl StateStore {
             &serde_json::to_vec_pretty(&marker)?,
             &self.paths.data_dir.join("evidence-root-v1.json"),
         )
-    }
-
-    pub fn platform_evidence_key_manager(&self) -> Result<EvidenceKeyManager> {
-        EvidenceKeyManager::platform(self.evidence_location_identity())
-            .map_err(|error| StorageError::EvidenceAuthentication(error.to_string()))
     }
 
     /// Appends one immutable import-protocol checkpoint. The plan lock held by
@@ -614,6 +605,7 @@ impl StateStore {
         let mut plan = match self.load_stored_plan_record(operation_id)? {
             StoredPlanRecord::Current(plan) => *plan,
             StoredPlanRecord::LegacyReadable(_) | StoredPlanRecord::RequiredSidecarMissing(_) => {
+                self.reject_archived_operation(operation_id)?;
                 return Err(StorageError::PlanV2NotFound(operation_id.to_owned()));
             }
             StoredPlanRecord::ProjectionDrift { .. } => {
@@ -652,6 +644,7 @@ impl StateStore {
         let projection_exists = validate_existing_managed_file(&projection_path)?;
         let current_exists = validate_existing_managed_file(&current_path)?;
         if !projection_exists && !current_exists {
+            self.reject_archived_operation(operation_id)?;
             return Err(StorageError::PlanNotFound(operation_id.to_owned()));
         }
 

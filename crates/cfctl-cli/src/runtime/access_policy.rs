@@ -404,9 +404,9 @@ pub(super) fn validate_access_application_owned_whole_host_input(
                     .to_owned(),
             )
         })?;
-    if destination != format!("https://{self_hosted_domains}") {
+    if destination != self_hosted_domains {
         return Err(CliError::Input(
-            "owned whole-host Access application destination must be the exact HTTPS whole-host origin"
+            "owned whole-host Access application destination must be the exact bare whole hostname"
                 .to_owned(),
         ));
     }

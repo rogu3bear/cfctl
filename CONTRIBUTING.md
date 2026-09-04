@@ -184,7 +184,7 @@ side effect of building:
 
 Making a draft public is always a separate operator action.
 
-The v1.3.0 operator posture requires the identity-bearing lane. Publication is
+The prebuilt v1.3.0 operator posture requires the identity-bearing lane. Publication is
 admissible only after both macOS binaries pass Developer ID signing and Apple
 notarization, and both `SHA256SUMS` and provenance pass Sigstore verification
 against the certificate identity and OIDC issuer committed independently to
@@ -216,3 +216,9 @@ rotates, revokes, and verifies one short-lived token.
 
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [docs/v2-security.md](docs/v2-security.md) for the runtime security contract.
+
+For a source-only release, publish the exact reviewed and locally verified
+annotated tag with a release title and notes that say source-only. Upload no
+prebuilt executable, checksum set, or installer manifest, and set GitHub latest
+to false. This source publication does not invoke or replace the signed artifact
+lane above. Local source bootstrap remains separate from public binary trust.

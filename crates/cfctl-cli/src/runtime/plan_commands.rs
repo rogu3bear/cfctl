@@ -1056,6 +1056,7 @@ pub(super) struct LivePreconditionEvidence {
     pub(super) web_analytics_rum_state: Option<EvidenceV1>,
     pub(super) dns_record_state: Option<EvidenceV1>,
     pub(super) same_path_prior_state: Option<EvidenceV1>,
+    pub(super) access_application_absence: Option<EvidenceV1>,
     pub(super) access_operator_group_policy_ownership: Option<EvidenceV1>,
     pub(super) security_action_state: Option<EvidenceV1>,
     pub(super) oauth_client_secret_state: Option<EvidenceV1>,
@@ -1135,6 +1136,10 @@ pub(super) fn validate_live_plan_precondition_evidence<'a>(
             )
             .await?,
             same_path_prior_state: validate_live_same_path_prior_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+            access_application_absence: super::access_create::validate_live(
                 store, catalog, plan, input, credential,
             )
             .await?,
@@ -1373,6 +1378,7 @@ pub(super) fn prepend_live_precondition_evidence(
         evidence.worker_deployment_state,
         evidence.dns_record_state,
         evidence.same_path_prior_state,
+        evidence.access_application_absence,
         evidence.access_operator_group_policy_ownership,
         evidence.security_action_state,
         evidence.web_analytics_rum_state,

@@ -64,8 +64,8 @@ fn EdgeHydrationScripts(options: LeptosOptions) -> impl IntoView {
     let hydration_script = edge_hydration_script(&options);
 
     view! {
-        <link rel="modulepreload" href=js_href.clone()/>
-        <link rel="preload" href=wasm_href.clone() r#as="fetch" r#type="application/wasm"/>
+        <link rel="modulepreload" href=js_href.clone() crossorigin="anonymous"/>
+        <link rel="preload" href=wasm_href.clone() r#as="fetch" r#type="application/wasm" crossorigin="anonymous"/>
         <script type="module">{hydration_script}</script>
     }
 }

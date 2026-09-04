@@ -80,6 +80,8 @@ fn row() -> Map<String, Value> {
         "desired_state_digest":format!("sha256:{}", "b".repeat(64)),
         "semantic_projection_digest":format!("sha256:{}", "c".repeat(64)),
         "immutable_policy_object_key":format!("config/policy/{}.json", "a".repeat(64)),
+        "revision_r2_key":format!("config/policy/{}.json", "a".repeat(64)),
+        "projection_policy_sha256":format!("sha256:{}", "a".repeat(64)),
         "expected_domain_count":2,
         "projected_domain_count":2,
         "expected_route_count":1,
@@ -614,4 +616,47 @@ fn failure_receipts_preserve_stage_and_boundary_without_source_material() {
         assert!(!encoded.contains("operator@example.com"));
         assert!(!encoded.contains("provider_payload"));
     }
+}
+
+#[test]
+fn independent_policy_sources_preserve_disagreement_without_substitution() {
+    let mut evidence_row = row();
+    let revision = format!("config/policy/{}.json", "d".repeat(64));
+    let projection = format!("sha256:{}", "e".repeat(64));
+    evidence_row.insert("revision_r2_key".to_owned(), json!(revision));
+    evidence_row.insert("projection_policy_sha256".to_owned(), json!(projection));
+    let (evidence, _) =
+        project_evidence(&contract(), vec![evidence_row]).expect("independent observations");
+    assert_eq!(evidence.revision_r2_key.as_deref(), Some(revision.as_str()));
+    assert_eq!(
+        evidence.projection_policy_sha256.as_deref(),
+        Some(projection.as_str())
+    );
+    assert_ne!(
+        evidence.projection_policy_sha256.as_deref(),
+        Some(evidence.active_policy_digest.as_str())
+    );
+    for (field, invalid) in [
+        ("revision_r2_key", json!("private@example.com")),
+        ("revision_r2_key", json!("x".repeat(1025))),
+        ("projection_policy_sha256", json!("sha256:invalid")),
+        ("projection_policy_sha256", Value::Null),
+    ] {
+        let mut invalid_row = row();
+        invalid_row.insert(field.to_owned(), invalid);
+        assert!(project_evidence(&contract(), vec![invalid_row]).is_err());
+    }
+}
+
+#[test]
+fn historical_policy_aggregate_does_not_fabricate_new_observations() {
+    let (evidence, _) = project_evidence(&contract(), vec![row()]).expect("current evidence");
+    let mut historical = serde_json::to_value(evidence).expect("encoded evidence");
+    let fields = historical.as_object_mut().expect("evidence fields");
+    fields.remove("revision_r2_key");
+    fields.remove("projection_policy_sha256");
+    let restored: MaildeskD1EvidenceV1 =
+        serde_json::from_value(historical).expect("historical compatibility");
+    assert!(restored.revision_r2_key.is_none());
+    assert!(restored.projection_policy_sha256.is_none());
 }

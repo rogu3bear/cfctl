@@ -548,7 +548,8 @@ pub(super) fn plan_requires_live_credential(
     capability: &CapabilityV1,
     adapter_targets: &Value,
 ) -> bool {
-    should_bind_pages_project_absence(capability)
+    super::access_create::applies(capability)
+        || should_bind_pages_project_absence(capability)
         || pages_deployment::binds_project_state(capability)
         || worker_deployment::target(adapter_targets).is_some()
         || should_resolve_entitlement_probe(capability)

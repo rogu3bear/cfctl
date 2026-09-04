@@ -68,8 +68,11 @@ pub fn load_workspace_d1_reply_admission_capability(
     let graph = WorkspaceGraph::discover(&registered)?;
     let mut matches = Vec::new();
     for repository in &graph.repositories {
-        let pack_path = repository.path.join(PACK_RELATIVE_PATH);
-        if !pack_path.is_file() {
+        if !super::operation_identity::contains(
+            &repository.path,
+            PACK_RELATIVE_PATH,
+            capability_id,
+        )? {
             continue;
         }
         if repository.git.dirty {

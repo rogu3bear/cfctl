@@ -176,15 +176,18 @@ credential store or its private mode-0600 fallback. Slot activation is
 old-or-new atomic. A healthy managed-profile check repeats all three live reads
 and retires any unreachable legacy profile-keyed credential left by the
 one-time migration without touching the active immutable slot. On macOS,
-Keychain writes, reads, and deletes use a bounded native subprocess. Writes
-send the value only through stdin and trust only `/usr/bin/security`, the same
-reader used by unattended cfctl processes. `cfctl auth
-repair-keychain-access <profile>` performs a one-time opaque rewrite for items
-created before this contract. An interactive access prompt becomes a nonzero
-scheduler failure instead of an indefinite hang. Keychain reads receive the
-credential only through a private, bounded child-process pipe; no token value
-reaches inherited or user-visible cfctl stdout, arguments, logs, profiles,
-plans, evidence, or repository files.
+Keychain writes, reads, and deletes call Security.framework in process. Every
+operation disables system interaction regardless of terminal attachment. A
+process-wide mutex covers the interaction-state query, suppression, credential
+operation and restoration; an already disabled flag remains disabled. If the
+interaction-state query or suppression fails, the credential API is not called.
+Authorization-required and locked-store results are reported without opening a
+password dialog. Explicit `cfctl auth repair-keychain-access <profile>` follows
+the same noninteractive boundary; it does not unlock the Keychain or grant
+itself access. Secret values stay in private process memory and never reach
+user-visible stdout, arguments, logs, profiles, plans, evidence or repository
+files. Existing credential fallback and evidence-key custody rules remain in
+force; disabling dialogs does not create a new authority or rotate an old key.
 
 The cfctl v2 macOS Keychain representation is a one-way storage migration.
 After a v2 build writes or migrates a credential, running a binary released
@@ -275,3 +278,38 @@ or recovery persistence fails. The result identifies that execution happened
 (or the receipt explicitly proves it did not), reports pending verification,
 and directs inspection of the consumed operation without replay. A storage
 error after a receipt is never classified as a pre-execution subprocess failure.
+
+## Explicit private authority
+
+`auth evidence-key private-preview` and `private-activate` provide an explicit
+fresh local runtime. This is a deliberate OS-user trust boundary, not automatic
+fallback from failed platform evidence custody or an implicit reset. The old
+platform registry, state and histories remain intact; signing-key continuity is
+unavailable and old approvals, standing grants and proof caches carry no new
+authority. The new runtime uses durable private files for both evidence keys
+and account-pinned credentials, including its first import. Doctor identifies
+this choice as `private_file` and reports the platform as `not_selected`.
+
+A private transition plan binds the selected credential bytes and exact source
+configuration/history internally without exposing secret-derived digests.
+Activation revalidates the snapshot under an exclusive runtime-selection lock;
+normal invocations share that lock while existing resource locks govern their
+own operations. Pointer publication follows staged runtime initialization and
+verification. A fresh epoch has new random root/generation identities; an
+interrupted attempt resumes its own staged identity. Pending OAuth login,
+running execution or pending revocation blocks activation. Older executables
+must be quiesced before transition because they cannot honor this new lock.
+
+Private files reject symlinks, hardlinks, foreign owners, non-private modes and
+oversized values. Descriptor-relative writes sync file and directory. This
+protects filesystem custody from other users; software running as the same OS
+user is inside the trust boundary and can access credentials and signing keys.
+Platform repair/recovery remain explicit platform-mode operations and never
+silently reselect platform storage from an active private runtime.
+
+Existing active admission restrictions are preserved as source constraints:
+the exact active pointer and referenced restrictive-only bundle enter the
+transition snapshot, the preview shows all rules, and confirmation re-admits
+unchanged rules under a fresh local bundle. Old approval metadata is not
+copied. An interrupted staged bundle/pointer publication resumes the same new
+bundle; malformed or drifted rules fail before runtime selection changes.

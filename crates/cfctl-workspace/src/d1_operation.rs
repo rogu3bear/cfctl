@@ -167,8 +167,7 @@ fn load_from_repository(
     repository: &super::RepositoryNode,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    let pack_path = repository.path.join(PACK_RELATIVE_PATH);
-    if !pack_path.is_file() {
+    if !super::operation_identity::contains(&repository.path, PACK_RELATIVE_PATH, capability_id)? {
         return Ok(None);
     }
     if repository.git.dirty {

@@ -134,6 +134,17 @@ require_old_worker_compatibility = true
 "#,
     )
     .expect("schema-v2 pack");
+    for (pack, id) in [
+        ("d1-policy-projections.toml", "maildesk.policy"),
+        ("d1-reply-admission.toml", "maildesk.reply"),
+        ("d1-evidence.toml", "maildesk.evidence"),
+    ] {
+        fs::write(
+            repository.path().join(".cfctl/operations").join(pack),
+            format!("schema_version = 1\n[[operation]]\nid = \"{id}\"\n"),
+        )
+        .expect("committed identity fixture");
+    }
     git(&["add", "."]);
     git(&["commit", "-qm", "schema-v2 fixture"]);
 
@@ -161,7 +172,12 @@ require_old_worker_compatibility = true
 
     fs::write(repository.path().join("dirty.txt"), "unrelated work")
         .expect("unrelated fixture dirt");
-    for intent in ["deploy JKCA workers", "workers-scripts-list"] {
+    for intent in [
+        "deploy JKCA workers",
+        "workers-scripts-list",
+        "workers",
+        "dns",
+    ] {
         let envelope = resolve_command(
             &store,
             ResolveArgs {
@@ -175,10 +191,26 @@ require_old_worker_compatibility = true
         assert_eq!(envelope.command, "resolve");
         assert!(!envelope.performed);
     }
-    assert!(
-        load_workspace_capability(&store, "mln-web.founder-d1-migration-apply").is_err(),
-        "the selected dirty workspace operation must still fail closed"
-    );
+    for id in [
+        "mln-web.founder-d1-migration-apply",
+        "maildesk.policy",
+        "maildesk.reply",
+        "maildesk.evidence",
+    ] {
+        assert!(
+            resolve_command(
+                &store,
+                ResolveArgs {
+                    intent: id.to_owned(),
+                    account: None,
+                    limit: 5,
+                }
+            )
+            .await
+            .is_err(),
+            "selected committed workspace identity still enforces clean source: {id}"
+        );
+    }
 }
 
 #[test]

@@ -31,6 +31,10 @@ pub const MAILDESK_D1_EVIDENCE_COLUMNS_V1: &[&str] = &[
     "dlq_correlation_count",
 ];
 
+/// Independent active-policy sources required by current Maildesk verification.
+pub const MAILDESK_D1_POLICY_IDENTITY_COLUMNS_V2: &[&str] =
+    &["revision_r2_key", "projection_policy_sha256"];
+
 /// Additive route-health columns carried by the same compiler-owned query.
 /// The V1 aggregate column contract above remains unchanged.
 pub const MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2: &[&str] =
@@ -75,6 +79,8 @@ pub const MAILDESK_D1_EVIDENCE_SQL_V1: &str = r"SELECT
   'sha256:' || (SELECT value FROM policy_projection_state WHERE key = 'active_desired_state_sha256') AS desired_state_digest,
   'sha256:' || (SELECT value FROM policy_projection_state WHERE key = 'active_projection_sha256') AS semantic_projection_digest,
   rs.active_policy_r2_key AS immutable_policy_object_key,
+  substr(pr.r2_object_key, 1, 1025) AS revision_r2_key,
+  'sha256:' || (SELECT value FROM policy_projection_state WHERE key = 'active_policy_sha256') AS projection_policy_sha256,
   pr.expected_domain_count AS expected_domain_count,
   (SELECT COUNT(DISTINCT ar.domain_id) FROM alias_routes ar WHERE ar.enabled = 1 AND ar.policy_sha256 = rs.active_policy_sha256) AS projected_domain_count,
   pr.expected_route_count AS expected_route_count,
@@ -192,8 +198,7 @@ fn load_from_repository(
     repository: &super::RepositoryNode,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    let pack_path = repository.path.join(PACK_RELATIVE_PATH);
-    if !pack_path.is_file() {
+    if !super::operation_identity::contains(&repository.path, PACK_RELATIVE_PATH, capability_id)? {
         return Ok(None);
     }
     if repository.git.dirty {
@@ -266,14 +271,10 @@ fn load_from_repository(
 }
 
 fn validate_operation(operation: &OperationDeclaration) -> Result<()> {
-    let identity_matches = matches!(
-        (operation.id.as_str(), operation.projection.as_str()),
-        ("star-maildesk-cf.d1-evidence-read", "maildesk_v1")
-            | (
-                MAILDESK_INBOUND_ACCEPTANCE_CAPABILITY_ID,
-                MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1
-            )
-    );
+    let identity_matches = (operation.projection == "maildesk_v1"
+        && valid_evidence_operation_id(&operation.id))
+        || (operation.id == MAILDESK_INBOUND_ACCEPTANCE_CAPABILITY_ID
+            && operation.projection == MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1);
     if !identity_matches
         || operation.title.trim().is_empty()
         || operation.description.trim().is_empty()
@@ -425,6 +426,27 @@ fn safe_relative(value: &str) -> Result<PathBuf> {
         ));
     }
     Ok(path.to_path_buf())
+}
+
+fn valid_evidence_operation_id(value: &str) -> bool {
+    value
+        .strip_suffix(".d1-evidence-read")
+        .is_some_and(|namespace| {
+            !namespace.is_empty()
+                && namespace.len() <= 96
+                && namespace.split('.').all(|part| {
+                    part.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                        && part
+                            .as_bytes()
+                            .last()
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                        && part.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'-' | b'_')
+                        })
+                })
+        })
 }
 
 fn safe_identifier(value: &str) -> bool {
@@ -623,11 +645,53 @@ mod tests {
     }
 
     #[test]
+    fn adopted_evidence_namespace_keeps_the_fixed_query_and_clean_authority() {
+        for id in [
+            "maildesk-cf.d1-evidence-read",
+            "team.maildesk.d1-evidence-read",
+        ] {
+            let root = fixture();
+            let pack = root.path().join(PACK_RELATIVE_PATH);
+            let declaration = fs::read_to_string(&pack)
+                .expect("pack")
+                .replace("star-maildesk-cf.d1-evidence-read", id);
+            fs::write(&pack, declaration).expect("adopted pack");
+            git(root.path(), &["add", "."]);
+            git(root.path(), &["commit", "-qm", "adopt namespace"]);
+            let capability =
+                load_workspace_d1_evidence_capability(&[root.path().to_path_buf()], id)
+                    .expect("load")
+                    .expect("adopted capability");
+            assert_eq!(capability.id, id);
+            assert!(!capability.mutating);
+            assert_eq!(
+                capability
+                    .workspace_d1_evidence
+                    .expect("fixed query contract")
+                    .query_sha256,
+                sha256(MAILDESK_D1_EVIDENCE_SQL_V1.as_bytes())
+            );
+            fs::write(root.path().join("dirty"), "unrelated").expect("dirty fixture");
+            assert!(
+                load_workspace_d1_evidence_capability(&[root.path().to_path_buf()], id).is_err()
+            );
+        }
+        for id in [
+            ".d1-evidence-read",
+            "../maildesk.d1-evidence-read",
+            "Maildesk.d1-evidence-read",
+            "maildesk.d1-query",
+        ] {
+            assert!(!valid_evidence_operation_id(id));
+        }
+    }
+
+    #[test]
     fn operation_identity_and_projection_are_exact() {
         for (field, replacement) in [
             (
                 "id = \"star-maildesk-cf.d1-evidence-read\"",
-                "id = \"other-repository.d1-evidence-read\"",
+                "id = \"other/repository.d1-evidence-read\"",
             ),
             (
                 "projection = \"maildesk_v1\"",
@@ -642,8 +706,8 @@ mod tests {
             fs::write(&pack, declaration).expect("drifted pack");
             git(root.path(), &["add", "."]);
             git(root.path(), &["commit", "-qm", "drift operation"]);
-            let capability_id = if replacement.contains("other-repository") {
-                "other-repository.d1-evidence-read"
+            let capability_id = if replacement.contains("other/repository") {
+                "other/repository.d1-evidence-read"
             } else {
                 "star-maildesk-cf.d1-evidence-read"
             };

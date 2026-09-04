@@ -39,6 +39,24 @@ The unsigned `cargo xtask assemble` output is local qualification evidence and
 is deliberately not a published release. A source install is a separate local
 build, not proof that a published binary was installed.
 
+## Set up private local storage
+
+For routine use without platform password dialogs, choose private local storage
+once. Other software running as your OS user can access these private files.
+Review which existing profiles and restrictions will be retained, then run the
+exact activation command returned by the preview:
+
+```bash
+cfctl auth evidence-key private-preview --json
+cfctl auth evidence-key private-activate <plan-id> --yes --json
+cfctl auth evidence-key status --json
+```
+
+This flow also works on a fresh host before the first token import. It preserves
+any prior state as history, creates fresh local authority, and persists the
+storage choice across restarts. Old approvals do not carry over. Status and
+doctor report `private_file`; normal operation does not call Keychain.
+
 Confirm the exact running build after any install path:
 
 ```bash
@@ -67,12 +85,12 @@ dynamic API adapter; generated writes remain discoverable but blocked until
 their full safety contract is implemented, and `catalog show` explains every
 missing field.
 
-For disposable tests, isolate all non-credential state with an absolute
-`CFCTL_HOME` (for example `CFCTL_HOME=/tmp/cfctl-proof cfctl doctor --json`).
-Credentials go to the platform keyring first — Keychain on macOS or Secret
-Service on Linux — and fail down to a governed mode-0600 file store under
-cfctl's data directory (`auth/secrets`) when that keyring is unavailable;
-`cfctl doctor` reports the active backend.
+For disposable tests, use an absolute `CFCTL_HOME` and perform the same private
+setup within it. Continue using that original home for subsequent commands;
+its persistent selection is independent of the default installation. In
+explicit private mode this isolates credentials as well as non-secret state.
+Platform mode remains available as a separate choice with its governed
+credential fallback behavior.
 
 ## Authenticate
 
@@ -80,8 +98,8 @@ Simplest day-to-day lane — scoped API token from stdin, account pin required:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_TOKEN" | \
-  cfctl auth import-api-token --account <account-id> --stdin
-cfctl auth status --json
+  cfctl auth import-api-token --profile production --account <account-id> --stdin
+cfctl auth status production --json
 ```
 
 A build wrapper such as the in-repo `./cfctl` shim can lose stdin to `cargo`;
@@ -219,3 +237,7 @@ Agents use deterministic commands underneath; a recursion marker prevents an
 agent from launching another agent, and model output never approves or
 directly mutates Cloudflare. Quote natural language — a bare single token that
 is not a known command fails closed with a usage error, never an agent launch.
+
+A source-only GitHub release may identify accepted source without uploaded
+binaries or installer assets. It is labeled source-only and is not marked
+GitHub latest. It does not satisfy the prebuilt trust requirements above.

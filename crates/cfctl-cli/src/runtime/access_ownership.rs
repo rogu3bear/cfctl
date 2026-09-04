@@ -56,44 +56,6 @@ pub(super) fn normalized_access_application_hostname(value: &str) -> Option<Stri
     Some(hostname.to_owned())
 }
 
-pub(super) fn access_application_hostname_overlaps(candidate: &str, target: &str) -> bool {
-    let Some(candidate) = normalized_access_application_hostname(candidate) else {
-        return false;
-    };
-    candidate == target
-        || candidate
-            .strip_prefix("*.")
-            .is_some_and(|suffix| target.ends_with(&format!(".{suffix}")))
-}
-
-pub(super) fn access_application_mentions_hostname(application: &Value, hostname: &str) -> bool {
-    application
-        .get("domain")
-        .and_then(Value::as_str)
-        .is_some_and(|value| access_application_hostname_overlaps(value, hostname))
-        || application
-            .get("self_hosted_domains")
-            .and_then(Value::as_array)
-            .is_some_and(|values| {
-                values.iter().any(|value| {
-                    value
-                        .as_str()
-                        .is_some_and(|value| access_application_hostname_overlaps(value, hostname))
-                })
-            })
-        || application
-            .get("destinations")
-            .and_then(Value::as_array)
-            .is_some_and(|values| {
-                values.iter().any(|value| {
-                    value
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| access_application_hostname_overlaps(value, hostname))
-                })
-            })
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "the complete ownership collection, overlap rejection, and prior-snapshot receipt remain visible at one admission boundary"
@@ -108,7 +70,14 @@ pub(super) fn owned_whole_host_access_application_receipt(
             response.status
         )));
     }
-    if !collection_read_complete(response) {
+    if !collection_read_complete(response)
+        || response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.get("cfctl_page_complete"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
         return Err(CliError::Input(
             "Access application ownership collection read was not terminally paginated; the mutation boundary was not crossed"
                 .to_owned(),
@@ -140,6 +109,7 @@ pub(super) fn owned_whole_host_access_application_receipt(
         CliError::Input("owned Access application omitted its exact hostname".to_owned())
     })?;
 
+    let mut seen_ids = std::collections::BTreeSet::new();
     let mut selected = Vec::new();
     let mut candidates = Vec::new();
     for application in applications {
@@ -155,6 +125,11 @@ pub(super) fn owned_whole_host_access_application_receipt(
                     .to_owned(),
             )
         })?;
+        if !seen_ids.insert(id) {
+            return Err(CliError::Input(
+                "Access application inventory contained duplicate identity".to_owned(),
+            ));
+        }
         let app_type = object
             .get("type")
             .and_then(Value::as_str)
@@ -168,9 +143,8 @@ pub(super) fn owned_whole_host_access_application_receipt(
         if id == app_id {
             selected.push(application);
         }
-        if object.get("name").and_then(Value::as_str) == Some(name)
-            || access_application_mentions_hostname(application, hostname)
-        {
+        let overlap = cfctl_cloudflare::access_application_host_overlap(application, hostname)?;
+        if object.get("name").and_then(Value::as_str) == Some(name) || overlap {
             candidates.push((id, app_type));
         }
     }
@@ -231,7 +205,13 @@ pub(super) fn access_policy_collection_source_contract_supported(source: &Capabi
             source.adapter_status,
             AdapterStatus::Native | AdapterStatus::DynamicApi
         )
-        && source.selectors.len() == 2
+        && source.selectors.iter().all(|selector| {
+            (selector.location == "path"
+                && matches!(selector.name.as_str(), "account_id" | "app_id"))
+                || (selector.location == "query"
+                    && !selector.required
+                    && matches!(selector.name.as_str(), "page" | "per_page"))
+        })
         && ["account_id", "app_id"].iter().all(|name| {
             source.selectors.iter().any(|selector| {
                 selector.name == *name
@@ -508,7 +488,7 @@ pub(super) async fn read_live_same_path_prior_state(
             ));
         }
         let collection_response = executor
-            .execute_read(
+            .read_access_application_inventory(
                 collection_source,
                 &CallInput {
                     selectors: json!({"account_id": account_id}),

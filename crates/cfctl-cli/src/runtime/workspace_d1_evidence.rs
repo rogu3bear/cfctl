@@ -14,8 +14,9 @@ use tokio::time::Duration;
 
 use cfctl_workspace::{
     MAILDESK_D1_EVIDENCE_COLUMNS_V1, MAILDESK_D1_EVIDENCE_SQL_V1,
-    MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2, MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1,
-    MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1, MAILDESK_INBOUND_ACCEPTANCE_SQL_V1,
+    MAILDESK_D1_POLICY_IDENTITY_COLUMNS_V2, MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2,
+    MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1, MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1,
+    MAILDESK_INBOUND_ACCEPTANCE_SQL_V1,
 };
 
 use super::{
@@ -702,11 +703,14 @@ fn project_evidence_rows(
     let expected = MAILDESK_D1_EVIDENCE_COLUMNS_V1
         .iter()
         .chain(MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2)
+        .chain(MAILDESK_D1_POLICY_IDENTITY_COLUMNS_V2)
         .copied()
         .collect::<BTreeSet<_>>();
     if observed != expected
         || observed.len()
-            != MAILDESK_D1_EVIDENCE_COLUMNS_V1.len() + MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2.len()
+            != MAILDESK_D1_EVIDENCE_COLUMNS_V1.len()
+                + MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2.len()
+                + MAILDESK_D1_POLICY_IDENTITY_COLUMNS_V2.len()
     {
         return Err(CliError::Input(
             "workspace D1 evidence projection returned a private, missing, or arbitrary column set"
@@ -725,6 +729,16 @@ fn project_evidence_rows(
                 .to_owned(),
         ));
     }
+    let revision_r2_key = bounded_string(&row, "revision_r2_key", 1024)?;
+    let revision_digest = revision_r2_key
+        .strip_prefix("config/policy/")
+        .and_then(|key| key.strip_suffix(".json"));
+    if !revision_digest.is_some_and(|digest| valid_prefixed_digest(&format!("sha256:{digest}"))) {
+        return Err(CliError::Input(
+            "workspace D1 evidence revision key is not a bounded policy object key".to_owned(),
+        ));
+    }
+    let projection_policy_sha256 = digest(&row, "projection_policy_sha256")?;
     let projected_route_count = count(&row, "projected_route_count")?;
     let active_route_health_count = count(&row, "active_route_health_count")?;
     let route_health = project_route_health(
@@ -739,6 +753,8 @@ fn project_evidence_rows(
         desired_state_digest: digest(&row, "desired_state_digest")?,
         semantic_projection_digest: digest(&row, "semantic_projection_digest")?,
         immutable_policy_object_key,
+        revision_r2_key: Some(revision_r2_key),
+        projection_policy_sha256: Some(projection_policy_sha256),
         expected_domain_count: count(&row, "expected_domain_count")?,
         projected_domain_count: count(&row, "projected_domain_count")?,
         expected_route_count: count(&row, "expected_route_count")?,

@@ -1,5 +1,7 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
+mod maildesk_evidence;
+pub use maildesk_evidence::MaildeskD1EvidenceV1;
 mod workspace_d1;
 pub use workspace_d1::{
     WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID, WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION,
@@ -106,6 +108,9 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
                     CommandNodeV1::leaf("adopt-preview"),
                     CommandNodeV1::leaf("init"),
                     CommandNodeV1::leaf("init-preview"),
+                    CommandNodeV1::leaf("private-activate"),
+                    CommandNodeV1::leaf("private-history"),
+                    CommandNodeV1::leaf("private-preview"),
                     CommandNodeV1::leaf("recover"),
                     CommandNodeV1::branch("recover-plan", EVIDENCE_KEY_RECOVERY_PLAN_COMMANDS),
                     CommandNodeV1::leaf("recover-preview"),
@@ -2041,28 +2046,6 @@ pub struct WorkspaceReplySubdomainIngressContractV1 {
     pub consumer_contract_path: String,
     pub consumer_contract_sha256: String,
     pub projection: String,
-}
-
-/// Body-free operational evidence emitted by a workspace-owned Maildesk D1
-/// projection. No message, address, recipient, subject, arbitrary row, or SQL
-/// field exists in this public type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaildeskD1EvidenceV1 {
-    pub schema_version: u8,
-    pub active_policy_digest: String,
-    pub desired_state_digest: String,
-    pub semantic_projection_digest: String,
-    pub immutable_policy_object_key: String,
-    pub expected_domain_count: u64,
-    pub projected_domain_count: u64,
-    pub expected_route_count: u64,
-    pub projected_route_count: u64,
-    pub approved_schema_present: bool,
-    pub approved_table_presence: BTreeMap<String, bool>,
-    pub audit_event_counts: BTreeMap<String, u64>,
-    pub queue_correlation_count: u64,
-    pub dlq_correlation_count: u64,
-    pub body_returned: bool,
 }
 
 /// Closed route classes emitted by the Maildesk D1 route-health projection.

@@ -1,5 +1,8 @@
 #!/usr/bin/env bun
 
+import { verifyAssetBytes, verifyAssetManifest } from "./asset-integrity.mjs";
+export { verifyAssetManifest } from "./asset-integrity.mjs";
+
 const CALLBACK_CODE_SENTINEL = "cfctl-live-verifier-code-do-not-log";
 const CALLBACK_STATE_SENTINEL = "cfctl-live-verifier-state-do-not-log";
 const REQUIRED_CSP = new Map([
@@ -120,18 +123,6 @@ export async function verifyHtmlResponse(response, route) {
   }
 }
 
-export function verifyAssetManifest(manifest) {
-  requireCondition(manifest && typeof manifest === "object", "asset manifest is not an object");
-  requireCondition(manifest.hashes && typeof manifest.hashes === "object", "asset manifest lacks hashes");
-  for (const kind of ["js", "wasm", "css"]) {
-    const path = manifest[kind];
-    const digest = manifest.hashes[kind];
-    requireCondition(typeof path === "string" && path.startsWith("/pkg/"), `manifest ${kind} path is invalid`);
-    requireCondition(typeof digest === "string" && /^[0-9a-f]{16}$/.test(digest), `manifest ${kind} hash is invalid`);
-    requireCondition(path.includes(`.${digest}.`), `manifest ${kind} path is not bound to its hash`);
-  }
-}
-
 async function fetchExact(url) {
   return fetch(url, {
     redirect: "manual",
@@ -164,7 +155,7 @@ export async function verifyLiveSite(originValue) {
     requireCondition(header(response, "cache-control") === "public, max-age=31536000, immutable", `${manifest[kind]} is not immutable`);
     requireCondition(header(response, "x-content-type-options").toLowerCase() === "nosniff", `${manifest[kind]} lacks nosniff`);
     const bytes = await response.arrayBuffer();
-    requireCondition(bytes.byteLength > 0, `${manifest[kind]} is empty`);
+    verifyAssetBytes(manifest, kind, bytes);
     assets.push({ kind, path: manifest[kind], bytes: bytes.byteLength });
   }
 

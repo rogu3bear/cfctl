@@ -191,6 +191,9 @@ pub(super) async fn call_command(
         || is_access_operator_group_policy_update(&capability)
     {
         validate_access_operator_group_policy_input(&capability, &prepared.input)?;
+    } else if super::access_create::applies(&capability) {
+        preflight_call_input(&capability, &prepared.input, None)?;
+        cfctl_cloudflare::validate_owned_access_create_input(&prepared.input)?;
     } else if is_access_application_owned_whole_host_mutation(&capability) {
         validate_access_application_owned_whole_host_input(&capability, &prepared.input)?;
     } else if is_access_application_login_methods_mutation(&capability) {
