@@ -314,9 +314,12 @@ cfctl workspace audit --json
 ```
 
 Removing a root stops future discovery and removes its account pin while
-preserving historical graph and evidence records. Discovery excludes nested
-generated, cache, fixture, vendor, and nested-repository paths unless they are
-registered directly. It inventories Git repositories even when they carry no Cloudflare
+preserving historical graph and evidence records. Discovery skips a fixed list
+of directory names — build, cache, fixture, dependency and tool-owned
+directories such as `target`, `node_modules`, `DerivedData`, and `var` — rather
+than inferring a category, so a generated directory whose name is not on that
+list is still walked. `included_entry` in `crates/cfctl-workspace` is the list.
+Register an excluded directory directly to opt it into discovery. It inventories Git repositories even when they carry no Cloudflare
 configuration, and links Wrangler TOML/JSON/JSONC, Terraform HCL/JSON, and
 Pulumi YAML to catalog targets with current-content, `HEAD`-content, and exact
 worktree-diff hashes, so dirty or unmanaged dependencies stay visible in a

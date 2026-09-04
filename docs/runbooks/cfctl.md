@@ -192,10 +192,16 @@ cfctl workspace audit --json
 
 Only registered roots are scanned. `workspace remove` retires a root and its
 account pin from future discovery without deleting historical graph or evidence
-records. Nested generated and cache paths (`var`, `cargo-home`, `.cache`,
-`coverage`, and `dist`) plus fixtures, dependency/build output, vendor, and
-nested repository metadata are excluded from a broader root; register an
-excluded directory directly to opt it into discovery.
+records. Discovery skips directories by exact name, not by category: `.build`,
+`.cache`, `.git`, `.swiftpm`, `.terraform`, `.wrangler`, `Carthage`,
+`DerivedData`, `Pods`, `__fixtures__`, `cargo-home`, `coverage`, `dist`,
+`fixtures`, `node_modules`, `target`, `test-data`, `test_data`, `testdata`,
+`var`, and `vendor`. A generated directory whose name is absent from that list
+is still walked — `DerivedData` was missing, and twenty vendored Swift package
+checkouts under one app's `build/DerivedData` were adopted as workspace
+repositories. `build` is deliberately walkable because it is also a legitimate
+source directory name. Register an excluded directory directly to opt it into
+discovery.
 Fix account ambiguity or dirty overlap before planning writes.
 
 ## Local registry
