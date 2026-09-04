@@ -637,8 +637,8 @@ pub(super) fn persist_prepared_plan(
         },
     )?;
     store.save_plan_v2(&plan_v2)?;
-    let evidence =
-        store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan_v2)?)?;
+    let evidence = store
+        .write_observation_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan_v2)?)?;
     let result = if plan.capability.execution_supported {
         json!({
             "plan": plan,

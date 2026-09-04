@@ -894,6 +894,6 @@ pub(super) async fn prepare_access_human_policy_plan_input(
         preflight_call_input(capability, input, None)?;
     }
     let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok(Some((receipt, evidence)))
 }

@@ -1,6 +1,7 @@
 //! Platform-local persistence for plans, evidence, catalogs, and registered roots.
 
 mod evidence;
+mod observations;
 
 use evidence::{
     atomic_create_capability_file, open_evidence_directories, read_optional_capability_file,
@@ -206,6 +207,7 @@ pub struct StateStore {
     paths: RuntimePaths,
     evidence_directories: Arc<EvidenceDirectoryCapabilities>,
     evidence_authenticator: Option<Arc<dyn EvidenceMacProvider>>,
+    observation_attestation: Option<cfctl_core::AttestationStatusV1>,
 }
 
 impl std::fmt::Debug for StateStore {
@@ -361,6 +363,7 @@ impl StateStore {
             paths,
             evidence_directories,
             evidence_authenticator: None,
+            observation_attestation: None,
         })
     }
 

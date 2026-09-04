@@ -214,7 +214,7 @@ impl ExecutionContext<'_> {
             Some(
                 self.request
                     .store
-                    .write_evidence(EvidenceClass::LiveRead, &receipt)?,
+                    .write_observation_evidence(EvidenceClass::LiveRead, &receipt)?,
             )
         } else {
             None
@@ -243,7 +243,7 @@ impl ExecutionContext<'_> {
         let evidence = self
             .request
             .store
-            .write_evidence(EvidenceClass::LiveRead, &receipt)?;
+            .write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
         let mut envelope = envelope(
             &self.request.catalog.schema_hash,
             &self.request.capability.id,

@@ -256,3 +256,22 @@ irreversible by risk. An operation that cannot be replayed or recalled refuses
 when it cannot be attested; one replayable on both axes executes and reports
 `attestation.state=unattested_reversible_effect`. `docs/v2-security.md` is authoritative for that gate, including why the
 attestation marker is telemetry rather than a control.
+
+Eligible unattested operations use an explicitly scoped observation writer for
+preparation, live preconditions, apply receipts, and post-change readback.
+Those bodies are redacted audit records with `qualifying:false` metadata; no
+MAC, authenticated descriptor, or operational proof is created for the new
+observation. Identical bodies may already have genuine authenticated evidence;
+that older descriptor and its timestamp remain unchanged, and the new audit
+metadata cannot be substituted into a qualifying proof. Strict evidence writes
+and qualification reads are unchanged. Approval still binds the exact
+plan and does not become implicit. The execution gate is reacquired at run time.
+An unattested read does not enter the operational-proof index. Recovery retains
+this distinction: a successful readback can establish the observed outcome but
+cannot create authority for another operation.
+
+A delegated boundary receipt is retained in the response even when local apply
+or recovery persistence fails. The result identifies that execution happened
+(or the receipt explicitly proves it did not), reports pending verification,
+and directs inspection of the consumed operation without replay. A storage
+error after a receipt is never classified as a pre-execution subprocess failure.

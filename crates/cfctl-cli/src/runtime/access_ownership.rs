@@ -451,7 +451,7 @@ pub(super) async fn read_live_access_operator_group_policy_ownership(
         .await?;
     let receipt =
         access_operator_group_policy_ownership_receipt(capability, input, account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -522,6 +522,6 @@ pub(super) async fn read_live_same_path_prior_state(
         receipt["ownership"] =
             owned_whole_host_access_application_receipt(input, &collection_response)?;
     }
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }

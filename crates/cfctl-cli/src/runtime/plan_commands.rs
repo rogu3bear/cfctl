@@ -263,8 +263,10 @@ pub(super) fn persist_transaction_stage(
     plan: &mut PlanV1,
     stage: TransactionStageV1,
 ) -> Result<()> {
-    plan.record_transaction_stage(stage)?;
-    store.save_plan(plan)?;
+    let mut checkpoint = plan.clone();
+    checkpoint.record_transaction_stage(stage)?;
+    store.save_plan(&checkpoint)?;
+    *plan = checkpoint;
     Ok(())
 }
 
@@ -274,8 +276,10 @@ pub(super) fn persist_transaction_stage_with_artifact(
     stage: TransactionStageV1,
     artifact: Value,
 ) -> Result<()> {
-    plan.record_transaction_stage_with_artifact(stage, artifact)?;
-    store.save_plan(plan)?;
+    let mut checkpoint = plan.clone();
+    checkpoint.record_transaction_stage_with_artifact(stage, artifact)?;
+    store.save_plan(&checkpoint)?;
+    *plan = checkpoint;
     Ok(())
 }
 
@@ -325,10 +329,14 @@ pub(super) fn approve_plan(
     let _lock = store.lock_plan(&arguments.operation_id)?;
     let mut plan = load_validated_plan(store, &arguments.operation_id)?;
     ensure_plan_execution_contract(store, &plan)?;
+    let attestation = observation_attestation(store, &plan.capability)?;
+    let scoped_store = store.with_observation_attestation(&attestation);
+    let store = &scoped_store;
     let max_cost = arguments.max_cost.as_deref().map(parse_money).transpose()?;
     plan.approve(arguments.yes, max_cost)?;
     store.save_plan(&plan)?;
-    let evidence = store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
+    let evidence =
+        store.write_observation_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
     let mut envelope = ResultEnvelopeV2::success(
         "plans approve",
         json!({
@@ -343,6 +351,7 @@ pub(super) fn approve_plan(
     envelope.operation_id = Some(plan.operation_id);
     envelope.capability_id = Some(plan.capability.id);
     envelope.policy_decision = Some(plan.policy);
+    envelope.attestation = Some(attestation);
     Ok(envelope)
 }
 
@@ -378,6 +387,21 @@ pub(super) fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result
     envelope.capability_id = Some(plan.capability.id);
     envelope.policy_decision = Some(plan.policy);
     Ok(envelope)
+}
+
+/// Selects persistence for observations. Protected capabilities keep the strict
+/// writer; this selection never grants permission to execute.
+pub(super) fn observation_attestation(
+    store: &StateStore,
+    capability: &cfctl_core::CapabilityV1,
+) -> Result<AttestationStatusV1> {
+    match store.require_qualifying_evidence_authority() {
+        Ok(()) => Ok(AttestationStatusV1::attested()),
+        Err(error) if !capability.requires_attestation_to_execute() => Ok(
+            AttestationStatusV1::unattested_reversible_effect(error.to_string()),
+        ),
+        Err(error) => Err(CliError::Storage(error)),
+    }
 }
 
 /// Admits plan execution against the evidence gate, keyed to the plan's
@@ -423,6 +447,8 @@ pub(super) async fn run_plan(
 ) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&selector.operation_id)?;
     let attestation = admit_execution_attestation(store, &selector.operation_id)?;
+    let scoped_store = store.with_observation_attestation(&attestation);
+    let store = &scoped_store;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
     ensure_plan_execution_contract(store, &plan)?;
@@ -574,6 +600,8 @@ pub(super) async fn run_plan_under_standing_authority(
     // admission critical section below and is released before network I/O.
     let _plan_lock = store.lock_plan(operation_id)?;
     let attestation = admit_execution_attestation(store, operation_id)?;
+    let scoped_store = store.with_observation_attestation(&attestation);
+    let store = &scoped_store;
     let authority_snapshot = store.load_authority(authority_id)?;
     store.bind_plan_authority_hash(operation_id, &authority_snapshot.content_hash)?;
     let catalog = ensure_catalog(store).await?;
@@ -1162,6 +1190,8 @@ pub(super) async fn execute_consumed_plan(
         evidence,
         attestation,
     } = admission;
+    let scoped_store = store.with_observation_attestation(&attestation);
+    let store = &scoped_store;
     let mut envelope = Box::pin(execute_consumed_plan_inner(
         store,
         catalog,
@@ -1210,8 +1240,17 @@ async fn execute_consumed_plan_inner(
             Err(error)
                 if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted =>
             {
-                persist_delegated_pre_response_failure(store, plan, &error, secrets)?;
+                let persistence =
+                    persist_delegated_pre_response_failure(store, plan, &error, secrets);
                 let mut envelope = delegated_pre_response_failure_envelope(plan, &error);
+                if let Err(persistence_error) = persistence
+                    && let Some(error) = envelope.error.as_mut()
+                {
+                    error.message = format!(
+                        "{}; recovery persistence also failed: {persistence_error}",
+                        error.message
+                    );
+                }
                 prepend_live_precondition_evidence(&mut envelope, evidence);
                 Ok(envelope)
             }

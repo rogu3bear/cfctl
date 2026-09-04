@@ -211,8 +211,10 @@ pub(super) async fn call_command(
             .as_deref()
             .map(read_r2_log_retrieval_credentials)
             .transpose()?;
+        let attestation = super::plan_commands::observation_attestation(store, &capability)?;
+        let scoped_store = store.with_observation_attestation(&attestation);
         let executed = execute_read(
-            store,
+            &scoped_store,
             &catalog,
             &capability,
             &prepared.input,
@@ -224,6 +226,13 @@ pub(super) async fn call_command(
         )
         .await?;
         let mut envelope = executed.envelope;
+        envelope.attestation = Some(attestation.clone());
+        if attestation.state == cfctl_core::AttestationStateV1::UnattestedReversibleEffect {
+            if let Some(result) = envelope.result.as_object_mut() {
+                result.insert("operational_proof_indexed".to_owned(), json!(false));
+            }
+            return Ok(envelope);
+        }
         let proof_result = record_operational_proof(
             store,
             &catalog,

@@ -620,7 +620,7 @@ pub(super) async fn execute_read(
                 live_read_availability(capability, &response),
             );
         }
-        let evidence = store.write_evidence(EvidenceClass::LiveRead, &sanitized)?;
+        let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &sanitized)?;
         let mut envelope = ResultEnvelopeV2::success("call", sanitized).with_evidence(evidence);
         envelope.capability_id = Some(capability.id.clone());
         envelope.profile_id = Some(fixture.profile_id);
@@ -717,7 +717,7 @@ pub(super) async fn execute_read(
             live_read_availability(capability, &response),
         );
     }
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &sanitized)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &sanitized)?;
     let mut envelope = ResultEnvelopeV2::success("call", sanitized).with_evidence(evidence);
     envelope.capability_id = Some(capability.id.clone());
     envelope.profile_id = Some(profile.id.clone());

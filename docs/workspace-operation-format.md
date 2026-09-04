@@ -5,7 +5,10 @@ five application-named modules in `cfctl-cli`. Nothing implements it yet.
 
 ## Why
 
-`CapabilityAuthorityScopeV1::WorkspaceOwned` exists and nothing uses it.
+`CapabilityAuthorityScopeV1::WorkspaceOwned` is already assigned by workspace
+loaders and excluded from the provider catalog. The limitation is that those
+loaders and their acceptance semantics are still specialized and compiled into
+cfctl.
 Operation packs already carry an application's *data* from a registered root,
 but its *logic* is five Rust modules compiled into the CLI:
 
@@ -49,8 +52,8 @@ axes, and every existing operation is a point in that space:
 
 | operation | mutates | compiled input | success proof | may leave the boundary |
 |---|---|---|---|---|
-| `d1-evidence-read` | no | no | row shape | declared projection |
-| `inbound-acceptance-read` | no | no | row shape | declared projection |
+| `d1-evidence-read` | no | no | exact columns, bounded values, policy binding, complete unique active-route inventory | declared projection |
+| `inbound-acceptance-read` | no | no | exact columns, one match, requested identity, positive and complete provider acceptance | declared projection |
 | `d1-migrations-apply` | yes | no | assertion rows | counts only |
 | `d1-policy-project` | yes | no | digest readback | digests only |
 | `reply-admission-activate` | yes | yes (Bun, pinned) | cardinality + digest | nothing |
@@ -144,11 +147,13 @@ A compiled input adds one block; nothing else changes:
 
 ## Verification strategies
 
-Four, closed. A pack naming anything else fails to load.
+Four candidate primitives, closed. These are not sufficient to replace the
+current application acceptance validators. A future implementation must reject
+unsupported semantics rather than silently reducing them to shape checks.
 
 | strategy | proves | used by |
 |---|---|---|
-| `row_shape` | the projection returned exactly the declared columns | evidence reads |
+| `row_shape` | the projection returned exactly the declared columns; no application acceptance claim | structural checking only |
 | `assertion_rows` | a declared query returned the expected row count | migrations |
 | `digest_readback` | a declared state key equals a declared digest | policy projection |
 | `cardinality_digest` | exactly N rows, and a declared digest matches | reply admission |
@@ -183,6 +188,26 @@ declares *which* proof applies, never *how* to prove it.
 
 ## Gate
 
-R25 migrates `workspace_d1_evidence` first: 1,167 lines, already
-contract-driven, `row_shape` verification. **If this format cannot express
-that case, stop and revise here rather than during R26's 1,994-line module.**
+The first proposed migration is `workspace_d1_evidence`. It is blocked on a
+semantic equivalence contract; `row_shape` alone cannot qualify it. R25/R26/R28
+are proposal sequencing labels, not staffed or approved work orders.
+
+Before implementation, assign an owner and evaluator to each existing predicate:
+
+| Existing guarantee | Current owner | Required migration evidence |
+|---|---|---|
+| Exactly one inbound match, fingerprint-derived delivery/relay IDs, requested route and policy | `project_inbound_acceptance` | no match, multiple match, wrong identity, wrong route/policy rejected |
+| Provider accepted status, positive recipients, accepted count equals recipients, valid thread/timestamp | `project_inbound_acceptance` | partial/zero acceptance and invalid fields rejected |
+| Exact bounded projection and approved field vocabulary | projection validators | extra/private/missing columns and invalid values rejected |
+| Complete active inventory, unique route references, policy equality, enabled routes | `project_route_health` | partial/duplicate/wrong-policy/disabled inventory rejected |
+| Target, config, repository, query and tool identity | workspace loader/runtime | dirty/drifted/ambiguous target rejected |
+| Accurate attempted/performed accounting and no replay after uncertain execution | execution/journal owner | fault injection across receipt persistence and recovery |
+
+Application repositories should own the meaning of application acceptance;
+cfctl retains provider targeting, authority, provenance, and execution accounting.
+The evaluator location is deliberately unresolved until a complete mapping is
+reviewed. Existing typed validators remain authoritative throughout migration.
+No module or predicate is removed until the replacement passes the same valid
+and invalid fixtures and consumers cut over compatibly. If that needs a new
+proof language rather than a small repeated invariant, stop and revise the
+proposal. A second concrete consumer must demonstrate reuse before broadening.

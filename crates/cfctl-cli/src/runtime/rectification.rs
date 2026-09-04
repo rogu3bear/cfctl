@@ -31,37 +31,55 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::hash_value;
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "rectification must keep transaction-journal, boundary, verification, compensation, and terminal-state decisions visible as one recovery state machine"
-)]
 pub(super) async fn rectify_plan(
     store: &StateStore,
     selector: &PlanSelector,
 ) -> Result<ResultEnvelopeV2> {
     let _plan_lock = store.lock_plan(&selector.operation_id)?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
-    ensure_capability_execution_supported(&plan)?;
+    let attestation = if plan.capability.requires_attestation_to_execute() {
+        None
+    } else {
+        Some(super::plan_commands::admit_execution_attestation(
+            store,
+            &selector.operation_id,
+        )?)
+    };
+    let scoped_store = attestation.as_ref().map_or_else(
+        || store.clone(),
+        |status| store.with_observation_attestation(status),
+    );
+    let mut envelope = rectify_loaded_plan(&scoped_store, &mut plan).await?;
+    envelope.attestation = attestation;
+    Ok(envelope)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "recovery dispatch preserves each capability's exact compensation contract"
+)]
+async fn rectify_loaded_plan(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+    ensure_capability_execution_supported(plan)?;
     if plan.capability.d1_approved_mln_import.is_some() {
-        return rectify_approved_mln_import(store, &mut plan);
+        return rectify_approved_mln_import(store, plan);
     }
-    if r2_private_upload_rectification_eligible(&plan) {
-        return rectify_r2_private_upload(store, &mut plan).await;
+    if r2_private_upload_rectification_eligible(plan) {
+        return rectify_r2_private_upload(store, plan).await;
     }
-    if email_routing_subdomain_dns_rectification_eligible(&plan) {
-        return rectify_email_routing_subdomain_dns(store, &mut plan).await;
+    if email_routing_subdomain_dns_rectification_eligible(plan) {
+        return rectify_email_routing_subdomain_dns(store, plan).await;
     }
-    if worker_version_rollback_rectification_eligible(&plan) {
-        return rectify_worker_version_rollback(store, &mut plan).await;
+    if worker_version_rollback_rectification_eligible(plan) {
+        return rectify_worker_version_rollback(store, plan).await;
     }
-    if workspace_d1_migration_rectification_eligible(&plan) {
-        return rectify_workspace_d1_migration(store, &mut plan).await;
+    if workspace_d1_migration_rectification_eligible(plan) {
+        return rectify_workspace_d1_migration(store, plan).await;
     }
-    if workspace_d1_projection_rectification_eligible(&plan) {
-        return rectify_workspace_d1_projection(store, &mut plan).await;
+    if workspace_d1_projection_rectification_eligible(plan) {
+        return rectify_workspace_d1_projection(store, plan).await;
     }
-    let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
-    if let Some(mut request) = compensation_request(&plan)? {
+    let lineage_evidence = reconcile_standing_lineage_from_plan(store, plan)?;
+    if let Some(mut request) = compensation_request(plan)? {
         let catalog = ensure_catalog(store).await?;
         let capability = catalog
             .get(&request.capability_id)
@@ -289,7 +307,8 @@ pub(super) fn persist_worker_version_rollback_rectification(
         "verification_only":true,
         "boundary_replayed":false,
     });
-    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let evidence =
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     if passed {
         plan.status = PlanStatus::Verified;
         persist_transaction_stage_with_artifact(
@@ -471,7 +490,8 @@ pub(super) async fn rectify_r2_private_upload(
         "verification_only":true,
         "boundary_replayed":false,
     });
-    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let evidence =
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let receipt = json!({
         "state":if passed { "passed" } else { "failed" },
         "evidence_hash":evidence.content_hash,
@@ -629,7 +649,8 @@ pub(super) fn persist_email_routing_subdomain_dns_rectification(
     })?;
     object.insert("verification_only".to_owned(), Value::Bool(true));
     object.insert("boundary_replayed".to_owned(), Value::Bool(false));
-    let evidence = store.write_evidence(EvidenceClass::PostChangeVerification, &projected)?;
+    let evidence =
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &projected)?;
     if passed {
         plan.status = PlanStatus::Verified;
         persist_transaction_stage_with_artifact(
@@ -727,7 +748,7 @@ pub(super) async fn rectify_workspace_d1_projection(
     let verification =
         workspace_d1_projection::verify_rectification(store, plan, &credential).await;
     let verification_evidence =
-        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
         .get("passed")
         .and_then(Value::as_bool)
@@ -858,7 +879,7 @@ pub(super) async fn rectify_workspace_d1_migration(
     }
     let verification = workspace_d1_migration::verify_rectification(store, plan, &credential).await;
     let verification_evidence =
-        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
         .get("passed")
         .and_then(Value::as_bool)
@@ -1081,7 +1102,7 @@ pub(super) fn rectify_approved_mln_import(
             "disposition":"abandoned_unuploaded_provider_init_session",
         });
         let verification_evidence =
-            store.write_evidence(EvidenceClass::PostChangeVerification, &completion)?;
+            store.write_observation_evidence(EvidenceClass::PostChangeVerification, &completion)?;
         persist_transaction_stage_with_artifact(
             store,
             plan,
@@ -1209,7 +1230,7 @@ pub(super) fn rectify_approved_mln_import(
         "target":staged.get("target"),
     });
     let verification_evidence =
-        store.write_evidence(EvidenceClass::PostChangeVerification, &completion)?;
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &completion)?;
     persist_transaction_stage_with_artifact(
         store,
         plan,
