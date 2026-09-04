@@ -416,3 +416,14 @@ and binds the exact source pointer and bundle. When I activate that reviewed
 transition, then the new runtime retains those restrictions under a fresh
 bundle and approval; an old approval is not copied. Malformed or drifted source
 policy prevents activation, and interruption resumes the same staged bundle.
+
+
+### AC36 — Admit the actual SSR scripts without broad inline execution
+
+Given a rendered site response containing the hydration module and Leptos
+initialization scripts, when the browser enforces its Content Security Policy,
+then the module's exact hash and the framework's per-response nonce admit
+those scripts without allowing arbitrary inline scripts. Response headers
+preserve the issued nonce. Given an extra unnonced executable script, a wrong
+nonce or changed hash-bound script bytes, when live HTML verification runs,
+then it fails. Source tests and mocked responses do not replace browser proof.

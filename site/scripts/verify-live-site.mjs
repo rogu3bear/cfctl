@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { createHash } from "node:crypto";
 import { verifyAssetBytes, verifyAssetManifest } from "./asset-integrity.mjs";
 export { verifyAssetManifest } from "./asset-integrity.mjs";
 
@@ -97,10 +98,11 @@ export async function verifyHtmlResponse(response, route) {
   const scriptSources = csp.get("script-src");
   requireCondition(scriptSources !== undefined, `${route.path} CSP is missing script-src`);
   requireCondition(
-    scriptSources.length === 3
+    scriptSources.length === 4
       && scriptSources[0] === "'self'"
       && /^'sha256-[A-Za-z0-9+/]{43}='$/.test(scriptSources[1])
-      && scriptSources[2] === "'wasm-unsafe-eval'",
+      && scriptSources[2] === "'wasm-unsafe-eval'"
+      && /^'nonce-[A-Za-z0-9_-]{22}'$/.test(scriptSources[3]),
     `${route.path} CSP script-src does not match the production hash-bound policy`,
   );
 
@@ -116,10 +118,24 @@ export async function verifyHtmlResponse(response, route) {
   }
 
   const body = await response.text();
+  verifyInlineScripts(body, scriptSources);
   requireCondition(body.includes(route.marker), `${route.path} is missing its semantic marker`);
   if (route.callback) {
     requireCondition(!body.includes(CALLBACK_CODE_SENTINEL), "callback code leaked into SSR HTML");
     requireCondition(!body.includes(CALLBACK_STATE_SENTINEL), "callback state leaked into SSR HTML");
+  }
+}
+
+export function verifyInlineScripts(html, sources) {
+  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
+    const attributes = match[1];
+    const attribute = (name) => attributes.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"))?.slice(1).find((value) => value !== undefined);
+    if (attribute("src") !== undefined) continue;
+    const type = (attribute("type") ?? "").toLowerCase();
+    if (!["", "module", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript"].includes(type)) continue;
+    const hash = createHash("sha256").update(match[2]).digest("base64");
+    const nonce = attribute("nonce");
+    requireCondition(sources.includes(`'sha256-${hash}'`) || (nonce !== undefined && sources.includes(`'nonce-${nonce}'`)), "inline script is not admitted by the response CSP");
   }
 }
 

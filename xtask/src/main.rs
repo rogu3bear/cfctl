@@ -4069,7 +4069,7 @@ mod tests {
             "non-HEAD refspec must fail closed"
         );
         assert!(
-            String::from_utf8_lossy(&non_head.stderr).contains("must equal the checked-out HEAD"),
+            String::from_utf8_lossy(&non_head.stderr).contains("must equal checked-out HEAD"),
             "unexpected non-HEAD error: {}",
             String::from_utf8_lossy(&non_head.stderr)
         );

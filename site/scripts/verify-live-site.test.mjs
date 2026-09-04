@@ -6,6 +6,7 @@ import {
   productionOrigin,
   verifyAssetManifest,
   verifyHtmlResponse,
+  verifyInlineScripts,
 } from "./verify-live-site.mjs";
 
 function htmlResponse(body = "See the boundary before you cross it.", overrides = {}) {
@@ -13,7 +14,7 @@ function htmlResponse(body = "See the boundary before you cross it.", overrides 
     status: overrides.status ?? 200,
     headers: {
       "cache-control": "no-cache, max-age=0, must-revalidate",
-      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' 'wasm-unsafe-eval';",
+      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' 'wasm-unsafe-eval' 'nonce-AAAAAAAAAAAAAAAAAAAAAA';",
       "content-type": "text/html; charset=utf-8",
       "cross-origin-opener-policy": "same-origin",
       "permissions-policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
@@ -172,4 +173,17 @@ test("live asset readback validates actual served bytes", async () => {
     corrupt = true;
     await expect(verifyLiveSite("https://cfctl.example")).rejects.toThrow("actual bytes");
   } finally { stub.mockRestore(); }
+});
+
+
+test("inline framework scripts must carry the exact response nonce or an admitted byte hash", async () => {
+  const { createHash } = await import("node:crypto");
+  const script = "initialize();";
+  const hash = createHash("sha256").update(script).digest("base64");
+  const sources = [`'sha256-${hash}'`, "'nonce-AAAAAAAAAAAAAAAAAAAAAA'"];
+  expect(() => verifyInlineScripts(`<script type="module">${script}</script><script nonce="AAAAAAAAAAAAAAAAAAAAAA">__INCOMPLETE_CHUNKS=[];</script>`, sources)).not.toThrow();
+  expect(() => verifyInlineScripts(`<script>${script}changed();</script>`, sources)).toThrow("not admitted");
+  expect(() => verifyInlineScripts('<script>__INCOMPLETE_CHUNKS=[];</script>', sources)).toThrow("not admitted");
+  expect(() => verifyInlineScripts('<script nonce="BBBBBBBBBBBBBBBBBBBBBB">__INCOMPLETE_CHUNKS=[];</script>', sources)).toThrow("not admitted");
+  expect(() => verifyInlineScripts('<script type="application/json">{"data":true}</script>', sources)).not.toThrow();
 });
