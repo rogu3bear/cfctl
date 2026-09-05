@@ -457,3 +457,9 @@ installer assets, and do not replace the GitHub latest binary release. They
 allow publication and local installation from accepted source without Apple
 signing credentials. Follow the source bootstrap in CONTRIBUTING.md; source
 installation does not qualify a public prebuilt binary.
+
+### Worker module identity
+
+Use the [immutable Worker module digest read](docs/worker-version-artifact-digest.md)
+when a release needs version-bound module hashes without retaining deployed source.
+It does not qualify active traffic or static assets.

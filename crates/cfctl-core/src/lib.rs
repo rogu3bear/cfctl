@@ -1,8 +1,14 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
+mod artifact_digest;
+pub use artifact_digest::{
+    R2PrivateObjectDigestContractV1, R2PrivateObjectDigestV1, WORKER_VERSION_ARTIFACT_DIGEST_ID,
+    WORKER_VERSION_ARTIFACT_PATH,
+};
+
 mod maildesk_evidence;
 pub use maildesk_evidence::MaildeskD1EvidenceV1;
-mod workspace_d1;
+pub mod workspace_d1;
 pub use workspace_d1::{
     WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID, WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION,
     WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY, WorkspaceD1AtomicityQualificationV1,
@@ -2134,25 +2140,6 @@ pub struct R2PrivateFileUploadContractV1 {
     pub etag_algorithm: String,
 }
 
-/// A bounded R2 object read whose bytes may exist only inside the executor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct R2PrivateObjectDigestContractV1 {
-    pub max_object_bytes: u64,
-}
-
-/// Body-free identity receipt for one exact private R2 object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct R2PrivateObjectDigestV1 {
-    pub schema_version: u8,
-    pub account_id: String,
-    pub bucket_name: String,
-    pub object_key: String,
-    pub byte_count: u64,
-    pub etag: String,
-    pub sha256: String,
-    pub body_returned: bool,
-}
-
 /// Provider readback used after Email Sending DNS repair. The verifier reads
 /// the live DNS status endpoint and accepts only a conflict-free, complete
 /// configuration; it never treats the mutation response as final authority.
@@ -2757,48 +2744,7 @@ impl CapabilityV1 {
                     && self
                         .workspace_d1_migration
                         .as_ref()
-                        .is_some_and(|contract| {
-                            let manifest_valid = contract.manifest_migration.as_ref().is_none_or(|manifest| {
-                                !manifest.manifest_path.is_empty()
-                                    && !manifest.manifest_sha256.is_empty()
-                                    && !manifest.account_id.is_empty()
-                                    && !manifest.profile_id.is_empty()
-                                    && !manifest.database_name.is_empty()
-                                    && !manifest.database_id.is_empty()
-                                    && (1..=64).contains(&manifest.baseline.len())
-                                    && manifest.baseline_start_sequence <= manifest.baseline_end_sequence
-                                    && workspace_d1::target_is_immediate_successor(
-                                        manifest.baseline_end_sequence,
-                                        manifest.target_sequence,
-                                    )
-                                    && !manifest.target_git_blob_oid.is_empty()
-                                    && contract.migrations.len() == 1
-                                    && !manifest.baseline_digest.is_empty()
-                                    && !manifest.migrations_pattern.is_empty()
-                                    && !manifest.ledger_table.is_empty()
-                                    && !manifest.ledger_name.is_empty()
-                                    && !manifest.wrangler_cli_sha256.is_empty()
-                                    && manifest.full_export_capability_id == "d1-full-export"
-                                    && manifest.require_exact_post_ledger
-                                    && manifest.require_exact_schema_sql
-                                    && manifest.require_foreign_key_check_empty
-                                    && manifest.require_integrity_check_ok
-                                    && manifest.require_unchanged_worker_identity
-                                    && manifest.require_old_worker_compatibility
-                            });
-                            !contract.repository_root.is_empty()
-                                && !contract.repository_head.is_empty()
-                                && !contract.operation_pack_sha256.is_empty()
-                                && !contract.config_template_sha256.is_empty()
-                                && !contract.wrangler_version.is_empty()
-                                && !contract.migrations.is_empty()
-                                && !contract.assertions.is_empty()
-                                && manifest_valid
-                                && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
-                                && contract.recovery_max_age_seconds > 0
-                                && contract.recovery_max_age_seconds <= 600
-                                && contract.rollback_capability_id == "d1-restore-exact-bookmark"
-                        })
+                        .is_some_and(WorkspaceD1MigrationContractV1::legacy_verification_supported)
             }
             "workspace_d1_policy_projection_count_and_digest" => {
                 self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
@@ -2993,25 +2939,7 @@ impl CapabilityV1 {
                                 && contract.etag_algorithm == "md5"
                         })
             }
-            "r2_private_object_digest" => {
-                self.id == "r2-get-private-object-digest"
-                    && self.method == "GET"
-                    && self.path
-                        == "/accounts/{account_id}/r2/buckets/{bucket_name}/objects/{object_key}"
-                    && !self.mutating
-                    && self.risk == RiskClass::Read
-                    && self.effect == EffectClass::ReadOnly
-                    && self.permissions == ["Workers R2 Storage Read"]
-                    && self.request_schema.is_none()
-                    && self.r2_private_object_digest.as_ref().is_some_and(|contract| {
-                        contract.max_object_bytes > 0
-                            && contract.max_object_bytes <= 300_000_000
-                    })
-                    && self.response_contract.as_ref().is_some_and(|response| {
-                        response.success_statuses == ["200"]
-                            && response.body_mode == ResponseBodyModeV1::R2PrivateObjectDigest
-                    })
-            }
+            "worker_version_artifact_digest" | "r2_private_object_digest" => artifact_digest::verification_supported(self),
             "email_sending_dns_status_reports_ready" => {
                 self.id == "email-sending-subdomains-fix-sending-subdomain-dns"
                     && self.method == "POST"

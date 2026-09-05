@@ -826,6 +826,7 @@ fn migration_names_are_filename_only() {
         recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
         recovery_max_age_seconds: 600,
         rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        transition: None,
         manifest_migration: None,
     };
     assert_eq!(
@@ -864,6 +865,7 @@ fn manifest_migration_distinguishes_remote_baseline_from_the_sole_local_target()
         recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
         recovery_max_age_seconds: 600,
         rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        transition: None,
         manifest_migration: Some(cfctl_core::WorkspaceD1ManifestMigrationContractV1 {
             manifest_path: ".control-plane/d1_migration_manifest.json".to_owned(),
             manifest_sha256: format!("sha256:{}", "d".repeat(64)),
