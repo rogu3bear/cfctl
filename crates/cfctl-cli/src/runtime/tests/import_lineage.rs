@@ -1458,7 +1458,7 @@ fn direct_ingest_completion_requires_exact_durable_terminal_ingest() {
         });
         match defect {
             "final_bookmark" => {
-                ingest["receipt"]["result"]["result"]["final_bookmark"] = json!("other")
+                ingest["receipt"]["result"]["result"]["final_bookmark"] = json!("other");
             }
             "action" => ingest["receipt"]["response_action"] = json!("poll"),
             "target" => ingest["receipt"]["target"]["database_id"] = json!("other"),
