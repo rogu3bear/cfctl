@@ -11,7 +11,14 @@ use cfctl_auth::refresh_oauth_tokens;
 use cfctl_core::hash_value;
 
 pub(super) fn platform_secrets(store: &StateStore) -> PlatformSecretStore {
-    PlatformSecretStore::new(store.paths().data_dir.join("auth").join("secrets"))
+    let root = store.paths().data_dir.join("auth").join("secrets");
+    if store.private_origin().is_some() {
+        return PlatformSecretStore::private_only(
+            root.clone(),
+            std::sync::Arc::new(cfctl_storage::PrivateFileSecretStore::new(root)),
+        );
+    }
+    PlatformSecretStore::new(root)
 }
 
 pub(super) fn describe_secret_backend(
@@ -24,6 +31,10 @@ pub(super) fn describe_secret_backend(
         Some(SecretBackend::FallbackFile) => (
             "fallback_file",
             "in cfctl's mode-0600 file secret store because the platform keyring is unavailable (see `cfctl doctor`)",
+        ),
+        Some(SecretBackend::PrivateFile) => (
+            "private_file",
+            "in the explicitly selected private local credential store",
         ),
         Some(SecretBackend::Memory) => ("memory", "in the in-process secret store"),
         None => ("unknown", "in an undetermined backend"),

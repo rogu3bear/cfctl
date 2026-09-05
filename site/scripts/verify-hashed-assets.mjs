@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { verifyAssetBytes, verifyAssetManifest } from "./asset-integrity.mjs";
 import { existsSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -38,12 +39,13 @@ async function filesUnder(root, relative = "") {
   return files;
 }
 
+verifyAssetManifest(manifest, outputName);
 for (const kind of ["js", "wasm", "css"]) {
   const href = manifest[kind];
-  if (typeof href !== "string" || !href.includes(`.${manifest.hashes[kind]}.`)) throw new Error(`${kind} is not hashed`);
+  verifyAssetBytes(manifest, kind, await readFile(join(siteRoot, href.slice(1))), outputName);
   if (!existsSync(join(siteRoot, href.replace(/^\//, "")))) throw new Error(`${kind} manifest target is missing`);
   if (existsSync(join(pkgDir, `${outputName}.${kind}`))) throw new Error(`unhashed ${kind} artifact remains`);
-  if (!generatedHashes.includes(`"${manifest.hashes[kind]}"`)) throw new Error(`${kind} hash env is out of sync`);
+  if (!generatedHashes.split(/\r?\n/).includes(`export LEPTOS_EDGE_${kind.toUpperCase()}_HASH="${manifest.hashes[kind]}"`)) throw new Error(`${kind} hash env is out of sync`);
 }
 
 for (const snippet of ["/pkg/*", "Cache-Control: public, max-age=31536000, immutable", "/asset-manifest.json", "Cache-Control: no-store"]) {

@@ -118,7 +118,14 @@ pub(super) async fn resolve_command(
         ));
     }
     let catalog = ensure_catalog(store).await?;
-    let workspace = load_workspace_capability(store, intent)?;
+    // Workspace loaders resolve exact operation IDs, not natural-language
+    // provider searches. An unrelated dirty registered application must not
+    // prevent discovering a provider capability.
+    let workspace = if catalog.get(intent).is_some() || intent.chars().any(char::is_whitespace) {
+        None
+    } else {
+        load_workspace_capability(store, intent)?
+    };
     let ranked = workspace.as_ref().map_or_else(
         || catalog.search_scored(intent),
         |capability| vec![(capability, usize::MAX)],

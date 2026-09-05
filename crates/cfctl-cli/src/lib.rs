@@ -86,7 +86,7 @@ pub enum AuthCommand {
     Profiles,
     /// Select the profile used when a command does not name one.
     Use(ProfileSelector),
-    /// Rewrite one opaque credential with the unattended platform-reader ACL.
+    /// Repair one opaque credential through noninteractive platform access.
     RepairKeychainAccess(ProfileSelector),
     /// Remove one profile and its stored credential.
     Logout(ProfileSelector),
@@ -106,6 +106,12 @@ pub struct EvidenceKeyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EvidenceKeyCommand {
+    /// Prepare a private local storage transition, preserving old history separately.
+    PrivatePreview,
+    /// Activate the exact prepared fresh local authority without platform prompts.
+    PrivateActivate(EvidenceKeyPrivateActivateArgs),
+    /// Inspect archived operation identities without giving them execution authority.
+    PrivateHistory,
     /// Preview marker-only adoption of one exact valid platform authority.
     AdoptPreview,
     /// Inspect adoption history; creation is held pending authenticated receipt support.
@@ -130,6 +136,13 @@ pub enum EvidenceKeyCommand {
     Recover(EvidenceKeyRecoverArgs),
     /// Discard one unattributable, unused platform authority and initialize a fresh one.
     Reset(EvidenceKeyResetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyPrivateActivateArgs {
+    pub plan_id: String,
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

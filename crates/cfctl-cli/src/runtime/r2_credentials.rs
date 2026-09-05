@@ -302,7 +302,7 @@ pub(super) async fn read_live_r2_parent_token(
         .execute_read(source_capability, &CallInput::default(), credential)
         .await?;
     let receipt = apply_r2_parent_token_response(capability, account_id, input, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 

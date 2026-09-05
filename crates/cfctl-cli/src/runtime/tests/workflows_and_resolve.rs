@@ -56,7 +56,7 @@ pub(super) fn resolver_workflow_capability(id: &str, title: &str) -> CapabilityV
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn registered_schema_v2_pack_does_not_block_cli_resolve_for_an_unrelated_intent() {
+async fn dirty_registered_pack_does_not_block_cli_resolve_for_an_unrelated_intent() {
     let runtime = tempfile::tempdir().expect("runtime root");
     let repository = tempfile::tempdir().expect("registered repository");
     let git = |arguments: &[&str]| {
@@ -134,6 +134,17 @@ require_old_worker_compatibility = true
 "#,
     )
     .expect("schema-v2 pack");
+    for (pack, id) in [
+        ("d1-policy-projections.toml", "maildesk.policy"),
+        ("d1-reply-admission.toml", "maildesk.reply"),
+        ("d1-evidence.toml", "maildesk.evidence"),
+    ] {
+        fs::write(
+            repository.path().join(".cfctl/operations").join(pack),
+            format!("schema_version = 1\n[[operation]]\nid = \"{id}\"\n"),
+        )
+        .expect("committed identity fixture");
+    }
     git(&["add", "."]);
     git(&["commit", "-qm", "schema-v2 fixture"]);
 
@@ -159,18 +170,47 @@ require_old_worker_compatibility = true
         .write_json(&store.paths().catalog_file(), &catalog)
         .expect("store catalog");
 
-    let envelope = resolve_command(
-        &store,
-        ResolveArgs {
-            intent: "deploy JKCA workers".to_owned(),
-            account: None,
-            limit: 5,
-        },
-    )
-    .await
-    .expect("unrelated schema-v2 pack must not become a workspace resolver error");
-    assert_eq!(envelope.command, "resolve");
-    assert!(!envelope.performed);
+    fs::write(repository.path().join("dirty.txt"), "unrelated work")
+        .expect("unrelated fixture dirt");
+    for intent in [
+        "deploy JKCA workers",
+        "workers-scripts-list",
+        "workers",
+        "dns",
+    ] {
+        let envelope = resolve_command(
+            &store,
+            ResolveArgs {
+                intent: intent.to_owned(),
+                account: None,
+                limit: 5,
+            },
+        )
+        .await
+        .expect("unrelated schema-v2 pack must not become a workspace resolver error");
+        assert_eq!(envelope.command, "resolve");
+        assert!(!envelope.performed);
+    }
+    for id in [
+        "mln-web.founder-d1-migration-apply",
+        "maildesk.policy",
+        "maildesk.reply",
+        "maildesk.evidence",
+    ] {
+        assert!(
+            resolve_command(
+                &store,
+                ResolveArgs {
+                    intent: id.to_owned(),
+                    account: None,
+                    limit: 5,
+                }
+            )
+            .await
+            .is_err(),
+            "selected committed workspace identity still enforces clean source: {id}"
+        );
+    }
 }
 
 #[test]

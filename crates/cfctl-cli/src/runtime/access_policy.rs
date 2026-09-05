@@ -404,9 +404,9 @@ pub(super) fn validate_access_application_owned_whole_host_input(
                     .to_owned(),
             )
         })?;
-    if destination != format!("https://{self_hosted_domains}") {
+    if destination != self_hosted_domains {
         return Err(CliError::Input(
-            "owned whole-host Access application destination must be the exact HTTPS whole-host origin"
+            "owned whole-host Access application destination must be the exact bare whole hostname"
                 .to_owned(),
         ));
     }
@@ -894,6 +894,6 @@ pub(super) async fn prepare_access_human_policy_plan_input(
         preflight_call_input(capability, input, None)?;
     }
     let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok(Some((receipt, evidence)))
 }
