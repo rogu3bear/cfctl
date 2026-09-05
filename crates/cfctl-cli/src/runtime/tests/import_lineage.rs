@@ -1420,3 +1420,86 @@ pub(super) fn poll_child_resolver_rejects_grafted_or_semantically_drifted_exhaus
         "semantically mismatched exhaustion evidence must fail closed"
     );
 }
+
+#[test]
+fn direct_ingest_completion_requires_exact_durable_terminal_ingest() {
+    let fixture = build_poll_child_lineage(1);
+    for defect in ["none", "final_bookmark", "action", "target", "not_durable"] {
+        let original = &fixture.root_plan;
+        let mut plan = PlanV1::draft(
+            &original.profile_id,
+            &original.account_id,
+            &original.catalog_hash,
+            original.capability.clone(),
+            json!({}),
+        )
+        .expect("fresh import");
+        plan.created_at = original.created_at;
+        plan.expires_at = original.expires_at;
+        plan.input = original.input.clone();
+        plan.targets = original.targets.clone();
+        plan.precondition_hashes = original.precondition_hashes.clone();
+        plan.refresh_hash().expect("hash");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        save_current_test_plan(&fixture.store, &plan);
+        let stage = &plan.targets["adapter"]["approved_mln_import"];
+        let mut ingest = json!({
+            "schema_version":1,"operation_id":plan.operation_id,"step":"ingest_response",
+            "performed":true,"rectification_required":false,
+            "receipt":{"http_status":200,"success":true,"response_action":"ingest",
+                "provider":"cloudflare","effect":"d1_import_ingest_accepted",
+                "migration_id":"0143","target":stage["target"],
+                "plan_input_hash":hash_value(&plan.input).expect("input hash"),
+                "no_replay":true,"result":{"type":"import","status":"complete","success":true,
+                    "at_bookmark":"accepted","result":{"final_bookmark":"finished"}}}
+        });
+        match defect {
+            "final_bookmark" => {
+                ingest["receipt"]["result"]["result"]["final_bookmark"] = json!("other")
+            }
+            "action" => ingest["receipt"]["response_action"] = json!("poll"),
+            "target" => ingest["receipt"]["target"]["database_id"] = json!("other"),
+            _ => {}
+        }
+        if defect == "not_durable" {
+            fixture
+                .store
+                .record_d1_import_checkpoint(&plan.operation_id, &ingest)
+                .expect("checkpoint only");
+        } else {
+            persist_poll_lineage_checkpoint(&fixture.store, &plan.operation_id, &ingest);
+        }
+        let completion = json!({
+            "schema_version":1,"operation_id":plan.operation_id,"step":"provider_complete",
+            "performed":true,"rectification_required":false,
+            "receipt":{"provider":"cloudflare","effect":"d1_import_provider_complete",
+                "response_action":"ingest","no_replay":true,"state":"provider_complete",
+                "provider_status":"complete","provider_success":true,"migration_id":"0143",
+                "target":stage["target"],"plan_input_hash":hash_value(&plan.input).expect("hash"),
+                "source_sha256":stage["sha256"],"source_md5":stage["md5"],"source_bytes":stage["bytes"],
+                "source_authority_hash":stage["source_authority_hash"],"stage_identity_hash":hash_value(stage).expect("stage hash"),
+                "prerequisites":plan.input["body"],"at_bookmark":"accepted","final_bookmark":"finished"}
+        });
+        persist_poll_lineage_checkpoint(&fixture.store, &plan.operation_id, &completion);
+        let result =
+            super::exact_durable_provider_complete_boundary(&fixture.store, &plan.operation_id);
+        if defect == "none" {
+            result.expect("exact immediate completion");
+        } else {
+            assert!(result.is_err(), "{defect}");
+        }
+        let checkpoints = fixture
+            .store
+            .read_d1_import_checkpoints(&plan.operation_id)
+            .expect("checkpoints");
+        assert_eq!(checkpoints.len(), 2);
+        assert!(!checkpoints.iter().any(|(_, value)| {
+            value["step"]
+                .as_str()
+                .is_some_and(|step| step.starts_with("poll_"))
+        }));
+    }
+}

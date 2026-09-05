@@ -850,6 +850,21 @@ bytes to the immutable target. Schema meaning remains a separate governed
 `d1-schema-introspection` receipt. If bounded polling exhausts, continue only
 with `d1-resume-database-import-poll`; never replay the consumed import root.
 
+The authenticated init response delegates upload to an R2 storage account;
+that account need not equal the D1 customer's account. The upload accepts only
+a canonical HTTPS `<32 lowercase hex digits>.r2.cloudflarestorage.com`
+presigned endpoint, with no user information, explicit port, fragment, or
+redirect. The separate upload client carries no D1 bearer credential. Its
+ETag must match the reviewed SQL's MD5 before ingest on the original D1 target.
+An ingest response that already reports complete persists both validated
+bookmarks and terminal authority immediately, without another poll. Active
+and pending responses retain the existing bounded polling path. Unknown host
+shapes and malformed completion responses remain blocked.
+
+Protocol references: [D1 import](https://developers.cloudflare.com/d1/tutorials/import-to-d1-with-rest-api/),
+[R2 presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/),
+and [Wrangler import response types](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/d1/types.ts).
+
 OSINT Research Center migrations 0028 through 0034 use the narrower
 `d1-import-approved-osint-research-migration` adapter. It pins account
 `ca30e922fda7f5578e49873542e4aaca`, database
