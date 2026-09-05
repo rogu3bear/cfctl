@@ -234,11 +234,16 @@ complete inventory.
 4. Bind the request, permission lane, workspace graph, source-config hashes, official pricing references, cost metadata, and exact plan content hash.
 5. Apply policy and, when required, approve that operation ID.
 6. Acquire the local operation lock.
-7. Recheck drift, append the consumption checkpoint, and durably consume the plan.
-8. Append the boundary-attempt checkpoint and cross one adapter boundary.
-9. Persist the response and secret sink, then run the operation-specific verifier.
-10. Close verified/rejected transactions or require rectification without replay.
-11. Write the redacted content-addressed body and its authenticated descriptor
+7. Admit against the evidence authority. A qualifying authority is proven before
+   provider boundary is crossed. A non-qualifying one refuses any operation
+   severe on either its effect or its risk classification, and lets a replayable
+   one proceed marked unattested. Doctor reports marker presence without probing
+   credentials; only an explicit evidence-key check can establish authority access.
+8. Recheck drift, append the consumption checkpoint, and durably consume the plan.
+9. Append the boundary-attempt checkpoint and cross one adapter boundary.
+10. Persist the response and secret sink, then run the operation-specific verifier.
+11. Close verified/rejected transactions or require rectification without replay.
+12. Write the redacted content-addressed body and its authenticated descriptor
     or operational-proof envelope.
 
 Apply, sink, and verification receipts are hash-bound into their journal

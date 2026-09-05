@@ -1123,6 +1123,13 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     assert_eq!(doctor["result"]["build_identity_healthy"], identity_healthy);
     assert_eq!(doctor["result"]["catalog"]["present"], false);
     assert_eq!(doctor["result"]["path_build"]["state"], "current");
+
+    let evidence = &doctor["result"]["evidence_authority"];
+    assert_eq!(evidence["qualifying"], false);
+    assert_eq!(evidence["marker_present"], false);
+    assert_eq!(evidence["state"], "not_initialized");
+    assert_eq!(evidence["credential_store_accessed"], false);
+    assert!(doctor["result"]["standing_authorities"].is_array());
     assert_eq!(
         doctor["result"]["running_build"],
         doctor["result"]["path_build"]["build"]
