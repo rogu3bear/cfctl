@@ -425,6 +425,18 @@ fn register_repository(
     Ok(repo_path)
 }
 
+/// Directory basenames discovery does not descend into.
+///
+/// This is an enumeration, not a category. Documentation that describes it as
+/// excluding "dependency or build output" promises more than a fixed list can
+/// deliver: `DerivedData` was absent, so twenty Swift package checkouts under
+/// one repository's `build/DerivedData` were discovered as workspace
+/// repositories and stamped with its Cloudflare account pin. Anything a build
+/// tool owns and rewrites belongs here by name.
+///
+/// `build` is deliberately excluded from this list. It is a legitimate source
+/// directory name, and skipping it repository-wide could hide real Cloudflare
+/// configuration; the tool-owned subdirectory is the precise thing to skip.
 fn included_entry(entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() || entry.depth() == 0 {
         return true;
@@ -432,10 +444,15 @@ fn included_entry(entry: &DirEntry) -> bool {
     !matches!(
         entry.file_name().to_str(),
         Some(
-            ".cache"
+            ".build"
+                | ".cache"
                 | ".git"
+                | ".swiftpm"
                 | ".terraform"
                 | ".wrangler"
+                | "Carthage"
+                | "DerivedData"
+                | "Pods"
                 | "__fixtures__"
                 | "cargo-home"
                 | "coverage"
