@@ -63,6 +63,15 @@ if [ "$skip_agent_sync" = false ]; then
 fi
 "$binary" agents doctor
 "$binary" doctor
+
+# Installation is valid without an initialized authority (including offline
+# hosts without a platform credential service). Inspect the selected runtime
+# explicitly, retain failures, and do not claim this read repaired credentials.
+if ! "$binary" auth evidence-key status --json; then
+  echo "cfctl is installed; evidence authority readiness remains unresolved." >&2
+  echo "Inspect cfctl auth evidence-key status --json before governed operations." >&2
+fi
+
 echo "installed $install_root/bin/cfctl"
 echo "next: cfctl catalog sync"
 echo "then: cfctl auth import-api-token --account <account-id> --stdin"
