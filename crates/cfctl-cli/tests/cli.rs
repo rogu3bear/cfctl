@@ -1124,27 +1124,12 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     assert_eq!(doctor["result"]["catalog"]["present"], false);
     assert_eq!(doctor["result"]["path_build"]["state"], "current");
 
-    // A clean install has produced no authenticated evidence yet, which is a
-    // different state from an authority this build cannot read. Both report
-    // here, and neither may reach the platform keyring to decide -- the probe
-    // assertion above covers that, and `doctor` runs too often to risk a
-    // prompt.
     let evidence = &doctor["result"]["evidence_authority"];
-    assert_eq!(evidence["qualifying"], true);
-    assert_eq!(evidence["retained_count"], 0);
-    assert_eq!(evidence["candidate_failure_count"], 0);
-    assert_eq!(evidence["total_index_rows"], 0);
-    assert_eq!(
-        evidence["detail"],
-        "no authenticated evidence has been produced yet"
-    );
-
-    // The authority projection carries expiry as a computed field. An empty
-    // store has none, so this pins the shape the reporting depends on.
-    assert!(
-        doctor["result"]["standing_authorities"].is_array(),
-        "standing authority health must always project an array"
-    );
+    assert_eq!(evidence["qualifying"], false);
+    assert_eq!(evidence["marker_present"], false);
+    assert_eq!(evidence["state"], "not_initialized");
+    assert_eq!(evidence["credential_store_accessed"], false);
+    assert!(doctor["result"]["standing_authorities"].is_array());
     assert_eq!(
         doctor["result"]["running_build"],
         doctor["result"]["path_build"]["build"]

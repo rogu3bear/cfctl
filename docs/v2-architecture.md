@@ -235,9 +235,10 @@ complete inventory.
 5. Apply policy and, when required, approve that operation ID.
 6. Acquire the local operation lock.
 7. Admit against the evidence authority. A qualifying authority is proven before
-   the plan record, the credential, or the provider is touched. A non-qualifying
-   one refuses any operation severe on either its effect or its risk
-   classification, and lets a replayable one proceed marked unattested.
+   provider boundary is crossed. A non-qualifying one refuses any operation
+   severe on either its effect or its risk classification, and lets a replayable
+   one proceed marked unattested. Doctor reports marker presence without probing
+   credentials; only an explicit evidence-key check can establish authority access.
 8. Recheck drift, append the consumption checkpoint, and durably consume the plan.
 9. Append the boundary-attempt checkpoint and cross one adapter boundary.
 10. Persist the response and secret sink, then run the operation-specific verifier.
