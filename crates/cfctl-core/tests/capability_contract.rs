@@ -90,39 +90,49 @@ const CAPABILITY_V1_APPLICATION_FIELDS: [&str; 10] = [
     "workspace_d1_evidence",
     "email_routing_subdomain_dns",
 ];
-fn declared_fields(content: &str) -> Result<Vec<&str>, String> {
-    let body = content
-        .split_once("pub struct CapabilityV1 {")
-        .and_then(|(_, rest)| rest.split_once("\n}"))
-        .map(|(body, _)| body)
+fn declared_fields(content: &str) -> Result<Vec<String>, String> {
+    let source = syn::parse_file(content).map_err(|error| error.to_string())?;
+    let mut declarations = source.items.into_iter().filter_map(|item| match item {
+        syn::Item::Struct(declaration) if declaration.ident == "CapabilityV1" => Some(declaration),
+        _ => None,
+    });
+    let declaration = declarations
+        .next()
         .ok_or_else(|| "cfctl-core source does not declare CapabilityV1".to_owned())?;
-    Ok(body
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("pub "))
-        .filter_map(|rest| rest.split_once(':'))
-        .map(|(name, _)| name.trim())
-        .filter(|name| !name.is_empty())
-        .collect())
+    if declarations.next().is_some() {
+        return Err("cfctl-core source declares CapabilityV1 more than once".to_owned());
+    }
+    declaration
+        .fields
+        .iter()
+        .map(|field| {
+            field
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .ok_or_else(|| "CapabilityV1 must have named fields".to_owned())
+        })
+        .collect()
 }
 
 fn check(content: &str) -> Result<(), String> {
     let declared = declared_fields(content)?;
     for field in &declared {
-        if !CAPABILITY_V1_FIELDS.contains(field) {
+        if !CAPABILITY_V1_FIELDS.contains(&field.as_str()) {
             return Err(format!(
                 "CapabilityV1 declares `{field}`, which is not in CAPABILITY_V1_FIELDS; review the universal contract and update its inventory in the same change"
             ));
         }
     }
     for field in CAPABILITY_V1_FIELDS {
-        if !declared.contains(&field) {
+        if !declared.iter().any(|declared| declared == field) {
             return Err(format!(
                 "CAPABILITY_V1_FIELDS lists `{field}`, which CapabilityV1 no longer declares; remove it from both inventories if present"
             ));
         }
     }
     for field in CAPABILITY_V1_APPLICATION_FIELDS {
-        if !declared.contains(&field) {
+        if !declared.iter().any(|declared| declared == field) {
             return Err(format!(
                 "CAPABILITY_V1_APPLICATION_FIELDS lists `{field}`, which CapabilityV1 no longer declares; remove the extracted application field from the inventory"
             ));
@@ -139,13 +149,17 @@ fn current_contract_matches_the_inventory() {
 }
 
 #[test]
-fn added_field_requires_an_inventory_change() {
-    let changed = CORE_SOURCE.replace(
-        "pub struct CapabilityV1 {",
-        "pub struct CapabilityV1 {\n    pub new_application_field: Option<String>,",
-    );
-    let error = check(&changed).expect_err("unlisted field");
-    assert!(error.contains("new_application_field"));
+fn added_field_requires_an_inventory_change_at_every_visibility() {
+    for visibility in ["pub ", "pub(crate) ", ""] {
+        let changed = CORE_SOURCE.replace(
+            "pub struct CapabilityV1 {",
+            &format!(
+                "pub struct CapabilityV1 {{\n    {visibility}new_application_field: Option<String>,"
+            ),
+        );
+        let error = check(&changed).expect_err("unlisted field");
+        assert!(error.contains("new_application_field"), "{error}");
+    }
 }
 
 #[test]
