@@ -128,7 +128,7 @@ impl fmt::Debug for EvidenceKeyManager {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("EvidenceKeyManager")
-            .field("store", &"[platform keyring]")
+            .field("store", &"[redacted selected secret store]")
             .field("location_identity", &self.location_identity)
             .field("required_backend", &self.required_backend)
             .finish()

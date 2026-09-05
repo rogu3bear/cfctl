@@ -470,8 +470,8 @@ pub(super) async fn validate_live_permission_inventory_precondition(
     if let Some(authority) = standing_authority {
         validate_standing_authority_permission_inventory(authority, &response.result)?;
     }
-    let evidence =
-        store.write_evidence(EvidenceClass::LiveRead, &serde_json::to_value(&response)?)?;
+    let evidence = store
+        .write_observation_evidence(EvidenceClass::LiveRead, &serde_json::to_value(&response)?)?;
     Ok(Some(evidence))
 }
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env bun
 
+import { createHash } from "node:crypto";
+import { verifyAssetBytes, verifyAssetManifest } from "./asset-integrity.mjs";
+export { verifyAssetManifest } from "./asset-integrity.mjs";
+
 const CALLBACK_CODE_SENTINEL = "cfctl-live-verifier-code-do-not-log";
 const CALLBACK_STATE_SENTINEL = "cfctl-live-verifier-state-do-not-log";
 const REQUIRED_CSP = new Map([
@@ -94,10 +98,11 @@ export async function verifyHtmlResponse(response, route) {
   const scriptSources = csp.get("script-src");
   requireCondition(scriptSources !== undefined, `${route.path} CSP is missing script-src`);
   requireCondition(
-    scriptSources.length === 3
+    scriptSources.length === 4
       && scriptSources[0] === "'self'"
       && /^'sha256-[A-Za-z0-9+/]{43}='$/.test(scriptSources[1])
-      && scriptSources[2] === "'wasm-unsafe-eval'",
+      && scriptSources[2] === "'wasm-unsafe-eval'"
+      && /^'nonce-[A-Za-z0-9_-]{22}'$/.test(scriptSources[3]),
     `${route.path} CSP script-src does not match the production hash-bound policy`,
   );
 
@@ -113,6 +118,7 @@ export async function verifyHtmlResponse(response, route) {
   }
 
   const body = await response.text();
+  verifyInlineScripts(body, scriptSources);
   requireCondition(body.includes(route.marker), `${route.path} is missing its semantic marker`);
   if (route.callback) {
     requireCondition(!body.includes(CALLBACK_CODE_SENTINEL), "callback code leaked into SSR HTML");
@@ -120,15 +126,16 @@ export async function verifyHtmlResponse(response, route) {
   }
 }
 
-export function verifyAssetManifest(manifest) {
-  requireCondition(manifest && typeof manifest === "object", "asset manifest is not an object");
-  requireCondition(manifest.hashes && typeof manifest.hashes === "object", "asset manifest lacks hashes");
-  for (const kind of ["js", "wasm", "css"]) {
-    const path = manifest[kind];
-    const digest = manifest.hashes[kind];
-    requireCondition(typeof path === "string" && path.startsWith("/pkg/"), `manifest ${kind} path is invalid`);
-    requireCondition(typeof digest === "string" && /^[0-9a-f]{16}$/.test(digest), `manifest ${kind} hash is invalid`);
-    requireCondition(path.includes(`.${digest}.`), `manifest ${kind} path is not bound to its hash`);
+export function verifyInlineScripts(html, sources) {
+  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
+    const attributes = match[1];
+    const attribute = (name) => attributes.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"))?.slice(1).find((value) => value !== undefined);
+    if (attribute("src") !== undefined) continue;
+    const type = (attribute("type") ?? "").toLowerCase();
+    if (!["", "module", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript"].includes(type)) continue;
+    const hash = createHash("sha256").update(match[2]).digest("base64");
+    const nonce = attribute("nonce");
+    requireCondition(sources.includes(`'sha256-${hash}'`) || (nonce !== undefined && sources.includes(`'nonce-${nonce}'`)), "inline script is not admitted by the response CSP");
   }
 }
 
@@ -164,7 +171,7 @@ export async function verifyLiveSite(originValue) {
     requireCondition(header(response, "cache-control") === "public, max-age=31536000, immutable", `${manifest[kind]} is not immutable`);
     requireCondition(header(response, "x-content-type-options").toLowerCase() === "nosniff", `${manifest[kind]} lacks nosniff`);
     const bytes = await response.arrayBuffer();
-    requireCondition(bytes.byteLength > 0, `${manifest[kind]} is empty`);
+    verifyAssetBytes(manifest, kind, bytes);
     assets.push({ kind, path: manifest[kind], bytes: bytes.byteLength });
   }
 

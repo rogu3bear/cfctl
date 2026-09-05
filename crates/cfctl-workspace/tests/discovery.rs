@@ -779,3 +779,66 @@ fn run_git(path: &Path, arguments: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn tool_owned_build_directories_do_not_become_workspace_repositories() {
+    // The real shape this fixes: a Swift package checkout under an app's
+    // `build/DerivedData` is its own git repository, so discovery adopted each
+    // one as a workspace repository and stamped it with the enclosing account
+    // pin. Twenty arrived from a single app that way.
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("production-app");
+    init_repo(&repository, "wrangler.toml", "name = \"real-worker\"\n");
+
+    let vendored = repository
+        .join("build")
+        .join("DerivedData")
+        .join("SourcePackages")
+        .join("checkouts")
+        .join("swift-nio");
+    init_repo(&vendored, "wrangler.toml", "name = \"vendored-worker\"\n");
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("build-output-safe discovery");
+
+    assert!(
+        graph
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:real-worker"),
+        "the application's own configuration must still be discovered"
+    );
+    assert!(
+        graph
+            .resources
+            .iter()
+            .all(|resource| resource.key != "worker:vendored-worker"),
+        "configuration inside tool-owned build output must not be adopted"
+    );
+    assert!(
+        graph
+            .repositories
+            .iter()
+            .all(|entry| entry.path != vendored),
+        "a checkout under DerivedData must not become a workspace repository"
+    );
+
+    // `build` itself is a legitimate source directory name and stays walkable,
+    // so a real surface kept there is not silently dropped.
+    let source_under_build = root.path().join("built-app");
+    init_repo(&source_under_build, "README.md", "app\n");
+    let kept = source_under_build.join("build").join("edge");
+    std::fs::create_dir_all(&kept).expect("source build directory");
+    std::fs::write(kept.join("wrangler.toml"), "name = \"kept-worker\"\n")
+        .expect("configuration under a source build directory");
+
+    let second = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("discovery with a source build directory");
+    assert!(
+        second
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:kept-worker"),
+        "excluding `build` wholesale would hide this; only tool-owned names are skipped"
+    );
+}

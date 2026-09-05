@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -24,16 +24,16 @@ repository = "https://github.com/rogu3bear/cfctl"
 [workspace.dependencies]
 # Intra-workspace crates: path + version declared once here, consumed by member
 # crates as `cfctl-x = { workspace = true }`.
-cfctl-agent = { path = "crates/cfctl-agent", version = "1.3.0" }
-cfctl-auth = { path = "crates/cfctl-auth", version = "1.3.0" }
-cfctl-catalog = { path = "crates/cfctl-catalog", version = "1.3.0" }
-cfctl-cli = { path = "crates/cfctl-cli", version = "1.3.0" }
-cfctl-cloudflare = { path = "crates/cfctl-cloudflare", version = "1.3.0" }
-cfctl-core = { path = "crates/cfctl-core", version = "1.3.0" }
-cfctl-planner = { path = "crates/cfctl-planner", version = "1.3.0" }
-cfctl-registry = { path = "crates/cfctl-registry", version = "1.3.0" }
-cfctl-storage = { path = "crates/cfctl-storage", version = "1.3.0" }
-cfctl-workspace = { path = "crates/cfctl-workspace", version = "1.3.0" }
+cfctl-agent = { path = "crates/cfctl-agent", version = "1.3.1" }
+cfctl-auth = { path = "crates/cfctl-auth", version = "1.3.1" }
+cfctl-catalog = { path = "crates/cfctl-catalog", version = "1.3.1" }
+cfctl-cli = { path = "crates/cfctl-cli", version = "1.3.1" }
+cfctl-cloudflare = { path = "crates/cfctl-cloudflare", version = "1.3.1" }
+cfctl-core = { path = "crates/cfctl-core", version = "1.3.1" }
+cfctl-planner = { path = "crates/cfctl-planner", version = "1.3.1" }
+cfctl-registry = { path = "crates/cfctl-registry", version = "1.3.1" }
+cfctl-storage = { path = "crates/cfctl-storage", version = "1.3.1" }
+cfctl-workspace = { path = "crates/cfctl-workspace", version = "1.3.1" }
 async-trait = "0.1.91"
 base64 = "0.22.1"
 cap-std = "4.0.2"
@@ -49,7 +49,7 @@ memchr = "2.7.6"
 md-5 = "0.11.0"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls"] }
-rustix = { version = "1.1.4", features = ["fs", "time"] }
+rustix = { version = "1.1.4", features = ["fs", "time", "process"] }
 security-framework = { version = "=3.7.0", default-features = false }
 sysctl = "=0.7.1"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled", "hooks"] }

@@ -1,3 +1,5 @@
+pub mod transition;
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -275,6 +277,8 @@ pub struct WorkspaceD1MigrationContractV1 {
     pub rollback_capability_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_migration: Option<WorkspaceD1ManifestMigrationContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<Box<transition::Compiled>>,
 }
 
 /// A workspace-owned D1 policy projection. The private SQL projection is
@@ -358,4 +362,53 @@ pub struct WorkspaceD1EvidenceContractV1 {
     pub wrangler_version: String,
     pub projection: String,
     pub query_sha256: String,
+}
+
+impl WorkspaceD1MigrationContractV1 {
+    pub(crate) fn legacy_verification_supported(&self) -> bool {
+        if self.transition.is_some() {
+            return false;
+        }
+        let contract = self;
+        let manifest_valid = contract.manifest_migration.as_ref().is_none_or(|manifest| {
+            !manifest.manifest_path.is_empty()
+                && !manifest.manifest_sha256.is_empty()
+                && !manifest.account_id.is_empty()
+                && !manifest.profile_id.is_empty()
+                && !manifest.database_name.is_empty()
+                && !manifest.database_id.is_empty()
+                && (1..=64).contains(&manifest.baseline.len())
+                && manifest.baseline_start_sequence <= manifest.baseline_end_sequence
+                && target_is_immediate_successor(
+                    manifest.baseline_end_sequence,
+                    manifest.target_sequence,
+                )
+                && !manifest.target_git_blob_oid.is_empty()
+                && contract.migrations.len() == 1
+                && !manifest.baseline_digest.is_empty()
+                && !manifest.migrations_pattern.is_empty()
+                && !manifest.ledger_table.is_empty()
+                && !manifest.ledger_name.is_empty()
+                && !manifest.wrangler_cli_sha256.is_empty()
+                && manifest.full_export_capability_id == "d1-full-export"
+                && manifest.require_exact_post_ledger
+                && manifest.require_exact_schema_sql
+                && manifest.require_foreign_key_check_empty
+                && manifest.require_integrity_check_ok
+                && manifest.require_unchanged_worker_identity
+                && manifest.require_old_worker_compatibility
+        });
+        !contract.repository_root.is_empty()
+            && !contract.repository_head.is_empty()
+            && !contract.operation_pack_sha256.is_empty()
+            && !contract.config_template_sha256.is_empty()
+            && !contract.wrangler_version.is_empty()
+            && !contract.migrations.is_empty()
+            && !contract.assertions.is_empty()
+            && manifest_valid
+            && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
+            && contract.recovery_max_age_seconds > 0
+            && contract.recovery_max_age_seconds <= 600
+            && contract.rollback_capability_id == "d1-restore-exact-bookmark"
+    }
 }

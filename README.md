@@ -151,14 +151,25 @@ The token lives in the platform keyring (Keychain on macOS, Secret Service on
 Linux) and falls back to a mode-0600 file store when the keyring is
 unavailable; `cfctl doctor` reports which backend is active.
 
-Qualifying local evidence uses a separate platform-only integrity key. It
-never falls back to a file: inspect the exact initialization transition with
+Qualifying local evidence uses a separate, explicitly selected integrity key.
+The platform mode never automatically falls back to a file: inspect the exact initialization transition with
 `cfctl auth evidence-key init-preview --json`, initialize it explicitly with
 `init`, inspect it with `status`, rotate to a new signing generation with
 `rotate`, and retire an inactive generation only when cfctl reports that no
 authenticated local artifact still depends on it. The preview discloses
 backend, custody, state-root transition, verification-generation behavior, and
 recovery semantics without creating a key or exposing key bytes.
+
+For routine use without platform credential dialogs, prepare an explicit fresh
+local runtime with `cfctl auth evidence-key private-preview --json`, inspect
+its carried/missing profile IDs and local trust boundary, then run the returned
+`private-activate <plan-id> --yes --json` command. The same flow works on a fresh
+host before importing its first scoped token. It creates a fresh authority,
+keeps old state and history intact, and persistently selects private local
+credentials and evidence storage. `status` and `doctor` report `private_file`.
+No continuity with old signing keys or approval authority is claimed. Software
+running as your OS user can access these files; filesystem privacy does not
+isolate mutually distrustful programs running as the same user.
 
 Initialization crosses two independent custody domains: the platform registry
 and the filesystem state-root marker. No transaction spans both, so `init`
@@ -314,9 +325,12 @@ cfctl workspace audit --json
 ```
 
 Removing a root stops future discovery and removes its account pin while
-preserving historical graph and evidence records. Discovery excludes nested
-generated, cache, fixture, vendor, and nested-repository paths unless they are
-registered directly. It inventories Git repositories even when they carry no Cloudflare
+preserving historical graph and evidence records. Discovery skips a fixed list
+of directory names — build, cache, fixture, dependency and tool-owned
+directories such as `target`, `node_modules`, `DerivedData`, and `var` — rather
+than inferring a category, so a generated directory whose name is not on that
+list is still walked. `included_entry` in `crates/cfctl-workspace` is the list.
+Register an excluded directory directly to opt it into discovery. It inventories Git repositories even when they carry no Cloudflare
 configuration, and links Wrangler TOML/JSON/JSONC, Terraform HCL/JSON, and
 Pulumi YAML to catalog targets with current-content, `HEAD`-content, and exact
 worktree-diff hashes, so dirty or unmanaged dependencies stay visible in a
@@ -410,7 +424,7 @@ workflow or hosted CI service is required. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 
-v1.3.0 must not be published unless its two macOS binaries carry one reviewed
+Prebuilt release artifacts must not be published unless both macOS binaries carry one reviewed
 Developer ID Application identity, hardened runtime, secure timestamps, and
 accepted Apple notarization receipts. `SHA256SUMS` and the commit-bound
 provenance must each carry a Sigstore bundle for the certificate identity and
@@ -440,3 +454,15 @@ This checks public routes, security and cache headers, callback SSR privacy,
 the live asset manifest, and immutable JS/Wasm/CSS delivery. It proves HTTP
 behavior for that origin; the active Worker version and traffic allocation
 still require the separate governed `cfctl` provider readback.
+
+Source-only releases are labeled explicitly, contain no uploaded binary or
+installer assets, and do not replace the GitHub latest binary release. They
+allow publication and local installation from accepted source without Apple
+signing credentials. Follow the source bootstrap in CONTRIBUTING.md; source
+installation does not qualify a public prebuilt binary.
+
+### Worker module identity
+
+Use the [immutable Worker module digest read](docs/worker-version-artifact-digest.md)
+when a release needs version-bound module hashes without retaining deployed source.
+It does not qualify active traffic or static assets.

@@ -11,7 +11,7 @@ pub fn SecurityPage() -> impl IntoView {
                 <h1>"Your credential is not your consent."</h1>
                 <p class="lede">"cfctl separates credential custody, plan construction, exact approval, provider execution, and post-change verification."</p>
                 <div class="security-ledger">
-                    <EvidenceReceipt label="local" title="Credential backend" body="Ordinary use stays on the governed local backend. Keychain repair is explicit and warned."/>
+                    <EvidenceReceipt label="local" title="Credential backend" body="Ordinary use does not open password dialogs. Scoped credentials can stay in explicitly selected private local storage, accessible to your OS user."/>
                     <EvidenceReceipt label="preview" title="Hash-bound plans" body="Account, target, permissions, cost, warnings, verification, and compensation travel together."/>
                     <EvidenceReceipt label="authority" title="Exact approval" body="Consent binds to one reviewed operation ID. Model output never grants it."/>
                     <EvidenceReceipt label="readback" title="Verification" body="A provider response is not convergence. Close only with the declared live read."/>

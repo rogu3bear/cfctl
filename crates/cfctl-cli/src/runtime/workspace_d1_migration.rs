@@ -103,6 +103,17 @@ pub(super) fn prepare_plan_target(
     let Some(contract) = capability.workspace_d1_migration.as_ref() else {
         return Ok(None);
     };
+    if contract.transition.is_some() {
+        return super::workspace_d1_transition::prepare(
+            store,
+            contract,
+            input,
+            account_id,
+            &profile.id,
+            &credential_generation_for_read(profile)?,
+            &catalog.schema_hash,
+        );
+    }
     let config = validated_config(contract, input)?;
     let evidence_joins = contract
         .manifest_migration
@@ -203,6 +214,10 @@ pub(super) fn validate_bound_plan_for_rectification(
     validate_bound_plan_inner(store, plan, false)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "legacy admission retains existing checks and rejects the disabled V3 executor before any state access"
+)]
 fn validate_bound_plan_inner(
     store: &StateStore,
     plan: &PlanV1,
@@ -211,6 +226,11 @@ fn validate_bound_plan_inner(
     let Some(contract) = plan.capability.workspace_d1_migration.as_ref() else {
         return Ok(());
     };
+    if contract.transition.is_some() {
+        return Err(CliError::Input(
+            "workspace D1 V3 production transport is disabled".to_owned(),
+        ));
+    }
     let current = load(store, &plan.capability.id)?.ok_or_else(|| {
         CliError::Input(
             "workspace D1 migration operation is no longer uniquely available; create a new plan"
