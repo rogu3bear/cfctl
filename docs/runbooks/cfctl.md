@@ -1675,6 +1675,10 @@ preview, apply, and post-change verification evidence.
 
 ## Known limitations
 
+- **Version 3 workspace D1 transitions compile source only.** The complete frozen
+  schedule and exact SQL segments are checked, while provider execution stays
+  disabled. See [the V3 source and receipt contract](../workspace-d1-transitions-v3.md).
+
 - **Manifest-selected workspace D1 migrations remain fail-closed until
   qualification is produced.** Every create, apply, restore, delete,
   deployment, and other provider mutation remains its own immutable PlanV2:

@@ -1,3 +1,5 @@
+mod transition;
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -197,6 +199,20 @@ fn load_from_repository(
     if pack_value
         .get("schema_version")
         .and_then(toml::Value::as_integer)
+        == Some(3)
+    {
+        return transition::load(
+            repository,
+            capability_id,
+            head,
+            origin,
+            &pack_bytes,
+            pack_text,
+        );
+    }
+    if pack_value
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
         == Some(2)
     {
         let pack: OperationPackV2 = toml::from_str(pack_text)
@@ -282,6 +298,7 @@ fn load_from_repository(
         recovery_capability_id: operation.recovery_capability_id.clone(),
         recovery_max_age_seconds: operation.recovery_max_age_seconds,
         rollback_capability_id: operation.rollback_capability_id.clone(),
+        transition: None,
         manifest_migration: None,
     };
     Ok(Some(capability(operation, contract)))
@@ -528,6 +545,7 @@ fn load_manifest_operation(
         recovery_capability_id: operation.recovery.bookmark_capability_id.clone(),
         recovery_max_age_seconds: 600,
         rollback_capability_id: operation.recovery.rollback_capability_id.clone(),
+        transition: None,
         manifest_migration: Some(manifest_contract),
     };
     Ok(Some(capability_manifest(operation, contract)))

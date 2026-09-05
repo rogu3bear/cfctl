@@ -8,7 +8,7 @@ pub use artifact_digest::{
 
 mod maildesk_evidence;
 pub use maildesk_evidence::MaildeskD1EvidenceV1;
-mod workspace_d1;
+pub mod workspace_d1;
 pub use workspace_d1::{
     WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_ID, WORKSPACE_D1_FOUNDER_CANARY_CONTRACT_VERSION,
     WORKSPACE_D1_FOUNDER_CANARY_OWNER_REPOSITORY, WorkspaceD1AtomicityQualificationV1,
@@ -2744,48 +2744,7 @@ impl CapabilityV1 {
                     && self
                         .workspace_d1_migration
                         .as_ref()
-                        .is_some_and(|contract| {
-                            let manifest_valid = contract.manifest_migration.as_ref().is_none_or(|manifest| {
-                                !manifest.manifest_path.is_empty()
-                                    && !manifest.manifest_sha256.is_empty()
-                                    && !manifest.account_id.is_empty()
-                                    && !manifest.profile_id.is_empty()
-                                    && !manifest.database_name.is_empty()
-                                    && !manifest.database_id.is_empty()
-                                    && (1..=64).contains(&manifest.baseline.len())
-                                    && manifest.baseline_start_sequence <= manifest.baseline_end_sequence
-                                    && workspace_d1::target_is_immediate_successor(
-                                        manifest.baseline_end_sequence,
-                                        manifest.target_sequence,
-                                    )
-                                    && !manifest.target_git_blob_oid.is_empty()
-                                    && contract.migrations.len() == 1
-                                    && !manifest.baseline_digest.is_empty()
-                                    && !manifest.migrations_pattern.is_empty()
-                                    && !manifest.ledger_table.is_empty()
-                                    && !manifest.ledger_name.is_empty()
-                                    && !manifest.wrangler_cli_sha256.is_empty()
-                                    && manifest.full_export_capability_id == "d1-full-export"
-                                    && manifest.require_exact_post_ledger
-                                    && manifest.require_exact_schema_sql
-                                    && manifest.require_foreign_key_check_empty
-                                    && manifest.require_integrity_check_ok
-                                    && manifest.require_unchanged_worker_identity
-                                    && manifest.require_old_worker_compatibility
-                            });
-                            !contract.repository_root.is_empty()
-                                && !contract.repository_head.is_empty()
-                                && !contract.operation_pack_sha256.is_empty()
-                                && !contract.config_template_sha256.is_empty()
-                                && !contract.wrangler_version.is_empty()
-                                && !contract.migrations.is_empty()
-                                && !contract.assertions.is_empty()
-                                && manifest_valid
-                                && contract.recovery_capability_id == "d1-time-travel-get-bookmark"
-                                && contract.recovery_max_age_seconds > 0
-                                && contract.recovery_max_age_seconds <= 600
-                                && contract.rollback_capability_id == "d1-restore-exact-bookmark"
-                        })
+                        .is_some_and(WorkspaceD1MigrationContractV1::legacy_verification_supported)
             }
             "workspace_d1_policy_projection_count_and_digest" => {
                 self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
