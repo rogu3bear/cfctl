@@ -78,8 +78,12 @@ cargo xtask verify
 
 Bootstrap requires a checkout clean of tracked and untracked non-ignored files,
 proves the installed binary is the exact `HEAD` commit, synchronizes only
-managed agent integrations, and runs both doctors. Use `--check-only` for
-source proof or `--skip-agent-sync` for an intentional binary-only install.
+managed agent integrations, and runs both doctors. It also reports the selected
+runtime's evidence-key status without changing credentials. An unresolved status
+remains visible but does not invalidate an offline installation; inspect
+`cfctl auth evidence-key status --json` before governed operations. Use
+`--check-only` for source proof or `--skip-agent-sync` for an intentional
+binary-only install.
 
 Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
