@@ -238,7 +238,7 @@ pub(super) async fn update_command(check: bool) -> Result<ResultEnvelopeV2> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use super::{StateStore, Utc, evidence_authority_health, standing_authorities_health};
     use cfctl_core::{StandingAuthorityRunV1, StandingAuthorityV1};
     use cfctl_storage::RuntimePaths;
     use chrono::Duration;
