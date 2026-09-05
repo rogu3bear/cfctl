@@ -12,7 +12,7 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional};
+use super::{Result, WorkspaceError, git_blob, git_optional};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-policy-projections.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
@@ -52,13 +52,17 @@ pub fn load_workspace_d1_policy_projection_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    let registered = roots
-        .iter()
-        .map(|path| RegisteredRoot::new(path))
-        .collect::<Vec<_>>();
-    let graph = WorkspaceGraph::discover(&registered)?;
+    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+}
+
+pub(super) fn load_selected(
+    candidates: &[PathBuf],
+    capability_id: &str,
+) -> Result<Option<CapabilityV1>> {
+    let repositories =
+        super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
     let mut matches = Vec::new();
-    for repository in &graph.repositories {
+    for repository in &repositories {
         if let Some(capability) = load_from_repository(repository, capability_id)? {
             matches.push(capability);
         }

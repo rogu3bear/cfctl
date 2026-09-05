@@ -11,7 +11,7 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional};
+use super::{Result, WorkspaceError, git_blob, git_optional};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-evidence.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
@@ -174,13 +174,17 @@ pub fn load_workspace_d1_evidence_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    let registered = roots
-        .iter()
-        .map(|path| RegisteredRoot::new(path))
-        .collect::<Vec<_>>();
-    let graph = WorkspaceGraph::discover(&registered)?;
+    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+}
+
+pub(super) fn load_selected(
+    candidates: &[PathBuf],
+    capability_id: &str,
+) -> Result<Option<CapabilityV1>> {
+    let repositories =
+        super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
     let mut matches = Vec::new();
-    for repository in &graph.repositories {
+    for repository in &repositories {
         if let Some(capability) = load_from_repository(repository, capability_id)? {
             matches.push(capability);
         }
@@ -521,6 +525,69 @@ mod tests {
         git(root.path(), &["add", "."]);
         git(root.path(), &["commit", "-qm", "fixture"]);
         root
+    }
+
+    #[test]
+    fn distinct_committed_owners_are_ambiguous_but_overlapping_roots_are_not() {
+        let first = fixture();
+        let second = fixture();
+        let first_path = first.path().to_path_buf();
+        assert!(
+            load_workspace_d1_evidence_capability(
+                &[first_path.clone(), first_path.clone()],
+                "star-maildesk-cf.d1-evidence-read"
+            )
+            .expect("same canonical owner")
+            .is_some()
+        );
+        let error = load_workspace_d1_evidence_capability(
+            &[first_path, second.path().to_path_buf()],
+            "star-maildesk-cf.d1-evidence-read",
+        )
+        .expect_err("distinct owners must remain ambiguous");
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous across 2 registered repositories")
+        );
+    }
+
+    #[test]
+    fn unrelated_configuration_does_not_participate_in_operation_lookup() {
+        let selected = fixture();
+        let unrelated = fixture();
+        let pack = unrelated.path().join(PACK_RELATIVE_PATH);
+        fs::write(
+            &pack,
+            "[[operation]]\nid = \"unrelated.d1-evidence-read\"\n",
+        )
+        .expect("unrelated pack");
+        git(unrelated.path(), &["add", "."]);
+        git(unrelated.path(), &["commit", "-qm", "unrelated identity"]);
+        let nested = unrelated.path().join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        fs::write(
+            nested.join("wrangler.router.production.toml"),
+            "invalid = [",
+        )
+        .expect("unrelated invalid role config");
+        let roots = [
+            selected.path().to_path_buf(),
+            unrelated.path().to_path_buf(),
+        ];
+        let registered = roots
+            .iter()
+            .map(|path| super::super::RegisteredRoot::new(path))
+            .collect::<Vec<_>>();
+        assert!(
+            super::super::WorkspaceGraph::discover(&registered).is_err(),
+            "the full config graph has an independent error"
+        );
+        assert!(
+            load_workspace_d1_evidence_capability(&roots, "star-maildesk-cf.d1-evidence-read")
+                .expect("only selected operation inputs are validated")
+                .is_some()
+        );
     }
 
     #[test]

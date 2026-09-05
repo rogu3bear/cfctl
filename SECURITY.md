@@ -75,7 +75,7 @@ These checks are local proof. They do not prove that an account mutation,
 signature, notarization, upload, deployment, domain verification, or OAuth
 promotion occurred.
 
-Prebuilt v1.3.0 artifacts must not be published unless both macOS binaries carry the reviewed
+Prebuilt release artifacts must not be published unless both macOS binaries carry the reviewed
 Developer ID Application identity, hardened runtime, secure timestamps, and
 accepted Apple notarization receipts. `SHA256SUMS` and commit-bound provenance
 must carry Sigstore bundles for the reviewed certificate identity and OIDC
@@ -87,7 +87,7 @@ represented as a binary release.
 The exact Developer ID authority, TeamIdentifier, certificate fingerprints,
 Sigstore certificate identity, and OIDC issuer must be committed here before
 publication. Until those non-secret trust roots are present, no downloaded
-formula or installer is an authenticated bootstrap path and prebuilt v1.3.0 artifacts remain
+formula or installer is an authenticated bootstrap path and prebuilt release artifacts remain
 held from publication.
 
 Machine-read release trust roots (non-secret):

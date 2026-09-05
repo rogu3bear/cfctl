@@ -16,7 +16,7 @@ leaves them untouched), and runs both doctors:
 cargo install --path crates/cfctl-cli --locked
 ```
 
-Prebuilt binaries may ship from the GitHub release only after v1.3.0 is signed,
+Prebuilt binaries may ship from the GitHub release only after that release is signed,
 notarized, published, and read back. Both macOS binaries must carry the reviewed
 Developer ID Application identity and accepted Apple notarization receipts;
 `SHA256SUMS` and provenance must carry Sigstore bundles for the certificate
@@ -31,7 +31,7 @@ above. The release procedure will add platform installation commands only when
 those independent trust roots can authenticate them.
 
 The reserved artifact namespace is
-`https://github.com/rogu3bear/cfctl/releases/download/v1.3.0/`; its presence in
+`https://github.com/rogu3bear/cfctl/releases/download/v1.3.1/`; its presence in
 source documentation is a version pin, not evidence that a release or any
 asset exists there.
 

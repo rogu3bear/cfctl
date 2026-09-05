@@ -421,7 +421,7 @@ workflow or hosted CI service is required. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 
-Prebuilt v1.3.0 artifacts must not be published unless its two macOS binaries carry one reviewed
+Prebuilt release artifacts must not be published unless both macOS binaries carry one reviewed
 Developer ID Application identity, hardened runtime, secure timestamps, and
 accepted Apple notarization receipts. `SHA256SUMS` and the commit-bound
 provenance must each carry a Sigstore bundle for the certificate identity and

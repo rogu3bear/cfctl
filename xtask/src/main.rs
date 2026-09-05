@@ -1696,15 +1696,15 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
     for (path, required) in [
         (
             "README.md",
-            "Prebuilt v1.3.0 artifacts must not be published unless its two macOS binaries",
+            "Prebuilt release artifacts must not be published unless both macOS binaries",
         ),
         (
             "QUICKSTART.md",
-            "Prebuilt binaries may ship from the GitHub release only after v1.3.0 is signed",
+            "Prebuilt binaries may ship from the GitHub release only after that release is signed",
         ),
         (
             "SECURITY.md",
-            "Prebuilt v1.3.0 artifacts must not be published unless both macOS binaries",
+            "Prebuilt release artifacts must not be published unless both macOS binaries",
         ),
         (
             "CONTRIBUTING.md",

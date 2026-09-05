@@ -427,3 +427,12 @@ those scripts without allowing arbitrary inline scripts. Response headers
 preserve the issued nonce. Given an extra unnonced executable script, a wrong
 nonce or changed hash-bound script bytes, when live HTML verification runs,
 then it fails. Source tests and mocked responses do not replace browser proof.
+
+
+### AC37 — Workspace operation discovery scales with relevant authority
+
+**Story:** As an operator with many registered repositories, I can discover a workspace-owned operation within consumer command deadlines without weakening its source authority.
+
+- **Given** registered roots containing unrelated dirty or invalid Wrangler configurations, **when** I request a committed operation ID, **then** discovery selects from committed packs before inspecting selected repository execution inputs and does not build the unrelated resource graph.
+- **Given** nested repositories, overlapping registered roots, or symlinked directories, **when** I discover an operation, **then** canonical repository deduplication and traversal exclusions remain intact, distinct repositories with the same operation remain ambiguous, and uncommitted pack changes cannot supply selection authority.
+- **Given** the actual operator registry, **when** Maildesk checks its installed cfctl contracts with the existing ten-second per-command deadline, **then** discovery succeeds without increasing that deadline. Direct timing is local proof; it does not establish provider readiness.

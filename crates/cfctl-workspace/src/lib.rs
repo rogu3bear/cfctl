@@ -18,6 +18,7 @@ mod d1_operation;
 mod d1_policy_projection;
 mod d1_reply_admission;
 mod operation_identity;
+pub use operation_identity::load_workspace_operation_capability;
 mod reply_subdomain_ingress;
 
 pub use d1_evidence::{
