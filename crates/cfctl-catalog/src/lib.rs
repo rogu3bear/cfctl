@@ -1,5 +1,10 @@
 //! Cloudflare capability catalog normalization and indexing.
 
+mod artifact_digest;
+use artifact_digest::{
+    finalize_r2_private_object_digest_contract, finalize_worker_version_artifact_digest,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -117,6 +122,42 @@ mod maildesk_provider_contract_tests {
             description: Some(description.to_owned()),
             contract: None,
         }
+    }
+
+    #[test]
+    fn worker_version_digest_is_a_dedicated_body_free_native_read() {
+        let mut raw = read(
+            "getWorkerVersion",
+            cfctl_core::WORKER_VERSION_ARTIFACT_PATH,
+            "Versions",
+        );
+        raw.adapter_status = AdapterStatus::DynamicApi;
+        raw.selectors = ["account_id", "worker_id", "version_id", "include"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: if name == "include" { "query" } else { "path" }.to_owned(),
+                required: name != "include",
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        let mut capabilities = BTreeMap::from([(raw.id.clone(), raw)]);
+        finalize_worker_version_artifact_digest(&mut capabilities);
+        let digest = &capabilities[cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID];
+        assert_eq!(digest.adapter_status, AdapterStatus::Native);
+        assert!(digest.verification_contract_supported());
+        assert_eq!(digest.permissions, ["Workers Scripts Read"]);
+        assert_eq!(
+            capabilities["getWorkerVersion"].adapter_status,
+            AdapterStatus::DynamicApi
+        );
+        let mut malformed = capabilities["getWorkerVersion"].clone();
+        malformed.path.push_str("/wrong");
+        let mut rejected = BTreeMap::from([(malformed.id.clone(), malformed)]);
+        finalize_worker_version_artifact_digest(&mut rejected);
+        assert!(!rejected.contains_key(cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID));
     }
 
     #[test]
@@ -8439,76 +8480,6 @@ fn finalize_r2_private_file_upload_contract(capabilities: &mut BTreeMap<String, 
     refresh_dynamic_mutation_contract(capability);
 }
 
-fn finalize_r2_private_object_digest_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
-    let Some(raw) = capabilities.get("r2-get-object").cloned() else {
-        return;
-    };
-    let selectors_are_exact = ["account_id", "bucket_name", "object_key"]
-        .iter()
-        .all(|name| {
-            raw.selectors.iter().any(|selector| {
-                selector.name == *name
-                    && selector.location == "path"
-                    && selector.required
-                    && selector.value_type == "string"
-            })
-        });
-    let raw_supported = raw.method == "GET"
-        && raw.path == R2_OBJECT_PATH
-        && raw.product == "R2 Object"
-        && !raw.mutating
-        && raw.request_schema.is_none()
-        && selectors_are_exact;
-    if raw_supported {
-        let mut digest = raw;
-        "r2-get-private-object-digest".clone_into(&mut digest.id);
-        "Read one private R2 object digest without returning bytes".clone_into(&mut digest.title);
-        digest.description = Some(
-            "Streams one exact private object only inside cfctl and returns bounded identity, ETag, byte count, and SHA-256 evidence; object bytes never enter stdout, plans, receipts, logs, or files."
-                .to_owned(),
-        );
-        digest.permissions = vec!["Workers R2 Storage Read".to_owned()];
-        digest.risk = RiskClass::Read;
-        digest.effect = EffectClass::ReadOnly;
-        digest.adapter_status = AdapterStatus::Native;
-        digest.blocked_reason = None;
-        digest.response_contract = Some(ResponseContractV1 {
-            success_statuses: vec!["200".to_owned()],
-            success_media_types: vec!["application/octet-stream".to_owned()],
-            body_mode: ResponseBodyModeV1::R2PrivateObjectDigest,
-        });
-        digest.verification = VerificationSpecV1 {
-            required: true,
-            strategy: "r2_private_object_digest".to_owned(),
-        };
-        digest.rollback = RollbackSpecV1 {
-            supported: false,
-            strategy: None,
-            warning: None,
-        };
-        digest.r2_private_file_upload = None;
-        digest.r2_private_object_digest = Some(R2PrivateObjectDigestContractV1 {
-            max_object_bytes: 300_000_000,
-        });
-        zero_direct_usage_cost(
-            &mut digest,
-            "the digest is one R2 Class B read with no direct configuration charge and never retains object bytes",
-            vec![official_reference(
-                "R2 pricing",
-                "https://developers.cloudflare.com/r2/pricing/",
-            )],
-        );
-        capabilities.insert(digest.id.clone(), digest);
-    }
-    if let Some(raw) = capabilities.get_mut("r2-get-object") {
-        raw.adapter_status = AdapterStatus::Blocked;
-        raw.blocked_reason = Some(
-            "raw R2 object bytes are intentionally unavailable; use r2-get-private-object-digest for body-free identity evidence"
-                .to_owned(),
-        );
-    }
-}
-
 fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
     let read_supported = capabilities
         .get("r2-get-bucket-lifecycle-configuration")
@@ -8886,6 +8857,7 @@ fn apply_post_normalization_contracts(
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_r2_private_file_upload_contract(capabilities);
     finalize_r2_private_object_digest_contract(capabilities);
+    finalize_worker_version_artifact_digest(capabilities);
     finalize_r2_lifecycle_contract(capabilities);
     finalize_email_sending_contracts(capabilities);
     finalize_email_routing_subdomain_contract(capabilities);

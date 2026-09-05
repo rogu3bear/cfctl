@@ -681,7 +681,17 @@ pub(super) async fn execute_read(
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
-    let response = if capability.r2_private_object_digest.is_some() {
+    let response = if capability.id == cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID {
+        if output_path.is_some() {
+            return Err(CloudflareError::InvalidRequestBody(
+                "Worker module bytes cannot be written to an output file".to_owned(),
+            )
+            .into());
+        }
+        executor
+            .execute_read(capability, input, &credential)
+            .await?
+    } else if capability.r2_private_object_digest.is_some() {
         executor
             .execute_r2_private_object_digest(capability, input, &credential)
             .await?
@@ -740,6 +750,16 @@ pub(super) async fn execute_read(
         };
         envelope.verification.basis =
             Some("closed MLN 0143 phase assertions and bounded completeness manifest".to_owned());
+    } else if capability.id == cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID {
+        let verified = response.success
+            && response.result["complete"] == true
+            && response.result["body_returned"] == false;
+        envelope.verification.state = if verified {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis = Some("exact immutable version and complete bounded module digest manifest; static assets not qualified".to_owned());
     } else if capability.r2_private_object_digest.is_some() {
         let verified = response
             .result
