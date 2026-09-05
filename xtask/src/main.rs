@@ -1,5 +1,8 @@
 //! Local verification and release orchestration for cfctl.
 
+mod local_adapters;
+
+use local_adapters::LOCAL_OPERATOR_ADAPTERS;
 use std::{
     collections::BTreeSet,
     env,
@@ -33,14 +36,6 @@ const MACOS_RELEASE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-
 const VERIFY_CROSS_TARGET: &str = "x86_64-unknown-linux-musl";
 const CARGO_AUDITABLE_VERSION: &str = "0.7.5";
 const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
-/// Local operator adapters. `LAYERS.md` keeps these gitignored so a clone
-/// inherits the constitution without an operator context, which also puts them
-/// outside `git ls-files` and therefore outside every tracked-file scan. Source
-/// contracts that guard doctrine must check them explicitly or leave a blind
-/// spot: the retired public domain survived in `AGENTS.md` for exactly that
-/// reason. Present-only — a clone legitimately has neither.
-const LOCAL_OPERATOR_ADAPTERS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
-
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
 struct Arguments {
@@ -454,50 +449,6 @@ fn verify_security_contract() -> Result<(), TaskError> {
     Ok(())
 }
 
-/// Keeps local operator adapters from re-growing a hand-maintained command map.
-///
-/// `AGENTS.md` and `CLAUDE.md` are gitignored, so a drifted copy of the command
-/// surface inside one cannot be caught by reviewing a diff — there is no diff.
-/// One had already fallen five commands behind the parser while `README.md` was
-/// explicitly declining to maintain a second registry for that exact reason.
-///
-/// The signature of a hand-maintained map is an enumerated verb list:
-/// `cfctl <area> <verb>|<verb>`. A pointer at `cfctl commands` has no such line.
-/// Absent adapters pass; a clone legitimately has neither.
-fn verify_local_adapters_defer_the_command_map() -> Result<(), TaskError> {
-    let repository_root = repository_root()?;
-    for path in ["AGENTS.md", "CLAUDE.md"] {
-        let absolute_path = repository_root.join(path);
-        if !absolute_path.is_file() {
-            continue;
-        }
-        let content = fs::read_to_string(&absolute_path)
-            .map_err(|source| io_error(&absolute_path, source))?;
-        if let Some(line) = enumerated_command_line(&content) {
-            return Err(TaskError::InvalidSourceContract(format!(
-                "{path} enumerates the command surface (`{line}`). The map is generated from the \
-                 parser; point at `cfctl commands` instead of keeping a second copy that cannot \
-                 be reviewed."
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Returns the first line that enumerates subcommands for one `cfctl` area.
-fn enumerated_command_line(content: &str) -> Option<&str> {
-    content.lines().map(str::trim).find(|line| {
-        let Some(rest) = line.strip_prefix("cfctl ") else {
-            return false;
-        };
-        // Only tokens before the first flag count. `guide --topic a|b` is one
-        // command's flag values; `catalog sync|search|show` is an area's verbs.
-        rest.split_whitespace()
-            .take_while(|token| !token.starts_with('-'))
-            .any(|token| token.contains('|'))
-    })
-}
-
 fn verify_source_contract() -> Result<(), TaskError> {
     run(
         "sh",
@@ -520,7 +471,7 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_v1_cutover_contract()?;
     verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
-    verify_local_adapters_defer_the_command_map()?;
+    local_adapters::verify()?;
     verify_documented_contracts()
 }
 
@@ -4997,51 +4948,5 @@ mod tests {
         assert!(!preview_run.status.success());
         assert!(String::from_utf8_lossy(&preview_run.stderr).contains("unsigned assembly"));
         assert!(render_linux_installer_text(template, "bad", "bad", Some(("", "issuer"))).is_err());
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod local_adapter_command_map_tests {
-    use super::{enumerated_command_line, verify_local_adapters_defer_the_command_map};
-
-    #[test]
-    fn the_repaired_adapters_pass() {
-        verify_local_adapters_defer_the_command_map()
-            .expect("local adapters must defer the command map to the generated one");
-    }
-
-    #[test]
-    fn a_hand_maintained_verb_list_is_detected() {
-        // The exact shape that had drifted five commands behind the parser.
-        let drifted = "## Public command contract\n\n```text\n\
-                       cfctl catalog sync|search|show|changes|coverage\n\
-                       cfctl doctor\n```\n";
-        assert_eq!(
-            enumerated_command_line(drifted),
-            Some("cfctl catalog sync|search|show|changes|coverage"),
-            "an enumerated verb list must be recognized"
-        );
-    }
-
-    #[test]
-    fn a_pointer_at_the_generated_map_is_accepted() {
-        let pointer = "## Public command contract\n\n```bash\n\
-                       cfctl commands\ncfctl commands --json\n```\n";
-        assert!(
-            enumerated_command_line(pointer).is_none(),
-            "pointing at the generated map must not look like a hand-maintained list"
-        );
-    }
-
-    #[test]
-    fn a_topic_flag_alternative_is_not_a_verb_list() {
-        // `--topic system|standing-authority` is one command's flag values, not
-        // an area's verb enumeration, and must not trip the check.
-        let flags = "cfctl guide --topic system|standing-authority\n";
-        assert!(
-            enumerated_command_line(flags).is_none(),
-            "flag value alternatives are not a command map"
-        );
     }
 }
