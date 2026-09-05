@@ -73,18 +73,19 @@ impl Executor {
         let mut request = self.builder.build(capability, &exact)?;
         request.max_bytes = MAX_RESPONSE_BYTES;
         let mut response = self.send(&request, credential).await?;
-        let projection = if response.success && response.status == 200 && response.errors.is_empty()
-        {
-            project(&response.result, version)
+        let projection = if response.status != 200 {
+            Err("provider_status_unexpected")
+        } else if !response.success || !response.errors.is_empty() {
+            Err("provider_rejected")
         } else {
-            Err(invalid())
+            project(&response.result, version)
         };
         // Discard the entire provider value, including vars, bindings, JWTs and code,
         // on success and failure alike. Never include its text in a diagnostic.
-        response.result = projection.unwrap_or_else(|_| {
+        response.result = projection.unwrap_or_else(|reason| {
             json!({
                 "schema_version":1, "complete":false, "body_returned":false,
-                "diagnostic":"worker_module_projection_rejected"
+                "diagnostic":reason
             })
         });
         response.success = response.success && response.result["complete"] == true;
@@ -94,21 +95,25 @@ impl Executor {
     }
 }
 
-fn project(value: &Value, expected_version: &str) -> Result<Value> {
+fn project(value: &Value, expected_version: &str) -> std::result::Result<Value, &'static str> {
     if !canonical_version(expected_version) || value["id"].as_str() != Some(expected_version) {
-        return Err(invalid());
+        return Err("version_binding_mismatch");
     }
-    let main = value["main_module"].as_str().ok_or_else(invalid)?;
-    let modules = value["modules"].as_array().ok_or_else(invalid)?;
+    let main = value["main_module"].as_str().ok_or("main_module_missing")?;
+    let modules = value["modules"].as_array().ok_or("modules_missing")?;
     if modules.is_empty() || modules.len() > MAX_MODULES {
-        return Err(invalid());
+        return Err("module_count_out_of_bounds");
     }
     let mut entries = BTreeMap::new();
     let mut total = 0_usize;
     for module in modules {
-        let name = module["name"].as_str().ok_or_else(invalid)?;
-        let content_type = module["content_type"].as_str().ok_or_else(invalid)?;
-        let encoded = module["content_base64"].as_str().ok_or_else(invalid)?;
+        let name = module["name"].as_str().ok_or("module_name_missing")?;
+        let content_type = module["content_type"]
+            .as_str()
+            .ok_or("module_content_type_missing")?;
+        let encoded = module["content_base64"]
+            .as_str()
+            .ok_or("module_content_missing")?;
         if name.is_empty()
             || name.len() > 512
             || name.starts_with('/')
@@ -117,22 +122,33 @@ fn project(value: &Value, expected_version: &str) -> Result<Value> {
             || name
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == "..")
-            || content_type.is_empty()
+        {
+            return Err("module_name_invalid");
+        }
+        if content_type.is_empty()
             || content_type.len() > 128
             || !content_type.is_ascii()
             || content_type.chars().any(char::is_control)
-            || entries.contains_key(name)
-            || encoded.len() > MAX_MODULE_BYTES * 4 / 3 + 4
         {
-            return Err(invalid());
+            return Err("module_content_type_invalid");
         }
-        let bytes = STANDARD.decode(encoded).map_err(|_| invalid())?;
+        if entries.contains_key(name) {
+            return Err("module_duplicate_name");
+        }
+        if encoded.len() > MAX_MODULE_BYTES * 4 / 3 + 4 {
+            return Err("module_encoded_size_exceeded");
+        }
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|_| "module_base64_invalid")?;
         if STANDARD.encode(&bytes) != encoded {
-            return Err(invalid());
+            return Err("module_base64_noncanonical");
         }
-        total = total.checked_add(bytes.len()).ok_or_else(invalid)?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or("module_bytes_overflow")?;
         if total > MAX_MODULE_BYTES {
-            return Err(invalid());
+            return Err("module_bytes_out_of_bounds");
         }
         entries.insert(
             name.to_owned(),
@@ -143,11 +159,11 @@ fn project(value: &Value, expected_version: &str) -> Result<Value> {
         );
     }
     if !entries.contains_key(main) {
-        return Err(invalid());
+        return Err("main_module_not_in_manifest");
     }
     let manifest = json!({"schema_version":1,"main_module":main,
         "modules":entries.into_values().collect::<Vec<_>>()});
-    let bytes = serde_json::to_vec(&manifest).map_err(|_| invalid())?;
+    let bytes = serde_json::to_vec(&manifest).map_err(|_| "manifest_serialization_failed")?;
     Ok(json!({
         "schema_version":1,"version_id":expected_version,"complete":true,
         "body_returned":false,"provider_output_retained":false,

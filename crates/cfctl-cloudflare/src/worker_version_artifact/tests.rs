@@ -139,6 +139,9 @@ async fn provider_boundary_never_returns_code_or_private_metadata() {
         assert!(request.contains("include=modules"));
         assert!(request.contains(VERSION));
         assert_eq!(response.success, !wrong_version);
+        if wrong_version {
+            assert_eq!(response.result["diagnostic"], "version_binding_mismatch");
+        }
         let retained = serde_json::to_string(&response).expect("valid bounded test fixture");
         assert!(!retained.contains("private-jwt"));
         assert!(!retained.contains(&STANDARD.encode("private module text")));

@@ -10,7 +10,9 @@ UUID. Prefixes and `latest` are rejected before a provider request. The executor
 forces `include=modules`; callers may omit that query parameter. It admits at
 most 256 modules, 32 MiB decoded module bytes, and a 64 MiB response. Missing
 modules or main entrypoint, version mismatch, duplicate or unsafe module names,
-noncanonical base64, and exceeded bounds fail closed.
+noncanonical base64, and exceeded bounds fail closed. Rejections return a fixed
+reason code so an operator can distinguish a missing module response from a
+version, encoding, name, or size failure without retaining provider text.
 
 Raw module content, sourcemaps, variables, bindings, and asset JWTs are discarded
 inside the executor before evidence is written. The response contains the exact
