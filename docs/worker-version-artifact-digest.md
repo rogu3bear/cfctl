@@ -14,6 +14,9 @@ noncanonical base64, and exceeded bounds fail closed. Rejections return a fixed
 reason code so an operator can distinguish a missing module response from a
 version, encoding, name, or size failure without retaining provider text.
 
+Wrangler module names may have one `./` prefix. The receipt preserves it exactly;
+traversal, repeated prefixes, and aliases such as `x.wasm` plus `./x.wasm` are rejected.
+
 Raw module content, sourcemaps, variables, bindings, and asset JWTs are discarded
 inside the executor before evidence is written. The response contains the exact
 version ID and a sorted manifest of module name, MIME type, byte count and

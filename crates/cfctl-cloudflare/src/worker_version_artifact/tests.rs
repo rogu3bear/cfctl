@@ -182,3 +182,27 @@ async fn refuses_nonexact_inputs_before_network() {
         assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
     }
 }
+
+#[test]
+fn preserves_wrangler_relative_module_names_and_rejects_alias_collisions() {
+    let mut value = fixture();
+    let wasm = json!({"name":"./module.wasm","content_type":"application/wasm","content_base64":STANDARD.encode([0,97,115,109])});
+    value["modules"]
+        .as_array_mut()
+        .expect("modules array")
+        .push(wasm.clone());
+    let projected = project(&value, VERSION).expect("Wrangler relative module name");
+    assert_eq!(projected["manifest"]["modules"][0]["name"], "./module.wasm");
+    let mut alias = wasm;
+    alias["name"] = json!("module.wasm");
+    value["modules"]
+        .as_array_mut()
+        .expect("modules array")
+        .push(alias);
+    assert_eq!(project(&value, VERSION), Err("module_duplicate_name"));
+    for name in ["./../module.wasm", "././module.wasm", ".//module.wasm"] {
+        let mut unsafe_value = fixture();
+        unsafe_value["modules"][0]["name"] = json!(name);
+        assert_eq!(project(&unsafe_value, VERSION), Err("module_name_invalid"));
+    }
+}

@@ -114,12 +114,13 @@ fn project(value: &Value, expected_version: &str) -> std::result::Result<Value, 
         let encoded = module["content_base64"]
             .as_str()
             .ok_or("module_content_missing")?;
-        if name.is_empty()
+        let canonical_name = name.strip_prefix("./").unwrap_or(name);
+        if canonical_name.is_empty()
             || name.len() > 512
-            || name.starts_with('/')
+            || canonical_name.starts_with('/')
             || name.contains('\\')
             || name.chars().any(char::is_control)
-            || name
+            || canonical_name
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == "..")
         {
@@ -132,7 +133,9 @@ fn project(value: &Value, expected_version: &str) -> std::result::Result<Value, 
         {
             return Err("module_content_type_invalid");
         }
-        if entries.contains_key(name) {
+        if entries.keys().any(|existing: &String| {
+            existing.strip_prefix("./").unwrap_or(existing) == canonical_name
+        }) {
             return Err("module_duplicate_name");
         }
         if encoded.len() > MAX_MODULE_BYTES * 4 / 3 + 4 {
