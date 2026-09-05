@@ -17,7 +17,7 @@ flowchart TD
     CLI -->|scope sync and event reconciliation| REG[cfctl-registry]
     REG -.->|immutable evidence references| STORE
     PLAN -->|canonical pinned PlanV2 and policy decision| STORE[cfctl-storage]
-    AUTH -->|platform-only evidence integrity authority| STORE
+    AUTH -->|explicit evidence integrity authority| STORE
     STORE -->|approved, durably consumed plan| CF[cfctl-cloudflare]
     AUTH -->|one selected credential| CF
     CF -->|receipts and verification| STORE
@@ -27,7 +27,7 @@ flowchart TD
 |---|---|
 | `cfctl-cli` | Public command parser, human/JSON rendering, orchestration |
 | `cfctl-core` | Versioned contracts, hashes, evidence, redaction, plan lifecycle |
-| `cfctl-auth` | OAuth PKCE, profiles, account selection, ordinary credential storage with governed mode-0600 fallback, and the separate platform-only evidence-integrity key with no fallback |
+| `cfctl-auth` | OAuth PKCE, profiles, account selection, ordinary credential storage with governed mode-0600 fallback, and the separate evidence-integrity key with no automatic fallback; explicit fresh private epochs use storage-owned private files |
 | `cfctl-cloudflare` | Schema-validated HTTP execution, retries, pagination, conditionals, and idempotency |
 | `cfctl-catalog` | Official OpenAPI/docs/changelog/CLI ingestion and SQLite search index |
 | `cfctl-planner` | Risk, impact, cost, and approval policy |
@@ -196,7 +196,7 @@ profile/account scope, captured credential generation, outcome, and receipt.
 body-only evidence behind an explicit audit reader, while current descriptors
 and proof indexes use strict storage-v2 envelopes authenticated over the full
 public V1 payload, state-root identity, and key generation. `cfctl-auth` owns
-the platform-only HMAC key lifecycle; callers cannot substitute the ordinary
+the explicitly selected HMAC key lifecycle; callers cannot substitute the ordinary
 credential fallback store or silently promote legacy rows into qualification.
 Capability-held handles bind the body, descriptor, proof, and lifecycle-lock
 directories to the opened state incarnation, while generation-usage scans keep

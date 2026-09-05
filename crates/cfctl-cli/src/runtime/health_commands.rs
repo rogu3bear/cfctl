@@ -15,6 +15,11 @@ use cfctl_core::StandingAuthorityStatus;
 
 pub(super) fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
     let secrets = platform_secrets(store);
+    if secrets.is_private() {
+        return Ok(
+            json!({"preferred": "private_file", "keyring": "not_selected", "active_backend": "private_file", "private_dir": secrets.fallback_root(), "private_secret_count": secrets.fallback_secret_count()?}),
+        );
+    }
     let preferred = if cfg!(target_os = "macos") {
         "keychain"
     } else if cfg!(target_os = "linux") {

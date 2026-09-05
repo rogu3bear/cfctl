@@ -447,6 +447,7 @@ pub(super) fn kv_cost_resolves_only_with_a_bound_empty_precondition() {
         web_analytics_rum_state: None,
         dns_record_state: None,
         same_path_prior_state: None,
+        access_application_absence: None,
         access_operator_group_policy_ownership: None,
         security_action_state: None,
         oauth_client_secret_state: None,

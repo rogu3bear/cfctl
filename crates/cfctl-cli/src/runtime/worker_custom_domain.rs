@@ -408,7 +408,7 @@ pub(super) async fn read_live_state(
         &domain_response,
         &dns_response,
     )?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 

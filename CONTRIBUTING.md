@@ -116,9 +116,16 @@ without re-pinning blocks every push until the allowlist is updated; that
 tripwire is deliberate.
 
 Gate logic lives in `.githooks/pre-push-gate.sh`, which is not pinned, so it can
-change without re-pinning. `CFCTL_PRE_PUSH_GATE=off` skips the gate for genuine
-emergencies — prefer it over `git push --no-verify`, which also skips the global
-branch and tag deletion policy.
+change without re-pinning. The gate accepts only `CFCTL_PRE_PUSH_GATE=on`;
+there is no proof bypass. It verifies the clean canonical checkout and rechecks
+its branch, HEAD, pushed ref and source after verification. It creates no linked
+checkout and strips inherited Git context from proof subprocesses.
+
+One exact checked-out branch or one new annotated tag peeling to checked-out
+HEAD may be published per push. Lightweight, moved, existing and non-HEAD tags
+are refused. Tag admission proves source identity only; signed-artifact and
+provenance verification remain mandatory in the release/publish lane below.
+Neither the hook nor creating a tag makes release assets public.
 
 Without the delegate, treat `cargo xtask verify` before every push as a manual
 obligation.
@@ -177,7 +184,7 @@ side effect of building:
 
 Making a draft public is always a separate operator action.
 
-The v1.3.0 operator posture requires the identity-bearing lane. Publication is
+The prebuilt v1.3.0 operator posture requires the identity-bearing lane. Publication is
 admissible only after both macOS binaries pass Developer ID signing and Apple
 notarization, and both `SHA256SUMS` and provenance pass Sigstore verification
 against the certificate identity and OIDC issuer committed independently to
@@ -209,3 +216,9 @@ rotates, revokes, and verifies one short-lived token.
 
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [docs/v2-security.md](docs/v2-security.md) for the runtime security contract.
+
+For a source-only release, publish the exact reviewed and locally verified
+annotated tag with a release title and notes that say source-only. Upload no
+prebuilt executable, checksum set, or installer manifest, and set GitHub latest
+to false. This source publication does not invoke or replace the signed artifact
+lane above. Local source bootstrap remains separate from public binary trust.

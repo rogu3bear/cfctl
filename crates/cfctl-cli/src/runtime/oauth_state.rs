@@ -377,7 +377,7 @@ pub(super) async fn read_live_oauth_client_update_state(
         .await?;
     let receipt =
         apply_oauth_client_update_state_response(capability, input, account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -512,6 +512,6 @@ pub(super) async fn read_live_oauth_client_secret_state(
         oauth_client_id,
         &response,
     )?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }

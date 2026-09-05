@@ -278,7 +278,7 @@ pub(super) fn owned_whole_host_access_application_input() -> CallInput {
     live["domain"] = json!("health.example.com");
     live["name"] = json!("Routing health");
     live["self_hosted_domains"] = json!(["health.example.com"]);
-    live["destinations"] = json!([{"type":"public","uri":"https://health.example.com"}]);
+    live["destinations"] = json!([{"type":"public","uri":"health.example.com"}]);
     let body = super::access_application_mutable_body(
         &live,
         &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
@@ -302,7 +302,7 @@ pub(super) fn access_application_collection(result: Value, complete: bool) -> Cl
         result,
         errors: Vec::new(),
         result_info: Some(if complete {
-            json!({"cfctl_cursor_complete":true,"cfctl_pages":1})
+            json!({"cfctl_page_complete":true,"page":1,"total_pages":1,"cfctl_pages":1})
         } else {
             json!({"cursor":"next-page"})
         }),
@@ -652,8 +652,8 @@ pub(super) fn owned_whole_host_access_application_requires_exact_closed_shape() 
         ),
         (
             "/destinations/0/uri",
-            json!("https://health.example.com/path"),
-            "exact HTTPS whole-host origin",
+            json!("other.example.com"),
+            "exact bare whole hostname",
         ),
         ("/type", json!("saas"), "pinned enum values"),
     ] {
@@ -676,7 +676,7 @@ pub(super) fn owned_whole_host_access_application_binds_unique_terminal_collecti
         "type":"self_hosted",
         "domain":"health.example.com",
         "self_hosted_domains":["health.example.com"],
-        "destinations":[{"type":"public","uri":"https://health.example.com"}]
+        "destinations":[{"type":"public","uri":"health.example.com"}]
     });
     let receipt = super::owned_whole_host_access_application_receipt(
         &input,
@@ -712,6 +712,24 @@ pub(super) fn owned_whole_host_access_application_binds_unique_terminal_collecti
     .expect_err("alternate-type name collision must fail closed");
     assert!(ambiguous.to_string().contains("ambiguous"));
 
+    for other in [
+        json!({"id":"other","type":"self_hosted","destinations":[{"type":"public"}]}),
+        json!({"id":"other","type":"self_hosted"}),
+        json!({"id":"other","type":"unknown"}),
+    ] {
+        assert!(
+            super::owned_whole_host_access_application_receipt(
+                &input,
+                &access_application_collection(json!([selected.clone(), other]), true),
+            )
+            .is_err(),
+            "unclassifiable rows must not establish unique ownership"
+        );
+    }
+    let mut terminal_only = access_application_collection(json!([selected.clone()]), true);
+    terminal_only.result_info = Some(json!({"page":2,"total_pages":2}));
+    assert!(super::owned_whole_host_access_application_receipt(&input, &terminal_only).is_err());
+
     let wildcard_overlap = json!({
         "id":"overlapping-app",
         "name":"Other application",
@@ -734,7 +752,7 @@ pub(super) fn owned_whole_host_access_application_receipt_binds_ownership_and_pr
     live["domain"] = json!("health.example.com");
     live["name"] = json!("Routing health");
     live["self_hosted_domains"] = json!(["health.example.com"]);
-    live["destinations"] = json!([{"type":"public","uri":"https://health.example.com"}]);
+    live["destinations"] = json!([{"type":"public","uri":"health.example.com"}]);
     let mut receipt = super::apply_same_path_prior_state_response(
         &capability,
         &input,
@@ -756,7 +774,7 @@ pub(super) fn owned_whole_host_access_application_receipt_binds_ownership_and_pr
         "type":"self_hosted",
         "domain":"health.example.com",
         "self_hosted_domains":["health.example.com"],
-        "destinations":[{"type":"public","uri":"https://health.example.com"}]
+        "destinations":[{"type":"public","uri":"health.example.com"}]
     });
     receipt["ownership"] = super::owned_whole_host_access_application_receipt(
         &input,

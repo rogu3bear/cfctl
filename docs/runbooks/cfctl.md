@@ -14,7 +14,7 @@ applies, and verification receipts separate.
 | No profile is selected, or the governed fallback store is active | Run `cfctl auth profiles --json`, select one existing account-pinned profile with `cfctl auth use <profile> --json`, then rerun `cfctl auth status --json`. An active fallback store is authoritative by design; use the explicit repair command only when the operator intentionally wants to test or restore the platform keyring. | Never ask the operator to paste a token, OAuth callback, global key, or fallback file. Do not broaden permissions merely to make the error disappear. |
 | Evidence qualification reports an uninitialized or split platform authority | Run `cfctl auth evidence-key status --json`, then `cfctl auth evidence-key init-preview --json` before any first initialization. Initialize only when both the canonical state-root marker and direct platform registry are absent. `init` is resumable across its own interruption: it publishes a private intent naming the state root before creating the authority, so a registry left without its marker by process death is recognized on the next `init` and resumed forward by creating only the missing marker. Rotate explicitly; retire only an inactive generation after cfctl reports zero authenticated local artifacts. | Never use the credential fallback store for the evidence integrity key, recreate a missing half over existing state, or treat legacy unauthenticated proof rows as current qualification. A valid registry with no published intent is not resumable and must never be completed by hand-creating its marker; that is an unknown-provenance authority, not an interrupted initialization. |
 | The exact sole canonical evidence registry is valid but its marker is absent | Run `cfctl auth evidence-key adopt-preview --json` for a strictly read-only classification. `adopt-plan current|status` remain read-only historical inspection and `adopt-plan revoke` may retire only a plan that never crossed. `adopt-plan create` and `adopt <plan-id> --yes` return `CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED`; they do not persist a plan, create the marker, publish a crossing seal, or complete adoption. Signed publication and installation may proceed independently. | Do not pass raw source, artifact, architecture, CDHash, algorithm, or provenance claims as adoption authority. Wait for a separately reviewed authenticated installed-identity receipt producer and consumer. Do not hand-create the marker, initialize a replacement authority, edit Keychain state, or treat historical plan inspection as an adoption outcome. |
-| A valid evidence registry has no marker, no resumable intent, and no authenticated artifacts | Confirm the classification with `cfctl auth evidence-key adopt-preview --json`; it must report `marker_present: false`, `initialized: true`, and zero authenticated descriptors and proofs. Then run `cfctl auth evidence-key reset --yes --json`. Reset discards that authority through the managed platform teardown and initializes a fresh one; it claims no lineage and no continuity with the discarded authority, so it needs no installed-identity receipt. | Never hand-delete the platform registry to reach this state. The keyring stores managed values as an inventory, generation manifest, and chunk set, so removing the root item alone orphans the chunks and corrupts the store. Never reset an authority with a present marker, more than one generation, or any authenticated artifact; rotate, retire, or stop instead. If a reset is interrupted mid-discard, reads report `platform keyring credential deletion is incomplete`; that is a resumable managed state, not corruption. Rerun the same `reset --yes` to finish it forward. Never hand-remove the remaining items. The evidence integrity key has no file fallback by design, so unlike credentials it cannot route around the platform boundary: if macOS raises a keychain approval or unlock dialog, answer it. cfctl waits up to two minutes per operation and reports an unanswered dialog as such rather than as an unavailable backend. |
+| A valid evidence registry has no marker, no resumable intent, and no authenticated artifacts | Confirm the classification with `cfctl auth evidence-key adopt-preview --json`; it must report `marker_present: false`, `initialized: true`, and zero authenticated descriptors and proofs. Then run `cfctl auth evidence-key reset --yes --json`. Reset discards that authority through the managed platform teardown and initializes a fresh one; it claims no lineage and no continuity with the discarded authority, so it needs no installed-identity receipt. | Never hand-delete the platform registry to reach this state. The keyring stores managed values as an inventory, generation manifest, and chunk set, so removing the root item alone orphans the chunks and corrupts the store. Never reset an authority with a present marker, more than one generation, or any authenticated artifact; rotate, retire, or stop instead. If a reset is interrupted mid-discard, reads report `platform keyring credential deletion is incomplete`; that is a resumable managed state, not corruption. Rerun the same `reset --yes` to finish it forward. Never hand-remove the remaining items. The evidence integrity key has no file fallback by design, so unlike credentials it cannot route around the platform boundary: all cfctl Keychain operations are noninteractive, including explicit repair and reset. A locked or unauthorized platform item produces an error without opening a password dialog. Preserve the existing authority and diagnose its custody; do not replace or rotate it merely to clear an access error. |
 | The sole canonical evidence registry is malformed while the marker is absent | Run `cfctl auth evidence-key recover-preview --json`. Recovery is admissible only when the direct platform backend has no managed transition and local storage has zero authenticated descriptors or proofs. The preview is classification-only and read-only: it returns a byte count but no raw value, digest, secret-derived identity, quarantine identity, or execution handle. Create the protected private intent with `cfctl auth evidence-key recover-plan create --json`; inspect or revoke its random opaque ID with `recover-plan status|revoke` without another confirmation prompt. Only the protected quarantine-and-replacement transition requires `cfctl auth evidence-key recover <plan-id> --yes --json`. | Never print or export the registry, hand-edit Keychain, initialize over it, derive an execution identity from secret material, retire quarantine in the same transaction, restore malformed bytes after quarantine begins, or delete historical V1 evidence. A marker, authenticated artifact, unmanaged custody drift, or conflicting readback remains a hold; after a crossed quarantine transition, resume only the same private plan forward. |
 | `plans run` succeeded but the envelope reports `attestation.state: unattested_reversible_effect` | The evidence authority did not qualify and the plan's effect was replayable, so cfctl executed it and said so instead of refusing. Read `attestation.reason` for why the authority did not qualify, then repair it with `cfctl auth evidence-key status --json` and the rows above. Expect the plan to be `RectificationRequired`: the crossing is durable but its receipt is not authenticated, so run `cfctl plans status <operation-id> --json` and reconcile from the boundary response the envelope names. | Do not treat the marker as proof the operation was attested. It is unauthenticated telemetry written by the same installation whose authority was unavailable, so it proves nothing against an adversary able to suppress evidence. Do not replay the plan to obtain a receipt; the boundary was already crossed. Irreversible, destructive, identity, external-communication, spend, and unknown effects never reach this state — they refuse instead, and a refusal there is the authority failing, not the plan. |
 | Catalog sync, coverage, or a stored catalog fails | Run `cfctl catalog sync --json`, then `cfctl catalog coverage --json`. Preserve `previous_catalog` and the returned error code; a discarded invalid current catalog is evidence of safe replacement, not evidence that earlier plans are valid. | Never edit a catalog body or content hash, restore a stale snapshot as current, or reuse a plan whose catalog pin drifted. |
@@ -850,6 +850,21 @@ bytes to the immutable target. Schema meaning remains a separate governed
 `d1-schema-introspection` receipt. If bounded polling exhausts, continue only
 with `d1-resume-database-import-poll`; never replay the consumed import root.
 
+The authenticated init response delegates upload to an R2 storage account;
+that account need not equal the D1 customer's account. The upload accepts only
+a canonical HTTPS `<32 lowercase hex digits>.r2.cloudflarestorage.com`
+presigned endpoint, with no user information, explicit port, fragment, or
+redirect. The separate upload client carries no D1 bearer credential. Its
+ETag must match the reviewed SQL's MD5 before ingest on the original D1 target.
+An ingest response that already reports complete persists both validated
+bookmarks and terminal authority immediately, without another poll. Active
+and pending responses retain the existing bounded polling path. Unknown host
+shapes and malformed completion responses remain blocked.
+
+Protocol references: [D1 import](https://developers.cloudflare.com/d1/tutorials/import-to-d1-with-rest-api/),
+[R2 presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/),
+and [Wrangler import response types](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/d1/types.ts).
+
 OSINT Research Center migrations 0028 through 0034 use the narrower
 `d1-import-approved-osint-research-migration` adapter. It pins account
 `ca30e922fda7f5578e49873542e4aaca`, database
@@ -1025,6 +1040,22 @@ application plus the terminally paginated collection, rejects overlapping
 hostname/name ownership and every unclassified field, binds the complete prior
 snapshot including optional absence, and verifies every intended field by exact
 ID. Restoration is a separate snapshot-bound update plan.
+
+For a new owned whole-host application, use
+`access-applications-create-owned-self-hosted-whole-host`. This closed create
+contract verifies every requested field, the returned application ID, and
+terminal account inventory uniqueness. Its `policies` array is exactly empty:
+create the operator-group policy in a separate plan after the application ID is
+verified. Both specialized create and owned update use one public destination
+whose `uri` is the exact bare hostname, for example
+`{"type":"public","uri":"ops.example.com"}`. Creation omits the deprecated
+`self_hosted_domains`; the existing snapshot-preserving update contract still
+requires its complete prior representation. Unknown or incomplete ownership,
+changed inventory, and readback mismatch fail closed. Missing create identity
+or uncertain execution requires the original operation's recovery path, never a
+blind retry. Deleting an Access application removes protection and can expose a
+routed host, so a separately reviewed compensation plan must keep the host dark
+or independently protected.
 
 Generic polymorphic Access policy create/update also remain blocked. The
 specialized operator-group capabilities accept only `allow`, exactly one
@@ -1644,6 +1675,10 @@ preview, apply, and post-change verification evidence.
 
 ## Known limitations
 
+- **Version 3 workspace D1 transitions compile source only.** The complete frozen
+  schedule and exact SQL segments are checked, while provider execution stays
+  disabled. See [the V3 source and receipt contract](../workspace-d1-transitions-v3.md).
+
 - **Manifest-selected workspace D1 migrations remain fail-closed until
   qualification is produced.** Every create, apply, restore, delete,
   deployment, and other provider mutation remains its own immutable PlanV2:
@@ -1741,3 +1776,61 @@ preview, apply, and post-change verification evidence.
   populated or truncated result fails closed, and the emptiness is re-read live
   before the boundary is crossed. The four production namespaces were not created
   by cfctl and can never enter this path.
+
+
+### Maildesk policy evidence from an adopted workspace
+
+A clean registered workspace may declare `<namespace>.d1-evidence-read` in
+`.cfctl/operations/d1-evidence.toml` with `projection = "maildesk_v1"`. The
+namespace uses lowercase repository-style identifiers; the original
+`star-maildesk-cf.d1-evidence-read` remains supported. The operation retains its
+exact committed pack, config template, production config, database binding and
+Wrangler version checks. The workspace cannot supply SQL.
+
+The aggregate exposes `revision_r2_key` from `policy_revisions.r2_object_key`
+and `projection_policy_sha256` from the projection state's active policy digest.
+Both are independent observations; disagreement with the runtime state remains
+visible for the consumer to reject. Current reads require both bounded values.
+Historical aggregates lacking them remain readable, with those observations
+absent rather than inferred. Route-health and audit counts do not prove actual
+inbox receipt; that requires separately qualifying delivery evidence.
+
+## Explicit private local setup and transition
+
+Use this route for an ordinary source-installed CLI that must operate without
+platform password dialogs. Run `cfctl auth evidence-key private-preview --json`
+and inspect the exact carried, missing and excluded profile IDs, retained
+history location, unsupported standing-authority references and OS-user trust
+boundary. The preview creates a private local transition plan; it does not
+create an evidence key or select a new runtime. Then run the returned
+`cfctl auth evidence-key private-activate <plan-id> --yes --json` command.
+
+Before activation, finish other cfctl operations and stop older installed
+executables that do not honor the new selection guard. New ordinary commands
+hold shared guards, so they can run concurrently; activation requires the
+exclusive guard and fails promptly if another invocation is active. A changed
+source profile, selected credential, configuration or plan history invalidates
+the preview. Pending OAuth logins and running executions must be resolved first.
+
+Activation preserves the old state and platform keys, creates a new random
+signing authority and publishes the persistent location only after verification.
+An interrupted activation resumes the same staged authority. Repeating a
+completed activation reports already active. No old approval, standing grant,
+proof cache or plan becomes executable in the new runtime. Inspect old operation
+IDs with `cfctl auth evidence-key private-history --json`; old files remain at
+the reported archive location. Renew standing authority separately when needed.
+
+The same commands work under an explicit `CFCTL_HOME` for isolated setup;
+they affect only that home's selection. Keep using that original home for
+subsequent invocations. Ordinary use needs no environment override because the
+default installation follows its persistent selection. A fresh setup can then
+import its first account-pinned scoped token through stdin, run `auth status`,
+`auth evidence-key status`, `doctor`, and `catalog sync` without Keychain access.
+
+Both evidence authority and selected private credentials require owned 0700
+directories and owned 0600 regular files, with symbolic links, hard links and
+oversized entries rejected. Writes sync the file and parent directory before
+completion. This protects against other OS users; another process running as
+the same user can read credentials and signing keys. Keep that local trust
+boundary distinct from Cloudflare's account pins and least-privilege token
+permissions.

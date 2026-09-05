@@ -28,13 +28,49 @@ pub(super) async fn execute_delegated_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let mut receipt = Box::pin(run_delegated_plan_boundary(store, plan, input, credential)).await?;
+    let receipt = Box::pin(run_delegated_plan_boundary(store, plan, input, credential)).await?;
+    Ok(complete_delegated_plan(store, catalog, plan, input, credential, secrets, receipt).await)
+}
+
+/// The boundary returned a receipt. All subsequent errors are post-boundary,
+/// including errors while recording the receipt or the recovery checkpoint.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one returned receipt owns all subsequent failure accounting and verification"
+)]
+pub(super) async fn complete_delegated_plan(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &mut PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+    mut receipt: Value,
+) -> ResultEnvelopeV2 {
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let evidence = store.write_evidence(EvidenceClass::Apply, &receipt)?;
-    persist_delegated_boundary_result(store, plan, success, &receipt, &evidence, secrets)?;
+    let evidence = match store.write_observation_evidence(EvidenceClass::Apply, &receipt) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return delegated_post_response_failure(
+                store,
+                plan,
+                receipt,
+                None,
+                &CliError::Storage(error),
+            );
+        }
+    };
+    if let Err(error) =
+        persist_delegated_boundary_result(store, plan, success, &receipt, &evidence, secrets)
+    {
+        return delegated_post_response_failure(store, plan, receipt, Some(evidence), &error);
+    }
+    let recovery_receipt = receipt.clone();
+    let recovery_evidence = evidence.clone();
+    let result = async {
     if !success {
         if workspace_reply_subdomain_ingress::is_unperformed_fresh_precondition_failure(&receipt) {
             return Ok(reply_subdomain_fresh_precondition_failure_envelope(
@@ -59,7 +95,7 @@ pub(super) async fn execute_delegated_plan(
         receipt["deployment_id"] = Value::String(deployment_id.to_owned());
     }
     let verification_evidence =
-        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
         .get("passed")
         .and_then(Value::as_bool)
@@ -116,6 +152,75 @@ pub(super) async fn execute_delegated_plan(
         });
     }
     Ok(envelope)
+    }.await;
+    match result {
+        Ok(envelope) => envelope,
+        Err(error) => delegated_post_response_failure(
+            store,
+            plan,
+            recovery_receipt,
+            Some(recovery_evidence),
+            &error,
+        ),
+    }
+}
+
+pub(super) fn delegated_post_response_failure(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    receipt: Value,
+    evidence: Option<EvidenceV1>,
+    error: &CliError,
+) -> ResultEnvelopeV2 {
+    let performed = receipt
+        .get("boundary_crossed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    plan.status = PlanStatus::RectificationRequired;
+    let persistence = if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted {
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"adapter":"delegated_cli", "success":receipt.get("success"),
+                "boundary_crossed":performed,
+                "apply_evidence_hash":evidence.as_ref().map(|item| &item.content_hash),
+                "receipt_available":true}),
+        )
+    } else if plan.transaction_stage != TransactionStageV1::Closed {
+        let stage = if plan.transaction_stage == TransactionStageV1::VerificationResponsePersisted {
+            TransactionStageV1::Closed
+        } else {
+            TransactionStageV1::VerificationResponsePersisted
+        };
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            stage,
+            json!({"state":"recovery_required", "boundary_crossed":performed,
+                "receipt_available":true, "verification_completed":false}),
+        )
+    } else {
+        Err(CliError::Input(
+            "closed transaction requires exact durable readback before further persistence"
+                .to_owned(),
+        ))
+    };
+    let message = match persistence {
+        Ok(()) => format!("{error}; recovery state persisted"),
+        Err(persistence_error) => {
+            format!("{error}; recovery persistence also failed: {persistence_error}")
+        }
+    };
+    super::api_boundary::post_boundary_failure_envelope(
+        plan,
+        receipt,
+        evidence,
+        None,
+        &CliError::Input(message),
+        performed,
+        "the delegated boundary returned a receipt; local persistence or verification failed, so inspect the consumed plan and live state without replay",
+    )
 }
 
 pub(super) fn persist_delegated_boundary_result(

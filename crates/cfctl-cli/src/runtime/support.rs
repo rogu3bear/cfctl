@@ -3,10 +3,6 @@ use super::prelude::{
     AgentKind, BTreeSet, CapabilityV1, CliError, Duration, Path, PathBuf,
     R2LogRetrievalCredentials, Read, Result, StateStore, Value, env,
 };
-use super::{
-    workspace_d1_evidence, workspace_d1_migration, workspace_d1_projection,
-    workspace_d1_reply_admission, workspace_reply_subdomain_ingress,
-};
 use cfctl_core::redact_json;
 
 pub(super) fn catalog_is_stale(store: &StateStore) -> bool {
@@ -190,19 +186,10 @@ pub(super) fn load_workspace_capability(
     store: &StateStore,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    if let Some(capability) = workspace_d1_migration::load(store, capability_id)? {
-        return Ok(Some(capability));
-    }
-    if let Some(capability) = workspace_d1_projection::load(store, capability_id)? {
-        return Ok(Some(capability));
-    }
-    if let Some(capability) = workspace_d1_reply_admission::load(store, capability_id)? {
-        return Ok(Some(capability));
-    }
-    if let Some(capability) = workspace_reply_subdomain_ingress::load(store, capability_id)? {
-        return Ok(Some(capability));
-    }
-    workspace_d1_evidence::load(store, capability_id)
+    Ok(cfctl_workspace::load_workspace_operation_capability(
+        &store.workspace_roots()?,
+        capability_id,
+    )?)
 }
 
 pub(super) fn is_secret_path(path: &Path) -> bool {
