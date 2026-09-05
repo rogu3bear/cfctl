@@ -10,6 +10,7 @@ repository.workspace = true
 cfctl-auth = { workspace = true }
 cfctl-core = { workspace = true }
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 hex.workspace = true

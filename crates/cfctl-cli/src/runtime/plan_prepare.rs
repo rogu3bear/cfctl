@@ -63,8 +63,6 @@ pub(super) async fn prepare_live_plan_preconditions(
     credential: Option<&AuthCredential>,
 ) -> Result<LivePlanPreconditions> {
     Ok(LivePlanPreconditions {
-        entitlement: None,
-        zone_account: None,
         pages_project_absence: prepare_pages_project_absence_precondition(
             store, catalog, capability, input, account_id, credential,
         )
@@ -73,7 +71,6 @@ pub(super) async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
-        r2_parent_token: None,
         global_warp_override_state: prepare_global_warp_override_state_precondition(
             store, catalog, capability, input, account_id, credential,
         )
@@ -124,7 +121,10 @@ pub(super) async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
-        access_operator_group_policy_ownership: None,
+        access_application_absence: super::access_create::prepare(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
         security_action_state: prepare_security_action_state_precondition(
             store,
             catalog,
@@ -156,6 +156,7 @@ pub(super) async fn prepare_live_plan_preconditions(
             credential,
         )
         .await?,
+        ..LivePlanPreconditions::default()
     })
 }
 
@@ -164,6 +165,7 @@ pub(super) struct PlanAuthority<'a> {
     pub(super) account_id: &'a str,
 }
 
+#[derive(Default)]
 pub(super) struct LivePlanPreconditions {
     pub(super) entitlement: Option<(Value, EvidenceV1)>,
     pub(super) zone_account: Option<(Value, EvidenceV1)>,
@@ -179,6 +181,7 @@ pub(super) struct LivePlanPreconditions {
     pub(super) web_analytics_rum_state: Option<(Value, EvidenceV1)>,
     pub(super) dns_record_state: Option<(Value, EvidenceV1)>,
     pub(super) same_path_prior_state: Option<(Value, EvidenceV1)>,
+    pub(super) access_application_absence: Option<(Value, EvidenceV1)>,
     pub(super) access_operator_group_policy_ownership: Option<(Value, EvidenceV1)>,
     pub(super) security_action_state: Option<(Value, EvidenceV1)>,
     pub(super) oauth_client_secret_state: Option<(Value, EvidenceV1)>,
@@ -233,6 +236,9 @@ pub(super) fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.same_path_prior_state {
         targets["live_preconditions"][SAME_PATH_PRIOR_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.access_application_absence {
+        targets["live_preconditions"]["access_application_absence"] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.access_operator_group_policy_ownership {
         targets["live_preconditions"][ACCESS_OPERATOR_GROUP_POLICY_OWNERSHIP_PRECONDITION] =
@@ -310,6 +316,10 @@ pub(super) fn bind_live_plan_preconditions(
         (
             SAME_PATH_PRIOR_STATE_PRECONDITION,
             &live_preconditions.same_path_prior_state,
+        ),
+        (
+            "access_application_absence",
+            &live_preconditions.access_application_absence,
         ),
         (
             ACCESS_OPERATOR_GROUP_POLICY_OWNERSHIP_PRECONDITION,
@@ -637,8 +647,8 @@ pub(super) fn persist_prepared_plan(
         },
     )?;
     store.save_plan_v2(&plan_v2)?;
-    let evidence =
-        store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan_v2)?)?;
+    let evidence = store
+        .write_observation_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan_v2)?)?;
     let result = if plan.capability.execution_supported {
         json!({
             "plan": plan,
@@ -683,6 +693,7 @@ pub(super) fn prepend_prepared_plan_evidence(
         live_preconditions.web_analytics_rum_state,
         live_preconditions.dns_record_state,
         live_preconditions.same_path_prior_state,
+        live_preconditions.access_application_absence,
         live_preconditions.access_operator_group_policy_ownership,
         live_preconditions.security_action_state,
         live_preconditions.oauth_client_secret_state,

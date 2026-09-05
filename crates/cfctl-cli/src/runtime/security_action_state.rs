@@ -840,7 +840,7 @@ pub(super) async fn read_live_security_action_state(
             &metadata_response,
             &items_response,
         )?;
-        let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+        let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
         return Ok((receipt, evidence));
     }
     if matches!(
@@ -886,7 +886,7 @@ pub(super) async fn read_live_security_action_state(
             account_id,
             &response,
         )?;
-        let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+        let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
         return Ok((receipt, evidence));
     }
     let source = catalog
@@ -947,6 +947,6 @@ pub(super) async fn read_live_security_action_state(
         account_id,
         &response,
     )?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }

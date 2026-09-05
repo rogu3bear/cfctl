@@ -58,6 +58,7 @@ fn migration_contract(
         recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
         recovery_max_age_seconds: 600,
         rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        transition: None,
         manifest_migration: manifest_backed.then(|| WorkspaceD1ManifestMigrationContractV1 {
             manifest_path: ".control-plane/d1_migration_manifest.json".to_owned(),
             manifest_sha256: digest("manifest"),

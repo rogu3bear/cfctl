@@ -11,12 +11,6 @@
 # in scripts/, which the xtask source contract forbids as a quarantined v1
 # runtime path.
 #
-# Escape hatch for genuine emergencies:
-#   CFCTL_PRE_PUSH_GATE=off git push ...
-# Use that rather than `git push --no-verify`; the global pre-push hook enforces
-# repo-independent policy (branch/tag deletion, non-fast-forward) that must keep
-# running even when this gate is skipped.
-
 set -euo pipefail
 
 updates=()
@@ -27,23 +21,25 @@ done
 GATE_MODE="${CFCTL_PRE_PUSH_GATE:-on}"
 
 case "$GATE_MODE" in
-  off)
-    echo "pre-push gate skipped: CFCTL_PRE_PUSH_GATE=off" >&2
-    exit 0
-    ;;
   on) ;;
   *)
-    echo "unknown CFCTL_PRE_PUSH_GATE value: ${GATE_MODE} (expected: on, off)" >&2
+    echo "unknown CFCTL_PRE_PUSH_GATE value: ${GATE_MODE} (expected: on; proof cannot be bypassed)" >&2
     exit 1
     ;;
 esac
 
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
+git_dir="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
+common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+if [ "$git_dir" != "$common_dir" ]; then
+  echo "pre-push REFUSED: use the canonical checkout, not a linked checkout" >&2
+  exit 1
+fi
 
 # This gate proves the checked-out source tree, so bind that tree to the exact
 # object Git is about to publish. Multi-ref, detached-HEAD, non-HEAD, and dirty
-# pushes need a separate object-checkout proof lane; accepting them here would
+# pushes are refused; accepting them here would
 # let the gate inspect bytes other than the pushed commit.
 if [ "${#updates[@]}" -ne 1 ]; then
   echo "pre-push REFUSED: expected exactly one pushed ref, got ${#updates[@]}" >&2
@@ -54,15 +50,30 @@ read -r local_ref local_oid remote_ref _remote_oid <<<"${updates[0]}"
 head_ref="$(git symbolic-ref -q HEAD || true)"
 head_oid="$(git rev-parse HEAD)"
 
-if [ -z "$head_ref" ] || [ "$local_ref" != "$head_ref" ] || [ "$local_oid" != "$head_oid" ]; then
-  echo "pre-push REFUSED: pushed ref/object must equal the checked-out HEAD" >&2
+if [ -z "$head_ref" ]; then
+  echo "pre-push REFUSED: canonical checkout must have an attached HEAD" >&2
   exit 1
 fi
 
-case "$remote_ref" in
-  refs/heads/*) ;;
+case "$local_ref:$remote_ref" in
+  refs/heads/*:refs/heads/*)
+    if [ "$local_ref" != "$head_ref" ] || [ "$local_oid" != "$head_oid" ]; then
+      echo "pre-push REFUSED: pushed branch/object must equal checked-out HEAD" >&2
+      exit 1
+    fi
+    ;;
+  refs/tags/*:refs/tags/*)
+    if [ "$local_ref" != "$remote_ref" ] || \
+       [ "$(git cat-file -t "$local_oid")" != tag ] || \
+       [ "$(git rev-parse "$local_ref")" != "$local_oid" ] || \
+       [ "$(git rev-parse "$local_oid^{commit}")" != "$head_oid" ] || \
+       [ "$_remote_oid" != 0000000000000000000000000000000000000000 ]; then
+      echo "pre-push REFUSED: only a new annotated tag at exact checked-out HEAD is admitted" >&2
+      exit 1
+    fi
+    ;;
   *)
-    echo "pre-push REFUSED: this proof lane publishes exactly one branch" >&2
+    echo "pre-push REFUSED: expected one branch or new annotated tag" >&2
     exit 1
     ;;
 esac
@@ -81,32 +92,16 @@ echo "pre-push: running cargo xtask verify for ${head_oid:0:7}..."
 # Capture unpiped. Piping the gate through tail/head masks its exit status and
 # has produced a false green in this repo before.
 log="$(mktemp -t cfctl-pre-push-gate)"
-proof_parent="$(mktemp -d -t cfctl-pre-push-proof)"
-proof_root="$proof_parent/checkout"
-cleanup() {
-  git worktree remove --force "$proof_root" >/dev/null 2>&1 || true
-  rm -rf "$proof_parent"
-}
-trap cleanup EXIT
-
-# Verify an immutable detached checkout of the exact object supplied by Git's
-# pre-push protocol. The operator's working checkout may change while this
-# long-running proof executes; those bytes must never become proof for the
-# object Git selected before invoking the hook.
-git worktree add --detach --quiet "$proof_root" "$local_oid"
+# Verify only this canonical checkout. The sole-writer rule prevents concurrent
+# edits; recheck exact source/HEAD after proof to reject observed drift.
+# Strip every inherited Git context variable from proof subprocesses: tests
+# must be free to initialize their own repositories without touching ours.
+proof_env=(env)
+while IFS= read -r variable; do
+  case "$variable" in GIT_*) proof_env+=(-u "$variable") ;; esac
+done < <(compgen -e)
 set +e
-# Git exports GIT_DIR and friends into hooks. Left in place they reach every
-# subprocess the gate starts, including tests that create their own throwaway
-# repositories — and a `git init` that silently retargets at the exported
-# GIT_DIR rewrites this repository's config instead. From a linked worktree the
-# exported path shares the main repository's config file, so that mistake marks
-# the real repository bare. The gate resolved its own root above; nothing past
-# this point should inherit the hook's git context.
-(cd "$proof_root" && \
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-    -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
-    cargo xtask verify) >"$log" 2>&1
+"${proof_env[@]}" cargo xtask verify >"$log" 2>&1
 verify_exit=$?
 set -e
 
@@ -116,32 +111,25 @@ if [ "$verify_exit" -ne 0 ]; then
   echo >&2
   echo "pre-push REFUSED: cargo xtask verify exited ${verify_exit}" >&2
   echo "full log: $log" >&2
-  echo "Fix the failure and retry, or CFCTL_PRE_PUSH_GATE=off to override." >&2
+  echo "Fix the failure and retry with the same reviewed source." >&2
   exit 1
 fi
 
-proof_oid="$(git -C "$proof_root" rev-parse HEAD)"
 current_head_ref="$(git symbolic-ref -q HEAD || true)"
 current_head_oid="$(git rev-parse HEAD)"
-if ! proof_status="$(git -C "$proof_root" status --porcelain=v1 --untracked-files=all)"; then
-  echo "pre-push REFUSED: could not observe exact-object proof checkout cleanliness" >&2
+if [ "$(git rev-parse "$local_ref")" != "$local_oid" ]; then
+  echo "pre-push REFUSED: pushed ref changed during verification" >&2
   exit 1
 fi
 if ! current_status="$(git status --porcelain=v1 --untracked-files=all)"; then
   echo "pre-push REFUSED: could not observe checked-out source cleanliness after verification" >&2
   exit 1
 fi
-if [ "$proof_oid" != "$local_oid" ] || [ -n "$proof_status" ]; then
-  echo "pre-push REFUSED: exact-object proof checkout drifted during verification" >&2
-  exit 1
-fi
-if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$local_oid" ] || \
+if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$head_oid" ] || \
    [ -n "$current_status" ]; then
   echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
   exit 1
 fi
 
 rm -f "$log"
-trap - EXIT
-cleanup
 echo "pre-push: verify passed."

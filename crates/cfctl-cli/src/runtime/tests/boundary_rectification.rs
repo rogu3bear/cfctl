@@ -350,6 +350,7 @@ pub(super) fn workspace_d1_rectification_requires_a_boundary_receipt_and_journal
         recovery_capability_id: "d1-time-travel-get-bookmark".to_owned(),
         recovery_max_age_seconds: 600,
         rollback_capability_id: "d1-restore-exact-bookmark".to_owned(),
+        transition: None,
         manifest_migration: None,
     });
     let mut plan = PlanV1::draft(

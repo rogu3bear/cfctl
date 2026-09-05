@@ -486,7 +486,7 @@ pub(super) async fn prepare_access_application_login_methods_plan_input(
     else {
         return Ok(None);
     };
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok(Some((receipt, evidence)))
 }
 

@@ -13,6 +13,11 @@ use cfctl_agent::inspect_agent;
 
 pub(super) fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
     let secrets = platform_secrets(store);
+    if secrets.is_private() {
+        return Ok(
+            json!({"preferred": "private_file", "keyring": "not_selected", "active_backend": "private_file", "private_dir": secrets.fallback_root(), "private_secret_count": secrets.fallback_secret_count()?}),
+        );
+    }
     let preferred = if cfg!(target_os = "macos") {
         "keychain"
     } else if cfg!(target_os = "linux") {
@@ -33,15 +38,41 @@ pub(super) fn platform_secret_store_health(store: &StateStore) -> Result<Value> 
     }))
 }
 
+/// Inspect only the local marker. Authenticating historical proofs also reads
+/// the keyring, and neither an empty history nor an old valid row proves that
+/// the current signing authority is usable. The explicit status command owns
+/// that check, including any platform interaction it requires.
+fn evidence_authority_health(store: &StateStore) -> Result<Value> {
+    let marker_present = store.evidence_root_identity()?.is_some();
+    Ok(json!({
+        "qualifying": if marker_present { None } else { Some(false) },
+        "marker_present": marker_present,
+        "state": if marker_present { "not_checked" } else { "not_initialized" },
+        "credential_store_accessed": false,
+        "check_argv": ["cfctl", "auth", "evidence-key", "status", "--json"],
+        "detail": if marker_present {
+            "an evidence-root marker exists; authority access and consistency require an explicit evidence-key status check"
+        } else {
+            "no evidence-root marker exists; inspect evidence-key status before choosing initialization or recovery"
+        },
+    }))
+}
+
 fn standing_authorities_health(store: &StateStore) -> Result<Value> {
     let now = Utc::now();
     let authorities: Vec<Value> = store
         .list_authorities()?
         .iter()
         .map(|authority| {
+            let expired = now > authority.expires_at;
             json!({
                 "authority_id": authority.authority_id,
                 "status": authority.status.as_str(),
+                "expired": expired,
+                // Operational status also checks the approval hash. An exact
+                // proposed operation must still satisfy the grant's bounds.
+                "admissible": authority.ensure_operational().is_ok()
+                    && authority.runs_in_last_day(now) < authority.max_runs_per_day as usize,
                 "account_id": authority.account_id,
                 "zone_id": authority.zone_id,
                 "bound_resources": authority.allowed_token_resources(),
@@ -138,6 +169,7 @@ pub(super) fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": platform_secret_store_health(store)?,
             "standing_authorities": standing_authorities_health(store)?,
+            "evidence_authority": evidence_authority_health(store)?,
             "instruction_drift": instruction_drift,
             "agents": agents,
             "public_oauth": "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
@@ -201,4 +233,83 @@ pub(super) async fn update_command(check: bool) -> Result<ResultEnvelopeV2> {
         "update",
         json!({"current": env!("CARGO_PKG_VERSION"), "latest": release.get("tag_name"), "release_url": release.get("html_url")}),
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{StateStore, Utc, evidence_authority_health, standing_authorities_health};
+    use cfctl_core::{StandingAuthorityRunV1, StandingAuthorityV1};
+    use cfctl_storage::RuntimePaths;
+    use chrono::Duration;
+
+    #[test]
+    fn evidence_health_does_not_authenticate_or_infer_health_from_history() {
+        let root = tempfile::tempdir().expect("runtime");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+        let proof = store
+            .paths()
+            .data_dir
+            .join("evidence-index")
+            .join(format!("{}.json", "a".repeat(64)));
+        std::fs::write(proof, "malformed historical proof").expect("history");
+        let health = evidence_authority_health(&store).expect("metadata-only health");
+        assert_eq!(health["qualifying"], false);
+        store
+            .initialize_evidence_root_identity(&format!("sha256:{}", "b".repeat(64)))
+            .expect("marker");
+        let health = evidence_authority_health(&store).expect("no authenticator needed");
+        assert_eq!(health["marker_present"], true);
+        assert_eq!(health["state"], "not_checked");
+        assert!(health["qualifying"].is_null());
+        assert_eq!(health["credential_store_accessed"], false);
+    }
+
+    #[test]
+    fn standing_authority_health_observes_expiry_approval_and_run_budget() {
+        for condition in [
+            "active",
+            "expired",
+            "revoked",
+            "unapproved",
+            "drifted",
+            "exhausted",
+        ] {
+            let root = tempfile::tempdir().expect("runtime");
+            let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+            let mut authority = StandingAuthorityV1::draft(
+                "account-a",
+                None,
+                vec!["api-tokens-create".to_owned()],
+                vec!["permission-a".to_owned()],
+                "inventory",
+                1,
+                "fixture-",
+                1,
+                Utc::now() + Duration::hours(1),
+            )
+            .expect("grant");
+            authority.approve(true).expect("approval");
+            match condition {
+                "expired" => authority.expires_at = Utc::now() - Duration::hours(1),
+                "revoked" => authority.revoke(),
+                "unapproved" => authority.approval = None,
+                "drifted" => authority.name_prefix = "changed-".to_owned(),
+                "exhausted" => authority.run_log.push(StandingAuthorityRunV1 {
+                    operation_id: "fixture".to_owned(),
+                    capability_id: "api-tokens-create".to_owned(),
+                    at: Utc::now(),
+                }),
+                _ => {}
+            }
+            store.save_authority(&authority).expect("store grant");
+            let health = standing_authorities_health(&store).expect("health");
+            assert_eq!(
+                health[0]["admissible"],
+                condition == "active",
+                "{condition}"
+            );
+            assert_eq!(health[0]["expired"], condition == "expired", "{condition}");
+        }
+    }
 }
