@@ -46,5 +46,5 @@ if [ "$first_digest" != "$second_digest" ]; then
   exit 1
 fi
 
-printf '[verify-reproducible-edge] exact deployment artifact reproduced: %s\n' \
+printf '[verify-reproducible-edge] site-relative build comparison reproduced: %s\n' \
   "$second_digest"

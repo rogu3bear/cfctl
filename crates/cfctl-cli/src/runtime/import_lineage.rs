@@ -495,19 +495,34 @@ pub(super) fn exact_durable_provider_complete_boundary(
                 .to_owned(),
         ));
     }
-    let accepted_ingest_bookmarks =
-        exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash);
+    let (hash, checkpoint) = provider_complete[0];
+    let final_bookmark = checkpoint
+        .pointer("/receipt/final_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let response_action = checkpoint
+        .pointer("/receipt/response_action")
+        .and_then(Value::as_str);
+    let accepted_ingest_bookmarks = match (response_action, final_bookmark) {
+        (Some("ingest"), Some(final_bookmark)) => exact_ingest_bookmarks(
+            store,
+            plan,
+            &checkpoints,
+            &target,
+            &input_hash,
+            Some(final_bookmark),
+        ),
+        (Some("poll"), _) => {
+            exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash)
+        }
+        _ => Vec::new(),
+    };
     if accepted_ingest_bookmarks.len() != 1 {
         return Err(CliError::Input(
             "provider completion requires exactly one immutable accepted-ingest authority"
                 .to_owned(),
         ));
     }
-    let (hash, checkpoint) = provider_complete[0];
-    let final_bookmark = checkpoint
-        .pointer("/receipt/final_bookmark")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
     let accepted_bookmark = accepted_ingest_bookmarks.first().map(String::as_str);
     let exact = checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
         && checkpoint.get("operation_id").and_then(Value::as_str) == Some(operation_id)
@@ -525,10 +540,7 @@ pub(super) fn exact_durable_provider_complete_boundary(
             .pointer("/receipt/effect")
             .and_then(Value::as_str)
             == Some("d1_import_provider_complete")
-        && checkpoint
-            .pointer("/receipt/response_action")
-            .and_then(Value::as_str)
-            == Some("poll")
+        && matches!(response_action, Some("poll" | "ingest"))
         && checkpoint
             .pointer("/receipt/no_replay")
             .and_then(Value::as_bool)
@@ -919,6 +931,17 @@ pub(super) fn exact_accepted_ingest_bookmarks(
     target: &Value,
     input_hash: &str,
 ) -> Vec<String> {
+    exact_ingest_bookmarks(store, plan, checkpoints, target, input_hash, None)
+}
+
+fn exact_ingest_bookmarks(
+    store: &StateStore,
+    plan: &PlanV1,
+    checkpoints: &[(String, Value)],
+    target: &Value,
+    input_hash: &str,
+    completed_final_bookmark: Option<&str>,
+) -> Vec<String> {
     let migration_id = plan
         .input
         .pointer("/body/migration_id")
@@ -967,17 +990,29 @@ pub(super) fn exact_accepted_ingest_bookmarks(
                 && checkpoint
                     .pointer("/receipt/no_replay")
                     .and_then(Value::as_bool)
-                    == Some(false)
+                    == Some(completed_final_bookmark.is_some())
                 && checkpoint
                     .pointer("/receipt/result/type")
                     .and_then(Value::as_str)
                     == Some("import")
-                && matches!(
-                    checkpoint
-                        .pointer("/receipt/result/status")
-                        .and_then(Value::as_str),
-                    Some("active" | "pending")
-                )
+                && match completed_final_bookmark {
+                    Some(final_bookmark) => {
+                        checkpoint
+                            .pointer("/receipt/result/status")
+                            .and_then(Value::as_str)
+                            == Some("complete")
+                            && checkpoint
+                                .pointer("/receipt/result/result/final_bookmark")
+                                .and_then(Value::as_str)
+                                == Some(final_bookmark)
+                    }
+                    None => matches!(
+                        checkpoint
+                            .pointer("/receipt/result/status")
+                            .and_then(Value::as_str),
+                        Some("active" | "pending")
+                    ),
+                }
                 && checkpoint
                     .pointer("/receipt/result/success")
                     .and_then(Value::as_bool)

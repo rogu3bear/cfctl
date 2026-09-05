@@ -641,28 +641,55 @@ fn validate_keychain_value(bytes: Vec<u8>) -> Result<String> {
     })
 }
 
-/// Suppress keychain dialogs when nothing in this context can answer one.
-///
-/// macOS raises an authorization dialog on its own and then waits. A caller with
-/// no terminal cannot answer it, so the operation blocks indefinitely on a prompt
-/// the operator may never see. Disabling interaction turns that invisible wait
-/// into `errSecInteractionNotAllowed`, which is reported as
-/// [`AuthError::SecretStoreAuthorizationRequired`]: an accurate, immediate answer
-/// instead of a hang.
-///
-/// An attended caller keeps the dialog, because there a person can approve it.
-///
-/// The returned guard re-enables interaction when dropped. Interaction is a
-/// process-wide setting, so these guards are deliberately held for one operation
-/// at a time and never nested.
-fn suppress_keychain_dialogs_when_unattended()
--> Option<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
-    use std::io::IsTerminal as _;
+// Security.framework's interaction flag is process-global. Hold this lock until
+// the SDK guard restores it so one operation cannot re-enable another's dialogs.
+static KEYCHAIN_INTERACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    if std::io::stdin().is_terminal() || std::io::stderr().is_terminal() {
-        return None;
+fn with_keychain_interaction<T, Guard>(
+    serialization: &std::sync::Mutex<()>,
+    suppress: impl FnOnce() -> Result<Guard>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _serialization = serialization.lock().map_err(|_| {
+        AuthError::SecretStore(
+            "Keychain interaction lock is poisoned; credential operation not attempted".to_owned(),
+        )
+    })?;
+    let _dialogs = suppress()?;
+    operation()
+}
+
+fn quiet_keychain_guard<Guard>(
+    interaction_allowed: impl FnOnce() -> Result<bool>,
+    disable: impl FnOnce() -> Result<Guard>,
+) -> Result<Option<Guard>> {
+    // The SDK destructor always enables interaction; preserve an already
+    // disabled process flag by avoiding that destructor entirely.
+    if !interaction_allowed()? {
+        return Ok(None);
     }
-    security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok()
+    disable().map(Some)
+}
+
+fn with_noninteractive_keychain<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    use security_framework::os::macos::keychain::SecKeychain;
+
+    let guard_error = |error: security_framework::base::Error| {
+        AuthError::SecretStore(format!(
+            "cannot establish noninteractive Keychain access (status {}); credential operation not attempted",
+            error.code()
+        ))
+    };
+    with_keychain_interaction(
+        &KEYCHAIN_INTERACTION,
+        || {
+            quiet_keychain_guard(
+                || SecKeychain::user_interaction_allowed().map_err(guard_error),
+                || SecKeychain::disable_user_interaction().map_err(guard_error),
+            )
+        },
+        operation,
+    )
 }
 
 fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
@@ -676,36 +703,38 @@ fn security_command_put(service: &str, key: &str, value: &str) -> Result<()> {
             "platform keyring item exceeds the maximum logical byte bound".to_owned(),
         ));
     }
-    let _dialogs = suppress_keychain_dialogs_when_unattended();
-    match security_framework::passwords::set_generic_password(service, key, value.as_bytes()) {
-        Ok(()) => Ok(()),
-        // Ownership migration. An item written by the superseded subprocess adapter
-        // is owned by /usr/bin/security, and no update can take that ownership, so
-        // every installation upgrading to the native adapter would otherwise fail its
-        // first write. Replacing the item in place is the only forward path, and it
-        // is confined to cfctl's own service and key namespace.
-        Err(error) if is_ownership_conflict(error.code()) => {
-            migrate_item_ownership(service, key, value)
+    with_noninteractive_keychain(|| {
+        match security_framework::passwords::set_generic_password(service, key, value.as_bytes()) {
+            Ok(()) => Ok(()),
+            // Ownership migration. An item written by the superseded subprocess adapter
+            // is owned by /usr/bin/security, and no update can take that ownership, so
+            // every installation upgrading to the native adapter would otherwise fail its
+            // first write. Replacing the item in place is the only forward path, and it
+            // is confined to cfctl's own service and key namespace.
+            Err(error) if is_ownership_conflict(error.code()) => {
+                migrate_item_ownership(service, key, value)
+            }
+            Err(error) => Err(classify_keychain_error(error)),
         }
-        Err(error) => Err(classify_keychain_error(error)),
-    }
+    })
 }
 
 fn security_command_get(service: &str, key: &str) -> Result<Option<String>> {
-    let _dialogs = suppress_keychain_dialogs_when_unattended();
-    let primary = read_item(service, key)?;
-    // Consult the migration journal only when the primary is absent. A pending
-    // crossing is an answer, not a failure: an interrupted ownership migration
-    // stays invisible to callers instead of reading as a missing credential.
-    let journal = if primary.is_some() {
-        None
-    } else {
-        read_item(service, &ownership_migration_key(key))?
-    };
-    match resolve_stored_value(primary, journal) {
-        Some(bytes) => validate_keychain_value(bytes).map(Some),
-        None => Ok(None),
-    }
+    with_noninteractive_keychain(|| {
+        let primary = read_item(service, key)?;
+        // Consult the migration journal only when the primary is absent. A pending
+        // crossing is an answer, not a failure: an interrupted ownership migration
+        // stays invisible to callers instead of reading as a missing credential.
+        let journal = if primary.is_some() {
+            None
+        } else {
+            read_item(service, &ownership_migration_key(key))?
+        };
+        match resolve_stored_value(primary, journal) {
+            Some(bytes) => validate_keychain_value(bytes).map(Some),
+            None => Ok(None),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -745,19 +774,128 @@ pub(super) fn decode_security_stdout(mut bytes: Vec<u8>) -> Result<String> {
 }
 
 fn security_command_delete(service: &str, key: &str) -> Result<()> {
-    let _dialogs = suppress_keychain_dialogs_when_unattended();
-    match security_framework::passwords::delete_generic_password(service, key) {
-        Ok(()) => Ok(()),
-        // Absence is the intended end state, so a missing item is success. The
-        // subprocess adapter expressed the same tolerance as exit status 44.
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-        Err(error) => Err(classify_keychain_error(error)),
-    }
+    with_noninteractive_keychain(|| {
+        match security_framework::passwords::delete_generic_password(service, key) {
+            Ok(()) => Ok(()),
+            // Absence is the intended end state, so a missing item is success. The
+            // subprocess adapter expressed the same tolerance as exit status 44.
+            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+            Err(error) => Err(classify_keychain_error(error)),
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+
+    #[test]
+    fn quiet_keychain_guard_failure_never_calls_credential_operation() {
+        for query_fails in [true, false] {
+            let lock = std::sync::Mutex::new(());
+            let invoked = std::cell::Cell::new(false);
+            let outcome = super::with_keychain_interaction(
+                &lock,
+                || {
+                    super::quiet_keychain_guard(
+                        || {
+                            if query_fails {
+                                Err(AuthError::SecretStore("query failed".to_owned()))
+                            } else {
+                                Ok(true)
+                            }
+                        },
+                        || Err::<(), _>(AuthError::SecretStore("disable failed".to_owned())),
+                    )
+                },
+                || {
+                    invoked.set(true);
+                    Ok(())
+                },
+            );
+            assert!(outcome.is_err());
+            assert!(!invoked.get());
+            assert!(lock.try_lock().is_ok());
+        }
+    }
+
+    #[test]
+    fn quiet_keychain_preserves_an_already_disabled_process_flag() {
+        let lock = std::sync::Mutex::new(());
+        let disabled_calls = std::cell::Cell::new(0);
+        let flag = std::cell::Cell::new(false);
+        super::with_keychain_interaction(
+            &lock,
+            || {
+                super::quiet_keychain_guard(
+                    || Ok(flag.get()),
+                    || {
+                        disabled_calls.set(disabled_calls.get() + 1);
+                        Ok(())
+                    },
+                )
+            },
+            || {
+                assert!(!flag.get());
+                Ok(())
+            },
+        )
+        .expect("quiet operation");
+        assert_eq!(disabled_calls.get(), 0);
+        assert!(!flag.get());
+    }
+
+    struct QuietTestGuard<'a> {
+        lock: &'a std::sync::Mutex<()>,
+        allowed: &'a std::sync::atomic::AtomicBool,
+    }
+    impl Drop for QuietTestGuard<'_> {
+        fn drop(&mut self) {
+            assert!(self.lock.try_lock().is_err(), "restore must precede unlock");
+            assert!(!self.allowed.swap(true, std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn quiet_keychain_serializes_operations_through_guard_restoration() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let lock = std::sync::Mutex::new(());
+        let allowed = AtomicBool::new(true);
+        let count = AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    super::with_keychain_interaction(
+                        &lock,
+                        || {
+                            super::quiet_keychain_guard(
+                                || Ok(allowed.load(Ordering::SeqCst)),
+                                || {
+                                    assert!(allowed.swap(false, Ordering::SeqCst));
+                                    Ok(QuietTestGuard {
+                                        lock: &lock,
+                                        allowed: &allowed,
+                                    })
+                                },
+                            )
+                        },
+                        || {
+                            assert!(!allowed.load(Ordering::SeqCst));
+                            std::thread::yield_now();
+                            assert!(!allowed.load(Ordering::SeqCst));
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .expect("serialized quiet operation");
+                });
+            }
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 8);
+        assert!(allowed.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn an_interrupted_ownership_migration_still_answers_reads() {

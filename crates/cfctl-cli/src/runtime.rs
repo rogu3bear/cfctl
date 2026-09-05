@@ -3,6 +3,7 @@
 #![deny(clippy::wildcard_imports)]
 
 mod access_application;
+mod access_create;
 mod access_ownership;
 mod access_policy;
 mod agent_commands;
@@ -46,6 +47,7 @@ mod preconditions_authority;
 mod preconditions_core;
 mod preconditions_extended;
 mod prelude;
+mod private_runtime;
 mod provider_state;
 mod r2_credentials;
 mod r2_private_upload;
@@ -66,6 +68,7 @@ mod workspace_d1_migration;
 mod workspace_d1_projection;
 mod workspace_d1_qualification;
 mod workspace_d1_reply_admission;
+mod workspace_d1_transition;
 mod workspace_reply_subdomain_ingress;
 mod workspace_state;
 
@@ -115,6 +118,16 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     if matches!(command, Command::Commands) {
         return Ok(crate::command_help::envelope());
     }
+    let activating = matches!(
+        &command,
+        Command::Auth(crate::AuthArgs {
+            command: crate::AuthCommand::EvidenceKey(crate::EvidenceKeyArgs {
+                command: crate::EvidenceKeyCommand::PrivateActivate(_)
+            })
+        })
+    );
+    let _runtime_lock =
+        cfctl_storage::lock_runtime_selection(&RuntimePaths::unselected()?, activating)?;
     let store = if command_uses_nonqualifying_audit_evidence(&command) {
         runtime_unqualified_state_store()?
     } else {
@@ -143,6 +156,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
 }
 
 pub async fn execute_natural_language(intent: &str) -> Result<ResultEnvelopeV2> {
+    let runtime_lock = cfctl_storage::lock_runtime_selection(&RuntimePaths::unselected()?, false)?;
     let store = runtime_qualifying_state_store()?;
     let agent = configured_agent()?;
     let context = InvocationContext {
@@ -152,6 +166,7 @@ pub async fn execute_natural_language(intent: &str) -> Result<ResultEnvelopeV2> 
     let action = build_intent_action(agent, intent, None)?;
     let evidence =
         store.write_evidence(EvidenceClass::AgentAction, &serde_json::to_value(&action)?)?;
+    drop(runtime_lock);
     let mut process = ProcessCommand::new(&invocation.program);
     process.args(&invocation.args);
     for (key, value) in invocation.env {

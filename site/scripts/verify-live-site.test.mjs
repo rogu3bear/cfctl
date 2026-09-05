@@ -1,9 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import {
+  ROUTES,
+  verifyLiveSite,
   parseCsp,
   productionOrigin,
   verifyAssetManifest,
   verifyHtmlResponse,
+  verifyInlineScripts,
 } from "./verify-live-site.mjs";
 
 function htmlResponse(body = "See the boundary before you cross it.", overrides = {}) {
@@ -11,7 +14,7 @@ function htmlResponse(body = "See the boundary before you cross it.", overrides 
     status: overrides.status ?? 200,
     headers: {
       "cache-control": "no-cache, max-age=0, must-revalidate",
-      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' 'wasm-unsafe-eval';",
+      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' 'wasm-unsafe-eval' 'nonce-AAAAAAAAAAAAAAAAAAAAAA';",
       "content-type": "text/html; charset=utf-8",
       "cross-origin-opener-policy": "same-origin",
       "permissions-policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
@@ -121,9 +124,9 @@ describe("HTML response contract", () => {
 describe("asset manifest contract", () => {
   test("binds every asset path to its digest", () => {
     expect(() => verifyAssetManifest({
-      js: "/pkg/site.0123456789abcdef.js",
-      wasm: "/pkg/site.1111111111111111.wasm",
-      css: "/pkg/site.2222222222222222.css",
+      js: "/pkg/cfctl-site.0123456789abcdef.js",
+      wasm: "/pkg/cfctl-site.1111111111111111.wasm",
+      css: "/pkg/cfctl-site.2222222222222222.css",
       hashes: {
         js: "0123456789abcdef",
         wasm: "1111111111111111",
@@ -131,9 +134,9 @@ describe("asset manifest contract", () => {
       },
     })).not.toThrow();
     expect(() => verifyAssetManifest({
-      js: "/pkg/site.js",
-      wasm: "/pkg/site.1111111111111111.wasm",
-      css: "/pkg/site.2222222222222222.css",
+      js: "/pkg/cfctl-site.js",
+      wasm: "/pkg/cfctl-site.1111111111111111.wasm",
+      css: "/pkg/cfctl-site.2222222222222222.css",
       hashes: {
         js: "0123456789abcdef",
         wasm: "1111111111111111",
@@ -141,4 +144,46 @@ describe("asset manifest contract", () => {
       },
     })).toThrow("not bound to its hash");
   });
+});
+
+
+test("live asset readback validates actual served bytes", async () => {
+  const { fingerprintAssets } = await import("./hash-assets.mjs");
+  const buffers = { js: Buffer.from('new URL("cfctl-site.wasm",import.meta.url)'), wasm: Buffer.from("wasm"), css: Buffer.from("body{}") };
+  const result = fingerprintAssets("cfctl-site", buffers);
+  const manifest = { ...Object.fromEntries(Object.entries(result.names).map(([kind, name]) => [kind, `/pkg/${name}`])), hashes: result.hashes };
+  const served = { ...buffers, js: Buffer.from(result.rewrittenJs) };
+  let corrupt = false;
+  const stub = spyOn(globalThis, "fetch").mockImplementation(async (value) => {
+    const url = new URL(value);
+    const route = ROUTES.find((route) => new URL(route.path, url.origin).pathname === url.pathname);
+    if (route) return htmlResponse(route.marker, { status: route.status, headers: route.callback ? {
+      "cache-control": "no-store, no-cache, max-age=0", "pragma": "no-cache", "referrer-policy": "no-referrer",
+    } : {} });
+    if (url.pathname === "/asset-manifest.json") return Response.json(manifest, { headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+    const kind = ["js", "wasm", "css"].find((kind) => manifest[kind] === url.pathname);
+    if (!kind) throw new Error("unexpected fixture fetch");
+    return new Response(corrupt && kind === "wasm" ? Buffer.from("wrong") : served[kind], { headers: {
+      "cache-control": "public, max-age=31536000, immutable", "x-content-type-options": "nosniff",
+    } });
+  });
+  try {
+    const proof = await verifyLiveSite("https://cfctl.example");
+    expect(proof.assets).toHaveLength(3);
+    corrupt = true;
+    await expect(verifyLiveSite("https://cfctl.example")).rejects.toThrow("actual bytes");
+  } finally { stub.mockRestore(); }
+});
+
+
+test("inline framework scripts must carry the exact response nonce or an admitted byte hash", async () => {
+  const { createHash } = await import("node:crypto");
+  const script = "initialize();";
+  const hash = createHash("sha256").update(script).digest("base64");
+  const sources = [`'sha256-${hash}'`, "'nonce-AAAAAAAAAAAAAAAAAAAAAA'"];
+  expect(() => verifyInlineScripts(`<script type="module">${script}</script><script nonce="AAAAAAAAAAAAAAAAAAAAAA">__INCOMPLETE_CHUNKS=[];</script>`, sources)).not.toThrow();
+  expect(() => verifyInlineScripts(`<script>${script}changed();</script>`, sources)).toThrow("not admitted");
+  expect(() => verifyInlineScripts('<script>__INCOMPLETE_CHUNKS=[];</script>', sources)).toThrow("not admitted");
+  expect(() => verifyInlineScripts('<script nonce="BBBBBBBBBBBBBBBBBBBBBB">__INCOMPLETE_CHUNKS=[];</script>', sources)).toThrow("not admitted");
+  expect(() => verifyInlineScripts('<script type="application/json">{"data":true}</script>', sources)).not.toThrow();
 });

@@ -220,7 +220,7 @@ provider drift, or inability to prove the running source.
 
 ## Explicitly separate future work
 
-- The v1.3.0 CLI posture requires signed and notarized publication in
+- The prebuilt v1.3.0 CLI posture requires signed and notarized publication in
   `README.md` and `CONTRIBUTING.md`. Its trust-root binding, source merge,
   annotated tag, empty draft, signing,
   notarization, artifact upload, public-release transition, installation, and
@@ -231,3 +231,15 @@ provider drift, or inability to prove the running source.
   path.
 - The keyring-core migration remains blocked on real Linux Secret Service
   runtime evidence and is not part of the website launch.
+
+The site reproducibility log hashes paths relative to `site/` (`build/...` and
+`target/site/...`). That comparison digest is local build proof. A cfctl upload
+plan binds paths relative to the owning Git repository (`site/build/...` and
+`site/target/site/...`) and computes its own `artifact_set_sha256`. Deployment
+receipts and annotations must use the cfctl plan's digest; do not copy the site
+reproducibility digest into that field.
+
+A labeled source-only CLI release with no uploaded binary or installer assets
+and GitHub latest disabled may accompany site publication without Apple
+credentials. The site must keep source bootstrap distinct from authenticated
+prebuilt installation and must not advertise nonexistent binary artifacts.
