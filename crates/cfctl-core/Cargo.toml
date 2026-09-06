@@ -15,5 +15,8 @@ sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+syn.workspace = true
+
 [lints]
 workspace = true

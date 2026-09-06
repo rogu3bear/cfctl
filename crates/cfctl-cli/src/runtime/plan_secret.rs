@@ -82,7 +82,8 @@ pub(super) const ACCESS_OPERATOR_GROUP_POLICY_CREATE_CAPABILITY_ID: &str =
     "access-policies-create-operator-group-allow-policy";
 pub(super) const ACCESS_OPERATOR_GROUP_POLICY_UPDATE_CAPABILITY_ID: &str =
     "access-policies-update-operator-group-allow-policy";
-pub(super) const ACCESS_POLICY_LIST_CAPABILITY_ID: &str = "access-policies-list-access-policies";
+pub(super) const ACCESS_POLICY_LIST_CAPABILITY_ID: &str =
+    "access-policies-list-access-app-policies";
 pub(super) const ACCESS_POLICY_COLLECTION_PATH: &str =
     "/accounts/{account_id}/access/apps/{app_id}/policies";
 pub(super) const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";

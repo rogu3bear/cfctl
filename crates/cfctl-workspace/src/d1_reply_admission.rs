@@ -12,7 +12,7 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional};
+use super::{Result, WorkspaceError, git_blob, git_optional};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-reply-admission.toml";
 
@@ -53,23 +53,30 @@ struct Operation {
     rollback_capability_id: Option<String>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one loader binds the exact clean repository, operation pack, compiler, runtime, config, and closed capability variant"
-)]
 pub fn load_workspace_d1_reply_admission_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    let registered = roots
-        .iter()
-        .map(|path| RegisteredRoot::new(path))
-        .collect::<Vec<_>>();
-    let graph = WorkspaceGraph::discover(&registered)?;
+    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loader binds the exact clean repository, operation pack, compiler, runtime, config, and closed capability variant"
+)]
+pub(super) fn load_selected(
+    candidates: &[PathBuf],
+    capability_id: &str,
+) -> Result<Option<CapabilityV1>> {
+    let repositories =
+        super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
     let mut matches = Vec::new();
-    for repository in &graph.repositories {
-        let pack_path = repository.path.join(PACK_RELATIVE_PATH);
-        if !pack_path.is_file() {
+    for repository in &repositories {
+        if !super::operation_identity::contains(
+            &repository.path,
+            PACK_RELATIVE_PATH,
+            capability_id,
+        )? {
             continue;
         }
         if repository.git.dirty {

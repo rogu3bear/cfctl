@@ -1659,9 +1659,10 @@ fn read_operational_proof_index(store: &StateStore, name: &str) -> Result<Operat
 /// superseded state root can never satisfy a caller's filter: every caller
 /// selects on an authenticated governed-execution binding that such a row does
 /// not carry. Propagating them denied every proof lookup on any installation
-/// holding historical rows — a store with 9,390 legacy proofs and 15 qualifying
-/// ones could never validate a D1 recovery anchor — while withholding nothing
-/// from an adversary.
+/// holding historical rows, because one such row was enough — an installation
+/// accumulates them faster than it accumulates qualifying ones, so a store old
+/// enough to hold history could never validate a D1 recovery anchor, while the
+/// refusal withheld nothing from an adversary.
 ///
 /// Skipping cannot manufacture a match. A corrupted qualifying proof is skipped
 /// too, which lowers the match count and makes callers fail closed, so the
