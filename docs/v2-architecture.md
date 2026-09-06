@@ -82,8 +82,10 @@ compiler-owned verification identifiers, and exact recovery capabilities.
 Workspace-owned body-free D1 evidence uses the same authority boundary without
 creating a mutation plan: the repository owns a fixed query and result-column
 declaration, while cfctl owns bounds, execution, and reduction into the public
-`MaildeskD1EvidenceV1` type. The same call additively emits a bounded
-`MaildeskD1RouteHealthEvidenceV2` projection beside the unchanged V1 aggregate:
+`MaildeskD1EvidenceV1` type. Current reads require independently observed
+`revision_r2_key` and `projection_policy_sha256` values; historical aggregates
+may omit them. The same call additively emits a bounded
+`MaildeskD1RouteHealthEvidenceV2` projection beside the V1 aggregate:
 each active route is represented only by cfctl-computed route and domain
 SHA-256 references, closed policy/provider/readiness codes, body-free proof
 timestamps, and a bounded error code. cfctl accepts the V2 projection only when

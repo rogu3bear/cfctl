@@ -248,7 +248,7 @@ pub(super) fn load(store: &StateStore, capability_id: &str) -> Result<Option<Cap
     )?)
 }
 
-/// Accept a delegated receipt as verified only when the unchanged aggregate
+/// Accept a delegated receipt as verified only when the aggregate
 /// V1 and the additive bounded-complete route-health V2 are both coherent.
 pub(super) fn receipt_is_complete(receipt: &Value) -> bool {
     if receipt.get("adapter").and_then(Value::as_str) == Some("workspace_inbound_acceptance_v1") {
