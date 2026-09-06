@@ -15,7 +15,8 @@ It has no MCP dependency, accepts natural-language intent through a local
 agent, and every command emits stable JSON for automation.
 
 - [Quickstart](QUICKSTART.md) — install, first commands, first governed write
-- [Operator runbook](docs/runbooks/cfctl.md) — the full command lifecycle
+- [Operator runbook](docs/runbooks/cfctl.md) — triage, health, exit codes, recovery
+- [Capability procedures](docs/runbooks/capability-procedures.md) — per-capability reads and writes
 - [Runtime policy](docs/runtime-policy.md) — what needs approval, and why
 - [Security contract](docs/v2-security.md) — secrets, hashing, redaction, evidence
 - [Capability safety contracts](docs/capability-safety-contracts.md) — what each governed capability depends on
