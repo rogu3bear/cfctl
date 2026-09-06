@@ -75,6 +75,9 @@ pub(super) async fn create_plan(
     requested_account: Option<&str>,
     adapter_targets: Value,
 ) -> Result<ResultEnvelopeV2> {
+    let attestation = super::plan_commands::observation_attestation(store, &capability)?;
+    let scoped_store = store.with_observation_attestation(&attestation);
+    let store = &scoped_store;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let resolved_account = resolve_account_id(store, profile, requested_account, &input)?;
@@ -261,7 +264,7 @@ pub(super) async fn create_plan(
     live_preconditions.access_operator_group_policy_ownership =
         access_operator_group_policy_ownership;
     resolve_kv_empty_namespace_delete_cost(&mut capability, &live_preconditions);
-    persist_prepared_plan(
+    let mut envelope = persist_prepared_plan(
         store,
         catalog,
         capability,
@@ -272,7 +275,9 @@ pub(super) async fn create_plan(
         },
         adapter_targets,
         live_preconditions,
-    )
+    )?;
+    envelope.attestation = Some(attestation);
+    Ok(envelope)
 }
 
 pub(super) async fn prepare_pages_project_absence_precondition(
@@ -421,7 +426,7 @@ pub(super) async fn read_live_pages_deployment_project_state(
         receipt["deployment_list_source_capability_id"] =
             json!(pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID);
     }
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -659,7 +664,7 @@ pub(super) async fn read_live_kv_empty_namespace_state(
         )
         .await?;
     let receipt = apply_kv_empty_namespace_state_response(account_id, namespace_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -1046,7 +1051,7 @@ pub(super) async fn read_live_worker_deployment_state(
             capability.id == cfctl_core::WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
         )?
     };
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 

@@ -186,7 +186,7 @@ pub(super) fn repair_keychain_access(
     repair_keychain_access_with_warning(profiles, secrets, selector, &mut warnings)
 }
 
-pub(super) const KEYCHAIN_REPAIR_WARNING: &str = "warning: this explicit repair may open macOS Keychain for the selected profile; cancel the system prompt to stop without changing the credential\n";
+pub(super) const KEYCHAIN_REPAIR_WARNING: &str = "warning: this explicit repair uses noninteractive macOS Keychain access for the selected profile; unavailable authorization returns an error without opening a password dialog\n";
 
 pub(super) fn repair_keychain_access_with_warning(
     profiles: &ProfilesConfig,

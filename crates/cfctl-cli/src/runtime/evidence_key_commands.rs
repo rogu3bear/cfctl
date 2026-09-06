@@ -18,6 +18,21 @@ pub(super) fn evidence_key_command(
     store: &StateStore,
     command: EvidenceKeyCommand,
 ) -> Result<ResultEnvelopeV2> {
+    if store.private_origin().is_some()
+        && !matches!(
+            &command,
+            EvidenceKeyCommand::PrivatePreview
+                | EvidenceKeyCommand::PrivateActivate(_)
+                | EvidenceKeyCommand::PrivateHistory
+                | EvidenceKeyCommand::InitPreview
+                | EvidenceKeyCommand::Init
+                | EvidenceKeyCommand::Status
+                | EvidenceKeyCommand::Rotate
+                | EvidenceKeyCommand::Retire(_)
+        )
+    {
+        return Err(CliError::Input("this lifecycle command is specific to the archived platform authority; use auth evidence-key status or private-history for the active private runtime".to_owned()));
+    }
     if matches!(
         command,
         EvidenceKeyCommand::AdoptPlan(crate::EvidenceKeyAdoptPlanArgs {
@@ -29,8 +44,21 @@ pub(super) fn evidence_key_command(
         )
         .into());
     }
+    match &command {
+        EvidenceKeyCommand::PrivatePreview => return super::private_runtime::preview(store),
+        EvidenceKeyCommand::PrivateActivate(arguments) => {
+            return super::private_runtime::activate(store, arguments);
+        }
+        EvidenceKeyCommand::PrivateHistory => return super::private_runtime::history(store),
+        _ => {}
+    }
     let manager = store.platform_evidence_key_manager()?;
     match command {
+        EvidenceKeyCommand::PrivatePreview
+        | EvidenceKeyCommand::PrivateActivate(_)
+        | EvidenceKeyCommand::PrivateHistory => Err(CliError::Input(
+            "private runtime command was not dispatched".to_owned(),
+        )),
         EvidenceKeyCommand::AdoptPreview => adoption_preview(store, &manager),
         EvidenceKeyCommand::AdoptPlan(arguments) => match arguments.command {
             EvidenceKeyAdoptPlanCommand::Create => Err(cfctl_auth::AuthError::from(
@@ -586,13 +614,13 @@ fn initialization_preview(
             "performed": false,
             "initialization_state": state,
             "current_status": status,
-            "backend": "platform_keyring",
-            "generated_key_custody": "platform_keyring_only_non_exportable_through_cfctl",
+            "backend": if store.private_origin().is_some() { "private_file" } else { "platform_keyring" },
+            "generated_key_custody": if store.private_origin().is_some() { "private_files_accessible_to_same_os_user" } else { "platform_keyring_only_non_exportable_through_cfctl" },
             "local_marker_custody": "canonical_state_root_non_secret_identity_marker",
             "state_root_transition": "absent_to_random_content_addressed_identity",
             "verification_generation_behavior": "initial_generation_signs_and_verifies; rotation makes older generations verification-only",
             "recoverability": {
-                "before_marker_write": "a conclusively absent marker permits rollback of only the exact fresh platform authority",
+                "before_marker_write": "a conclusively absent marker permits rollback of only the exact fresh selected authority",
                 "after_marker_write_or_uncertainty": "preserve both sides, inspect status, and never replay initialization blindly",
                 "split_authority": "blocked; initialization will not overwrite either side"
             },
@@ -603,7 +631,10 @@ fn initialization_preview(
     ))
 }
 
-fn initialize(store: &StateStore, manager: &EvidenceKeyManager) -> Result<ResultEnvelopeV2> {
+pub(super) fn initialize(
+    store: &StateStore,
+    manager: &EvidenceKeyManager,
+) -> Result<ResultEnvelopeV2> {
     initialize_with_marker_write(store, manager, |state_root_identity| {
         store.initialize_evidence_root_identity(state_root_identity)
     })

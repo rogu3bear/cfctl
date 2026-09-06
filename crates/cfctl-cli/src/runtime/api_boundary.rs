@@ -42,14 +42,15 @@ pub(super) fn process_api_boundary_response(
     let response_value =
         redact_response_for_capability(&plan.capability, &serde_json::to_value(response)?);
     let mut failures = Vec::new();
-    let apply_evidence = match store.write_evidence(EvidenceClass::Apply, &response_value) {
-        Ok(evidence) => Some(evidence),
-        Err(error) => {
-            plan.status = PlanStatus::RectificationRequired;
-            failures.push(format!("apply evidence persistence failed: {error}"));
-            None
-        }
-    };
+    let apply_evidence =
+        match store.write_observation_evidence(EvidenceClass::Apply, &response_value) {
+            Ok(evidence) => Some(evidence),
+            Err(error) => {
+                plan.status = PlanStatus::RectificationRequired;
+                failures.push(format!("apply evidence persistence failed: {error}"));
+                None
+            }
+        };
     let boundary_response_persisted = match persist_transaction_stage_with_artifact(
         store,
         plan,
@@ -769,7 +770,10 @@ pub(super) fn verification_outcome(
         }
     }
     let evidence =
-        Some(store.write_evidence(EvidenceClass::PostChangeVerification, &verification_value)?);
+        Some(store.write_observation_evidence(
+            EvidenceClass::PostChangeVerification,
+            &verification_value,
+        )?);
     let error = (!verification.passed).then(|| ErrorV1 {
         code: "CFCTL_VERIFICATION_FAILED".to_owned(),
         message: verification.basis.clone(),
@@ -794,7 +798,7 @@ pub(super) fn verification_error_outcome(
 ) -> Result<ApiVerificationOutcome> {
     let basis = format!("operation-specific verifier failed: {verification_error}");
     plan.status = PlanStatus::RectificationRequired;
-    let evidence = Some(store.write_evidence(
+    let evidence = Some(store.write_observation_evidence(
         EvidenceClass::PostChangeVerification,
         &json!({
             "strategy": plan.capability.verification.strategy,

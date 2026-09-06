@@ -250,7 +250,7 @@ pub(super) async fn read_live_dns_record_state(
         .await?;
     let receipt =
         apply_dns_record_state_response(capability, account_id, zone_id, dns_record_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -352,7 +352,7 @@ pub(super) async fn read_live_d1_read_replication_state(
         .await?;
     let receipt =
         apply_d1_read_replication_state_response(capability, account_id, database_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -553,7 +553,7 @@ pub(super) async fn read_live_d1_empty_database_state(
         database_id,
         &response,
     )?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -679,7 +679,7 @@ pub(super) async fn read_live_cloudflare_tunnel_configuration_state(
     let receipt = apply_cloudflare_tunnel_configuration_state_response(
         capability, account_id, tunnel_id, &response,
     )?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -814,7 +814,7 @@ pub(super) async fn read_live_warp_connector_configuration_state(
     let receipt = apply_warp_connector_configuration_state_response(
         capability, account_id, tunnel_id, &response,
     )?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -915,7 +915,7 @@ pub(super) async fn read_live_web_analytics_rum_state(
         .await?;
     let receipt =
         apply_web_analytics_rum_state_response(capability, account_id, zone_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -1003,6 +1003,6 @@ pub(super) async fn read_live_global_warp_override_state(
         )
         .await?;
     let receipt = apply_global_warp_override_state_response(account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
