@@ -1313,4 +1313,3 @@ The first phase must read back `has_rotated_secret=true`; the second requires
 that state before planning and must read back `false`. A second rotation, a
 delete from one-secret state, target drift, and a stale approval all fail before
 the mutation boundary.
-
