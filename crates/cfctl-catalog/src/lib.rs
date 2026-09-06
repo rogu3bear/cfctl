@@ -20754,7 +20754,7 @@ fn classify_api_token_lifecycle(capability: &mut CapabilityV1) {
 /// leaving update to the generic blocker would tell an agent the wrong story:
 /// that filling in risk/effect/cost would unlock it. It would not. Token
 /// mutation is reserved to the inventory-bound `keys` workflow, which reads the
-/// live permission inventory before it writes; see `docs/runbooks/cfctl.md`.
+/// live permission inventory before it writes; see `docs/runbooks/capability-procedures.md`.
 ///
 /// The reason prefix is load-bearing. `refresh_dynamic_mutation_contract` only
 /// re-evaluates a blocked capability whose reason starts with
