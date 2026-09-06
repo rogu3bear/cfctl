@@ -1,8 +1,10 @@
 //! Local verification and release orchestration for cfctl.
 
 mod local_adapters;
+mod local_guidance;
 
 use local_adapters::LOCAL_OPERATOR_ADAPTERS;
+use local_guidance::verify_active_guidance_has_no_v1_commands;
 use std::{
     collections::BTreeSet,
     env,
@@ -555,8 +557,8 @@ fn verify_public_domain_contract() -> Result<(), TaskError> {
         }
     }
 
-    // Gitignored adapters are invisible to `git ls-files`, so scan them by name.
-    for path in LOCAL_OPERATOR_ADAPTERS {
+    // Gitignored guidance is invisible to `git ls-files`, so scan it by name.
+    for path in local_guidance::paths() {
         let absolute_path = repository_root.join(path);
         if !absolute_path.is_file() {
             continue;
@@ -877,7 +879,8 @@ fn verify_v1_cutover_contract() -> Result<(), TaskError> {
     verify_v1_quarantine_manifest()?;
     verify_quarantine_code_consumers()?;
     verify_tracked_cfctl_command_references()?;
-    verify_active_guidance_has_no_v1_commands()
+    verify_active_guidance_has_no_v1_commands()?;
+    local_guidance::verify()
 }
 
 fn repository_root() -> Result<&'static Path, TaskError> {
@@ -1534,81 +1537,6 @@ fn plausible_subcommand_token(token: &str) -> Option<String> {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
         })
         .then(|| token.to_owned())
-}
-
-fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
-    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or_else(|| {
-            TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
-        })?;
-    // First-load agent doctrine must not re-teach archived v1 verbs or layout.
-    // Historical material below compat/v1 is governed by the quarantine manifest instead.
-    // Tracked public guidance and constitutional doctrine are always required. Local
-    // operator adapters are gitignored but, when present, must stay v2-aligned.
-    let required_guidance = [
-        "CFCTL_PROMPT.md",
-        "docs/agent-landing.md",
-        "skills/cfctl-operator/SKILL.md",
-        "CONTRIBUTING.md",
-        "SECURITY.md",
-        "ANCHOR.md",
-        "NORTH_STAR.md",
-        "LAYERS.md",
-    ];
-    let stale_v1_guidance = [
-        // Archived public verbs / auth lanes
-        "./scripts/",
-        "--ack-plan",
-        "CF_DEV_TOKEN",
-        "cfctl surfaces",
-        "cfctl ownership",
-        "cfctl skills",
-        "cloudflare-api-mcp",
-        // Archived shell-runtime layout taught as live repo shape
-        "lib/runtime/",
-        "lib/backends/",
-        "`commands/` owns",
-        "`commands/` contains",
-        "`commands/`: ",
-        "`lib/runtime/`",
-        "`lib/backends/`",
-        "`scripts/`: ",
-        "verify_static_contract.sh",
-        "verify_public_contract.sh",
-        "cfctl standards audit",
-        "cfctl admin authorize-backend",
-        // Branch or PR lifecycle text must not survive into active guidance.
-        "pending merge",
-    ];
-    for path in required_guidance {
-        verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
-    }
-    for path in LOCAL_OPERATOR_ADAPTERS {
-        let absolute_path = repository_root.join(path);
-        if absolute_path.is_file() {
-            verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
-        }
-    }
-    Ok(())
-}
-
-fn verify_guidance_file_has_no_stale_v1(
-    repository_root: &Path,
-    path: &str,
-    stale_v1_guidance: &[&str],
-) -> Result<(), TaskError> {
-    let absolute_path = repository_root.join(path);
-    let content =
-        fs::read_to_string(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
-    for phrase in stale_v1_guidance {
-        if content.contains(phrase) {
-            return Err(TaskError::InvalidSourceContract(format!(
-                "{path} still teaches archived v1 guidance `{phrase}`"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn verify_documented_contracts() -> Result<(), TaskError> {
