@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createHash } from "node:crypto";
+import { shortHash, wasmImport } from "./asset-integrity.mjs";
 import { existsSync, readdirSync } from "node:fs";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -13,8 +13,15 @@ function runOrThrow(command, args) {
   return new TextDecoder().decode(result.stdout);
 }
 
-function shortHash(buffer) {
-  return createHash("sha256").update(buffer).digest("hex").slice(0, 16);
+export function fingerprintAssets(outputName, buffers) {
+  const hashes = { wasm: shortHash(buffers.wasm), css: shortHash(buffers.css) };
+  const names = { wasm: `${outputName}.${hashes.wasm}.wasm`, css: `${outputName}.${hashes.css}.css` };
+  const source = new TextDecoder("utf-8", { fatal: true }).decode(buffers.js);
+  const { pattern } = wasmImport(source);
+  const rewrittenJs = source.replace(pattern, `new URL("${names.wasm}",import.meta.url)`);
+  hashes.js = shortHash(rewrittenJs);
+  names.js = `${outputName}.${hashes.js}.js`;
+  return { rewrittenJs, hashes, names };
 }
 
 async function removeStale(pkgDir, outputName, extension) {
@@ -39,12 +46,10 @@ async function main() {
   await rm(join(pkgDir, `${outputName}_bg.wasm.d.ts`), { force: true });
   const paths = Object.fromEntries(["js", "wasm", "css"].map((extension) => [extension, join(pkgDir, `${outputName}.${extension}`)]));
   for (const path of Object.values(paths)) if (!existsSync(path)) throw new Error(`missing build artifact: ${path}`);
-  for (const extension of Object.keys(paths)) await removeStale(pkgDir, outputName, extension);
 
   const buffers = Object.fromEntries(await Promise.all(Object.entries(paths).map(async ([kind, path]) => [kind, await readFile(path)])));
-  const hashes = Object.fromEntries(Object.entries(buffers).map(([kind, buffer]) => [kind, shortHash(buffer)]));
-  const names = Object.fromEntries(Object.keys(paths).map((kind) => [kind, `${outputName}.${hashes[kind]}.${kind}`]));
-  const rewrittenJs = new TextDecoder().decode(buffers.js).replace(/new URL\("([^"]+\.wasm)",import\.meta\.url\)/, `new URL("${names.wasm}",import.meta.url)`);
+  const { rewrittenJs, hashes, names } = fingerprintAssets(outputName, buffers);
+  for (const extension of Object.keys(paths)) await removeStale(pkgDir, outputName, extension);
 
   await writeFile(join(pkgDir, names.js), rewrittenJs);
   await writeFile(join(pkgDir, names.css), buffers.css);
@@ -62,4 +67,4 @@ async function main() {
   ].join("\n"));
 }
 
-main().catch((error) => { console.error(`[hash-assets] ${error.message}`); process.exit(1); });
+if (import.meta.main) main().catch((error) => { console.error(`[hash-assets] ${error.message}`); process.exit(1); });

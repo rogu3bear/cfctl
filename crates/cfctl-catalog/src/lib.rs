@@ -1,5 +1,10 @@
 //! Cloudflare capability catalog normalization and indexing.
 
+mod artifact_digest;
+use artifact_digest::{
+    finalize_r2_private_object_digest_contract, finalize_worker_version_artifact_digest,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -30,7 +35,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+mod access_create;
 mod workspace_d1_qualification;
+use access_create::finalize_access_application_create_contract;
+pub use access_create::{ACCESS_APP_CREATE_OWNED_ID, access_application_create_owned_schema};
 
 use workspace_d1_qualification::{
     workspace_d1_qualification_observer_capability, workspace_d1_qualification_producer_capability,
@@ -114,6 +122,42 @@ mod maildesk_provider_contract_tests {
             description: Some(description.to_owned()),
             contract: None,
         }
+    }
+
+    #[test]
+    fn worker_version_digest_is_a_dedicated_body_free_native_read() {
+        let mut raw = read(
+            "getWorkerVersion",
+            cfctl_core::WORKER_VERSION_ARTIFACT_PATH,
+            "Versions",
+        );
+        raw.adapter_status = AdapterStatus::DynamicApi;
+        raw.selectors = ["account_id", "worker_id", "version_id", "include"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: if name == "include" { "query" } else { "path" }.to_owned(),
+                required: name != "include",
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        let mut capabilities = BTreeMap::from([(raw.id.clone(), raw)]);
+        finalize_worker_version_artifact_digest(&mut capabilities);
+        let digest = &capabilities[cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID];
+        assert_eq!(digest.adapter_status, AdapterStatus::Native);
+        assert!(digest.verification_contract_supported());
+        assert_eq!(digest.permissions, ["Workers Scripts Read"]);
+        assert_eq!(
+            capabilities["getWorkerVersion"].adapter_status,
+            AdapterStatus::DynamicApi
+        );
+        let mut malformed = capabilities["getWorkerVersion"].clone();
+        malformed.path.push_str("/wrong");
+        let mut rejected = BTreeMap::from([(malformed.id.clone(), malformed)]);
+        finalize_worker_version_artifact_digest(&mut rejected);
+        assert!(!rejected.contains_key(cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID));
     }
 
     #[test]
@@ -8436,76 +8480,6 @@ fn finalize_r2_private_file_upload_contract(capabilities: &mut BTreeMap<String, 
     refresh_dynamic_mutation_contract(capability);
 }
 
-fn finalize_r2_private_object_digest_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
-    let Some(raw) = capabilities.get("r2-get-object").cloned() else {
-        return;
-    };
-    let selectors_are_exact = ["account_id", "bucket_name", "object_key"]
-        .iter()
-        .all(|name| {
-            raw.selectors.iter().any(|selector| {
-                selector.name == *name
-                    && selector.location == "path"
-                    && selector.required
-                    && selector.value_type == "string"
-            })
-        });
-    let raw_supported = raw.method == "GET"
-        && raw.path == R2_OBJECT_PATH
-        && raw.product == "R2 Object"
-        && !raw.mutating
-        && raw.request_schema.is_none()
-        && selectors_are_exact;
-    if raw_supported {
-        let mut digest = raw;
-        "r2-get-private-object-digest".clone_into(&mut digest.id);
-        "Read one private R2 object digest without returning bytes".clone_into(&mut digest.title);
-        digest.description = Some(
-            "Streams one exact private object only inside cfctl and returns bounded identity, ETag, byte count, and SHA-256 evidence; object bytes never enter stdout, plans, receipts, logs, or files."
-                .to_owned(),
-        );
-        digest.permissions = vec!["Workers R2 Storage Read".to_owned()];
-        digest.risk = RiskClass::Read;
-        digest.effect = EffectClass::ReadOnly;
-        digest.adapter_status = AdapterStatus::Native;
-        digest.blocked_reason = None;
-        digest.response_contract = Some(ResponseContractV1 {
-            success_statuses: vec!["200".to_owned()],
-            success_media_types: vec!["application/octet-stream".to_owned()],
-            body_mode: ResponseBodyModeV1::R2PrivateObjectDigest,
-        });
-        digest.verification = VerificationSpecV1 {
-            required: true,
-            strategy: "r2_private_object_digest".to_owned(),
-        };
-        digest.rollback = RollbackSpecV1 {
-            supported: false,
-            strategy: None,
-            warning: None,
-        };
-        digest.r2_private_file_upload = None;
-        digest.r2_private_object_digest = Some(R2PrivateObjectDigestContractV1 {
-            max_object_bytes: 300_000_000,
-        });
-        zero_direct_usage_cost(
-            &mut digest,
-            "the digest is one R2 Class B read with no direct configuration charge and never retains object bytes",
-            vec![official_reference(
-                "R2 pricing",
-                "https://developers.cloudflare.com/r2/pricing/",
-            )],
-        );
-        capabilities.insert(digest.id.clone(), digest);
-    }
-    if let Some(raw) = capabilities.get_mut("r2-get-object") {
-        raw.adapter_status = AdapterStatus::Blocked;
-        raw.blocked_reason = Some(
-            "raw R2 object bytes are intentionally unavailable; use r2-get-private-object-digest for body-free identity evidence"
-                .to_owned(),
-        );
-    }
-}
-
 fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
     let read_supported = capabilities
         .get("r2-get-bucket-lifecycle-configuration")
@@ -8883,12 +8857,14 @@ fn apply_post_normalization_contracts(
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_r2_private_file_upload_contract(capabilities);
     finalize_r2_private_object_digest_contract(capabilities);
+    finalize_worker_version_artifact_digest(capabilities);
     finalize_r2_lifecycle_contract(capabilities);
     finalize_email_sending_contracts(capabilities);
     finalize_email_routing_subdomain_contract(capabilities);
     finalize_email_routing_rules_read_projection(capabilities);
     finalize_worker_script_delete_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
+    access_create::finalize_owned_create(document, capabilities);
     finalize_access_application_login_methods_contract(document, capabilities);
     finalize_access_human_policy_contract(document, capabilities);
     finalize_access_operator_group_policy_contracts(document, capabilities);
@@ -18061,7 +18037,7 @@ pub fn access_application_owned_whole_host_schema() -> Value {
                 "required":["type","uri"],
                 "properties":{
                     "type":{"type":"string","enum":["public"]},
-                    "uri":{"type":"string","format":"uri","minLength":9,"maxLength":261}
+                    "uri":{"type":"string","format":"hostname","minLength":1,"maxLength":253}
                 }
             }
         }),
@@ -20324,102 +20300,6 @@ fn finalize_access_operator_group_policy_contracts(
             );
         }
     }
-}
-
-/// Govern Access application creation. The delete side is already governed by
-/// the generic exact-resource path; the get and list readbacks exist. Create
-/// stays blocked under the generic binder because the request body is a 13-way
-/// `anyOf` over app types with no universally-required field — the generic
-/// union of variant fields is not an honest verified set. This finalizer binds
-/// a curated created-resource contract over `name` and `type`, which are
-/// present in every variant and declared on both the create and get responses,
-/// and routes it to a dedicated curated-fields strategy. Update stays blocked:
-/// there is no honest universal update-field contract across the union.
-fn finalize_access_application_create_contract(
-    document: &Value,
-    capabilities: &mut BTreeMap<String, CapabilityV1>,
-) {
-    let read_supported = capabilities
-        .get("access-applications-get-an-access-application")
-        .is_some_and(|capability| {
-            capability.method == "GET"
-                && capability.path == ACCESS_APP_DETAIL_PATH
-                && capability.product == "Access applications"
-                && capability
-                    .selectors
-                    .iter()
-                    .all(|selector| selector.location == "path")
-        })
-        && capabilities
-            .get("access-applications-delete-an-access-application")
-            .is_some_and(|capability| {
-                capability.method == "DELETE" && capability.path == ACCESS_APP_DETAIL_PATH
-            });
-    if !read_supported {
-        return;
-    }
-    // `name`, `type`, and the returned `id` must be observable on both the
-    // create and the detail-read responses for the curated verification to be
-    // honest.
-    let create_operation = document.pointer("/paths/~1accounts~1{account_id}~1access~1apps/post");
-    let read_operation =
-        document.pointer("/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/get");
-    let (Some(create_operation), Some(read_operation)) = (create_operation, read_operation) else {
-        return;
-    };
-    let fields_observable =
-        ["name", "type"].iter().all(|field| {
-            success_response_declares_result_string_field(document, create_operation, field)
-                && success_response_declares_result_string_field(document, read_operation, field)
-        }) && success_response_declares_result_string_field(document, create_operation, "id")
-            && success_response_declares_result_string_field(document, read_operation, "id");
-    if !fields_observable {
-        return;
-    }
-    let Some(capability) = capabilities.get_mut("access-applications-add-an-application") else {
-        return;
-    };
-    if capability.method != "POST"
-        || capability.path != ACCESS_APP_COLLECTION_PATH
-        || capability.product != "Access applications"
-        || capability.request_schema.is_none()
-    {
-        return;
-    }
-    // Access applications gate authentication in front of resources, so
-    // creation is identity-affecting and must land approval-required, never
-    // policy auto-execute.
-    capability.risk = RiskClass::IdentityOrOwnership;
-    capability.effect = EffectClass::IdentityOrOwnership;
-    capability.cost = cfctl_core::CostV1::default();
-    capability.cost.billing_model = BillingModelV1::Subscription;
-    capability.cost.exposure = CostExposureV1::DownstreamUsage;
-    capability.cost.basis = Some(
-        "creating an Access application has no per-operation charge; Access is seat and plan billed, unaffected by the number of application objects"
-            .to_owned(),
-    );
-    capability.cost.references = vec![KnowledgeReferenceV1 {
-        title: "Cloudflare Access pricing".to_owned(),
-        url: "https://developers.cloudflare.com/cloudflare-one/policies/access/".to_owned(),
-        source: "official Cloudflare docs".to_owned(),
-    }];
-    capability.created_resource = Some(CreatedResourceContractV1 {
-        detail_path: ACCESS_APP_DETAIL_PATH.to_owned(),
-        identity_selector: "app_id".to_owned(),
-        response_result_identity_pointer: "/id".to_owned(),
-        read_capability_id: "access-applications-get-an-access-application".to_owned(),
-        delete_capability_id: "access-applications-delete-an-access-application".to_owned(),
-        verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
-    });
-    "created_access_application_contains_planned_fields_by_returned_id"
-        .clone_into(&mut capability.verification.strategy);
-    capability.rollback.supported = true;
-    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
-    capability.rollback.warning = Some(
-        "compensation creates a separate exact Access application delete plan that must be reviewed and explicitly approved; deleting an application removes its policies and revokes access it granted"
-            .to_owned(),
-    );
-    refresh_dynamic_mutation_contract(capability);
 }
 
 const WORKER_SCRIPT_DELETE_PATH: &str = "/accounts/{account_id}/workers/scripts/{script_name}";

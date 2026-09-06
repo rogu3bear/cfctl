@@ -1,5 +1,10 @@
 //! Local verification and release orchestration for cfctl.
 
+mod local_adapters;
+mod local_guidance;
+
+use local_adapters::LOCAL_OPERATOR_ADAPTERS;
+use local_guidance::verify_active_guidance_has_no_v1_commands;
 use std::{
     collections::BTreeSet,
     env,
@@ -33,71 +38,6 @@ const MACOS_RELEASE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-
 const VERIFY_CROSS_TARGET: &str = "x86_64-unknown-linux-musl";
 const CARGO_AUDITABLE_VERSION: &str = "0.7.5";
 const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
-/// Local operator adapters. `LAYERS.md` keeps these gitignored so a clone
-/// inherits the constitution without an operator context, which also puts them
-/// outside `git ls-files` and therefore outside every tracked-file scan. Source
-/// contracts that guard doctrine must check them explicitly or leave a blind
-/// spot: the retired public domain survived in `AGENTS.md` for exactly that
-/// reason. Present-only — a clone legitimately has neither.
-const LOCAL_OPERATOR_ADAPTERS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
-
-/// The gitignored documents that are agent-facing without being adapters: an
-/// evidentiary sidecar and a live-estate map, both of which tell an agent to
-/// read them to orient. They share the adapters' blind spot — outside
-/// `git ls-files`, so outside every tracked-file scan — but carry no command
-/// map and no authority (`LAYERS.md`), only observations that go stale.
-/// Present-only, like the adapters.
-const LOCAL_AGENT_FACING_NOTES: [&str; 2] = ["NUANCE.md", "WEB.md"];
-
-/// Every gitignored document a doctrine gate must open by name because no
-/// tracked-file scan will reach it. `verify_gitignored_guidance_is_scanned`
-/// holds this set equal to what `.gitignore` actually hides.
-fn local_unscanned_guidance() -> impl Iterator<Item = &'static str> {
-    LOCAL_OPERATOR_ADAPTERS
-        .into_iter()
-        .chain(LOCAL_AGENT_FACING_NOTES)
-}
-
-/// Exact `.md` filenames a `.gitignore` hides. A glob or a path-scoped entry is
-/// not a name a gate can open by hand, so only bare filenames count here.
-fn gitignored_markdown_names(gitignore: &str) -> Vec<&str> {
-    gitignore
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-        .filter(|line| {
-            !line.contains(['*', '?', '[', '/'])
-                && Path::new(line)
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-        })
-        .collect()
-}
-
-/// Gitignoring a document removes it from every tracked-file scan at once. That
-/// is how the retired public domain survived in `AGENTS.md`: the gates were
-/// reading `git ls-files`, and the file was not in it. A new gitignored
-/// document must therefore join the by-name set or fail this contract, so the
-/// blind spot cannot be reopened by editing `.gitignore` alone.
-fn check_gitignored_guidance_is_scanned(gitignore: &str) -> Result<(), TaskError> {
-    for name in gitignored_markdown_names(gitignore) {
-        if !local_unscanned_guidance().any(|scanned| scanned == name) {
-            return Err(TaskError::InvalidSourceContract(format!(
-                "{name} is gitignored, so no tracked-file scan reaches it; add it to \
-                 LOCAL_OPERATOR_ADAPTERS or LOCAL_AGENT_FACING_NOTES so the doctrine \
-                 gates open it by name"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn verify_gitignored_guidance_is_scanned() -> Result<(), TaskError> {
-    let path = repository_root()?.join(".gitignore");
-    let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
-    check_gitignored_guidance_is_scanned(&content)
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
 struct Arguments {
@@ -326,11 +266,11 @@ fn verify_site() -> Result<(), TaskError> {
 
     let mut live_verifier = Command::new("bun");
     live_verifier
-        .args(["test", "./scripts/verify-live-site.test.mjs"])
+        .args(["test", "./scripts/"])
         .current_dir(&root);
     run_command(
         &mut live_verifier,
-        "bun test ./scripts/verify-live-site.test.mjs (site)",
+        "bun test site asset and live verification contracts (site)",
     )?;
 
     let mut edge = Command::new("bash");
@@ -533,6 +473,7 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_v1_cutover_contract()?;
     verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
+    local_adapters::verify()?;
     verify_documented_contracts()
 }
 
@@ -617,7 +558,7 @@ fn verify_public_domain_contract() -> Result<(), TaskError> {
     }
 
     // Gitignored guidance is invisible to `git ls-files`, so scan it by name.
-    for path in local_unscanned_guidance() {
+    for path in local_guidance::paths() {
         let absolute_path = repository_root.join(path);
         if !absolute_path.is_file() {
             continue;
@@ -939,7 +880,7 @@ fn verify_v1_cutover_contract() -> Result<(), TaskError> {
     verify_quarantine_code_consumers()?;
     verify_tracked_cfctl_command_references()?;
     verify_active_guidance_has_no_v1_commands()?;
-    verify_gitignored_guidance_is_scanned()
+    local_guidance::verify()
 }
 
 fn repository_root() -> Result<&'static Path, TaskError> {
@@ -1598,82 +1539,6 @@ fn plausible_subcommand_token(token: &str) -> Option<String> {
         .then(|| token.to_owned())
 }
 
-fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
-    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or_else(|| {
-            TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
-        })?;
-    // First-load agent doctrine must not re-teach archived v1 verbs or layout.
-    // Historical material below compat/v1 is governed by the quarantine manifest instead.
-    // Tracked public guidance and constitutional doctrine are always required. The
-    // gitignored adapters and the evidentiary sidecar are present-only, but when
-    // present they are agent-facing and must stay v2-aligned too.
-    let required_guidance = [
-        "CFCTL_PROMPT.md",
-        "docs/agent-landing.md",
-        "skills/cfctl-operator/SKILL.md",
-        "CONTRIBUTING.md",
-        "SECURITY.md",
-        "ANCHOR.md",
-        "NORTH_STAR.md",
-        "LAYERS.md",
-    ];
-    let stale_v1_guidance = [
-        // Archived public verbs / auth lanes
-        "./scripts/",
-        "--ack-plan",
-        "CF_DEV_TOKEN",
-        "cfctl surfaces",
-        "cfctl ownership",
-        "cfctl skills",
-        "cloudflare-api-mcp",
-        // Archived shell-runtime layout taught as live repo shape
-        "lib/runtime/",
-        "lib/backends/",
-        "`commands/` owns",
-        "`commands/` contains",
-        "`commands/`: ",
-        "`lib/runtime/`",
-        "`lib/backends/`",
-        "`scripts/`: ",
-        "verify_static_contract.sh",
-        "verify_public_contract.sh",
-        "cfctl standards audit",
-        "cfctl admin authorize-backend",
-        // Branch or PR lifecycle text must not survive into active guidance.
-        "pending merge",
-    ];
-    for path in required_guidance {
-        verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
-    }
-    for path in local_unscanned_guidance() {
-        let absolute_path = repository_root.join(path);
-        if absolute_path.is_file() {
-            verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
-        }
-    }
-    Ok(())
-}
-
-fn verify_guidance_file_has_no_stale_v1(
-    repository_root: &Path,
-    path: &str,
-    stale_v1_guidance: &[&str],
-) -> Result<(), TaskError> {
-    let absolute_path = repository_root.join(path);
-    let content =
-        fs::read_to_string(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
-    for phrase in stale_v1_guidance {
-        if content.contains(phrase) {
-            return Err(TaskError::InvalidSourceContract(format!(
-                "{path} still teaches archived v1 guidance `{phrase}`"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn verify_documented_contracts() -> Result<(), TaskError> {
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1755,19 +1620,19 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
     for (path, required) in [
         (
             "README.md",
-            "v1.3.0 must not be published unless its two macOS binaries",
+            "Prebuilt release artifacts must not be published unless both macOS binaries",
         ),
         (
             "QUICKSTART.md",
-            "Prebuilt binaries may ship from the GitHub release only after v1.3.0 is signed",
+            "Prebuilt binaries may ship from the GitHub release only after that release is signed",
         ),
         (
             "SECURITY.md",
-            "v1.3.0 must not be published unless both macOS binaries",
+            "Prebuilt release artifacts must not be published unless both macOS binaries",
         ),
         (
             "CONTRIBUTING.md",
-            "The v1.3.0 operator posture requires the identity-bearing lane.",
+            "The prebuilt v1.3.0 operator posture requires the identity-bearing lane.",
         ),
         ("CONTRIBUTING.md", "create `v1.3.0` as a new annotated tag"),
         (
@@ -1776,7 +1641,7 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
         ),
         (
             "site/docs/LAUNCH_CHECKLIST.md",
-            "The v1.3.0 CLI posture requires signed and notarized publication",
+            "The prebuilt v1.3.0 CLI posture requires signed and notarized publication",
         ),
         (
             "SECURITY.md",
@@ -3736,11 +3601,11 @@ mod tests {
 
     use super::{
         PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, bind_new_uploaded_asset,
-        check_gitignored_guidance_is_scanned, classify_pre_push_registration,
-        collect_workflow_paths, contains_retired_public_domain, expected_signed_release_file_names,
-        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
-        is_canonical_github_origin, is_declared_quarantine_path, is_forbidden_quarantine_consumer,
-        is_full_git_object_id, is_linux_musl, parse_bound_draft_release, parse_release_trust_roots,
+        classify_pre_push_registration, collect_workflow_paths, contains_retired_public_domain,
+        expected_signed_release_file_names, extract_cfctl_command_references,
+        extract_cfctl_command_refs, extract_prose_command_refs, is_canonical_github_origin,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_full_git_object_id,
+        is_linux_musl, parse_bound_draft_release, parse_release_trust_roots,
         parse_remote_tag_commit, release_build_driver, release_build_subcommand,
         release_tag_is_exact_version, render_linux_installer_text, repository_root,
         security_proof_commands, validate_bootstrap_contract, validate_bound_draft_release,
@@ -4128,7 +3993,7 @@ mod tests {
             "non-HEAD refspec must fail closed"
         );
         assert!(
-            String::from_utf8_lossy(&non_head.stderr).contains("must equal the checked-out HEAD"),
+            String::from_utf8_lossy(&non_head.stderr).contains("must equal checked-out HEAD"),
             "unexpected non-HEAD error: {}",
             String::from_utf8_lossy(&non_head.stderr)
         );
@@ -5011,44 +4876,5 @@ mod tests {
         assert!(!preview_run.status.success());
         assert!(String::from_utf8_lossy(&preview_run.stderr).contains("unsigned assembly"));
         assert!(render_linux_installer_text(template, "bad", "bad", Some(("", "issuer"))).is_err());
-    }
-
-    #[test]
-    fn gitignored_markdown_names_reads_only_openable_filenames() {
-        let gitignore = "\
-# comment .md
-AGENTS.md
-   NUANCE.md   
-*.local.md
-docs/private/notes.md
-!KEEP.md
-target/
-WEB.md
-";
-        assert_eq!(
-            super::gitignored_markdown_names(gitignore),
-            vec!["AGENTS.md", "NUANCE.md", "WEB.md"]
-        );
-    }
-
-    #[test]
-    fn a_gitignored_document_outside_the_scanned_set_is_rejected() {
-        let error = check_gitignored_guidance_is_scanned("AGENTS.md\nPRIVATE_NOTES.md\n")
-            .expect_err("a gitignored document no gate opens must fail the contract");
-        let message = error.to_string();
-        assert!(message.contains("PRIVATE_NOTES.md"), "{message}");
-        assert!(
-            message.contains("no tracked-file scan reaches it"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn the_scanned_set_covers_the_repository_gitignore() {
-        let repository_root = super::repository_root().expect("repository root");
-        let gitignore =
-            fs::read_to_string(repository_root.join(".gitignore")).expect("read .gitignore");
-        check_gitignored_guidance_is_scanned(&gitignore)
-            .expect("every gitignored document must be opened by name by some doctrine gate");
     }
 }

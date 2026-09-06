@@ -199,6 +199,7 @@ fn authenticated_test_store_reopens_the_same_authority() {
     );
 }
 
+mod acceptance_rectification;
 mod pages_and_delegated;
 use pages_and_delegated::*;
 mod import_admission;

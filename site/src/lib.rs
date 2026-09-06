@@ -46,7 +46,7 @@ pub fn app_router(leptos_options: leptos::prelude::LeptosOptions) -> axum::Route
 
     let routes = generate_route_list(app::App);
     Router::new()
-        .leptos_routes(&leptos_options, routes, {
+        .leptos_routes_with_context(&leptos_options, routes, install_ssr_csp, {
             let leptos_options = leptos_options.clone();
             move || app::shell(leptos_options.clone())
         })
@@ -100,15 +100,19 @@ fn apply_response_headers(
         HeaderName::from_static("strict-transport-security"),
         HeaderValue::from_static("max-age=31536000"),
     );
-    headers.insert(
-        HeaderName::from_static("content-security-policy"),
-        content_security_policy()?,
-    );
+    // The SSR integration owns its per-response nonce. Non-SSR responses use
+    // the strict hash-only fallback and never invent a nonce after rendering.
+    if !headers.contains_key("content-security-policy") {
+        headers.insert(
+            HeaderName::from_static("content-security-policy"),
+            content_security_policy(None)?,
+        );
+    }
     Ok(())
 }
 
 #[cfg(feature = "ssr")]
-fn content_security_policy() -> worker::Result<axum::http::header::HeaderValue> {
+fn content_security_policy(nonce: Option<&str>) -> worker::Result<axum::http::header::HeaderValue> {
     use base64::Engine;
     use leptos::prelude::*;
     use sha2::{Digest, Sha256};
@@ -117,11 +121,14 @@ fn content_security_policy() -> worker::Result<axum::http::header::HeaderValue> 
         get_configuration(None).map_err(|error| worker::Error::RustError(error.to_string()))?;
     let script = hydration_script(&conf.leptos_options);
     let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script.as_bytes()));
-    let script_sources = if cfg!(debug_assertions) {
+    let mut script_sources = if cfg!(debug_assertions) {
         "'self' 'unsafe-inline' 'wasm-unsafe-eval'".to_owned()
     } else {
         format!("'self' 'sha256-{hash}' 'wasm-unsafe-eval'")
     };
+    if let Some(nonce) = nonce {
+        script_sources.push_str(&format!(" 'nonce-{nonce}'"));
+    }
     let connect_sources = if cfg!(debug_assertions) {
         "'self' ws: wss:"
     } else {
@@ -132,6 +139,17 @@ fn content_security_policy() -> worker::Result<axum::http::header::HeaderValue> 
     );
     axum::http::header::HeaderValue::from_str(&value)
         .map_err(|error| worker::Error::RustError(error.to_string()))
+}
+
+#[cfg(feature = "ssr")]
+fn install_ssr_csp() {
+    use leptos::prelude::*;
+    let response = expect_context::<leptos_axum::ResponseOptions>();
+    let nonce = leptos::nonce::use_nonce().expect("Leptos SSR provides its response nonce");
+    response.insert_header(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        content_security_policy(Some(&nonce)).expect("configured CSP is a valid header"),
+    );
 }
 
 #[cfg(feature = "ssr")]
@@ -189,6 +207,41 @@ mod tests {
         assert!(csp.contains("default-src 'self'"));
         assert!(csp.contains("form-action 'none'"));
         assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn ssr_policy_uses_the_framework_nonce_and_survives_response_headers() {
+        use leptos::prelude::*;
+        let owner = Owner::new();
+        let policy = owner.with(|| {
+            let response = leptos_axum::ResponseOptions::default();
+            provide_context(response.clone());
+            leptos::nonce::provide_nonce();
+            let nonce = leptos::nonce::use_nonce().expect("framework nonce");
+            install_ssr_csp();
+            let headers = response.0.read().expect("response options");
+            let policy = headers.headers[header::CONTENT_SECURITY_POLICY].clone();
+            assert!(
+                policy
+                    .to_str()
+                    .expect("policy")
+                    .contains(&format!("'nonce-{nonce}'"))
+            );
+            policy
+        });
+        let mut response = Response::new(Body::empty());
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, policy.clone());
+        apply_response_headers(&mut response, "/start").expect("headers");
+        assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], policy);
+        assert!(
+            !content_security_policy(None)
+                .expect("fallback")
+                .to_str()
+                .expect("policy")
+                .contains("'nonce-")
+        );
     }
 
     #[test]

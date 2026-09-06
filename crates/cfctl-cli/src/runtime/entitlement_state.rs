@@ -231,7 +231,7 @@ pub(super) async fn read_live_zone_entitlement(
         )
         .await?;
     let receipt = apply_zone_entitlement_response(capability, &zone_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -342,7 +342,7 @@ pub(super) async fn read_live_entitlement_probe(
         )
         .await?;
     let receipt = apply_entitlement_probe_response(capability, &selectors, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -498,7 +498,7 @@ pub(super) async fn read_live_pages_project_absence(
         )
         .await?;
     let receipt = apply_pages_project_absence_response(account_id, project_name, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -540,7 +540,7 @@ pub(super) async fn read_live_zone_account(
         )
         .await?;
     let receipt = apply_zone_account_response(&zone_id, account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
 
@@ -548,7 +548,8 @@ pub(super) fn plan_requires_live_credential(
     capability: &CapabilityV1,
     adapter_targets: &Value,
 ) -> bool {
-    should_bind_pages_project_absence(capability)
+    super::access_create::applies(capability)
+        || should_bind_pages_project_absence(capability)
         || pages_deployment::binds_project_state(capability)
         || worker_deployment::target(adapter_targets).is_some()
         || should_resolve_entitlement_probe(capability)

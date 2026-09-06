@@ -214,7 +214,7 @@ impl ExecutionContext<'_> {
             Some(
                 self.request
                     .store
-                    .write_evidence(EvidenceClass::LiveRead, &receipt)?,
+                    .write_observation_evidence(EvidenceClass::LiveRead, &receipt)?,
             )
         } else {
             None
@@ -243,7 +243,7 @@ impl ExecutionContext<'_> {
         let evidence = self
             .request
             .store
-            .write_evidence(EvidenceClass::LiveRead, &receipt)?;
+            .write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
         let mut envelope = envelope(
             &self.request.catalog.schema_hash,
             &self.request.capability.id,
@@ -342,7 +342,7 @@ pub(super) fn set_workspace_d1_evidence_verification(
         "clean-repository fixed D1 projection reduced one deterministic delivery fingerprint to exactly one accepted body-free inbound, relay, and thread binding without retaining provider rows"
             .to_owned()
     } else if receipt_is_complete {
-        "clean-repository fixed D1 projection reduced to unchanged MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows".to_owned()
+        "clean-repository fixed D1 projection reduced to MaildeskD1EvidenceV1 plus complete bounded body-free MaildeskD1RouteHealthEvidenceV2 without retaining provider rows".to_owned()
     } else if inbound_acceptance {
         "workspace D1 inbound-acceptance receipt did not prove exactly one fully provider-accepted binding for the selected delivery fingerprint, route, and policy".to_owned()
     } else {

@@ -1,6 +1,8 @@
 //! OAuth, profile, account selection, and secret-store contracts.
 
 mod evidence_keys;
+mod platform_store;
+pub use platform_store::{PlatformSecretStore, export_fallback_profile};
 #[cfg(target_os = "macos")]
 mod macos_keyring;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,7 +15,7 @@ use std::{
     fmt, fs,
     io::Write as _,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 use chrono::{DateTime, Duration, Utc};
@@ -57,7 +59,7 @@ pub enum AuthError {
     /// This is a distinct disposition from an unavailable backend. The store is
     /// present and answering; it is withholding one operation pending authorization.
     #[error(
-        "platform keyring operation requires operator authorization that this context cannot obtain; approve the keychain prompt in an interactive session and retry"
+        "platform keyring authorization is unavailable; cfctl does not open password dialogs or unlock the store; preserve the selected credential and resolve its existing access authority before retrying"
     )]
     SecretStoreAuthorizationRequired,
     #[error(transparent)]
@@ -402,6 +404,7 @@ impl fmt::Debug for AuthCredential {
 pub enum SecretBackend {
     PlatformKeyring,
     FallbackFile,
+    PrivateFile,
     Memory,
 }
 
@@ -907,165 +910,6 @@ impl SecretStore for FileSecretStore {
     }
 }
 
-/// Platform keyring preferred for writes, with a durable file fallback so a
-/// broken keyring (for example `errSecAuthFailed` from a desynchronized login
-/// keychain) degrades to governed mode-0600 files instead of blocking
-/// credential import. A reserved fallback sidecar is the only state treated
-/// as an in-flight write-ahead journal. Unequal raw primary/fallback values
-/// from the legacy protocol are ambiguous and fail closed. When fallback state
-/// already exists, replacement first atomically stages the fresh value in the
-/// sidecar, then replaces the keyring value, then clears the legacy fallback
-/// and sidecar. A process crash at any completed boundary therefore exposes
-/// one complete old or new value without guessing which legacy copy is newer.
-/// `cfctl doctor` reports which backend is active.
-#[derive(Clone)]
-pub struct PlatformSecretStore {
-    keyring: Arc<dyn SecretStore>,
-    fallback: FileSecretStore,
-}
-
-impl fmt::Debug for PlatformSecretStore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PlatformSecretStore")
-            .field("keyring", &"[platform secret store]")
-            .field("fallback", &self.fallback)
-            .finish()
-    }
-}
-
-impl PlatformSecretStore {
-    #[must_use]
-    pub fn new(fallback_root: PathBuf) -> Self {
-        Self {
-            keyring: Arc::new(KeyringSecretStore),
-            fallback: FileSecretStore::new(fallback_root),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_keyring(fallback_root: PathBuf, keyring: Arc<dyn SecretStore>) -> Self {
-        Self {
-            keyring,
-            fallback: FileSecretStore::new(fallback_root),
-        }
-    }
-
-    #[must_use]
-    pub fn fallback_root(&self) -> &Path {
-        self.fallback.root()
-    }
-
-    pub fn fallback_secret_count(&self) -> Result<usize> {
-        self.fallback.stored_secret_count()
-    }
-
-    /// Prove the platform keyring accepts writes by round-tripping a
-    /// non-secret probe value. Returns the platform failure text when the
-    /// keyring is unusable.
-    pub fn keyring_probe(&self) -> std::result::Result<(), String> {
-        const PROBE_VALUE: &str = "cfctl-keyring-probe";
-        if self
-            .fallback_secret_count()
-            .map_err(|error| error.to_string())?
-            > 0
-        {
-            return Err(
-                "not probed while governed fallback credentials are active; this avoids interactive platform prompts"
-                    .to_owned(),
-            );
-        }
-        let probe_key = format!("doctor/keyring-probe/{}", Uuid::new_v4());
-        self.keyring
-            .put(&probe_key, PROBE_VALUE)
-            .map_err(|error| error.to_string())?;
-        let read = self
-            .keyring
-            .get(&probe_key)
-            .map_err(|error| error.to_string());
-        let _ = self.keyring.delete(&probe_key);
-        match read? {
-            Some(value) if value == PROBE_VALUE => Ok(()),
-            _ => Err("keyring probe read back an unexpected value".to_owned()),
-        }
-    }
-}
-
-impl SecretStore for PlatformSecretStore {
-    fn put(&self, key: &str, value: &str) -> Result<()> {
-        if self.fallback_secret_count()? > 0 {
-            return self.fallback.put(fallback_journal_key(key).as_str(), value);
-        }
-        chained_put(self.keyring.as_ref(), &self.fallback, key, value)
-    }
-
-    fn get(&self, key: &str) -> Result<Option<String>> {
-        if self.fallback_secret_count()? > 0 {
-            return authoritative_fallback_get(&self.fallback, key);
-        }
-        self.keyring.get(key)
-    }
-
-    fn delete(&self, key: &str) -> Result<()> {
-        if self.fallback_secret_count()? > 0 {
-            return delete_authoritative_fallback_key(&self.fallback, key);
-        }
-        chained_delete(self.keyring.as_ref(), &self.fallback, key)
-    }
-
-    fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
-        if self.fallback_secret_count()? > 0 {
-            return authoritative_fallback_get(&self.fallback, key)
-                .map(|value| value.map(|_| SecretBackend::FallbackFile));
-        }
-        self.keyring.locate(key)
-    }
-
-    fn load_profile_credential(&self, profile: &ProfileMetadata) -> Result<AuthCredential> {
-        if profile.kind == ProfileKind::OAuth {
-            let tokens = self.load_profile_oauth_tokens(profile)?;
-            return Ok(AuthCredential::Bearer {
-                token: tokens.access_token,
-            });
-        }
-        let key = profile_credential_key(profile)?;
-        let encoded = self
-            .get(&key)?
-            .ok_or_else(|| AuthError::CredentialUnavailable {
-                profile_id: profile.id.clone(),
-                reason: CredentialUnavailableReason::MissingSelectedFallback,
-            })?;
-        decode_selected_credential(profile, encoded)
-    }
-
-    fn delete_profile(&self, profile_id: &str) -> Result<()> {
-        if self.fallback_secret_count()? > 0 {
-            for key in [
-                oauth_key(profile_id),
-                api_token_key(profile_id),
-                global_key(profile_id),
-            ] {
-                delete_authoritative_fallback_key(&self.fallback, &key)?;
-            }
-            return Ok(());
-        }
-        self.keyring.delete_profile(profile_id)
-    }
-
-    fn repair_profile_credential_access(&self, profile: &ProfileMetadata) -> Result<()> {
-        let key = profile_credential_key(profile)?;
-        let value = self
-            .keyring
-            .get(&key)?
-            .ok_or_else(|| AuthError::CredentialUnavailable {
-                profile_id: profile.id.clone(),
-                reason: CredentialUnavailableReason::MissingSelectedFallback,
-            })?;
-        decode_selected_credential(profile, value.clone())?;
-        self.keyring.put(&key, &value)
-    }
-}
-
 fn authoritative_fallback_get(fallback: &dyn SecretStore, key: &str) -> Result<Option<String>> {
     if let Some(journal) = fallback.get(fallback_journal_key(key).as_str())? {
         return Ok(Some(journal));
@@ -1530,6 +1374,7 @@ pub async fn revoke_oauth_token(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use std::sync::Arc;
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
