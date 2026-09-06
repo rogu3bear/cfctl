@@ -10,6 +10,8 @@ mod agent_commands;
 mod api_boundary;
 mod api_execution;
 mod auth_commands;
+mod auth_import;
+mod auth_prompt;
 mod call_command;
 mod call_input;
 mod catalog_commands;
@@ -118,16 +120,21 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     if matches!(command, Command::Commands) {
         return Ok(crate::command_help::envelope());
     }
-    let activating = matches!(
+    // Token intake checks and writes one whole profile configuration plus its
+    // credential. Hold the existing exclusive runtime lock across that entire
+    // transaction, including input and verification. Every ordinary invocation
+    // already holds the shared side, so another profile writer cannot cross
+    // between the final collision/drift check and persistence.
+    let exclusive_runtime = matches!(
         &command,
         Command::Auth(crate::AuthArgs {
             command: crate::AuthCommand::EvidenceKey(crate::EvidenceKeyArgs {
                 command: crate::EvidenceKeyCommand::PrivateActivate(_)
-            })
+            }) | crate::AuthCommand::ImportApiToken(_)
         })
     );
     let _runtime_lock =
-        cfctl_storage::lock_runtime_selection(&RuntimePaths::unselected()?, activating)?;
+        cfctl_storage::lock_runtime_selection(&RuntimePaths::unselected()?, exclusive_runtime)?;
     let store = if command_uses_nonqualifying_audit_evidence(&command) {
         runtime_unqualified_state_store()?
     } else {

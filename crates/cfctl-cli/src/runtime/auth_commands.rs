@@ -1,3 +1,4 @@
+use super::auth_import::import_api_token;
 use super::call_input::parse_callback;
 use super::credential_resolution::describe_secret_backend;
 use super::credential_resolution::oauth_scope_inventory_hash;
@@ -5,9 +6,9 @@ use super::credential_resolution::platform_secrets;
 use super::credential_resolution::resolve_login_scopes;
 use super::evidence_key_commands::evidence_key_command;
 use super::prelude::{
-    AuthCommand, AuthLoginArgs, CliError, ImportApiTokenArgs, ImportGlobalKeyArgs,
-    OAuthClientConfig, PendingLogin, PkceSession, ProfileKind, ProfileMetadata, ProfileSelector,
-    ProfilesConfig, Result, ResultEnvelopeV2, SecretStore, StateStore, Write, json,
+    AuthCommand, AuthLoginArgs, CliError, ImportGlobalKeyArgs, OAuthClientConfig, PendingLogin,
+    PkceSession, ProfileKind, ProfileMetadata, ProfileSelector, ProfilesConfig, Result,
+    ResultEnvelopeV2, SecretStore, StateStore, Write, json,
 };
 use super::support::http_client;
 use super::support::read_import_secret;
@@ -47,7 +48,7 @@ pub(super) async fn auth_command(
             logout_profile(store, &mut profiles, &secrets, &selector).await
         }
         AuthCommand::ImportApiToken(arguments) => {
-            import_api_token(store, &mut profiles, &secrets, &arguments)
+            import_api_token(store, &mut profiles, &secrets, &arguments).await
         }
         AuthCommand::ImportGlobalKey(arguments) => {
             import_global_key(store, &mut profiles, &secrets, &arguments)
@@ -288,23 +289,6 @@ pub(super) async fn logout_profile(
     ))
 }
 
-pub(super) fn import_api_token(
-    store: &StateStore,
-    profiles: &mut ProfilesConfig,
-    secrets: &dyn SecretStore,
-    arguments: &ImportApiTokenArgs,
-) -> Result<ResultEnvelopeV2> {
-    let token = read_import_secret(arguments.stdin, arguments.value_in.as_deref(), "API token")?;
-    store_imported_api_token(
-        store,
-        profiles,
-        secrets,
-        &arguments.profile,
-        &arguments.account,
-        &token,
-    )
-}
-
 pub(super) fn store_imported_api_token(
     store: &StateStore,
     profiles: &mut ProfilesConfig,
@@ -313,6 +297,20 @@ pub(super) fn store_imported_api_token(
     account: &str,
     token: &str,
 ) -> Result<ResultEnvelopeV2> {
+    let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account.trim()));
+    store_api_token_profile(store, profiles, secrets, profile, token, true)
+}
+
+pub(super) fn store_api_token_profile(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    secrets: &dyn SecretStore,
+    profile: ProfileMetadata,
+    token: &str,
+    select: bool,
+) -> Result<ResultEnvelopeV2> {
+    let profile_id = profile.id.as_str();
+    let account = profile.account_id.as_deref().unwrap_or_default();
     let account = account.trim();
     let token = token.trim();
     if account.is_empty() {
@@ -330,13 +328,17 @@ pub(super) fn store_imported_api_token(
             "the supplied API token must be a single value without whitespace".to_owned(),
         ));
     }
-    let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account));
-    mark_credential_install_pending(store, profiles, &profile, true)?;
+    let previous_profile = profiles.current_profile.clone();
+    mark_credential_install_pending(store, profiles, &profile, select)?;
     secrets.store_api_token(profile_id, token)?;
     let (secret_backend, storage_note) =
         describe_secret_backend(secrets.locate_api_token(profile_id)?);
-    profiles.profiles.insert(profile_id.to_owned(), profile);
-    profiles.current_profile = Some(profile_id.to_owned());
+    profiles
+        .profiles
+        .insert(profile_id.to_owned(), profile.clone());
+    if select {
+        profiles.current_profile = Some(profile_id.to_owned());
+    }
     profiles.save(store)?;
     Ok(ResultEnvelopeV2::success(
         "auth import-api-token",
@@ -344,10 +346,12 @@ pub(super) fn store_imported_api_token(
             "profile": profile_id,
             "kind": "api_token",
             "account_id": account,
-            "selected": true,
+            "selected": profiles.current_profile.as_deref() == Some(profile_id),
+            "selection_changed": profiles.current_profile != previous_profile,
+            "credential_generation_id": profile.credential_generation_id,
             "emergency_only": false,
             "secret_backend": secret_backend,
-            "message": format!("API token stored {storage_note} and selected as the active profile. The token value was not written to stdout, plans, or repository files.")
+            "message": format!("API token stored {storage_note}. {} The token value was not written to stdout, plans, or repository files.", if select { "Selected as the active profile." } else { "Prior profile selection preserved." })
         }),
     ))
 }

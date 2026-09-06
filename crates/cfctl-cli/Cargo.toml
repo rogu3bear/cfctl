@@ -11,7 +11,7 @@ name = "cfctl"
 path = "src/main.rs"
 
 [dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["termios"] }
 cfctl-agent = { workspace = true }
 cfctl-auth = { workspace = true }
 cfctl-catalog = { workspace = true }

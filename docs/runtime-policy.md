@@ -233,6 +233,25 @@ receipts are redacted. When an API cannot read a newly issued credential back,
 the truthful terminal proof is the successful Cloudflare response plus the
 durable sink receipt; cfctl does not claim that a later read verified the value.
 
+API-token import also accepts a hidden controlling-terminal `--prompt`.
+`--create-only` refuses an existing profile or pending login before reading
+input, and `--no-select` preserves the active selection. `--verify-user`
+performs the catalog's exact read-only user-token verification with the supplied
+credential before any credential or profile write. `--expires-before` adds a
+future upper bound on provider-reported expiry. Failed verification stores
+only a redacted observation; it installs no credential. Profile or catalog
+drift during intake aborts storage. The observation follows the ordinary
+attestation policy and binds the new credential generation, user identity,
+status and expiry; account membership and permission-policy proof remain
+separate. The [authentication guide](../README.md#authenticate) owns invocation
+and bootstrap guidance.
+
+The public API-token import command acquires the existing runtime-selection
+lock exclusively before loading profile state and holds it through input,
+verification and persistence. Other invocations participate through the same
+shared lock and fail busy during intake. This closes the collision/drift
+check-to-write interval without a second profile locking or storage protocol.
+
 The per-capability secret-sink exceptions and verifiers — the Access
 service-token creation/update/refresh contracts, OAuth client creation, and the
 two-phase OAuth client-secret rotation — are owned by

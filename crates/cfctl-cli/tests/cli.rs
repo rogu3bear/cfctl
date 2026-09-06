@@ -3,6 +3,9 @@
 #[path = "cli/evidence_key.rs"]
 mod evidence_key;
 
+#[path = "cli/auth_import.rs"]
+mod auth_import;
+
 use std::{fs, path::Path, process::Command as ProcessCommand};
 
 use cfctl_auth::{FileSecretStore, SecretStore};

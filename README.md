@@ -141,8 +141,8 @@ the public contracts `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,
 
 ## Authenticate
 
-Day-to-day auth is a scoped API token, imported only through stdin — never
-argv — and pinned to one account:
+Day-to-day auth is a scoped API token, imported through protected input and
+pinned to one account:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_TOKEN" | \
@@ -152,6 +152,37 @@ printf '%s' "$CLOUDFLARE_API_TOKEN" | \
 The token lives in the platform keyring (Keychain on macOS, Secret Service on
 Linux) and falls back to a mode-0600 file store when the keyring is
 unavailable; `cfctl doctor` reports which backend is active.
+
+For interactive intake, use `--prompt` to enter a token without terminal echo.
+Noninteractive callers can use `--stdin` or `--value-in <mode-0600-path>`;
+token values never belong in command arguments. Ordinary import selects the
+profile and can replace it. Add `--create-only` to refuse an existing profile
+or pending login, and `--no-select` to preserve the current selection, including
+when no profile is selected.
+
+Import holds the existing runtime lock exclusively through input, verification
+and storage. Concurrent cfctl invocations fail with a retryable busy message,
+so another writer cannot invalidate the collision check or overwrite selection.
+
+When a capability requires a user-owned token, `--verify-user` checks the
+supplied token against the catalog's read-only user verification endpoint
+before storing it. Add `--expires-before <RFC3339-timestamp>` to require a
+provider-reported expiry no later than that future cutoff. For example:
+
+```bash
+cfctl auth import-api-token --profile publication-read --account <account-id> \
+  --prompt --create-only --no-select --verify-user \
+  --expires-before <future-RFC3339-timestamp>
+```
+
+Verification uses only the supplied token and requires an explicitly refreshed
+catalog. A rejection leaves credentials and profile selection untouched. The
+receipt binds the observed user identity, active status and expiry to the
+stored credential generation; it does not prove account membership or the
+permission policy. Inspect those separately for the intended operation.
+This command imports an existing token. Create it under Cloudflare's **My
+Profile > API Tokens**, or use `cfctl keys mint --user` with a qualified parent
+credential and the normal plan approval lifecycle.
 
 Qualifying local evidence uses a separate, explicitly selected integrity key.
 The platform mode never automatically falls back to a file: inspect the exact initialization transition with

@@ -247,6 +247,10 @@ pub struct ProfileSelector {
 }
 
 #[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "clap exposes independent opt-in import controls, not lifecycle states"
+)]
 pub struct ImportApiTokenArgs {
     #[arg(long, default_value = "default")]
     pub profile: String,
@@ -266,6 +270,21 @@ pub struct ImportApiTokenArgs {
         help = "Read the API token from a mode-0600 file instead of stdin; avoids piping secrets through a build wrapper such as `./cfctl`"
     )]
     pub value_in: Option<PathBuf>,
+    /// Read the token from a hidden prompt on the controlling terminal.
+    #[arg(long, conflicts_with_all = ["stdin", "value_in"])]
+    pub prompt: bool,
+    /// Preserve the current profile selection, including when none is selected.
+    #[arg(long)]
+    pub no_select: bool,
+    /// Refuse to replace an existing profile before reading the supplied token.
+    #[arg(long)]
+    pub create_only: bool,
+    /// Verify active user-owned token custody before storing the credential.
+    #[arg(long)]
+    pub verify_user: bool,
+    /// Require a provider-reported expiry no later than this RFC3339 timestamp.
+    #[arg(long, requires = "verify_user", value_name = "TIMESTAMP")]
+    pub expires_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Args)]
