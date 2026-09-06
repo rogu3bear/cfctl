@@ -1,5 +1,8 @@
 //! Local verification and release orchestration for cfctl.
 
+mod local_adapters;
+
+use local_adapters::LOCAL_OPERATOR_ADAPTERS;
 use std::{
     collections::BTreeSet,
     env,
@@ -33,14 +36,6 @@ const MACOS_RELEASE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-
 const VERIFY_CROSS_TARGET: &str = "x86_64-unknown-linux-musl";
 const CARGO_AUDITABLE_VERSION: &str = "0.7.5";
 const GITHUB_REPOSITORY: &str = "rogu3bear/cfctl";
-/// Local operator adapters. `LAYERS.md` keeps these gitignored so a clone
-/// inherits the constitution without an operator context, which also puts them
-/// outside `git ls-files` and therefore outside every tracked-file scan. Source
-/// contracts that guard doctrine must check them explicitly or leave a blind
-/// spot: the retired public domain survived in `AGENTS.md` for exactly that
-/// reason. Present-only — a clone legitimately has neither.
-const LOCAL_OPERATOR_ADAPTERS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
-
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask")]
 struct Arguments {
@@ -476,6 +471,7 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_v1_cutover_contract()?;
     verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
+    local_adapters::verify()?;
     verify_documented_contracts()
 }
 
