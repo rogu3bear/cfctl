@@ -10,7 +10,7 @@
 /// it applies. Widening it is a deliberate act: `verify` fails until this list
 /// is edited in the same change, which makes the addition something a reviewer
 /// sees rather than something that arrives quietly.
-const CAPABILITY_V1_FIELDS: [&str; 56] = [
+const CAPABILITY_V1_FIELDS: [&str; 57] = [
     "schema_version",
     "id",
     "title",
@@ -56,6 +56,7 @@ const CAPABILITY_V1_FIELDS: [&str; 56] = [
     "workspace_d1_reply_admission",
     "workspace_reply_subdomain_ingress",
     "workspace_d1_evidence",
+    "workspace_d1_read_inventory",
     "r2_private_file_upload",
     "r2_private_object_digest",
     "email_sending_dns_repair",

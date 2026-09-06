@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "query_count": 3,
+  "witness_count": 3,
+  "tables": [
+    {
+      "name": "owners",
+      "columns": [
+        "id",
+        "slug"
+      ]
+    },
+    {
+      "name": "items",
+      "columns": [
+        "owner_id",
+        "label",
+        "legacy"
+      ]
+    }
+  ],
+  "functions": [
+    "count"
+  ],
+  "limits": {
+    "max_total_response_bytes": 32768,
+    "max_elapsed_seconds": 120,
+    "stop_after_rows_read": 100000
+  },
+  "queries": [
+    {
+      "id": "q1",
+      "sql": "SELECT id FROM owners WHERE slug='example' LIMIT 1;",
+      "sha256": "sha256:1830914e08cffabf33500bbf9ff44faf00e0c62e31ceb6226d34018a65c23b7e",
+      "phase": "reconciliation",
+      "requires": [],
+      "parameters": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "min_rows": 0,
+        "max_rows": 1,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "q1",
+          "ordinal": 1,
+          "group": "synthetic",
+          "source_reference": "source.txt"
+        }
+      ]
+    },
+    {
+      "id": "q2",
+      "sql": "SELECT label FROM items WHERE owner_id=?1;",
+      "sha256": "sha256:6189c2a2c4ddf910ff750521c306b80005f765c88981e201374c44cdb176aaa2",
+      "phase": "reconciliation",
+      "requires": [],
+      "parameters": [
+        {
+          "index": 1,
+          "from_query": "q1",
+          "row_index": 0,
+          "column": "id",
+          "kind": "text",
+          "trim": true,
+          "nonempty": true,
+          "max_bytes": 256
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "label",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "min_rows": 0,
+        "max_rows": 20,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "q2",
+          "ordinal": 2,
+          "group": "synthetic",
+          "source_reference": "source.txt"
+        }
+      ]
+    },
+    {
+      "id": "q3",
+      "sql": "SELECT COUNT(*) AS c FROM items WHERE owner_id=?1 AND legacy=1;",
+      "sha256": "sha256:33d06089c6a1fb74a05e76e702f9b469308a3394c5feed0ee5a360735f6d0a9b",
+      "phase": "reconciliation",
+      "requires": [],
+      "parameters": [
+        {
+          "index": 1,
+          "from_query": "q1",
+          "row_index": 0,
+          "column": "id",
+          "kind": "text",
+          "trim": true,
+          "nonempty": true,
+          "max_bytes": 256
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "c",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "min_rows": 1,
+        "max_rows": 1,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "q3",
+          "ordinal": 3,
+          "group": "synthetic",
+          "source_reference": "source.txt"
+        }
+      ]
+    }
+  ]
+}

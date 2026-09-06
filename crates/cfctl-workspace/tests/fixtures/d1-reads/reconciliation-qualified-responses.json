@@ -1,0 +1,71 @@
+[
+  {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": [
+      {
+        "success": true,
+        "results": [
+          {
+            "id": "  example-organization  "
+          }
+        ],
+        "meta": {
+          "rows_read": 1,
+          "rows_written": 0,
+          "changes": 0,
+          "changed_db": false,
+          "duration": 0.1,
+          "total_attempts": 1
+        }
+      }
+    ]
+  },
+  {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": [
+      {
+        "success": true,
+        "results": [
+          {
+            "label": "example label"
+          }
+        ],
+        "meta": {
+          "rows_read": 1,
+          "rows_written": 0,
+          "changes": 0,
+          "changed_db": false,
+          "duration": 0.1,
+          "total_attempts": 1
+        }
+      }
+    ]
+  },
+  {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": [
+      {
+        "success": true,
+        "results": [
+          {
+            "c": 0
+          }
+        ],
+        "meta": {
+          "rows_read": 1,
+          "rows_written": 0,
+          "changes": 0,
+          "changed_db": false,
+          "duration": 0.1,
+          "total_attempts": 1
+        }
+      }
+    ]
+  }
+]

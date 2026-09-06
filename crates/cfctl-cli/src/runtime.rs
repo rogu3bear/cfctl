@@ -69,6 +69,7 @@ mod workspace_d1_evidence;
 mod workspace_d1_migration;
 mod workspace_d1_projection;
 mod workspace_d1_qualification;
+mod workspace_d1_reads;
 mod workspace_d1_reply_admission;
 mod workspace_d1_transition;
 mod workspace_reply_subdomain_ingress;

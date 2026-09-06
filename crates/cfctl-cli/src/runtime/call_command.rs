@@ -48,7 +48,36 @@ pub(super) async fn call_command(
     store: &StateStore,
     arguments: CallArgs,
 ) -> Result<ResultEnvelopeV2> {
-    let catalog = ensure_catalog(store).await?;
+    // Workspace-owned read populations must fail locally before any network
+    // request, including an automatic catalog refresh. Use the existing cached
+    // catalog for this route and require explicit synchronization beforehand.
+    let cached = if store.paths().catalog_file().is_file() {
+        Some(cfctl_catalog::CatalogSnapshot::load(
+            &store.paths().catalog_file(),
+        )?)
+    } else {
+        None
+    };
+    let workspace_read = if cached
+        .as_ref()
+        .and_then(|c| c.get(&arguments.capability_id))
+        .is_none()
+    {
+        load_workspace_capability(store, &arguments.capability_id)?
+            .filter(|c| c.workspace_d1_read_inventory.is_some())
+    } else {
+        None
+    };
+    let catalog = if workspace_read.is_some() {
+        cached.ok_or_else(|| {
+            CliError::Input(
+                "reviewed D1 reads require an existing catalog; synchronize it separately first"
+                    .into(),
+            )
+        })?
+    } else {
+        ensure_catalog(store).await?
+    };
     let capability = if let Some(capability) = catalog.get(&arguments.capability_id) {
         capability.clone()
     } else {

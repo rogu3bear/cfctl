@@ -1,6 +1,9 @@
 //! Typed Cloudflare request construction and governed execution.
 mod access_create;
+pub mod d1_read_inventory;
+mod d1_sql;
 mod read_dispatch;
+use d1_sql::reviewed_schema_statement_count;
 mod worker_version_artifact;
 pub use access_create::{
     access_application_host_overlap, access_create_collection_receipt,
@@ -398,6 +401,11 @@ impl RequestBuilder {
         capability: &CapabilityV1,
         input: &CallInput,
     ) -> Result<PreparedRequest> {
+        if capability.workspace_d1_read_inventory.is_some() {
+            return Err(CloudflareError::InvalidRequestBody(
+                "reviewed D1 inventory cannot use generic request construction".into(),
+            ));
+        }
         validate_request_contract(capability, input)?;
         let mut url = self.base_url.clone();
         let selectors = input.selectors.as_object();
@@ -1589,99 +1597,6 @@ fn reviewed_schema_object_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-fn reviewed_schema_statement_count(sql: &str) -> Option<u64> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum LexState {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        Backtick,
-        Bracket,
-        LineComment,
-        BlockComment,
-    }
-
-    let bytes = sql.as_bytes();
-    let mut index = 0;
-    let mut state = LexState::Normal;
-    let mut statement_has_token = false;
-    let mut count = 0_u64;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        let next = bytes.get(index + 1).copied();
-        match state {
-            LexState::Normal => match (byte, next) {
-                (b'-', Some(b'-')) => {
-                    state = LexState::LineComment;
-                    index += 1;
-                }
-                (b'/', Some(b'*')) => {
-                    state = LexState::BlockComment;
-                    index += 1;
-                }
-                (b'\'', _) => {
-                    statement_has_token = true;
-                    state = LexState::SingleQuote;
-                }
-                (b'"', _) => {
-                    statement_has_token = true;
-                    state = LexState::DoubleQuote;
-                }
-                (b'`', _) => {
-                    statement_has_token = true;
-                    state = LexState::Backtick;
-                }
-                (b'[', _) => {
-                    statement_has_token = true;
-                    state = LexState::Bracket;
-                }
-                (b';', _) if statement_has_token => {
-                    count = count.checked_add(1)?;
-                    statement_has_token = false;
-                }
-                _ if !byte.is_ascii_whitespace() => statement_has_token = true,
-                _ => {}
-            },
-            LexState::SingleQuote if byte == b'\'' => {
-                if next == Some(b'\'') {
-                    index += 1;
-                } else {
-                    state = LexState::Normal;
-                }
-            }
-            LexState::DoubleQuote if byte == b'"' => {
-                if next == Some(b'"') {
-                    index += 1;
-                } else {
-                    state = LexState::Normal;
-                }
-            }
-            LexState::Backtick if byte == b'`' => {
-                if next == Some(b'`') {
-                    index += 1;
-                } else {
-                    state = LexState::Normal;
-                }
-            }
-            LexState::Bracket if byte == b']' => state = LexState::Normal,
-            LexState::LineComment if matches!(byte, b'\n' | b'\r') => state = LexState::Normal,
-            LexState::BlockComment if byte == b'*' && next == Some(b'/') => {
-                state = LexState::Normal;
-                index += 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if !matches!(state, LexState::Normal | LexState::LineComment) {
-        return None;
-    }
-    if statement_has_token {
-        count = count.checked_add(1)?;
-    }
-    Some(count)
 }
 
 fn validate_reviewed_schema_sql(sql: &str, max_statements: u64) -> Result<u64> {
@@ -12764,6 +12679,9 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    if capability.workspace_d1_read_inventory.is_some() {
+        d1_read_inventory::validate(capability, input)?;
+    }
     validate_response_contract(capability)?;
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;

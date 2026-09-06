@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "query_count": 3,
+  "witness_count": 3,
+  "tables": [
+    {
+      "name": "organizations",
+      "columns": [
+        "id",
+        "slug"
+      ]
+    },
+    {
+      "name": "datasets",
+      "columns": [
+        "id",
+        "org_id",
+        "slug",
+        "is_active"
+      ]
+    },
+    {
+      "name": "dataset_entries",
+      "columns": [
+        "id",
+        "dataset_id",
+        "entry_key",
+        "value_json",
+        "effective_at",
+        "superseded_at",
+        "created_at"
+      ]
+    }
+  ],
+  "functions": [
+    "coalesce",
+    "count",
+    "json_extract",
+    "json_patch",
+    "json_type",
+    "json_valid",
+    "typeof"
+  ],
+  "limits": {
+    "max_total_response_bytes": 81920,
+    "max_elapsed_seconds": 120,
+    "stop_after_rows_read": 100000
+  },
+  "queries": [
+    {
+      "id": "resolve-organization",
+      "sql": "SELECT id FROM organizations WHERE slug = 'mlnavigator' LIMIT 1",
+      "sha256": "sha256:d9a551975ba6105f369ebf2c1689e07a54987405fa09345792cf4d04a9cca5d9",
+      "phase": "postdeploy-reconciliation",
+      "requires": [],
+      "parameters": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "min_rows": 1,
+        "max_rows": 1,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "reconciliation-1",
+          "ordinal": 1,
+          "group": "postdeploy-reconciliation",
+          "source_reference": "scripts/lib/founder-reconciliation.ts#resolve-organization"
+        }
+      ]
+    },
+    {
+      "id": "current-entity-entries",
+      "sql": "SELECT de.entry_key, CASE WHEN (typeof(de.value_json) = 'text' AND json_valid(de.value_json)) THEN json_type(de.value_json) ELSE 'invalid' END AS json_kind, CASE WHEN (typeof(de.value_json) = 'text' AND json_valid(de.value_json)) THEN COALESCE(json_type(json_patch('{}', de.value_json), '$.de_file_number'), 'missing') ELSE 'missing' END AS de_file_number_kind, CASE WHEN (typeof(de.value_json) = 'text' AND json_valid(de.value_json)) THEN CASE WHEN json_type(json_patch('{}', de.value_json), '$.de_file_number') = 'text' THEN json_extract(json_patch('{}', de.value_json), '$.de_file_number') ELSE NULL END ELSE NULL END AS de_file_number, CASE WHEN de.entry_key = 'entity_profile' THEN CASE WHEN (typeof(de.value_json) = 'text' AND json_valid(de.value_json)) THEN COALESCE(json_type(json_patch('{}', de.value_json), '$.mailing_address_line'), 'missing') ELSE 'missing' END ELSE 'missing' END AS mailing_address_kind, CASE WHEN de.entry_key = 'entity_profile' THEN CASE WHEN (typeof(de.value_json) = 'text' AND json_valid(de.value_json)) THEN CASE WHEN json_type(json_patch('{}', de.value_json), '$.mailing_address_line') = 'text' THEN json_extract(json_patch('{}', de.value_json), '$.mailing_address_line') ELSE NULL END ELSE NULL END ELSE NULL END AS mailing_address_line FROM dataset_entries de JOIN datasets d ON d.id = de.dataset_id WHERE d.org_id = ?1 AND d.slug = 'company_profile' AND d.is_active = 1 AND de.superseded_at IS NULL AND de.entry_key IN ('entity_profile', 'kansas_entity') ORDER BY COALESCE(de.effective_at, de.created_at) DESC, de.created_at DESC, de.id DESC",
+      "sha256": "sha256:0e635b258e0180a28ebe5d8f93597f1fbef3c247fd12140d6000dad4d717dd1a",
+      "phase": "postdeploy-reconciliation",
+      "requires": [
+        {
+          "query_id": "resolve-organization",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "parameters": [
+        {
+          "index": 1,
+          "from_query": "resolve-organization",
+          "row_index": 0,
+          "column": "id",
+          "kind": "text",
+          "trim": true,
+          "nonempty": true,
+          "max_bytes": 256
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "entry_key",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 8192,
+            "allowed_values": [
+              "entity_profile",
+              "kansas_entity"
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "json_kind",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 8192,
+            "allowed_values": [
+              "invalid",
+              "null",
+              "text",
+              "integer",
+              "real",
+              "true",
+              "false",
+              "array",
+              "object"
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "de_file_number_kind",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 8192,
+            "allowed_values": [
+              "missing",
+              "null",
+              "text",
+              "integer",
+              "real",
+              "true",
+              "false",
+              "array",
+              "object"
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "de_file_number",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "mailing_address_kind",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 8192,
+            "allowed_values": [
+              "missing",
+              "null",
+              "text",
+              "integer",
+              "real",
+              "true",
+              "false",
+              "array",
+              "object"
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "mailing_address_line",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "min_rows": 0,
+        "max_rows": 1000,
+        "max_bytes": 65536
+      },
+      "witnesses": [
+        {
+          "id": "reconciliation-2",
+          "ordinal": 2,
+          "group": "postdeploy-reconciliation",
+          "source_reference": "scripts/lib/founder-reconciliation.ts#current-entity-entries"
+        }
+      ]
+    },
+    {
+      "id": "legacy-entry-count",
+      "sql": "SELECT COUNT(*) AS c FROM dataset_entries de JOIN datasets d ON d.id = de.dataset_id WHERE d.org_id = ?1 AND d.slug = 'company_profile' AND d.is_active = 1 AND de.superseded_at IS NULL AND de.entry_key IN ('entity_profile', 'kansas_entity') AND (json_extract(de.value_json, '$.de_file_number') = '6207278' OR json_extract(de.value_json, '$.de_file_number') = '056207278')",
+      "sha256": "sha256:5cf2e4d20d8b6ef3a6855c2b266c64708a36f104008251728ad9c395a36537eb",
+      "phase": "postdeploy-reconciliation",
+      "requires": [
+        {
+          "query_id": "current-entity-entries",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "parameters": [
+        {
+          "index": 1,
+          "from_query": "resolve-organization",
+          "row_index": 0,
+          "column": "id",
+          "kind": "text",
+          "trim": true,
+          "nonempty": true,
+          "max_bytes": 256
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "c",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "min_rows": 1,
+        "max_rows": 1,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "reconciliation-3",
+          "ordinal": 3,
+          "group": "postdeploy-reconciliation",
+          "source_reference": "scripts/lib/founder-reconciliation.ts#legacy-entry-count"
+        }
+      ]
+    }
+  ]
+}

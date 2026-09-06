@@ -970,7 +970,7 @@ fn selector(name: &str, location: &str) -> SelectorV1 {
     }
 }
 
-fn committed_file(repository: &Path, relative: &Path) -> Result<Vec<u8>> {
+pub(super) fn committed_file(repository: &Path, relative: &Path) -> Result<Vec<u8>> {
     let relative = safe_relative(relative.to_string_lossy().as_ref())?;
     reject_symlinks(repository, &relative)?;
     let worktree = fs::read(repository.join(&relative))
@@ -990,7 +990,7 @@ fn committed_file(repository: &Path, relative: &Path) -> Result<Vec<u8>> {
     Ok(worktree)
 }
 
-fn reject_symlinks(repository: &Path, relative: &Path) -> Result<()> {
+pub(super) fn reject_symlinks(repository: &Path, relative: &Path) -> Result<()> {
     let mut cursor = repository.to_path_buf();
     for component in relative.components() {
         cursor.push(component.as_os_str());
@@ -1006,7 +1006,7 @@ fn reject_symlinks(repository: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-fn safe_relative(value: &str) -> Result<PathBuf> {
+pub(super) fn safe_relative(value: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
     if value.is_empty()
         || path.is_absolute()

@@ -1,0 +1,2553 @@
+{
+  "schema_version": 1,
+  "query_count": 40,
+  "witness_count": 40,
+  "tables": [
+    {
+      "name": "documents",
+      "columns": [
+        "id",
+        "filename",
+        "content_hash",
+        "artifact_signature",
+        "status",
+        "created_at",
+        "expires_at",
+        "artifact_key_id",
+        "artifact_signed_at",
+        "artifact_payload_sha256",
+        "artifact_key_assignment_state"
+      ]
+    },
+    {
+      "name": "signatures",
+      "columns": [
+        "id",
+        "doc_id",
+        "signer_name",
+        "signer_email",
+        "signature_data",
+        "crypto_signature",
+        "position_x",
+        "position_y",
+        "page",
+        "signed_at",
+        "ip_address",
+        "signature_kind",
+        "user_agent",
+        "geo_country",
+        "attestation_text",
+        "signing_key_id",
+        "signed_payload_sha256",
+        "key_assignment_state"
+      ]
+    },
+    {
+      "name": "signature_placements",
+      "columns": [
+        "id",
+        "signature_id",
+        "placement_index",
+        "page",
+        "position_x",
+        "position_y"
+      ]
+    },
+    {
+      "name": "audit_log",
+      "columns": [
+        "id",
+        "doc_id",
+        "action",
+        "metadata",
+        "timestamp",
+        "ip_address",
+        "prev_hash",
+        "leaf_hash"
+      ]
+    },
+    {
+      "name": "audit_segments",
+      "columns": [
+        "segment_id",
+        "merkle_root",
+        "leaf_count",
+        "first_leaf_id",
+        "last_leaf_id",
+        "sealed_at"
+      ]
+    },
+    {
+      "name": "signing_sessions",
+      "columns": [
+        "id",
+        "doc_id",
+        "uploader_email",
+        "recipient_email",
+        "uploader_name",
+        "recipient_name",
+        "uploader_signed",
+        "recipient_signed",
+        "uploader_token",
+        "recipient_token",
+        "status_token",
+        "created_at",
+        "first_signed_at",
+        "completed_at"
+      ]
+    },
+    {
+      "name": "download_tokens",
+      "columns": [
+        "id",
+        "session_id",
+        "email",
+        "token",
+        "expires_at",
+        "download_count",
+        "created_at"
+      ]
+    },
+    {
+      "name": "document_download_tokens",
+      "columns": [
+        "id",
+        "doc_id",
+        "token",
+        "expires_at",
+        "download_count",
+        "created_at"
+      ]
+    },
+    {
+      "name": "my_documents_tokens",
+      "columns": [
+        "id",
+        "email",
+        "token",
+        "expires_at",
+        "created_at"
+      ]
+    },
+    {
+      "name": "signing_keys",
+      "columns": [
+        "key_id",
+        "algorithm",
+        "public_key_b64",
+        "public_key_pem",
+        "fingerprint_sha256",
+        "status",
+        "not_before",
+        "issuance_cutoff_at",
+        "compromised_at",
+        "retired_at",
+        "incident_ref",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    {
+      "name": "sign_schema_migrations",
+      "columns": [
+        "version",
+        "digest_sha256",
+        "applied_at_ts"
+      ]
+    },
+    {
+      "name": "sign_schema_certifications",
+      "columns": [
+        "contract_version",
+        "migration_digest_sha256",
+        "certified_at_ts"
+      ]
+    },
+    {
+      "name": "sign_legacy_key_declaration",
+      "columns": [
+        "singleton",
+        "key_id"
+      ]
+    }
+  ],
+  "functions": [
+    "coalesce",
+    "count",
+    "max",
+    "trim"
+  ],
+  "limits": {
+    "max_total_response_bytes": 16777216,
+    "max_elapsed_seconds": 600,
+    "stop_after_rows_read": 1000000
+  },
+  "queries": [
+    {
+      "id": "S01",
+      "sql": "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') AND (name IN ('audit_log', 'audit_segments', 'document_download_tokens', 'documents', 'download_tokens', 'my_documents_tokens', 'sign_schema_certifications', 'sign_legacy_key_declaration', 'sign_schema_migrations', 'signature_placements', 'signatures', 'signing_keys', 'signing_sessions', 'signatures_fk_rebuild', 'audit_log_fk_rebuild', 'signing_sessions_fk_rebuild', 'signature_placements_fk_rebuild', 'download_tokens_fk_rebuild', 'document_download_tokens_fk_rebuild') OR tbl_name IN ('audit_log', 'audit_segments', 'document_download_tokens', 'documents', 'download_tokens', 'my_documents_tokens', 'sign_schema_certifications', 'sign_legacy_key_declaration', 'sign_schema_migrations', 'signature_placements', 'signatures', 'signing_keys', 'signing_sessions', 'signatures_fk_rebuild', 'audit_log_fk_rebuild', 'signing_sessions_fk_rebuild', 'signature_placements_fk_rebuild', 'download_tokens_fk_rebuild', 'document_download_tokens_fk_rebuild')) ORDER BY type, name;",
+      "sha256": "sha256:ceb7cc713629b59ae271acd2a3f67ce5c39e9dba9af466929187a8aacd82ba95",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "tbl_name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "sql",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-1",
+          "ordinal": 1,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:13-33; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-audit_log",
+      "sql": "PRAGMA table_info(audit_log);",
+      "sha256": "sha256:d638cdf47c380cdb0a445e3c4a0336d8a81ea545152158fabd3e2d84fccbb203",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-2",
+          "ordinal": 2,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-audit_segments",
+      "sql": "PRAGMA table_info(audit_segments);",
+      "sha256": "sha256:23810341099916a7421e206915d27c58207695af190f0a566a45d664e7a5984a",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-3",
+          "ordinal": 3,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-document_download_tokens",
+      "sql": "PRAGMA table_info(document_download_tokens);",
+      "sha256": "sha256:4de0a570b80dc549eb3fe4226a566c56b2ed949c50f86120b24e0de0122ddbff",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-4",
+          "ordinal": 4,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-documents",
+      "sql": "PRAGMA table_info(documents);",
+      "sha256": "sha256:310d1675ff576ea10d4000fc63606ae17edb659318a699624ebec2b407c93b3d",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-5",
+          "ordinal": 5,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-download_tokens",
+      "sql": "PRAGMA table_info(download_tokens);",
+      "sha256": "sha256:bd0ea70012508816e8b6da54a7c2a296a73bf7a74db44c65e913df6b4de44e4e",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-6",
+          "ordinal": 6,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-my_documents_tokens",
+      "sql": "PRAGMA table_info(my_documents_tokens);",
+      "sha256": "sha256:8917315805e5cb951769cf5620132af69f0c9c147dc99b975d3f7723ed21d7e1",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-7",
+          "ordinal": 7,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-sign_schema_certifications",
+      "sql": "PRAGMA table_info(sign_schema_certifications);",
+      "sha256": "sha256:ddf1815a52d26f9874a16cb38a714e4d27e39e09f0d648aef2078a121a120001",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-8",
+          "ordinal": 8,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-sign_legacy_key_declaration",
+      "sql": "PRAGMA table_info(sign_legacy_key_declaration);",
+      "sha256": "sha256:c0801e08954ceb8ffd3ee848c077b7f0f5fd930f321eef191a02ad1efcb2c59c",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-9",
+          "ordinal": 9,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-sign_schema_migrations",
+      "sql": "PRAGMA table_info(sign_schema_migrations);",
+      "sha256": "sha256:04f06e551c4955adaa647ba596999badc6c80a4f9a38ce6d92d217fe72abf320",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-10",
+          "ordinal": 10,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-signature_placements",
+      "sql": "PRAGMA table_info(signature_placements);",
+      "sha256": "sha256:8bea23ba6e34f39d61709784917156bd87ba49a1756024da1520a8ac303e1d78",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-11",
+          "ordinal": 11,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-signatures",
+      "sql": "PRAGMA table_info(signatures);",
+      "sha256": "sha256:a55f5c084668937a0255638f991f59559b4295d2c4888107333d0eac465dfe8d",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-12",
+          "ordinal": 12,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-signing_keys",
+      "sql": "PRAGMA table_info(signing_keys);",
+      "sha256": "sha256:ccbd617dd07cea31d79135e11286cd28994f8292b96e82ccc06a088852757b0d",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-13",
+          "ordinal": 13,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S02-signing_sessions",
+      "sql": "PRAGMA table_info(signing_sessions);",
+      "sha256": "sha256:84c7db5319f4e0b0259db9d22a4644208fc53cbb019da55cf66613bc8596d2de",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-14",
+          "ordinal": 14,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1221,1243; migrations 0001-0005"
+        }
+      ]
+    },
+    {
+      "id": "S03-audit_log",
+      "sql": "PRAGMA foreign_key_list(audit_log);",
+      "sha256": "sha256:e44c7d18930622372ef1f6d10df828c96bfc9055edf1d53ed52e46e69887a40c",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-15",
+          "ordinal": 15,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-audit_segments",
+      "sql": "PRAGMA foreign_key_list(audit_segments);",
+      "sha256": "sha256:4c47e003126d5e45f7e5b0ce4282d64c6e6bf45589556fd1b79001bb97615f31",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-16",
+          "ordinal": 16,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-document_download_tokens",
+      "sql": "PRAGMA foreign_key_list(document_download_tokens);",
+      "sha256": "sha256:354512596c2a2fbbc86236e5be59ae62f311b6418418fa39ca5acceb533b9a43",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-17",
+          "ordinal": 17,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-documents",
+      "sql": "PRAGMA foreign_key_list(documents);",
+      "sha256": "sha256:d24a36d253d60af2ba8e8a44dbd3f1e5174d76673fb9d033256e223715c2b1d5",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-18",
+          "ordinal": 18,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-download_tokens",
+      "sql": "PRAGMA foreign_key_list(download_tokens);",
+      "sha256": "sha256:60dd362ff5cfd3f00fddc1ebed82389ba8f25b4939ce7c54c0410e1f25e7858d",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-19",
+          "ordinal": 19,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-my_documents_tokens",
+      "sql": "PRAGMA foreign_key_list(my_documents_tokens);",
+      "sha256": "sha256:f7754a44899276f2db884866ecedf464cc4be56692979c42d340f239aef8e24f",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-20",
+          "ordinal": 20,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-sign_schema_certifications",
+      "sql": "PRAGMA foreign_key_list(sign_schema_certifications);",
+      "sha256": "sha256:07639d80235b12a875bf03be6bdd56c8edfc1c652ca912b10ba96ce070785926",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-21",
+          "ordinal": 21,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-sign_legacy_key_declaration",
+      "sql": "PRAGMA foreign_key_list(sign_legacy_key_declaration);",
+      "sha256": "sha256:31dc3d50e550aec2cc16c09f99c0ee710defcc8169361a6bd8863e53496d5b4a",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-22",
+          "ordinal": 22,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-sign_schema_migrations",
+      "sql": "PRAGMA foreign_key_list(sign_schema_migrations);",
+      "sha256": "sha256:73c490acef34ed17eb6806e8b6cbfc06965e581eae11fda478dec65ff874d4dc",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-23",
+          "ordinal": 23,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-signature_placements",
+      "sql": "PRAGMA foreign_key_list(signature_placements);",
+      "sha256": "sha256:5e6c6d4f9856ce523964c4dc4ce55c9908957ec42ecc9df8990b76be8e449947",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-24",
+          "ordinal": 24,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-signatures",
+      "sql": "PRAGMA foreign_key_list(signatures);",
+      "sha256": "sha256:ab706a78f049cb30ffd3c1c563ea430e45a1af2a81aae843ba33ec1893d1f959",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-25",
+          "ordinal": 25,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-signing_keys",
+      "sql": "PRAGMA foreign_key_list(signing_keys);",
+      "sha256": "sha256:84251773771c291ca23a2c93a08cadb028137a2465a83f3c24fd71ad4aa1efc9",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-26",
+          "ordinal": 26,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S03-signing_sessions",
+      "sql": "PRAGMA foreign_key_list(signing_sessions);",
+      "sha256": "sha256:18fe54ff7ebbceae0099621adbafea9ba19f7c63226b2b7de1c6db7816d606a2",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-27",
+          "ordinal": 27,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:865-886,908-934,1017-1065"
+        }
+      ]
+    },
+    {
+      "id": "S04",
+      "sql": "PRAGMA foreign_key_check;",
+      "sha256": "sha256:78390848a73c380a618898d9cc8e22f5cb3e5996bae72edd58dc46f699000f56",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "rowid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "parent",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "fkid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-28",
+          "ordinal": 28,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:992-996"
+        }
+      ]
+    },
+    {
+      "id": "S05",
+      "sql": "SELECT version, digest_sha256, applied_at_ts FROM sign_schema_migrations ORDER BY version;",
+      "sha256": "sha256:b6a17c33dbf5794b990942a3a49a415da22ce79d041792f05b486abb31a9247e",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "version",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          },
+          {
+            "name": "digest_sha256",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "applied_at_ts",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-29",
+          "ordinal": 29,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1272-1289; ensure_sign_schema_v1-v5"
+        }
+      ]
+    },
+    {
+      "id": "S06",
+      "sql": "SELECT contract_version, migration_digest_sha256, certified_at_ts FROM sign_schema_certifications ORDER BY contract_version;",
+      "sha256": "sha256:0b2bbcb9788c5eea378faca8b01470edd1307ac0922ffed8846de17714f5cc09",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "contract_version",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "migration_digest_sha256",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "certified_at_ts",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-30",
+          "ordinal": 30,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:888-1014"
+        }
+      ]
+    },
+    {
+      "id": "S07",
+      "sql": "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN ('signatures_assigned_identity_insert', 'signatures_assigned_identity_update', 'documents_artifact_identity_insert', 'documents_artifact_identity_update') ORDER BY name;",
+      "sha256": "sha256:af2e56504359a7f61b62a648c093ce6bec857909a19d83c1b2450c8e49111736",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "sql",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-31",
+          "ordinal": 31,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:1068-1125"
+        }
+      ]
+    },
+    {
+      "id": "S08",
+      "sql": "SELECT 1 AS invalid FROM signatures WHERE key_assignment_state = 'assigned' AND (signing_key_id IS NULL OR trim(signing_key_id) = '' OR signed_payload_sha256 IS NULL OR trim(signed_payload_sha256) = '') LIMIT 1;",
+      "sha256": "sha256:9d20866d5d03a3e71d3e7b0b5ba83e1114b688d67c81cf07c92d113743f6f386",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "invalid",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-32",
+          "ordinal": 32,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:942-985"
+        }
+      ]
+    },
+    {
+      "id": "S09",
+      "sql": "SELECT 1 AS invalid FROM documents WHERE artifact_key_assignment_state IS NULL OR artifact_key_assignment_state NOT IN ('assigned', 'legacy-unverifiable') OR (artifact_key_assignment_state = 'assigned' AND ( artifact_signature IS NULL OR trim(artifact_signature) = '' OR artifact_key_id IS NULL OR trim(artifact_key_id) = '' OR artifact_signed_at IS NULL OR trim(artifact_signed_at) = '' OR artifact_payload_sha256 IS NULL OR trim(artifact_payload_sha256) = '')) OR (artifact_key_assignment_state = 'legacy-unverifiable' AND ( (artifact_signature IS NULL AND ( artifact_key_id IS NOT NULL OR artifact_signed_at IS NOT NULL OR artifact_payload_sha256 IS NOT NULL)) OR (artifact_signature IS NOT NULL AND ( trim(artifact_signature) = '' OR (artifact_key_id IS NOT NULL AND ( trim(artifact_key_id) = '' OR artifact_key_id IS NOT ( SELECT key_id FROM sign_legacy_key_declaration WHERE singleton = 1))) OR artifact_signed_at IS NOT NULL OR artifact_payload_sha256 IS NOT NULL)))) LIMIT 1;",
+      "sha256": "sha256:be7fcf541f985eda5dad6b781f07264b0902abf045f4c555a4c60a6d3c3dbe4d",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "invalid",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-33",
+          "ordinal": 33,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:942-985"
+        }
+      ]
+    },
+    {
+      "id": "S10",
+      "sql": "SELECT key_id, algorithm, public_key_b64, fingerprint_sha256, status, not_before, issuance_cutoff_at, compromised_at, retired_at, incident_ref FROM signing_keys ORDER BY not_before, key_id;",
+      "sha256": "sha256:360a16c39245899abfaf41f43b1c8d180f015154457fbe2f277394c68b6d4dc1",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "key_id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "algorithm",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "public_key_b64",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "fingerprint_sha256",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "status",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "not_before",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "issuance_cutoff_at",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "compromised_at",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "retired_at",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "incident_ref",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-34",
+          "ordinal": 34,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:315-344,378-446,496-506"
+        }
+      ]
+    },
+    {
+      "id": "S11",
+      "sql": "SELECT singleton, key_id FROM sign_legacy_key_declaration ORDER BY singleton;",
+      "sha256": "sha256:bc14feec4df3dc359e8c9c8f30bbe5be4aa479b159c92a4c34a35926f484d6ab",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "singleton",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "key_id",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-35",
+          "ordinal": 35,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:449-480"
+        }
+      ]
+    },
+    {
+      "id": "S12",
+      "sql": "SELECT COUNT(*) AS unbound_legacy_artifacts FROM documents WHERE artifact_signature IS NOT NULL AND artifact_signature <> '' AND artifact_key_id IS NULL;",
+      "sha256": "sha256:98737475ca530b50fa36ead63e040454afc04a741cca8c7a4310678a0fb524e8",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "unbound_legacy_artifacts",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-36",
+          "ordinal": 36,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:466-474"
+        }
+      ]
+    },
+    {
+      "id": "S13",
+      "sql": "SELECT COUNT(*) AS unbound_legacy_signatures FROM signatures WHERE signing_key_id IS NULL;",
+      "sha256": "sha256:6489a4402a45c68199b52fb945230e3e5484d695cafc3f43ca75f1de46a3b26f",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "unbound_legacy_signatures",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-37",
+          "ordinal": 37,
+          "group": "sign-schema",
+          "source_reference": "signing_keys.rs:474-480"
+        }
+      ]
+    },
+    {
+      "id": "S14",
+      "sql": "SELECT 'audit_log' AS table_name, COUNT(*) AS row_count FROM audit_log UNION ALL SELECT 'audit_segments' AS table_name, COUNT(*) AS row_count FROM audit_segments UNION ALL SELECT 'document_download_tokens' AS table_name, COUNT(*) AS row_count FROM document_download_tokens UNION ALL SELECT 'documents' AS table_name, COUNT(*) AS row_count FROM documents UNION ALL SELECT 'download_tokens' AS table_name, COUNT(*) AS row_count FROM download_tokens UNION ALL SELECT 'my_documents_tokens' AS table_name, COUNT(*) AS row_count FROM my_documents_tokens UNION ALL SELECT 'sign_schema_certifications' AS table_name, COUNT(*) AS row_count FROM sign_schema_certifications UNION ALL SELECT 'sign_legacy_key_declaration' AS table_name, COUNT(*) AS row_count FROM sign_legacy_key_declaration UNION ALL SELECT 'sign_schema_migrations' AS table_name, COUNT(*) AS row_count FROM sign_schema_migrations UNION ALL SELECT 'signature_placements' AS table_name, COUNT(*) AS row_count FROM signature_placements UNION ALL SELECT 'signatures' AS table_name, COUNT(*) AS row_count FROM signatures UNION ALL SELECT 'signing_keys' AS table_name, COUNT(*) AS row_count FROM signing_keys UNION ALL SELECT 'signing_sessions' AS table_name, COUNT(*) AS row_count FROM signing_sessions;",
+      "sha256": "sha256:78c42f74853dcc282aceb763680a15b3843b5d774c9812567d039c0ed57380e7",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "table_name",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          },
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-38",
+          "ordinal": 38,
+          "group": "sign-schema",
+          "source_reference": "Migration 0005 copy/drop/rebuild; scripts/lib/d1_backup_manifest.py"
+        }
+      ]
+    },
+    {
+      "id": "S15",
+      "sql": "SELECT MAX(last_leaf_id) AS value FROM audit_segments;",
+      "sha256": "sha256:ef4beb321eebb2377092ef3d6599af4307a7a1de3cd475ccfd756200542cc754",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-39",
+          "ordinal": 39,
+          "group": "sign-schema",
+          "source_reference": "lib.rs:2954-2960"
+        }
+      ]
+    },
+    {
+      "id": "S16",
+      "sql": "SELECT COUNT(*) AS pending_leaf_count FROM audit_log WHERE id > COALESCE((SELECT MAX(last_leaf_id) FROM audit_segments), 0) AND leaf_hash IS NOT NULL;",
+      "sha256": "sha256:d4be139735d99452def328031df62ff984ecdf45f74ab7a96d61bad00b612f0e",
+      "phase": "compiler-coverage",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "pending_leaf_count",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1000,
+        "max_bytes": 16384
+      },
+      "witnesses": [
+        {
+          "id": "sign-40",
+          "ordinal": 40,
+          "group": "sign-schema",
+          "source_reference": "lib.rs:2961-2974; aggregate projection of the same pending-leaf predicate"
+        }
+      ]
+    }
+  ]
+}

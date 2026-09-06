@@ -1,5 +1,8 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
+pub mod d1_read_inventory;
+mod read_query;
+pub use read_query::{AnalyticsQueryKindV1, D1SchemaIntrospectionContractV1, OutputFormatV1};
 mod artifact_digest;
 pub use artifact_digest::{
     R2PrivateObjectDigestContractV1, R2PrivateObjectDigestV1, WORKER_VERSION_ARTIFACT_DIGEST_ID,
@@ -1465,35 +1468,6 @@ fn bounded_email_routing_string(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Output representations that a bounded analytics query may negotiate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputFormatV1 {
-    Json,
-    Ndjson,
-    Csv,
-}
-
-/// The protocol-specific validator and renderer used for an analytics read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AnalyticsQueryKindV1 {
-    StructuredSql,
-    LogExplorerSql,
-    GraphqlAnalytics,
-    WorkersObservability,
-}
-
-/// A fixed, read-only compiler contract for D1 schema assertions. Callers
-/// supply only the closed assertion object declared by the capability request
-/// schema; the executor owns every SQL token sent to Cloudflare.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct D1SchemaIntrospectionContractV1 {
-    pub max_rows: u64,
-    pub max_bytes: u64,
-    pub max_timeout_seconds: u64,
-}
-
 /// Exact post-import schema authority for `MLNavigator` migration 0142.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mln0142PostImportSchemaContractV1 {
@@ -2401,6 +2375,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_evidence: Option<WorkspaceD1EvidenceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_d1_read_inventory: Option<d1_read_inventory::WorkspaceD1ReadInventoryContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_file_upload: Option<R2PrivateFileUploadContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_private_object_digest: Option<R2PrivateObjectDigestContractV1>,
@@ -2552,6 +2528,7 @@ impl CapabilityV1 {
             workspace_d1_reply_admission: None,
             workspace_reply_subdomain_ingress: None,
             workspace_d1_evidence: None,
+            workspace_d1_read_inventory: None,
             r2_private_file_upload: None,
             r2_private_object_digest: None,
             email_sending_dns_repair: None,

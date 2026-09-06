@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "query_count": 2,
+  "witness_count": 2,
+  "tables": [
+    {
+      "name": "items",
+      "columns": [
+        "id",
+        "status"
+      ]
+    }
+  ],
+  "functions": [
+    "count"
+  ],
+  "limits": {
+    "max_total_response_bytes": 32768,
+    "max_elapsed_seconds": 60,
+    "stop_after_rows_read": 10000
+  },
+  "queries": [
+    {
+      "id": "table",
+      "sql": "SELECT name FROM sqlite_master WHERE type='table' AND name='items';",
+      "sha256": "sha256:899373db79aa0d9753d95e2ecdc063e7abe83471eb21673d05dfb19571bcf95c",
+      "phase": "prerequisites",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 128,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 10,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "table",
+          "ordinal": 1,
+          "group": "example",
+          "source_reference": "source.txt"
+        }
+      ]
+    },
+    {
+      "id": "count",
+      "sql": "DELETE FROM items;",
+      "sha256": "sha256:be20aa770e655af6b4e2e4c32f1635531ef0cbd6b4c21224f1829313e29a8a7f",
+      "phase": "prerequisites",
+      "requires": [
+        {
+          "query_id": "table",
+          "column": "name",
+          "equals": "items"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "n",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 10,
+        "max_bytes": 8192
+      },
+      "witnesses": [
+        {
+          "id": "count",
+          "ordinal": 2,
+          "group": "example",
+          "source_reference": "source.txt"
+        }
+      ]
+    }
+  ]
+}

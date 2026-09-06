@@ -1,0 +1,13 @@
+schema_version = 1
+
+[[operation]]
+id = "example.d1-read-inventory"
+title = "Read example prerequisites"
+description = "Synthetic metadata and aggregate read example."
+account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+database_id = "11111111-2222-4333-8444-555555555555"
+profile_id = "example-read"
+source_revision = "SOURCE_COMMIT_40_HEX"
+inventory_path = "inventory.json"
+inventory_sha256 = "sha256:005384ac31fec382b3f592a56d99d6cfd78032443862482e224fd0576a1d2736"
+source = [{ path = "source.txt", sha256 = "sha256:ec809354a9e458cfe45755e2a9887885b496d11957f67f8cd25daea5ba374985" }]

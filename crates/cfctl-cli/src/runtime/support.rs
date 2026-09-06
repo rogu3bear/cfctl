@@ -186,10 +186,17 @@ pub(super) fn load_workspace_capability(
     store: &StateStore,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    Ok(cfctl_workspace::load_workspace_operation_capability(
+    let capability = cfctl_workspace::load_workspace_operation_capability(
         &store.workspace_roots()?,
         capability_id,
-    )?)
+    )?;
+    if let Some(contract) = capability
+        .as_ref()
+        .and_then(|c| c.workspace_d1_read_inventory.as_ref())
+    {
+        cfctl_cloudflare::d1_read_inventory::validate_inventory(&contract.inventory)?;
+    }
+    Ok(capability)
 }
 
 pub(super) fn is_secret_path(path: &Path) -> bool {

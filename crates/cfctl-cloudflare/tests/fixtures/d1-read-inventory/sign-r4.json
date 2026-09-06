@@ -1,0 +1,4076 @@
+{
+  "schema_version": 1,
+  "query_count": 54,
+  "witness_count": 54,
+  "tables": [
+    {
+      "name": "documents",
+      "columns": [
+        "id",
+        "filename",
+        "content_hash",
+        "artifact_signature",
+        "status",
+        "created_at",
+        "expires_at",
+        "artifact_key_id",
+        "artifact_signed_at",
+        "artifact_payload_sha256",
+        "artifact_key_assignment_state"
+      ]
+    },
+    {
+      "name": "signatures",
+      "columns": [
+        "id",
+        "doc_id",
+        "signer_name",
+        "signer_email",
+        "signature_data",
+        "crypto_signature",
+        "position_x",
+        "position_y",
+        "page",
+        "signed_at",
+        "ip_address",
+        "signature_kind",
+        "user_agent",
+        "geo_country",
+        "attestation_text",
+        "signing_key_id",
+        "signed_payload_sha256",
+        "key_assignment_state"
+      ]
+    },
+    {
+      "name": "signature_placements",
+      "columns": [
+        "id",
+        "signature_id",
+        "placement_index",
+        "page",
+        "position_x",
+        "position_y"
+      ]
+    },
+    {
+      "name": "audit_log",
+      "columns": [
+        "id",
+        "doc_id",
+        "action",
+        "metadata",
+        "timestamp",
+        "ip_address",
+        "prev_hash",
+        "leaf_hash"
+      ]
+    },
+    {
+      "name": "audit_segments",
+      "columns": [
+        "segment_id",
+        "merkle_root",
+        "leaf_count",
+        "first_leaf_id",
+        "last_leaf_id",
+        "sealed_at"
+      ]
+    },
+    {
+      "name": "signing_sessions",
+      "columns": [
+        "id",
+        "doc_id",
+        "uploader_email",
+        "recipient_email",
+        "uploader_name",
+        "recipient_name",
+        "uploader_signed",
+        "recipient_signed",
+        "uploader_token",
+        "recipient_token",
+        "status_token",
+        "created_at",
+        "first_signed_at",
+        "completed_at"
+      ]
+    },
+    {
+      "name": "download_tokens",
+      "columns": [
+        "id",
+        "session_id",
+        "email",
+        "token",
+        "expires_at",
+        "download_count",
+        "created_at"
+      ]
+    },
+    {
+      "name": "document_download_tokens",
+      "columns": [
+        "id",
+        "doc_id",
+        "token",
+        "expires_at",
+        "download_count",
+        "created_at"
+      ]
+    },
+    {
+      "name": "my_documents_tokens",
+      "columns": [
+        "id",
+        "email",
+        "token",
+        "expires_at",
+        "created_at"
+      ]
+    },
+    {
+      "name": "signing_keys",
+      "columns": [
+        "key_id",
+        "algorithm",
+        "public_key_b64",
+        "public_key_pem",
+        "fingerprint_sha256",
+        "status",
+        "not_before",
+        "issuance_cutoff_at",
+        "compromised_at",
+        "retired_at",
+        "incident_ref",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    {
+      "name": "sign_schema_migrations",
+      "columns": [
+        "version",
+        "digest_sha256",
+        "applied_at_ts"
+      ]
+    },
+    {
+      "name": "sign_schema_certifications",
+      "columns": [
+        "contract_version",
+        "migration_digest_sha256",
+        "certified_at_ts"
+      ]
+    },
+    {
+      "name": "sign_legacy_key_declaration",
+      "columns": [
+        "singleton",
+        "key_id"
+      ]
+    }
+  ],
+  "functions": [
+    "coalesce",
+    "count",
+    "max",
+    "trim"
+  ],
+  "limits": {
+    "max_total_response_bytes": 2097152,
+    "max_elapsed_seconds": 180,
+    "stop_after_rows_read": 100000
+  },
+  "queries": [
+    {
+      "id": "S01",
+      "sql": "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name;",
+      "sha256": "sha256:aaa2393fe741654ef2e7096a3bedd87a846557ae1336cd0230945b2b78084519",
+      "phase": "schema",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": [
+              "table",
+              "index",
+              "trigger"
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "tbl_name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "sql",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 200,
+        "max_bytes": 65536,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S01",
+          "ordinal": 1,
+          "group": "schema",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-audit_log",
+      "sql": "PRAGMA table_info(audit_log);",
+      "sha256": "sha256:d638cdf47c380cdb0a445e3c4a0336d8a81ea545152158fabd3e2d84fccbb203",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-audit_log",
+          "ordinal": 2,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-audit_segments",
+      "sql": "PRAGMA table_info(audit_segments);",
+      "sha256": "sha256:23810341099916a7421e206915d27c58207695af190f0a566a45d664e7a5984a",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-audit_segments",
+          "ordinal": 3,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-document_download_tokens",
+      "sql": "PRAGMA table_info(document_download_tokens);",
+      "sha256": "sha256:4de0a570b80dc549eb3fe4226a566c56b2ed949c50f86120b24e0de0122ddbff",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-document_download_tokens",
+          "ordinal": 4,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-documents",
+      "sql": "PRAGMA table_info(documents);",
+      "sha256": "sha256:310d1675ff576ea10d4000fc63606ae17edb659318a699624ebec2b407c93b3d",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-documents",
+          "ordinal": 5,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-download_tokens",
+      "sql": "PRAGMA table_info(download_tokens);",
+      "sha256": "sha256:bd0ea70012508816e8b6da54a7c2a296a73bf7a74db44c65e913df6b4de44e4e",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-download_tokens",
+          "ordinal": 6,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-my_documents_tokens",
+      "sql": "PRAGMA table_info(my_documents_tokens);",
+      "sha256": "sha256:8917315805e5cb951769cf5620132af69f0c9c147dc99b975d3f7723ed21d7e1",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-my_documents_tokens",
+          "ordinal": 7,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-sign_schema_certifications",
+      "sql": "PRAGMA table_info(sign_schema_certifications);",
+      "sha256": "sha256:ddf1815a52d26f9874a16cb38a714e4d27e39e09f0d648aef2078a121a120001",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-sign_schema_certifications",
+          "ordinal": 8,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-sign_legacy_key_declaration",
+      "sql": "PRAGMA table_info(sign_legacy_key_declaration);",
+      "sha256": "sha256:c0801e08954ceb8ffd3ee848c077b7f0f5fd930f321eef191a02ad1efcb2c59c",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-sign_legacy_key_declaration",
+          "ordinal": 9,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-sign_schema_migrations",
+      "sql": "PRAGMA table_info(sign_schema_migrations);",
+      "sha256": "sha256:04f06e551c4955adaa647ba596999badc6c80a4f9a38ce6d92d217fe72abf320",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-sign_schema_migrations",
+          "ordinal": 10,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-signature_placements",
+      "sql": "PRAGMA table_info(signature_placements);",
+      "sha256": "sha256:8bea23ba6e34f39d61709784917156bd87ba49a1756024da1520a8ac303e1d78",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-signature_placements",
+          "ordinal": 11,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-signatures",
+      "sql": "PRAGMA table_info(signatures);",
+      "sha256": "sha256:a55f5c084668937a0255638f991f59559b4295d2c4888107333d0eac465dfe8d",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-signatures",
+          "ordinal": 12,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-signing_keys",
+      "sql": "PRAGMA table_info(signing_keys);",
+      "sha256": "sha256:ccbd617dd07cea31d79135e11286cd28994f8292b96e82ccc06a088852757b0d",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-signing_keys",
+          "ordinal": 13,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S02-signing_sessions",
+      "sql": "PRAGMA table_info(signing_sessions);",
+      "sha256": "sha256:84c7db5319f4e0b0259db9d22a4644208fc53cbb019da55cf66613bc8596d2de",
+      "phase": "columns",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "cid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "type",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "notnull",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              0,
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "dflt_value",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "pk",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S02-signing_sessions",
+          "ordinal": 14,
+          "group": "columns",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs; migrations 0001-0005"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-audit_log",
+      "sql": "PRAGMA foreign_key_list(audit_log);",
+      "sha256": "sha256:e44c7d18930622372ef1f6d10df828c96bfc9055edf1d53ed52e46e69887a40c",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-audit_log",
+          "ordinal": 15,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-audit_segments",
+      "sql": "PRAGMA foreign_key_list(audit_segments);",
+      "sha256": "sha256:4c47e003126d5e45f7e5b0ce4282d64c6e6bf45589556fd1b79001bb97615f31",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-audit_segments",
+          "ordinal": 16,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-document_download_tokens",
+      "sql": "PRAGMA foreign_key_list(document_download_tokens);",
+      "sha256": "sha256:354512596c2a2fbbc86236e5be59ae62f311b6418418fa39ca5acceb533b9a43",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-document_download_tokens",
+          "ordinal": 17,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-documents",
+      "sql": "PRAGMA foreign_key_list(documents);",
+      "sha256": "sha256:d24a36d253d60af2ba8e8a44dbd3f1e5174d76673fb9d033256e223715c2b1d5",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-documents",
+          "ordinal": 18,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-download_tokens",
+      "sql": "PRAGMA foreign_key_list(download_tokens);",
+      "sha256": "sha256:60dd362ff5cfd3f00fddc1ebed82389ba8f25b4939ce7c54c0410e1f25e7858d",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-download_tokens",
+          "ordinal": 19,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-my_documents_tokens",
+      "sql": "PRAGMA foreign_key_list(my_documents_tokens);",
+      "sha256": "sha256:f7754a44899276f2db884866ecedf464cc4be56692979c42d340f239aef8e24f",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-my_documents_tokens",
+          "ordinal": 20,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-sign_schema_certifications",
+      "sql": "PRAGMA foreign_key_list(sign_schema_certifications);",
+      "sha256": "sha256:07639d80235b12a875bf03be6bdd56c8edfc1c652ca912b10ba96ce070785926",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-sign_schema_certifications",
+          "ordinal": 21,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-sign_legacy_key_declaration",
+      "sql": "PRAGMA foreign_key_list(sign_legacy_key_declaration);",
+      "sha256": "sha256:31dc3d50e550aec2cc16c09f99c0ee710defcc8169361a6bd8863e53496d5b4a",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-sign_legacy_key_declaration",
+          "ordinal": 22,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-sign_schema_migrations",
+      "sql": "PRAGMA foreign_key_list(sign_schema_migrations);",
+      "sha256": "sha256:73c490acef34ed17eb6806e8b6cbfc06965e581eae11fda478dec65ff874d4dc",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-sign_schema_migrations",
+          "ordinal": 23,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-signature_placements",
+      "sql": "PRAGMA foreign_key_list(signature_placements);",
+      "sha256": "sha256:5e6c6d4f9856ce523964c4dc4ce55c9908957ec42ecc9df8990b76be8e449947",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-signature_placements",
+          "ordinal": 24,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-signatures",
+      "sql": "PRAGMA foreign_key_list(signatures);",
+      "sha256": "sha256:ab706a78f049cb30ffd3c1c563ea430e45a1af2a81aae843ba33ec1893d1f959",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-signatures",
+          "ordinal": 25,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-signing_keys",
+      "sql": "PRAGMA foreign_key_list(signing_keys);",
+      "sha256": "sha256:84251773771c291ca23a2c93a08cadb028137a2465a83f3c24fd71ad4aa1efc9",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-signing_keys",
+          "ordinal": 26,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S03-signing_sessions",
+      "sql": "PRAGMA foreign_key_list(signing_sessions);",
+      "sha256": "sha256:18fe54ff7ebbceae0099621adbafea9ba19f7c63226b2b7de1c6db7816d606a2",
+      "phase": "foreign_keys",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "id",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "from",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "to",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_update",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "on_delete",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "match",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S03-signing_sessions",
+          "ordinal": 27,
+          "group": "foreign_keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S04",
+      "sql": "PRAGMA foreign_key_check;",
+      "sha256": "sha256:78390848a73c380a618898d9cc8e22f5cb3e5996bae72edd58dc46f699000f56",
+      "phase": "integrity",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "table",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "rowid",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "parent",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "fkid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 65536,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S04",
+          "ordinal": 28,
+          "group": "integrity",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S05",
+      "sql": "SELECT version, digest_sha256, applied_at_ts FROM sign_schema_migrations ORDER BY version;",
+      "sha256": "sha256:b6a17c33dbf5794b990942a3a49a415da22ce79d041792f05b486abb31a9247e",
+      "phase": "receipts",
+      "requires": [
+        {
+          "query_id": "S02-sign_schema_migrations",
+          "column": "name",
+          "equals": "version"
+        },
+        {
+          "query_id": "S02-sign_schema_migrations",
+          "column": "name",
+          "equals": "digest_sha256"
+        },
+        {
+          "query_id": "S02-sign_schema_migrations",
+          "column": "name",
+          "equals": "applied_at_ts"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "version",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "digest_sha256",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 128,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "applied_at_ts",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S05",
+          "ordinal": 29,
+          "group": "receipts",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs::ensure_sign_schema_v1 through ensure_sign_schema_v6 and sign_schema_receipt"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S06",
+      "sql": "SELECT contract_version, migration_digest_sha256, certified_at_ts FROM sign_schema_certifications ORDER BY contract_version;",
+      "sha256": "sha256:0b2bbcb9788c5eea378faca8b01470edd1307ac0922ffed8846de17714f5cc09",
+      "phase": "receipts",
+      "requires": [
+        {
+          "query_id": "S02-sign_schema_certifications",
+          "column": "name",
+          "equals": "contract_version"
+        },
+        {
+          "query_id": "S02-sign_schema_certifications",
+          "column": "name",
+          "equals": "migration_digest_sha256"
+        },
+        {
+          "query_id": "S02-sign_schema_certifications",
+          "column": "name",
+          "equals": "certified_at_ts"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "contract_version",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "migration_digest_sha256",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 128,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "certified_at_ts",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S06",
+          "ordinal": 30,
+          "group": "receipts",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S07",
+      "sql": "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN ('signatures_assigned_identity_insert', 'signatures_assigned_identity_update', 'documents_artifact_identity_insert', 'documents_artifact_identity_update', 'signatures_versioned_insert') ORDER BY name;",
+      "sha256": "sha256:231fa5e3c258b6690b020ab0a18c43c9fb9c60955735234a3124b6b4d9014004",
+      "phase": "guards",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": null,
+          "equals": null
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "sql",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 8192,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 5,
+        "max_bytes": 65536,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S07",
+          "ordinal": 31,
+          "group": "guards",
+          "source_reference": "signing_keys.rs::require_sign_write_guard_contract_at_version; canonical 0004 and 0006"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S08",
+      "sql": "SELECT 1 AS invalid FROM signatures WHERE key_assignment_state = 'assigned' AND (signing_key_id IS NULL OR trim(signing_key_id) = '' OR signed_payload_sha256 IS NULL OR trim(signed_payload_sha256) = '') LIMIT 1;",
+      "sha256": "sha256:9d20866d5d03a3e71d3e7b0b5ba83e1114b688d67c81cf07c92d113743f6f386",
+      "phase": "integrity",
+      "requires": [
+        {
+          "query_id": "S02-signatures",
+          "column": "name",
+          "equals": "key_assignment_state"
+        },
+        {
+          "query_id": "S02-signatures",
+          "column": "name",
+          "equals": "signing_key_id"
+        },
+        {
+          "query_id": "S02-signatures",
+          "column": "name",
+          "equals": "signed_payload_sha256"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "invalid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S08",
+          "ordinal": 32,
+          "group": "integrity",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S09",
+      "sql": "SELECT 1 AS invalid FROM documents WHERE artifact_key_assignment_state IS NULL OR artifact_key_assignment_state NOT IN ('assigned', 'legacy-unverifiable') OR (artifact_key_assignment_state = 'assigned' AND ( artifact_signature IS NULL OR trim(artifact_signature) = '' OR artifact_key_id IS NULL OR trim(artifact_key_id) = '' OR artifact_signed_at IS NULL OR trim(artifact_signed_at) = '' OR artifact_payload_sha256 IS NULL OR trim(artifact_payload_sha256) = '')) OR (artifact_key_assignment_state = 'legacy-unverifiable' AND ( (artifact_signature IS NULL AND ( artifact_key_id IS NOT NULL OR artifact_signed_at IS NOT NULL OR artifact_payload_sha256 IS NOT NULL)) OR (artifact_signature IS NOT NULL AND ( trim(artifact_signature) = '' OR (artifact_key_id IS NOT NULL AND ( trim(artifact_key_id) = '' OR artifact_key_id IS NOT ( SELECT key_id FROM sign_legacy_key_declaration WHERE singleton = 1))) OR artifact_signed_at IS NOT NULL OR artifact_payload_sha256 IS NOT NULL)))) LIMIT 1;",
+      "sha256": "sha256:be7fcf541f985eda5dad6b781f07264b0902abf045f4c555a4c60a6d3c3dbe4d",
+      "phase": "integrity",
+      "requires": [
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_key_assignment_state"
+        },
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_signature"
+        },
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_key_id"
+        },
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_signed_at"
+        },
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_payload_sha256"
+        },
+        {
+          "query_id": "S02-sign_legacy_key_declaration",
+          "column": "name",
+          "equals": "singleton"
+        },
+        {
+          "query_id": "S02-sign_legacy_key_declaration",
+          "column": "name",
+          "equals": "key_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "invalid",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": [
+              1
+            ],
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S09",
+          "ordinal": 33,
+          "group": "integrity",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S10",
+      "sql": "SELECT key_id, algorithm, public_key_b64, fingerprint_sha256, status, not_before, issuance_cutoff_at, compromised_at, retired_at, incident_ref FROM signing_keys ORDER BY not_before, key_id;",
+      "sha256": "sha256:360a16c39245899abfaf41f43b1c8d180f015154457fbe2f277394c68b6d4dc1",
+      "phase": "keys",
+      "requires": [
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "key_id"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "algorithm"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "public_key_b64"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "fingerprint_sha256"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "status"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "not_before"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "issuance_cutoff_at"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "compromised_at"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "retired_at"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "incident_ref"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "key_id",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "algorithm",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "public_key_b64",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 128,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "fingerprint_sha256",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 128,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "status",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "not_before",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "issuance_cutoff_at",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "compromised_at",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "retired_at",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "incident_ref",
+            "kind": "text",
+            "nullable": true,
+            "max_bytes": 2048,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 128,
+        "max_bytes": 65536,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S10",
+          "ordinal": 34,
+          "group": "keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S11",
+      "sql": "SELECT singleton, key_id FROM sign_legacy_key_declaration ORDER BY singleton;",
+      "sha256": "sha256:bc14feec4df3dc359e8c9c8f30bbe5be4aa479b159c92a4c34a35926f484d6ab",
+      "phase": "keys",
+      "requires": [
+        {
+          "query_id": "S02-sign_legacy_key_declaration",
+          "column": "name",
+          "equals": "singleton"
+        },
+        {
+          "query_id": "S02-sign_legacy_key_declaration",
+          "column": "name",
+          "equals": "key_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "singleton",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "key_id",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S11",
+          "ordinal": 35,
+          "group": "keys",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S12",
+      "sql": "SELECT COUNT(*) AS unbound_legacy_artifacts FROM documents WHERE artifact_signature IS NOT NULL AND artifact_signature <> '' AND artifact_key_id IS NULL;",
+      "sha256": "sha256:98737475ca530b50fa36ead63e040454afc04a741cca8c7a4310678a0fb524e8",
+      "phase": "counts",
+      "requires": [
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_signature"
+        },
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "artifact_key_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "unbound_legacy_artifacts",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S12",
+          "ordinal": 36,
+          "group": "counts",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S13",
+      "sql": "SELECT COUNT(*) AS unbound_legacy_signatures FROM signatures WHERE signing_key_id IS NULL;",
+      "sha256": "sha256:6489a4402a45c68199b52fb945230e3e5484d695cafc3f43ca75f1de46a3b26f",
+      "phase": "counts",
+      "requires": [
+        {
+          "query_id": "S02-signatures",
+          "column": "name",
+          "equals": "signing_key_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "unbound_legacy_signatures",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S13",
+          "ordinal": 37,
+          "group": "counts",
+          "source_reference": "cloudflare/sign-worker/src/signing_keys.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14",
+      "sql": "SELECT 'audit_log' AS table_name, COUNT(*) AS row_count FROM audit_log UNION ALL SELECT 'audit_segments' AS table_name, COUNT(*) AS row_count FROM audit_segments UNION ALL SELECT 'document_download_tokens' AS table_name, COUNT(*) AS row_count FROM document_download_tokens UNION ALL SELECT 'documents' AS table_name, COUNT(*) AS row_count FROM documents UNION ALL SELECT 'download_tokens' AS table_name, COUNT(*) AS row_count FROM download_tokens UNION ALL SELECT 'my_documents_tokens' AS table_name, COUNT(*) AS row_count FROM my_documents_tokens UNION ALL SELECT 'sign_schema_certifications' AS table_name, COUNT(*) AS row_count FROM sign_schema_certifications UNION ALL SELECT 'sign_legacy_key_declaration' AS table_name, COUNT(*) AS row_count FROM sign_legacy_key_declaration UNION ALL SELECT 'sign_schema_migrations' AS table_name, COUNT(*) AS row_count FROM sign_schema_migrations UNION ALL SELECT 'signature_placements' AS table_name, COUNT(*) AS row_count FROM signature_placements UNION ALL SELECT 'signatures' AS table_name, COUNT(*) AS row_count FROM signatures UNION ALL SELECT 'signing_keys' AS table_name, COUNT(*) AS row_count FROM signing_keys UNION ALL SELECT 'signing_sessions' AS table_name, COUNT(*) AS row_count FROM signing_sessions;",
+      "sha256": "sha256:78c42f74853dcc282aceb763680a15b3843b5d774c9812567d039c0ed57380e7",
+      "phase": "counts",
+      "requires": [
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-signatures",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-signature_placements",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-audit_log",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-audit_segments",
+          "column": "name",
+          "equals": "segment_id"
+        },
+        {
+          "query_id": "S02-signing_sessions",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-download_tokens",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-document_download_tokens",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-my_documents_tokens",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "key_id"
+        },
+        {
+          "query_id": "S02-sign_schema_migrations",
+          "column": "name",
+          "equals": "version"
+        },
+        {
+          "query_id": "S02-sign_schema_certifications",
+          "column": "name",
+          "equals": "contract_version"
+        },
+        {
+          "query_id": "S02-sign_legacy_key_declaration",
+          "column": "name",
+          "equals": "singleton"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "table_name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 13,
+        "max_bytes": 32768,
+        "min_rows": 13
+      },
+      "witnesses": [
+        {
+          "id": "S14",
+          "ordinal": 38,
+          "group": "counts",
+          "source_reference": "Migration 0005 copy/drop/rebuild; scripts/lib/d1_backup_manifest.py"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S15",
+      "sql": "SELECT MAX(last_leaf_id) AS value FROM audit_segments;",
+      "sha256": "sha256:ef4beb321eebb2377092ef3d6599af4307a7a1de3cd475ccfd756200542cc754",
+      "phase": "audit",
+      "requires": [
+        {
+          "query_id": "S02-audit_segments",
+          "column": "name",
+          "equals": "last_leaf_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "value",
+            "kind": "integer",
+            "nullable": true,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S15",
+          "ordinal": 39,
+          "group": "audit",
+          "source_reference": "cloudflare/sign-worker/src/lib.rs"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S16",
+      "sql": "SELECT COUNT(*) AS pending_leaf_count FROM audit_log WHERE id > COALESCE((SELECT MAX(last_leaf_id) FROM audit_segments), 0) AND leaf_hash IS NOT NULL;",
+      "sha256": "sha256:d4be139735d99452def328031df62ff984ecdf45f74ab7a96d61bad00b612f0e",
+      "phase": "audit",
+      "requires": [
+        {
+          "query_id": "S02-audit_log",
+          "column": "name",
+          "equals": "id"
+        },
+        {
+          "query_id": "S02-audit_log",
+          "column": "name",
+          "equals": "leaf_hash"
+        },
+        {
+          "query_id": "S02-audit_segments",
+          "column": "name",
+          "equals": "last_leaf_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "pending_leaf_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 32768,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S16",
+          "ordinal": 40,
+          "group": "audit",
+          "source_reference": "cloudflare/sign-worker/src/lib.rs; aggregate projection of the same pending-leaf predicate"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S17",
+      "sql": "SELECT name, seq FROM sqlite_sequence WHERE name IN ('signatures', 'audit_log', 'signature_placements') ORDER BY name;",
+      "sha256": "sha256:0f10e101e8e844739f947b18b93cb6f09d05d9d482add180a9a31fd0e40f2ea3",
+      "phase": "counts",
+      "requires": [
+        {
+          "query_id": "S01",
+          "column": "name",
+          "equals": "sqlite_sequence"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 256,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          },
+          {
+            "name": "seq",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": null,
+            "max_integer": null
+          }
+        ],
+        "max_rows": 3,
+        "max_bytes": 32768,
+        "min_rows": 0
+      },
+      "witnesses": [
+        {
+          "id": "S17",
+          "ordinal": 41,
+          "group": "counts",
+          "source_reference": "cloudflare/sign-worker/src/sign_v5_preserve_children.sql and sign_v5_restore_children.sql"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-documents",
+      "sql": "SELECT COUNT(*) AS row_count FROM documents;",
+      "sha256": "sha256:7e32c37758ad79e75c91a6872b63065d919a6c46c17f69901dfce57d32a4c87a",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-documents",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-documents",
+          "ordinal": 42,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-signatures",
+      "sql": "SELECT COUNT(*) AS row_count FROM signatures;",
+      "sha256": "sha256:443b01ef95899d0db38b03087f5905f15274e663785d37b899a04c2dcc066d7d",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-signatures",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-signatures",
+          "ordinal": 43,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-signature_placements",
+      "sql": "SELECT COUNT(*) AS row_count FROM signature_placements;",
+      "sha256": "sha256:578fc376f01719cede968d258e25e7c9f6c3d14f4711543ca684b6440e768403",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-signature_placements",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-signature_placements",
+          "ordinal": 44,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-audit_log",
+      "sql": "SELECT COUNT(*) AS row_count FROM audit_log;",
+      "sha256": "sha256:614b5e5eed19e8b7cf4c6936f5751157b867153edbb6ec5b60a11797b2411b9e",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-audit_log",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-audit_log",
+          "ordinal": 45,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-audit_segments",
+      "sql": "SELECT COUNT(*) AS row_count FROM audit_segments;",
+      "sha256": "sha256:efeaa73cb361935713dce52d55ed46f8e43f7e3c86bf0c303d1fa273a6ed3a8f",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-audit_segments",
+          "column": "name",
+          "equals": "segment_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-audit_segments",
+          "ordinal": 46,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-signing_sessions",
+      "sql": "SELECT COUNT(*) AS row_count FROM signing_sessions;",
+      "sha256": "sha256:d36278707fb10ed21dcbe72244d06daf98c412484102ca3203a893b43bb02e03",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-signing_sessions",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-signing_sessions",
+          "ordinal": 47,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-download_tokens",
+      "sql": "SELECT COUNT(*) AS row_count FROM download_tokens;",
+      "sha256": "sha256:3db0fc6f97adabb6892989f8d94ec0ff685b9d6ae4910e50f4b785e16edf8d2e",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-download_tokens",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-download_tokens",
+          "ordinal": 48,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-document_download_tokens",
+      "sql": "SELECT COUNT(*) AS row_count FROM document_download_tokens;",
+      "sha256": "sha256:1357114629c4f14cce46806dbd00be14101d72e216e3b14275c2b9de62f1dfb5",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-document_download_tokens",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-document_download_tokens",
+          "ordinal": 49,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-my_documents_tokens",
+      "sql": "SELECT COUNT(*) AS row_count FROM my_documents_tokens;",
+      "sha256": "sha256:f4aeb5a1ce0e95924717e34d779af55ff15a70a90c7554984ded06b6bcd3ae3a",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-my_documents_tokens",
+          "column": "name",
+          "equals": "id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-my_documents_tokens",
+          "ordinal": 50,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-signing_keys",
+      "sql": "SELECT COUNT(*) AS row_count FROM signing_keys;",
+      "sha256": "sha256:21c30e1e19d19851d6e61e49a73f1fc326c1f02d559917214101b33b68b59506",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-signing_keys",
+          "column": "name",
+          "equals": "key_id"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-signing_keys",
+          "ordinal": 51,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-sign_schema_migrations",
+      "sql": "SELECT COUNT(*) AS row_count FROM sign_schema_migrations;",
+      "sha256": "sha256:81cb04f95ceab75d15edc48340d85a8bd2ebc369fea5f91507bb76d7c969db1c",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-sign_schema_migrations",
+          "column": "name",
+          "equals": "version"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-sign_schema_migrations",
+          "ordinal": 52,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-sign_schema_certifications",
+      "sql": "SELECT COUNT(*) AS row_count FROM sign_schema_certifications;",
+      "sha256": "sha256:9ecb38dc281e42b9971b9c62d04aff1694725a05d037b9da1551342697fd77b8",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-sign_schema_certifications",
+          "column": "name",
+          "equals": "contract_version"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-sign_schema_certifications",
+          "ordinal": 53,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    },
+    {
+      "id": "S14-sign_legacy_key_declaration",
+      "sql": "SELECT COUNT(*) AS row_count FROM sign_legacy_key_declaration;",
+      "sha256": "sha256:7e0d7958be29678696cae2d8937727a32fe34c1830ac1dd34d0b46bfcc4caac0",
+      "phase": "legacy_counts",
+      "requires": [
+        {
+          "query_id": "S02-sign_legacy_key_declaration",
+          "column": "name",
+          "equals": "singleton"
+        }
+      ],
+      "output": {
+        "columns": [
+          {
+            "name": "row_count",
+            "kind": "integer",
+            "nullable": false,
+            "max_bytes": null,
+            "allowed_values": null,
+            "min_integer": 0,
+            "max_integer": 9007199254740991
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 4096,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "S14-sign_legacy_key_declaration",
+          "ordinal": 54,
+          "group": "legacy_counts",
+          "source_reference": "infra/persistence.json; cloudflare/sign-worker/src/signing_keys.rs; S14 independent table count"
+        }
+      ],
+      "parameters": []
+    }
+  ]
+}

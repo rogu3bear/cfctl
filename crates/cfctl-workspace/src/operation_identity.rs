@@ -20,6 +20,7 @@ pub fn load_workspace_operation_capability(
         super::d1_operation::load_selected,
         super::d1_policy_projection::load_selected,
         super::d1_reply_admission::load_selected,
+        super::d1_reads::load_selected,
     ] {
         if let Some(capability) = loader(&candidates, capability_id)? {
             return Ok(Some(capability));

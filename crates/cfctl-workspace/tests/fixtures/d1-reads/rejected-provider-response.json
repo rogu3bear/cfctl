@@ -1,0 +1,24 @@
+{
+  "success": true,
+  "errors": [],
+  "messages": [],
+  "result": [
+    {
+      "success": true,
+      "results": [
+        {
+          "name": "items",
+          "private_value": "UNAPPROVED_ROW_MATERIAL"
+        }
+      ],
+      "meta": {
+        "rows_read": 1,
+        "rows_written": 0,
+        "changes": 0,
+        "changed_db": false,
+        "duration": 0.1,
+        "total_attempts": 1
+      }
+    }
+  ]
+}

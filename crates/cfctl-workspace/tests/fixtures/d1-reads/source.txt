@@ -1,0 +1,1 @@
+Synthetic source fixture for the public reviewed D1 read contract.

@@ -590,6 +590,22 @@ pub(super) async fn execute_read(
     r2_credentials: Option<&R2LogRetrievalCredentials>,
     reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
+    if capability.workspace_d1_read_inventory.is_some() {
+        if output_path.is_some() || r2_credentials.is_some() || reply_admission_source.is_some() {
+            return Err(CliError::Input(
+                "reviewed D1 reads do not accept alternate sinks or sources".into(),
+            ));
+        }
+        return super::workspace_d1_reads::execute(
+            store,
+            catalog,
+            capability,
+            input,
+            requested_profile,
+            requested_account,
+        )
+        .await;
+    }
     if capability.id == super::workspace_d1_qualification::OBSERVER_CAPABILITY_ID {
         return Ok(ExecutedRead::without_credential(
             super::workspace_d1_qualification::observe(store, catalog, input)?,

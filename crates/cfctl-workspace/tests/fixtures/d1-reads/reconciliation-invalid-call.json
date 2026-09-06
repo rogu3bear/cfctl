@@ -1,0 +1,7 @@
+{
+  "inventory_sha256": "sha256:9891f9aa061f5af2ca25fc2b24a6af7f6ed8b2efb82cede1df358ceddd07bf71",
+  "expected_credential_generation_id": "22222222-2222-4222-8222-222222222222",
+  "params": [
+    "CALLER_REPLACEMENT"
+  ]
+}

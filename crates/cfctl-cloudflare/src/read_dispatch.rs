@@ -13,6 +13,11 @@ impl Executor {
         input: &CallInput,
         credential: &AuthCredential,
     ) -> Result<CloudflareResponseV1> {
+        if capability.workspace_d1_read_inventory.is_some() {
+            return Err(CloudflareError::InvalidRequestBody(
+                "reviewed D1 inventory requires its validated batch Executor".into(),
+            ));
+        }
         if capability.id == cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID {
             return self
                 .execute_worker_version_artifact_digest(capability, input, credential)

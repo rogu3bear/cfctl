@@ -532,6 +532,24 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
         return argv.into_iter().map(str::to_owned).collect();
     }
 
+    if let Some(contract) = &capability.workspace_d1_read_inventory {
+        let operation = &contract.operation;
+        return argv(&[
+            "cfctl",
+            "call",
+            &capability.id,
+            "--profile",
+            &operation.profile_id,
+            "--account",
+            &operation.account_id,
+            "--selector",
+            &format!("account_id={}", operation.account_id),
+            "--selector",
+            &format!("database_id={}", operation.database_id),
+            "--body-stdin",
+            "--json",
+        ]);
+    }
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
     for selector in capability
         .selectors
