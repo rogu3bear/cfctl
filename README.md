@@ -17,7 +17,8 @@ agent, and every command emits stable JSON for automation.
 - [Quickstart](QUICKSTART.md) — install, first commands, first governed write
 - [Operator runbook](docs/runbooks/cfctl.md) — the full command lifecycle
 - [Runtime policy](docs/runtime-policy.md) — what needs approval, and why
-- [Security contract](docs/v2-security.md) — secrets, hashing, invariants
+- [Security contract](docs/v2-security.md) — secrets, hashing, redaction, evidence
+- [Capability safety contracts](docs/capability-safety-contracts.md) — what each governed capability depends on
 - [Architecture](docs/v2-architecture.md) — crates, boundaries, trust sequence
 - [Telemetry control plane](docs/telemetry-control-plane.md) — GraphQL, bounded queries, observability, Logpush, and security response
 - [Agent landing](docs/agent-landing.md) — first-load doctrine for agents
@@ -276,7 +277,9 @@ A narrow safe class of known, scoped, reversible operations runs without
 separate approval. Deletes, purges, identity and ownership changes, external
 sends, billing actions, irreversible changes, and anything paid always require
 it — see [runtime policy](docs/runtime-policy.md) for the exact contract, and
-[the security contract](docs/v2-security.md) for per-capability invariants.
+[the security contract](docs/v2-security.md) for the cross-cutting invariants,
+and [per-capability safety contracts](docs/capability-safety-contracts.md) for
+what each governed capability depends on.
 
 Secret outputs never reach stdout, plans, logs, or evidence. They require a
 new file sink, created mode 0600:
