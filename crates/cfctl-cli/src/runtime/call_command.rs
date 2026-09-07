@@ -68,10 +68,13 @@ pub(super) async fn call_command(
     } else {
         None
     };
-    let catalog = if workspace_read.is_some() {
+    let catalog = if workspace_read.is_some()
+        || arguments.capability_id == cfctl_core::r2_recovery::VERIFY_ID
+        || arguments.capability_id == cfctl_core::r2_restore::RESTORE_ID
+    {
         cached.ok_or_else(|| {
             CliError::Input(
-                "reviewed D1 reads require an existing catalog; synchronize it separately first"
+                "native local and reviewed read contracts require an existing catalog; synchronize it separately first"
                     .into(),
             )
         })?
@@ -96,16 +99,21 @@ pub(super) async fn call_command(
     let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
     let is_workspace_d1_reply_admission = capability.workspace_d1_reply_admission.is_some();
     let is_r2_private_file_upload = capability.r2_private_file_upload.is_some();
+    let is_r2_capture = capability.id == cfctl_core::r2_recovery::CAPTURE_ID;
+    let is_r2_capture_verify = capability.id == cfctl_core::r2_recovery::VERIFY_ID;
+    let is_r2_restore = capability.id == cfctl_core::r2_restore::RESTORE_ID;
     let is_d1_approved_mln_import_poll_resume =
         capability.d1_approved_mln_import_poll_resume.is_some();
     if (is_d1_approved_mln_import
         || is_workspace_d1_projection
         || is_workspace_d1_reply_admission
-        || is_r2_private_file_upload)
+        || is_r2_private_file_upload
+        || is_r2_restore
+        || is_r2_capture_verify)
         != arguments.source_file.is_some()
     {
         return Err(CliError::Input(
-            "governed D1 imports, workspace policy projections, reply-admission activation/read, and create-only private R2 uploads require exactly one private `--source-file`; no other capability accepts it"
+            "governed D1 imports, workspace policy projections, reply-admission activation/read, private R2 uploads, capture verification, and conditional restore require exactly one private `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
@@ -157,9 +165,10 @@ pub(super) async fn call_command(
         && capability.analytics_query.is_none()
         && !is_r2_log_retrieval
         && !is_d1_full_export
+        && !is_r2_capture
     {
         return Err(CliError::Input(
-            "`--out` is restricted to bounded analytics, governed R2 log retrieval, and D1 full export"
+            "`--out` is restricted to bounded analytics, governed R2 log retrieval, D1 full export, and private R2 capture"
                 .to_owned(),
         ));
     }
@@ -170,6 +179,39 @@ pub(super) async fn call_command(
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    if is_r2_capture && (arguments.out.is_none() || arguments.value_out.is_some()) {
+        return Err(CliError::Input(
+            "private R2 capture requires --out <new-private-directory>".into(),
+        ));
+    }
+    if is_r2_capture {
+        let window = super::r2_recovery::preflight_capture(
+            &capability,
+            &prepared.input,
+            arguments.out.as_deref().ok_or_else(|| {
+                CliError::Input("private capture output directory required".into())
+            })?,
+        )?;
+        // The proof and private manifest must share one timestamp encoding.
+        prepared.input.body = Some(serde_json::to_value(window)?);
+    }
+    if is_r2_capture_verify {
+        if arguments.value_out.is_some()
+            || arguments.profile.is_some()
+            || arguments.account.is_some()
+        {
+            return Err(CliError::Input("capture verification uses the recorded profile/account and accepts no credential selection".into()));
+        }
+        return super::r2_recovery::verify(
+            store,
+            &capability,
+            &prepared.input,
+            arguments
+                .source_file
+                .as_deref()
+                .ok_or_else(|| CliError::Input("private snapshot directory required".into()))?,
+        );
+    }
     if is_d1_approved_mln_import {
         let profiles = ProfilesConfig::load(store)?;
         let profile = profiles.selected(arguments.profile.as_deref())?;
@@ -456,6 +498,30 @@ pub(super) async fn call_command(
             CliError::Input("workspace reply-admission target could not be derived".to_owned())
         })?;
         adapter_targets.insert("workspace_d1_reply_admission".to_owned(), target);
+    }
+    if is_r2_restore {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        if arguments
+            .account
+            .as_deref()
+            .is_some_and(|account| profile.account_id.as_deref() != Some(account))
+        {
+            return Err(super::r2_restore::rejected());
+        }
+        let source = arguments
+            .source_file
+            .as_deref()
+            .ok_or_else(super::r2_restore::rejected)?;
+        let target = super::r2_restore::prepare(
+            store,
+            &catalog,
+            &prepared.input,
+            profile,
+            source,
+            &secrets,
+        )?;
+        adapter_targets.insert("r2_private_restore".into(), target);
     }
     if capability.r2_private_file_upload.is_some() {
         let source = arguments

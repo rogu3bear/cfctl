@@ -60,6 +60,9 @@ pub(super) async fn rectify_plan(
 )]
 async fn rectify_loaded_plan(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
     ensure_capability_execution_supported(plan)?;
+    if plan.capability.id == cfctl_core::r2_restore::RESTORE_ID {
+        return super::r2_restore_execution::rectify(store, plan).await;
+    }
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, plan);
     }

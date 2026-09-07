@@ -31,6 +31,17 @@ pub(super) async fn execute_api_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
+    if plan.capability.id == cfctl_core::r2_restore::RESTORE_ID {
+        return super::r2_restore_execution::execute(
+            store,
+            catalog_hash,
+            plan,
+            execution_input,
+            credential,
+            secrets,
+        )
+        .await;
+    }
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
     let is_reviewed_schema_migration = plan.capability.id == "d1-apply-reviewed-schema-migration";
     if is_reviewed_schema_migration {

@@ -225,6 +225,7 @@ pub(super) fn current_pages_source_remote_precondition(
 }
 
 pub(super) fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    super::r2_restore::validate_bound_plan(store, plan)?;
     workspace_reply_subdomain_ingress::validate_bound_plan(store, plan)?;
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;

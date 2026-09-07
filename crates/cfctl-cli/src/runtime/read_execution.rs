@@ -696,8 +696,26 @@ pub(super) async fn execute_read(
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let executor = Executor::new(http_client()?, API_BASE_URL)?;
-    let response = if capability.id == cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID {
+    let executor = Executor::new(
+        if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
+            super::support::private_capture_http_client()?
+        } else {
+            http_client()?
+        },
+        API_BASE_URL,
+    )?;
+    let response = if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
+        super::r2_recovery::capture(
+            &executor,
+            capability,
+            input,
+            &credential,
+            output_path.ok_or_else(|| {
+                CliError::Input("private capture output directory required".into())
+            })?,
+        )
+        .await?
+    } else if capability.id == cfctl_core::WORKER_VERSION_ARTIFACT_DIGEST_ID {
         if output_path.is_some() {
             return Err(CloudflareError::InvalidRequestBody(
                 "Worker module bytes cannot be written to an output file".to_owned(),
@@ -776,6 +794,13 @@ pub(super) async fn execute_read(
             VerificationState::Failed
         };
         envelope.verification.basis = Some("exact immutable version and complete bounded module digest manifest; static assets not qualified".to_owned());
+    } else if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
+        envelope.verification.state = if response.success {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis = Some("two bounded complete inventories, matching object identities and same private file hashes; capture integrity only".into());
     } else if capability.r2_private_object_digest.is_some() {
         let verified = response
             .result
@@ -842,9 +867,16 @@ pub(super) async fn execute_read(
     // guidance; attach a status-specific next step so the agent knows the move.
     if !response.success {
         let (code, next_step) = live_read_failure_guidance_for_response(capability, &response);
+        let capture_failed = capability.id == cfctl_core::r2_recovery::CAPTURE_ID;
         envelope.error = Some(ErrorV1 {
-            code: code.to_owned(),
-            message: if email_routing_contract_rejected {
+            code: if capture_failed {
+                "CFCTL_R2_CAPTURE_INCOMPLETE".into()
+            } else {
+                code.to_owned()
+            },
+            message: if capture_failed {
+                "the bounded capture did not produce a complete authenticated snapshot; private partial files may remain".into()
+            } else if email_routing_contract_rejected {
                 format!(
                     "the performed Cloudflare read failed the normalized response contract for capability `{}`",
                     capability.id

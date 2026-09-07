@@ -314,11 +314,32 @@ pub(super) fn show_plan(store: &StateStore, selector: &PlanSelector) -> Result<R
             serde_json::to_value(record.execution_incompatibility_reason())?,
         );
     }
+    let restore_state = if plan.capability.id == cfctl_core::r2_restore::RESTORE_ID {
+        let (projection, state) = super::r2_restore_projection::inspect(
+            store,
+            &plan,
+            matches!(
+                record,
+                StoredPlanRecord::ProjectionDrift { .. }
+                    | StoredPlanRecord::RequiredSidecarMissing(_)
+            ),
+        );
+        result["private_restore_verification"] = projection;
+        Some(state)
+    } else {
+        None
+    };
     let mut envelope = ResultEnvelopeV2::success("plans show", result);
     envelope.operation_id = Some(plan.operation_id);
     envelope.capability_id = Some(plan.capability.id);
     envelope.policy_decision = Some(plan.policy);
     envelope.verification.state = verification_for_status(plan.status);
+    if let Some(state) = restore_state {
+        envelope.verification.state = state;
+        envelope.verification.basis = Some(
+            "Native restore qualification comes from authenticated historical verification evidence joined to this operation; plan status grants no qualification or current authority.".into(),
+        );
+    }
     Ok(envelope)
 }
 
@@ -332,6 +353,7 @@ pub(super) fn approve_plan(
     let attestation = observation_attestation(store, &plan.capability)?;
     let scoped_store = store.with_observation_attestation(&attestation);
     let store = &scoped_store;
+    super::r2_restore::validate_bound_plan(store, &plan)?;
     let max_cost = arguments.max_cost.as_deref().map(parse_money).transpose()?;
     plan.approve(arguments.yes, max_cost)?;
     store.save_plan(&plan)?;

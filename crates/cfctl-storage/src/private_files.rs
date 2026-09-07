@@ -25,6 +25,32 @@ pub struct PrivateDirectory {
 }
 
 impl PrivateDirectory {
+    /// A fresh capture directory is created relative to the retained custody
+    /// descriptor. Replacing its named parent cannot redirect this operation.
+    pub fn create_new_directory(&self, name: &str) -> cfctl_auth::Result<Self> {
+        Self::name(name)?;
+        self.validate_address()?;
+        if self.path.canonicalize().map_err(|_| failure())? != self.path {
+            return Err(failure());
+        }
+        rustix::fs::mkdirat(&self.directory, name, Mode::RWXU).map_err(|_| failure())?;
+        let descriptor = openat(
+            &self.directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| failure())?;
+        let child = Self {
+            path: self.path.join(name),
+            directory: fs::File::from(descriptor),
+        };
+        child.validate_address()?;
+        self.directory.sync_all().map_err(|_| failure())?;
+        self.validate_address()?;
+        Ok(child)
+    }
+
     pub fn open(path: &Path) -> cfctl_auth::Result<Self> {
         let metadata = fs::symlink_metadata(path).map_err(|_| failure())?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -163,6 +189,30 @@ impl PrivateDirectory {
         }
         rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
             .map_err(|_| failure())?;
+        self.directory.sync_all().map_err(|_| failure())?;
+        self.validate_address()
+    }
+
+    /// Create an immutable private stream target. Unlike secret replacement,
+    /// capture must never reopen or replace a preexisting snapshot member.
+    pub fn create_new_file(&self, name: &str) -> cfctl_auth::Result<fs::File> {
+        Self::name(name)?;
+        self.validate_address()?;
+        let descriptor = openat(
+            &self.directory,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|_| failure())?;
+        let file = fs::File::from(descriptor);
+        Self::validate_file(&file, 0)?;
+        self.directory.sync_all().map_err(|_| failure())?;
+        self.validate_address()?;
+        Ok(file)
+    }
+
+    pub fn sync(&self) -> cfctl_auth::Result<()> {
         self.directory.sync_all().map_err(|_| failure())?;
         self.validate_address()
     }

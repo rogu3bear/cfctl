@@ -1,5 +1,7 @@
 //! Cloudflare capability catalog normalization and indexing.
 
+mod r2_private;
+use r2_private::finalize_r2_private_file_upload_contract;
 mod artifact_digest;
 use artifact_digest::{
     finalize_r2_private_object_digest_contract, finalize_worker_version_artifact_digest,
@@ -21,12 +23,12 @@ use cfctl_core::{
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
     Maturity, Mln0142PostImportSchemaContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1,
     PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
-    R2PrivateFileUploadContractV1, R2PrivateObjectDigestContractV1, ResponseBodyModeV1,
-    ResponseContractV1, RiskClass, RollbackSpecV1, SamePathReadContractV1,
-    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-    SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
-    UpdatedResourceContractV1, VerificationSpecV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
-    WorkflowContractV1, WorkflowStepV1, hash_value, request_header_is_reserved,
+    R2PrivateObjectDigestContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    RollbackSpecV1, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
+    TimestampFormatV1, UpdatedResourceContractV1, VerificationSpecV1,
+    WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID, WorkflowContractV1, WorkflowStepV1, hash_value,
+    request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -2649,6 +2651,9 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
         mln_0142_post_import_schema_capability(),
         d1_schema_introspection_capability(),
         d1_full_export_capability(),
+        r2_private::capture_capability(),
+        r2_private::verify_capability(),
+        r2_private::restore_capability(),
         d1_restore_exact_bookmark_capability(),
         d1_import_database_capability(),
         d1_reviewed_schema_migration_capability(),
@@ -8390,94 +8395,6 @@ fn zero_direct_usage_cost(
         exposure: CostExposureV1::DownstreamUsage,
         references,
     };
-}
-
-fn finalize_r2_private_file_upload_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
-    let read_supported = capabilities
-        .get("r2-get-object")
-        .is_some_and(|capability| capability.method == "GET" && capability.path == R2_OBJECT_PATH);
-    let delete_supported = capabilities
-        .get("r2-delete-object")
-        .is_some_and(|capability| {
-            capability.method == "DELETE"
-                && capability.path == R2_OBJECT_PATH
-                && capability.permissions == ["Workers R2 Storage Write"]
-        });
-    let Some(capability) = capabilities.get_mut("r2-put-object") else {
-        return;
-    };
-    let operation_supported = capability.method == "PUT"
-        && capability.path == R2_OBJECT_PATH
-        && capability.product == "R2 Object"
-        && capability.request_schema.is_none()
-        && capability
-            .response_contract
-            .as_ref()
-            .is_some_and(|response| {
-                response.success_statuses == ["200"]
-                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
-            })
-        && capability.selectors.iter().any(|selector| {
-            selector.name == "object_key"
-                && selector.location == "path"
-                && selector.required
-                && selector
-                    .description
-                    .as_deref()
-                    .is_some_and(|description| description.contains("MUST NOT be percent-encoded"))
-        });
-    if !operation_supported || !read_supported || !delete_supported {
-        capability.adapter_status = AdapterStatus::Blocked;
-        capability.blocked_reason = Some(
-            "R2 create-only private-file upload, conditional readback, or exact delete contract drifted"
-                .to_owned(),
-        );
-        return;
-    }
-    let Some(content_type) = capability
-        .selectors
-        .iter_mut()
-        .find(|selector| selector.name == "Content-Type" && selector.location == "header")
-    else {
-        capability.adapter_status = AdapterStatus::Blocked;
-        capability.blocked_reason = Some("R2 upload Content-Type selector drifted".to_owned());
-        return;
-    };
-    content_type.required = true;
-    capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
-    capability.risk = RiskClass::ScopedWrite;
-    capability.effect = EffectClass::ReversibleWrite;
-    zero_direct_usage_cost(
-        capability,
-        "the upload is one R2 Class A operation with no direct configuration charge; retained bytes and later reads incur ordinary R2 storage and operation usage",
-        vec![official_reference(
-            "R2 pricing",
-            "https://developers.cloudflare.com/r2/pricing/",
-        )],
-    );
-    capability.entitlement.source =
-        Some("https://developers.cloudflare.com/r2/platform/limits/".to_owned());
-    capability.verification.required = true;
-    "r2_private_file_upload_etag_and_conditional_read"
-        .clone_into(&mut capability.verification.strategy);
-    capability.rollback.supported = false;
-    capability.rollback.strategy = None;
-    capability.rollback.warning = Some(
-        "the immutable upload is create-only; rollback is a separately reviewed exact-object delete plan, while replacement requires a new digest-addressed key"
-            .to_owned(),
-    );
-    capability.r2_private_file_upload = Some(R2PrivateFileUploadContractV1 {
-        max_source_bytes: 300_000_000,
-        allowed_content_types: vec![
-            "application/json".to_owned(),
-            "application/octet-stream".to_owned(),
-        ],
-        require_if_none_match_star: true,
-        read_capability_id: "r2-get-object".to_owned(),
-        delete_capability_id: "r2-delete-object".to_owned(),
-        etag_algorithm: "md5".to_owned(),
-    });
-    refresh_dynamic_mutation_contract(capability);
 }
 
 fn finalize_r2_lifecycle_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {

@@ -626,13 +626,13 @@ pub struct CallArgs {
         long,
         value_name = "NEW_PATH",
         conflicts_with = "value_out",
-        help = "Stream a bounded analytics, governed log-retrieval, or D1 full-export result to a new mode-0600 file and return its hash receipt"
+        help = "Write bounded analytics/logs/D1 export to a new mode-0600 file, or private R2 capture to a new mode-0700 directory; return a hash receipt"
     )]
     pub out: Option<PathBuf>,
     #[arg(
         long,
-        value_name = "MODE_0600_SOURCE_PATH",
-        help = "Plan-creation-only source for an approved D1 operation or create-only private R2 upload; bytes never enter plan JSON"
+        value_name = "PRIVATE_SOURCE_PATH",
+        help = "Private source for governed D1/R2 operations, or a snapshot directory for authenticated R2 capture verification; bytes never enter plan JSON"
     )]
     pub source_file: Option<PathBuf>,
 }
@@ -645,7 +645,7 @@ pub struct PlansArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PlansCommand {
-    /// Show one redacted, hash-bound plan.
+    /// Show one redacted plan and authenticate native private restore verification.
     Show(PlanSelector),
     /// Approve one exact plan, with an explicit confirmation flag.
     Approve(PlanApproveArgs),

@@ -4,9 +4,11 @@ pub mod d1_read_inventory;
 mod read_query;
 pub use read_query::{AnalyticsQueryKindV1, D1SchemaIntrospectionContractV1, OutputFormatV1};
 mod artifact_digest;
+pub mod r2_recovery;
+pub mod r2_restore;
 pub use artifact_digest::{
-    R2PrivateObjectDigestContractV1, R2PrivateObjectDigestV1, WORKER_VERSION_ARTIFACT_DIGEST_ID,
-    WORKER_VERSION_ARTIFACT_PATH,
+    R2PrivateFileUploadContractV1, R2PrivateObjectDigestContractV1, R2PrivateObjectDigestV1,
+    WORKER_VERSION_ARTIFACT_DIGEST_ID, WORKER_VERSION_ARTIFACT_PATH,
 };
 
 mod maildesk_evidence;
@@ -2101,19 +2103,6 @@ pub struct MaildeskD1RouteHealthEvidenceV2 {
     pub body_returned: bool,
 }
 
-/// A create-only private local file upload to one exact R2 object key. The
-/// bytes remain in a mode-0600 managed stage; plans and receipts carry only
-/// content identity and bounded metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct R2PrivateFileUploadContractV1 {
-    pub max_source_bytes: u64,
-    pub allowed_content_types: Vec<String>,
-    pub require_if_none_match_star: bool,
-    pub read_capability_id: String,
-    pub delete_capability_id: String,
-    pub etag_algorithm: String,
-}
-
 /// Provider readback used after Email Sending DNS repair. The verifier reads
 /// the live DNS status endpoint and accepts only a conflict-free, complete
 /// configuration; it never treats the mutation response as final authority.
@@ -2916,7 +2905,7 @@ impl CapabilityV1 {
                                 && contract.etag_algorithm == "md5"
                         })
             }
-            "worker_version_artifact_digest" | "r2_private_object_digest" => artifact_digest::verification_supported(self),
+            "worker_version_artifact_digest" | "r2_private_object_digest" | r2_restore::STRATEGY => artifact_digest::verification_supported(self),
             "email_sending_dns_status_reports_ready" => {
                 self.id == "email-sending-subdomains-fix-sending-subdomain-dns"
                     && self.method == "POST"

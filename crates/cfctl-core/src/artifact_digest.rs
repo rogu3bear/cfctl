@@ -1,6 +1,19 @@
 use crate::{CapabilityV1, EffectClass, ResponseBodyModeV1, RiskClass};
 use serde::{Deserialize, Serialize};
 
+/// A create-only private local file upload to one exact R2 object key. The
+/// bytes remain in a mode-0600 managed stage; plans and receipts carry only
+/// content identity and bounded metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R2PrivateFileUploadContractV1 {
+    pub max_source_bytes: u64,
+    pub allowed_content_types: Vec<String>,
+    pub require_if_none_match_star: bool,
+    pub read_capability_id: String,
+    pub delete_capability_id: String,
+    pub etag_algorithm: String,
+}
+
 /// Native body-free module identity for one immutable Worker version.
 pub const WORKER_VERSION_ARTIFACT_DIGEST_ID: &str = "worker-version-artifact-digest";
 pub const WORKER_VERSION_ARTIFACT_PATH: &str =
@@ -27,6 +40,7 @@ pub struct R2PrivateObjectDigestV1 {
 
 pub(super) fn verification_supported(capability: &CapabilityV1) -> bool {
     match capability.verification.strategy.as_str() {
+        crate::r2_restore::STRATEGY => crate::r2_restore::capability_matches(capability),
         "worker_version_artifact_digest" => {
             capability.id == WORKER_VERSION_ARTIFACT_DIGEST_ID
                 && capability.method == "GET"

@@ -124,7 +124,7 @@ exact-bookmark restore, never an automatic compensating write.
 Provider-generic private R2 evidence is similarly reduced at the adapter
 boundary. `r2-get-private-object-digest` streams one exact object into a digest
 state and publishes only typed identity metadata; the raw object GET remains
-catalogued but blocked. The same consumer-first pattern is used for Access:
+catalogued but blocked. [Private whole-bucket capture](r2-private-capture.md) retains bytes only in protected storage and has a separate authenticated local integrity check. [Conditional private restore](r2-private-restore.md) stages authenticated original/current snapshots and binds one S3 PUT to the existing consumed-plan lifecycle; neither component qualifies combined recovery. Its versioned verification binding and object-result contracts belong to `cfctl-core`; CLI orchestration joins authenticated observations to the existing plan and journal. The same consumer-first pattern is used for Access:
 closed whole-host and operator-group lifecycles are derived only while the
 official schemas retain their reviewed shapes, while the polymorphic parent
 mutations stay unavailable.

@@ -14,10 +14,27 @@ pub(super) fn catalog_is_stale(store: &StateStore) -> bool {
 }
 
 pub(super) fn http_client() -> Result<reqwest::Client> {
+    http_client_with_private_capture(false)
+}
+
+pub(super) fn private_capture_http_client() -> Result<reqwest::Client> {
+    http_client_with_private_capture(true)
+}
+
+fn http_client_with_private_capture(private_capture: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_mins(2))
         .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")));
+    if private_capture {
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd();
+    }
     // IP-allowlisted API tokens (e.g. a laptop-pinned minter) are usually
     // scoped to the machine's IPv4. When the host default-routes over IPv6,
     // Cloudflare rejects the call with error 9109 ("Cannot use the access
