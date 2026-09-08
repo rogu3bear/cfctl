@@ -4,6 +4,8 @@ mod private_runtime;
 pub use private_runtime::*;
 mod private_files;
 pub use private_files::{PrivateDirectory, PrivateFileSecretStore};
+mod private_authority;
+pub use private_authority::PrivateAuthorityRebindPreviewV1;
 mod evidence;
 mod observations;
 
@@ -222,6 +224,8 @@ struct EvidenceDirectoryCapabilities {
     data_identity: Vec<u8>,
     locks: Dir,
     lifecycle_lock: cap_std::fs::File,
+    #[cfg(target_os = "macos")]
+    lock_identity: Vec<u8>,
     bodies: Dir,
     bodies_identity: Vec<u8>,
     descriptors: Dir,

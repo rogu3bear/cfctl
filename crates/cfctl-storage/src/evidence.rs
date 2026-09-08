@@ -30,6 +30,9 @@ use super::{
 const DESCRIPTOR_MAC_DOMAIN: &str = "evidence-descriptor-v2";
 const PROOF_MAC_DOMAIN: &str = "operational-proof-v2";
 
+mod history;
+pub(crate) use history::AuthenticatedHistoryV1;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceDescriptorV1 {
@@ -506,43 +509,16 @@ impl StateStore {
 
     pub fn evidence_key_generation_usage(
         &self,
-        _lifecycle: &EvidenceLifecycleLock,
+        lifecycle: &EvidenceLifecycleLock,
         generation_id: &str,
     ) -> Result<usize> {
-        let mut count = 0_usize;
-        let descriptor_display = self.paths.data_dir.join("evidence-descriptors");
-        for entry in self
-            .evidence_directories
-            .descriptors
-            .entries()
-            .map_err(|source| io_error(&descriptor_display, source))?
-        {
-            let entry = entry.map_err(|source| io_error(&descriptor_display, source))?;
-            let name = strict_managed_entry_name(entry.file_name(), &descriptor_display)?;
-            let content_hash =
-                content_hash_from_managed_name(&name, &descriptor_display, "evidence descriptor")?;
-            let envelope = self.load_authenticated_evidence_descriptor(&content_hash)?;
-            if envelope.authentication.key_generation_id == generation_id {
-                count = count.saturating_add(1);
-            }
-        }
-
-        let proof_display = self.paths.data_dir.join("evidence-index");
-        for entry in self
-            .evidence_directories
-            .proofs
-            .entries()
-            .map_err(|source| io_error(&proof_display, source))?
-        {
-            let entry = entry.map_err(|source| io_error(&proof_display, source))?;
-            let name = strict_managed_entry_name(entry.file_name(), &proof_display)?;
-            content_hash_from_managed_name(&name, &proof_display, "operational proof")?;
-            let envelope = read_authenticated_operational_proof_index(self, &name)?;
-            if envelope.authentication.key_generation_id == generation_id {
-                count = count.saturating_add(1);
-            }
-        }
-        Ok(count)
+        let history = self.authenticated_history(lifecycle)?;
+        Ok(history
+            .generation_usage
+            .get(generation_id)
+            .copied()
+            .unwrap_or(0)
+            + self.private_binding_generation_usage(generation_id)?)
     }
 
     /// Counts storage-v2 candidates without requiring the unavailable key.
@@ -655,10 +631,11 @@ pub(super) fn open_evidence_directories(
     let bodies_identity = durable_directory_identity(&bodies, &bodies_path)?;
     let descriptors_identity = durable_directory_identity(&descriptors, &descriptors_path)?;
     let proofs_identity = durable_directory_identity(&proofs, &proofs_path)?;
+    let lock_identity = durable_filesystem_identity(&lock_file, &lifecycle_lock_path)?;
     let location_identity = evidence_location_identity(
         canonical_data_text,
         &data_identity,
-        &durable_filesystem_identity(&lock_file, &lifecycle_lock_path)?,
+        &lock_identity,
         &bodies_identity,
         &descriptors_identity,
         &proofs_identity,
@@ -668,6 +645,8 @@ pub(super) fn open_evidence_directories(
         data_identity,
         locks,
         lifecycle_lock,
+        #[cfg(target_os = "macos")]
+        lock_identity,
         bodies,
         bodies_identity,
         descriptors,
@@ -803,7 +782,7 @@ pub(super) fn require_same_canonical_data_root(
     Ok(())
 }
 
-fn evidence_location_identity(
+pub(super) fn evidence_location_identity(
     canonical_path: &str,
     data_identity: &[u8],
     lock_identity: &[u8],

@@ -1,12 +1,10 @@
 //! Explicit state-location selection. Publication is the last activation step.
-use crate::PrivateFileSecretStore;
 use crate::{PrivateDirectory, Result, RuntimePaths, StorageError};
 use cfctl_auth::EvidenceKeyManager;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::os::unix::fs::MetadataExt as _;
-use std::sync::Arc;
 use std::{fs, path::PathBuf};
 use uuid::Uuid;
 
@@ -221,14 +219,7 @@ impl crate::StateStore {
 
     pub fn platform_evidence_key_manager(&self) -> Result<EvidenceKeyManager> {
         if self.private_origin.is_some() {
-            return EvidenceKeyManager::new(
-                Arc::new(PrivateFileSecretStore::new(
-                    self.paths.data_dir.join("private-authority"),
-                )),
-                self.evidence_location_identity(),
-                cfctl_auth::SecretBackend::PrivateFile,
-            )
-            .map_err(|error| StorageError::EvidenceAuthentication(error.to_string()));
+            return self.private_evidence_key_manager();
         }
         EvidenceKeyManager::platform(self.evidence_location_identity())
             .map_err(|error| StorageError::EvidenceAuthentication(error.to_string()))

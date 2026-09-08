@@ -266,6 +266,22 @@ impl PrivateFileSecretStore {
             hex::encode(Sha256::digest(key.as_bytes()))
         ))
     }
+
+    /// Recovery must identify one sole existing registry, not choose among keys
+    /// or silently skip residue from an interrupted secret-store operation.
+    pub(crate) fn contains_only(&self, key: &str) -> cfctl_auth::Result<bool> {
+        let private = PrivateDirectory::open(&self.root)?;
+        private.validate_address()?;
+        let directory =
+            cap_std::fs::Dir::from_std_file(private.directory.try_clone().map_err(|_| failure())?);
+        let names = directory
+            .entries()
+            .map_err(|_| failure())?
+            .map(|entry| entry.map(|entry| entry.file_name()).map_err(|_| failure()))
+            .collect::<cfctl_auth::Result<Vec<_>>>()?;
+        private.validate_address()?;
+        Ok(names.len() == 1 && names[0] == std::ffi::OsStr::new(&Self::name(key)?))
+    }
 }
 impl SecretStore for PrivateFileSecretStore {
     fn put(&self, key: &str, value: &str) -> cfctl_auth::Result<()> {

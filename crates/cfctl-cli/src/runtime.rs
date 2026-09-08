@@ -49,6 +49,7 @@ mod preconditions_authority;
 mod preconditions_core;
 mod preconditions_extended;
 mod prelude;
+mod private_authority;
 mod private_runtime;
 mod provider_state;
 mod r2_credentials;
@@ -136,6 +137,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Auth(crate::AuthArgs {
             command: crate::AuthCommand::EvidenceKey(crate::EvidenceKeyArgs {
                 command: crate::EvidenceKeyCommand::PrivateActivate(_)
+                    | crate::EvidenceKeyCommand::PrivateRebind(_)
             }) | crate::AuthCommand::ImportApiToken(_)
         })
     );

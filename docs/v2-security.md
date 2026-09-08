@@ -59,3 +59,17 @@ Report a suspected secret leak by preserving the operation ID and redacted recei
   sync file and directory writes. Platform adoption/recovery/reset commands
   reject an active private runtime; its status and initialization preview report
   the actual selected backend.
+
+- A macOS private registry stranded by a device-number change is rebound only
+  through `private-rebind-preview` and exact-digest, explicit `private-rebind`
+  confirmation. The previous device number reconstructs one original address
+  while preserving canonical path and all five inode/birth identities. The sole
+  original registry must validate against the existing root, and every retained
+  authenticated descriptor, referenced body and operational proof must verify.
+  The preview never writes. Recovery creates one immutable, original-key-signed
+  non-secret binding for the current location; it never copies or replaces keys,
+  markers, epochs or history. Ordinary attachment requires that exact binding,
+  filesystem identities and MAC. Future identity drift fails closed. Retiring a
+  key generation also counts binding signatures as dependents. This proves the
+  retained inventory, not completeness of history before that inventory was
+  recorded, and does not promote body-only audit records or older approvals.

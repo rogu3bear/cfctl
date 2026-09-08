@@ -24,6 +24,8 @@ pub(super) fn evidence_key_command(
             EvidenceKeyCommand::PrivatePreview
                 | EvidenceKeyCommand::PrivateActivate(_)
                 | EvidenceKeyCommand::PrivateHistory
+                | EvidenceKeyCommand::PrivateRebindPreview(_)
+                | EvidenceKeyCommand::PrivateRebind(_)
                 | EvidenceKeyCommand::InitPreview
                 | EvidenceKeyCommand::Init
                 | EvidenceKeyCommand::Status
@@ -50,6 +52,12 @@ pub(super) fn evidence_key_command(
             return super::private_runtime::activate(store, arguments);
         }
         EvidenceKeyCommand::PrivateHistory => return super::private_runtime::history(store),
+        EvidenceKeyCommand::PrivateRebindPreview(arguments) => {
+            return super::private_authority::preview(store, arguments);
+        }
+        EvidenceKeyCommand::PrivateRebind(arguments) => {
+            return super::private_authority::rebind(store, arguments);
+        }
         _ => {}
     }
     let manager = store.platform_evidence_key_manager()?;
@@ -59,6 +67,9 @@ pub(super) fn evidence_key_command(
         | EvidenceKeyCommand::PrivateHistory => Err(CliError::Input(
             "private runtime command was not dispatched".to_owned(),
         )),
+        EvidenceKeyCommand::PrivateRebindPreview(_) | EvidenceKeyCommand::PrivateRebind(_) => Err(
+            CliError::Input("private authority command was not dispatched".to_owned()),
+        ),
         EvidenceKeyCommand::AdoptPreview => adoption_preview(store, &manager),
         EvidenceKeyCommand::AdoptPlan(arguments) => match arguments.command {
             EvidenceKeyAdoptPlanCommand::Create => Err(cfctl_auth::AuthError::from(

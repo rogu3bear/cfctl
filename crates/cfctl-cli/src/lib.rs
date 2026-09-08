@@ -112,6 +112,10 @@ pub enum EvidenceKeyCommand {
     PrivateActivate(EvidenceKeyPrivateActivateArgs),
     /// Inspect archived operation identities without giving them execution authority.
     PrivateHistory,
+    /// Verify an original private registry and retained history after macOS device-number drift.
+    PrivateRebindPreview(EvidenceKeyPrivateRebindPreviewArgs),
+    /// Bind the exact reviewed original private registry to the current filesystem identity.
+    PrivateRebind(EvidenceKeyPrivateRebindArgs),
     /// Preview marker-only adoption of one exact valid platform authority.
     AdoptPreview,
     /// Inspect adoption history; creation is held pending authenticated receipt support.
@@ -141,6 +145,25 @@ pub enum EvidenceKeyCommand {
 #[derive(Debug, Args)]
 pub struct EvidenceKeyPrivateActivateArgs {
     pub plan_id: String,
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyPrivateRebindPreviewArgs {
+    /// Previous macOS device number used to address the original registry.
+    #[arg(long)]
+    pub previous_device: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct EvidenceKeyPrivateRebindArgs {
+    #[arg(long)]
+    pub previous_device: u64,
+    /// Exact `review_digest` returned by private-rebind-preview.
+    #[arg(long)]
+    pub expected_review: String,
+    /// Confirm one signed non-secret binding; keys and markers remain intact.
     #[arg(long)]
     pub yes: bool,
 }

@@ -2,6 +2,53 @@ use cfctl_cli::Cli;
 use clap::Parser as _;
 
 #[test]
+fn private_rebind_requires_explicit_device_digest_and_confirmation() {
+    use cfctl_cli::{AuthCommand, Command, EvidenceKeyCommand};
+    assert!(
+        Cli::try_parse_from(["cfctl", "auth", "evidence-key", "private-rebind-preview"]).is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "private-rebind",
+            "--previous-device",
+            "17"
+        ])
+        .is_err()
+    );
+    for yes in [false, true] {
+        let mut args = vec![
+            "cfctl",
+            "auth",
+            "evidence-key",
+            "private-rebind",
+            "--previous-device",
+            "17",
+            "--expected-review",
+            "sha256:review",
+        ];
+        if yes {
+            args.push("--yes");
+        }
+        let cli = Cli::try_parse_from(args).expect("exact recovery arguments parse");
+        let Some(Command::Auth(auth)) = cli.command else {
+            panic!("auth command");
+        };
+        let AuthCommand::EvidenceKey(evidence) = auth.command else {
+            panic!("evidence command");
+        };
+        let EvidenceKeyCommand::PrivateRebind(rebind) = evidence.command else {
+            panic!("private rebind");
+        };
+        assert_eq!(rebind.yes, yes);
+        assert_eq!(rebind.previous_device, 17);
+        assert_eq!(rebind.expected_review, "sha256:review");
+    }
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one parser contract enumerates the complete evidence-key lifecycle and exact confirmations"
@@ -31,6 +78,8 @@ fn evidence_key_lifecycle_surface_is_explicit_and_retirement_requires_confirmati
             EvidenceKeyCommand::PrivatePreview => "private-preview",
             EvidenceKeyCommand::PrivateActivate(_) => "private-activate",
             EvidenceKeyCommand::PrivateHistory => "private-history",
+            EvidenceKeyCommand::PrivateRebindPreview(_) => "private-rebind-preview",
+            EvidenceKeyCommand::PrivateRebind(_) => "private-rebind",
             EvidenceKeyCommand::AdoptPreview => "adopt-preview",
             EvidenceKeyCommand::AdoptPlan(_) => "adopt-plan",
             EvidenceKeyCommand::Adopt(_) => "adopt",

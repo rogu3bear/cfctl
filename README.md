@@ -204,6 +204,27 @@ No continuity with old signing keys or approval authority is claimed. Software
 running as your OS user can access these files; filesystem privacy does not
 isolate mutually distrustful programs running as the same user.
 
+For a private epoch whose original registry becomes unreachable after a macOS
+device-number change, `cfctl auth evidence-key private-rebind-preview
+--previous-device <original-device-number> --json` verifies the exact original
+registry, every retained authenticated descriptor and its body, and every
+retained operational proof. The original device number must be established from
+location evidence; the command does not search for a convenient key. It retains
+the canonical path and all five inode/birth identities. Missing, ambiguous,
+malformed or mismatched authority and incomplete or invalid retained history
+remain blocked. The preview exposes no key bytes and writes nothing.
+
+After reviewing that result, `cfctl auth evidence-key private-rebind
+--previous-device <original-device-number> --expected-review <review-digest>
+--yes --json` creates one signed, non-secret binding for the exact current
+location. It preserves the original key file, root marker, epoch and history.
+Normal authority attachment verifies that binding with the original key;
+filesystem identity drift remains blocked. There is no automatic ignore-device
+fallback. A changed history or location requires a fresh preview. A failed or
+uncertain publication is inspected with `auth evidence-key status --json` and
+the same preview; never overwrite an existing binding or recreate keys.
+Binding signatures also prevent retirement of a generation they still need.
+
 Initialization crosses two independent custody domains: the platform registry
 and the filesystem state-root marker. No transaction spans both, so `init`
 publishes a private initialization intent naming the exact state root before
