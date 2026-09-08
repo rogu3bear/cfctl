@@ -2,6 +2,8 @@
 
 #[path = "request/email_routing.rs"]
 mod email_routing;
+#[path = "request/pages_projects.rs"]
+mod pages_projects;
 
 use cfctl_auth::AuthCredential;
 use cfctl_cloudflare::{

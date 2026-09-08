@@ -43,8 +43,8 @@ use super::plan_secret::KV_NAMESPACE_DELETE_CAPABILITY_ID;
 use super::plan_secret::KV_NAMESPACE_KEYS_READ_CAPABILITY_ID;
 use super::prelude::{
     AdapterStatus, AuthCredential, BTreeSet, CallInput, CapabilityV1, CatalogSnapshot, CliError,
-    CloudflareResponseV1, EvidenceClass, EvidenceV1, Executor, PlanV1, ProfileKind, ProfilesConfig,
-    Result, ResultEnvelopeV2, StateStore, Value, json,
+    CloudflareResponseV1, EvidenceClass, EvidenceV1, Executor, PlanV1, ProfileKind,
+    ProfileMetadata, ProfilesConfig, Result, ResultEnvelopeV2, StateStore, Value, json,
 };
 use super::provider_state::read_live_cloudflare_tunnel_configuration_state;
 use super::provider_state::read_live_d1_empty_database_state;
@@ -252,7 +252,10 @@ pub(super) async fn create_plan(
         &capability,
         &input,
         &adapter_targets,
-        account_id,
+        PlanAuthority {
+            profile,
+            account_id,
+        },
         credential.as_ref(),
     )
     .await?;
@@ -309,6 +312,7 @@ pub(super) async fn read_live_pages_deployment_project_state(
     capability: &CapabilityV1,
     input: &CallInput,
     account_id: &str,
+    profile: &ProfileMetadata,
     credential: &AuthCredential,
 ) -> Result<(Value, EvidenceV1)> {
     if !pages_deployment::binds_project_state(capability) {
@@ -352,13 +356,38 @@ pub(super) async fn read_live_pages_deployment_project_state(
     let expected_branch = pages_deployment::binds_artifact(capability)
         .then(|| input.query.get("branch").and_then(Value::as_str))
         .flatten();
-    let mut receipt = pages_deployment::apply_project_response(
+    let result = pages_deployment::apply_project_response(
         capability,
         account_id,
         project_name,
         expected_branch,
         &project,
-    )?;
+    );
+    let mut receipt = match result {
+        Ok(receipt) => receipt,
+        Err(_)
+            if pages_deployment::binds_artifact(capability)
+                && project.result.get("source").is_none() =>
+        {
+            let proof = super::pages_direct_proof::find(
+                store,
+                catalog,
+                profile,
+                account_id,
+                project_name,
+                &project.result,
+            )?;
+            pages_deployment::apply_project_response_with_create_proof(
+                capability,
+                account_id,
+                project_name,
+                expected_branch,
+                &project,
+                Some(&proof),
+            )?
+        }
+        Err(error) => return Err(error),
+    };
     if pages_deployment::binds_artifact(capability) {
         let list = catalog
             .get(pages_deployment::DEPLOYMENT_LIST_CAPABILITY_ID)
@@ -436,6 +465,7 @@ pub(super) async fn prepare_pages_deployment_project_state_precondition(
     capability: &CapabilityV1,
     input: &CallInput,
     account_id: &str,
+    profile: &ProfileMetadata,
     credential: Option<&AuthCredential>,
 ) -> Result<Option<(Value, EvidenceV1)>> {
     if !pages_deployment::binds_project_state(capability) {
@@ -445,7 +475,7 @@ pub(super) async fn prepare_pages_deployment_project_state_precondition(
         CliError::Input("Pages deployment project-state credential was not resolved".to_owned())
     })?;
     read_live_pages_deployment_project_state(
-        store, catalog, capability, input, account_id, credential,
+        store, catalog, capability, input, account_id, profile, credential,
     )
     .await
     .map(Some)

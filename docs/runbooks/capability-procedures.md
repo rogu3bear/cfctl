@@ -963,12 +963,17 @@ fails closed because esbuild does not report every non-literal dynamic import
 in its metafile. A live exact-project read must then establish direct-upload
 mode, and the requested branch must equal the project's production branch.
 Explicit `source: null` remains authoritative. A provider response that omits
-`source` is compatible only when the same response also carries matching
+`source` is compatible when the same response also carries matching
 canonical and latest production deployments with one exact UUID, project, and
 branch; a successful `ad_hoc` deployment whose repository clone/build stages
 remain idle; no nested Git source; and no configured repository build command
 or root. A direct-upload output directory such as `target/site` is retained as
 project configuration, not misclassified as repository-build evidence.
+For an initial project with no deployment yet, the separate
+[direct-upload setup contract](../pages-direct-setup.md) permits an authenticated
+native direct-create receipt joined to the exact current project ID and
+execution pins. Both preparation and execution reload that proof; omission
+alone remains insufficient.
 Partial, contradictory, or Git-source evidence remains blocked before
 operation creation. The corroborating deployment ID and inference basis are
 hash-bound into the same project-mode receipt and must reproduce at the

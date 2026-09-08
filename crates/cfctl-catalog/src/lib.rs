@@ -38,6 +38,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 mod access_create;
+mod pages_projects;
 mod workspace_d1_qualification;
 use access_create::finalize_access_application_create_contract;
 pub use access_create::{ACCESS_APP_CREATE_OWNED_ID, access_application_create_owned_schema};
@@ -8756,6 +8757,7 @@ fn apply_post_normalization_contracts(
     finalize_worker_custom_domain_attach_contract(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
     classify_same_path_object_mutation_contracts(document, capabilities);
+    pages_projects::finalize(document, capabilities);
     finalize_r2_bucket_create_contract(document, capabilities);
     finalize_d1_database_create_contract(document, capabilities);
     finalize_workers_kv_namespace_contracts(document, capabilities);

@@ -1067,6 +1067,7 @@ pub(super) struct LivePreconditionEvidence {
     pub(super) zone_account: Option<EvidenceV1>,
     pub(super) entitlement: Option<EvidenceV1>,
     pub(super) pages_project_absence: Option<EvidenceV1>,
+    pub(super) pages_production_variables_state: Option<EvidenceV1>,
     pub(super) pages_deployment_project_state: Option<EvidenceV1>,
     pub(super) permission_inventory: Option<EvidenceV1>,
     pub(super) global_warp_override_state: Option<EvidenceV1>,
@@ -1088,6 +1089,10 @@ pub(super) struct LivePreconditionEvidence {
     pub(super) r2_parent_token: Option<EvidenceV1>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the execution dispatcher rechecks every independently bound live precondition before the provider boundary"
+)]
 pub(super) fn validate_live_plan_precondition_evidence<'a>(
     store: &'a StateStore,
     catalog: &'a CatalogSnapshot,
@@ -1098,6 +1103,10 @@ pub(super) fn validate_live_plan_precondition_evidence<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LivePreconditionEvidence>> + 'a>> {
     Box::pin(async move {
         Ok(LivePreconditionEvidence {
+            pages_production_variables_state: super::pages_projects::validate_live(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
             zone_account: validate_live_zone_account_precondition(
                 store, catalog, plan, input, credential,
             )
@@ -1392,6 +1401,7 @@ pub(super) fn prepend_live_precondition_evidence(
 ) {
     for item in [
         evidence.pages_project_absence,
+        evidence.pages_production_variables_state,
         evidence.pages_deployment_project_state,
         evidence.r2_parent_token,
         evidence.oauth_client_secret_state,

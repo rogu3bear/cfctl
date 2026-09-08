@@ -2,6 +2,7 @@
 mod access_create;
 pub mod d1_read_inventory;
 mod d1_sql;
+pub mod pages_projects;
 mod r2_private;
 pub mod r2_recovery;
 pub mod r2_restore;
@@ -3213,6 +3214,10 @@ impl Executor {
             .await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "consumed execution keeps contract checks, operation-specific boundary handling and no-replay transport dispatch together"
+    )]
     pub async fn execute_consumed_plan_with_input(
         &self,
         plan: &mut PlanV1,
@@ -3236,6 +3241,9 @@ impl Executor {
             ));
         }
         validate_verification_preconditions(&plan.capability, input)?;
+        if plan.capability.id == cfctl_core::pages_projects::VARIABLES_ID {
+            pages_projects::validate_variable_plan_state(plan, input)?;
+        }
         if plan.capability.r2_private_file_upload.is_some() {
             return Err(CloudflareError::InvalidRequestBody(
                 "private R2 upload requires the managed binary-stage executor; generic mutation execution is blocked"
@@ -3260,9 +3268,14 @@ impl Executor {
                     .to_owned(),
             ));
         }
-        let single_attempt = plan.capability.id == WORKER_VERSION_ROLLBACK_CAPABILITY_ID;
+        let worker_rollback = plan.capability.id == WORKER_VERSION_ROLLBACK_CAPABILITY_ID;
+        let single_attempt = worker_rollback
+            || matches!(
+                plan.capability.id.as_str(),
+                cfctl_core::pages_projects::CREATE_ID | cfctl_core::pages_projects::VARIABLES_ID
+            );
         let mut request = self.builder.build_unchecked(&plan.capability, input)?;
-        if single_attempt {
+        if worker_rollback {
             let reason = input
                 .body
                 .as_ref()
@@ -4079,6 +4092,10 @@ impl Executor {
     /// already validated by the caller. This lane is required for secret
     /// request bodies because the durable plan contains only a hash-bound
     /// credential-store reference, never the value-bearing body.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the central verifier dispatch remains explicit while bounded verifiers live in their owning modules"
+    )]
     pub async fn verify_plan_with_input(
         &self,
         plan: &PlanV1,
@@ -4088,6 +4105,15 @@ impl Executor {
     ) -> Result<OperationVerificationV1> {
         let strategy = plan.capability.verification.strategy.as_str();
         validate_verification_preconditions(&plan.capability, input)?;
+        if matches!(
+            strategy,
+            cfctl_core::pages_projects::CREATE_STRATEGY
+                | cfctl_core::pages_projects::VARIABLES_STRATEGY
+        ) {
+            return self
+                .verify_pages_setup(plan, apply_response, input, credential)
+                .await;
+        }
         if strategy == "d1_current_bookmark_equals_restore_result_bookmark" {
             return self
                 .verify_d1_restore_exact_bookmark(plan, apply_response, input, credential)
@@ -12511,6 +12537,7 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    pages_projects::validate(capability, input)?;
     if capability.workspace_d1_read_inventory.is_some() {
         d1_read_inventory::validate(capability, input)?;
     }

@@ -436,6 +436,7 @@ pub(super) fn kv_cost_resolves_only_with_a_bound_empty_precondition() {
         entitlement: None,
         zone_account: None,
         pages_project_absence: None,
+        pages_production_variables_state: None,
         pages_deployment_project_state: None,
         r2_parent_token: None,
         global_warp_override_state: None,

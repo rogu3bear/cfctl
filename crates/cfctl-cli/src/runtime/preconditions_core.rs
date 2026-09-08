@@ -10,8 +10,7 @@ use super::live_state_contracts::should_bind_d1_empty_database_state;
 use super::live_state_contracts::should_bind_d1_read_replication_state;
 use super::live_state_contracts::should_bind_global_warp_override_state;
 use super::pages_deployment::{
-    PROJECT_ABSENCE_PRECONDITION, PROJECT_CREATE_CAPABILITY_ID, PROJECT_DETAIL_PATH,
-    PROJECT_READ_CAPABILITY_ID,
+    PROJECT_ABSENCE_PRECONDITION, PROJECT_DETAIL_PATH, PROJECT_READ_CAPABILITY_ID,
 };
 use super::plan_create::read_live_pages_deployment_project_state;
 use super::plan_create::read_live_worker_deployment_state;
@@ -175,7 +174,8 @@ pub(super) fn validate_pages_project_absence_receipt(plan: &PlanV1, receipt: &Va
             == Some(PROJECT_READ_CAPABILITY_ID)
         && receipt.get("source_path").and_then(Value::as_str) == Some(PROJECT_DETAIL_PATH)
         && receipt.get("target_capability_id").and_then(Value::as_str)
-            == Some(PROJECT_CREATE_CAPABILITY_ID)
+            == Some(plan.capability.id.as_str())
+        && should_bind_pages_project_absence(&plan.capability)
         && receipt.get("target_path").and_then(Value::as_str)
             == Some("/accounts/{account_id}/pages/projects")
         && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
@@ -406,12 +406,15 @@ pub(super) async fn validate_live_pages_deployment_project_state_precondition(
     let Some(expected_hash) = required_pages_deployment_project_state_precondition(plan)? else {
         return Ok(None);
     };
+    let profiles = super::prelude::ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
     let (receipt, evidence) = read_live_pages_deployment_project_state(
         store,
         catalog,
         &plan.capability,
         input,
         &plan.account_id,
+        profile,
         credential,
     )
     .await?;

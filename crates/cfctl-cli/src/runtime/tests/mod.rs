@@ -201,6 +201,7 @@ fn authenticated_test_store_reopens_the_same_authority() {
 
 mod acceptance_rectification;
 mod pages_and_delegated;
+mod pages_setup;
 use pages_and_delegated::*;
 mod import_admission;
 mod import_lineage;

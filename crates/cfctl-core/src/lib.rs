@@ -2,6 +2,7 @@
 
 pub mod d1_read_inventory;
 mod email_routing;
+pub mod pages_projects;
 pub use email_routing::{
     EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH,
     EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_RULES_LIST_PATH,
@@ -2288,6 +2289,9 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            pages_projects::CREATE_STRATEGY | pages_projects::VARIABLES_STRATEGY => {
+                pages_projects::contract_supported(self)
+            }
             "workspace_d1_migration_ledger_and_schema_assertions" => {
                 self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
                     && self.adapter_status == AdapterStatus::DelegatedCli
@@ -6546,7 +6550,8 @@ fn deployment_plan_set_provider_hashes(
     Ok(union)
 }
 
-fn valid_sha256_identity(value: &str) -> bool {
+#[must_use]
+pub fn valid_sha256_identity(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|digest| {
         digest.len() == 64
             && digest

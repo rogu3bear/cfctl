@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "catalog/pages_projects.rs"]
+mod pages_projects;
+
 use std::collections::BTreeMap;
 
 use cfctl_catalog::{

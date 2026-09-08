@@ -1,5 +1,4 @@
 use super::credential_resolution::platform_secrets;
-use super::entitlement_state::should_bind_pages_project_absence;
 use super::import_planning::SECURITY_ACTION_STATE_PRECONDITION;
 use super::pages_deployment::PROJECT_ABSENCE_PRECONDITION;
 use super::pages_source::SOURCE_REMOTE_PRECONDITION;
@@ -183,7 +182,7 @@ pub(super) fn current_pages_source_remote_precondition(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<Option<String>> {
-    if !should_bind_pages_project_absence(&plan.capability) {
+    if !super::entitlement_state::is_git_pages_project_create(&plan.capability) {
         return Ok(None);
     }
     let expected = plan

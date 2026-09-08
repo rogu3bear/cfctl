@@ -1214,6 +1214,24 @@ pub(super) fn apply_project_response(
     expected_branch: Option<&str>,
     response: &CloudflareResponseV1,
 ) -> Result<Value, CliError> {
+    apply_project_response_with_create_proof(
+        capability,
+        account_id,
+        project_name,
+        expected_branch,
+        response,
+        None,
+    )
+}
+
+pub(super) fn apply_project_response_with_create_proof(
+    capability: &CapabilityV1,
+    account_id: &str,
+    project_name: &str,
+    expected_branch: Option<&str>,
+    response: &CloudflareResponseV1,
+    create_proof: Option<&Value>,
+) -> Result<Value, CliError> {
     if !response.success || response.status != 200 {
         return Err(CliError::Input(format!(
             "Pages project admission read returned HTTP {}; the deployment boundary was not crossed",
@@ -1252,28 +1270,75 @@ pub(super) fn apply_project_response(
     {
         ("git_integrated", "explicit_git_source", None)
     } else if source.is_none() {
-        let deployment_id = omitted_source_direct_deployment_id(
-            &response.result,
-            project_name,
-            production_branch,
-        )
-        .ok_or_else(|| {
-            CliError::Input(
+        let deployment_id =
+            omitted_source_direct_deployment_id(&response.result, project_name, production_branch);
+        if let Some(deployment_id) = deployment_id {
+            (
+                "direct_upload",
+                "omitted_source_exact_direct_deployment",
+                Some(deployment_id),
+            )
+        } else if create_proof.is_some()
+            && binds_artifact(capability)
+            && cfctl_core::pages_projects::project_is_direct(&response.result, project_name)
+        {
+            (
+                "direct_upload",
+                "omitted_source_authenticated_direct_create",
+                None,
+            )
+        } else {
+            return Err(CliError::Input(
                 "Pages project admission read omitted its source without exact direct-upload deployment corroboration; the deployment boundary was not crossed"
                     .to_owned(),
-            )
-        })?;
-        (
-            "direct_upload",
-            "omitted_source_exact_direct_deployment",
-            Some(deployment_id),
-        )
+            ));
+        }
     } else {
         return Err(CliError::Input(
             "Pages project admission read returned an unknown source mode; the deployment boundary was not crossed"
                 .to_owned(),
         ));
     };
+    validate_project_deployment_mode(
+        capability,
+        project_name,
+        production_branch,
+        source_mode,
+        expected_branch,
+    )?;
+    let mut receipt = json!({
+        "schema_version": 1,
+        "source_capability_id": PROJECT_READ_CAPABILITY_ID,
+        "source_path": PROJECT_DETAIL_PATH,
+        "target_capability_id": capability.id,
+        "account_id": account_id,
+        "project_name": project_name,
+        "production_branch": production_branch,
+        "source_mode": source_mode,
+        "source_mode_basis": source_mode_basis,
+    });
+    if let Some(deployment_id) = corroborating_deployment_id {
+        receipt["corroborating_deployment_id"] = json!(deployment_id);
+    }
+    if source_mode_basis == "omitted_source_authenticated_direct_create" {
+        receipt["project_id"] = response.result["id"].clone();
+        receipt["direct_create_proof"] = create_proof.cloned().unwrap_or(Value::Null);
+        if !super::pages_direct_proof::reference_is_bound(&receipt) {
+            return Err(CliError::Input(
+                "Pages direct-create proof does not match the current project identity".to_owned(),
+            ));
+        }
+    }
+    Ok(receipt)
+}
+
+fn validate_project_deployment_mode(
+    capability: &CapabilityV1,
+    project_name: &str,
+    production_branch: &str,
+    source_mode: &str,
+    expected_branch: Option<&str>,
+) -> Result<(), CliError> {
     let expected_mode = if binds_artifact(capability) {
         "direct_upload"
     } else {
@@ -1295,21 +1360,7 @@ pub(super) fn apply_project_response(
             "Pages direct-upload branch does not match project production branch `{production_branch}`; the deployment boundary was not crossed"
         )));
     }
-    let mut receipt = json!({
-        "schema_version": 1,
-        "source_capability_id": PROJECT_READ_CAPABILITY_ID,
-        "source_path": PROJECT_DETAIL_PATH,
-        "target_capability_id": capability.id,
-        "account_id": account_id,
-        "project_name": project_name,
-        "production_branch": production_branch,
-        "source_mode": source_mode,
-        "source_mode_basis": source_mode_basis,
-    });
-    if let Some(deployment_id) = corroborating_deployment_id {
-        receipt["corroborating_deployment_id"] = json!(deployment_id);
-    }
-    Ok(receipt)
+    Ok(())
 }
 
 fn omitted_source_direct_deployment_id<'a>(
@@ -1393,6 +1444,10 @@ pub(super) fn receipt_source_mode_is_bound(receipt: &Value, expected_mode: &str)
         }
         (Some("direct_upload"), Some("omitted_source_exact_direct_deployment"), Some(id)) => {
             expected_mode == "direct_upload" && uuid::Uuid::parse_str(id).is_ok()
+        }
+        (Some("direct_upload"), Some("omitted_source_authenticated_direct_create"), None) => {
+            expected_mode == "direct_upload"
+                && super::pages_direct_proof::reference_is_bound(receipt)
         }
         (Some("git_integrated"), Some("explicit_git_source"), None) => {
             expected_mode == "git_integrated"

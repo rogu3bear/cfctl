@@ -1,5 +1,4 @@
 use super::api_boundary::blocked_capability_envelope;
-use super::entitlement_state::should_bind_pages_project_absence;
 use super::guide_generation::approval_command_argv;
 use super::import_planning::SECURITY_ACTION_STATE_PRECONDITION;
 use super::keys_commands::validate_selected_permission_groups;
@@ -53,22 +52,40 @@ use super::{pages_deployment, worker_custom_domain, worker_deployment};
 use crate::build_identity::current_build_info;
 use cfctl_core::hash_value;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the preparation dispatcher keeps each independent live precondition and its evidence in one assembly point"
+)]
 pub(super) async fn prepare_live_plan_preconditions(
     store: &StateStore,
     catalog: &CatalogSnapshot,
     capability: &CapabilityV1,
     input: &CallInput,
     adapter_targets: &Value,
-    account_id: &str,
+    authority: PlanAuthority<'_>,
     credential: Option<&AuthCredential>,
 ) -> Result<LivePlanPreconditions> {
+    let PlanAuthority {
+        profile,
+        account_id,
+    } = authority;
     Ok(LivePlanPreconditions {
+        pages_production_variables_state: super::pages_projects::prepare(
+            store,
+            catalog,
+            capability,
+            input,
+            adapter_targets,
+            account_id,
+            credential,
+        )
+        .await?,
         pages_project_absence: prepare_pages_project_absence_precondition(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
         pages_deployment_project_state: prepare_pages_deployment_project_state_precondition(
-            store, catalog, capability, input, account_id, credential,
+            store, catalog, capability, input, account_id, profile, credential,
         )
         .await?,
         global_warp_override_state: prepare_global_warp_override_state_precondition(
@@ -170,6 +187,7 @@ pub(super) struct LivePlanPreconditions {
     pub(super) entitlement: Option<(Value, EvidenceV1)>,
     pub(super) zone_account: Option<(Value, EvidenceV1)>,
     pub(super) pages_project_absence: Option<(Value, EvidenceV1)>,
+    pub(super) pages_production_variables_state: Option<(Value, EvidenceV1)>,
     pub(super) pages_deployment_project_state: Option<(Value, EvidenceV1)>,
     pub(super) r2_parent_token: Option<(Value, EvidenceV1)>,
     pub(super) global_warp_override_state: Option<(Value, EvidenceV1)>,
@@ -203,6 +221,9 @@ pub(super) fn plan_targets(
     });
     if let Some((receipt, _)) = &live_preconditions.pages_project_absence {
         targets["live_preconditions"][PROJECT_ABSENCE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.pages_production_variables_state {
+        targets["live_preconditions"][super::pages_projects::STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.pages_deployment_project_state {
         targets["live_preconditions"][pages_deployment::PROJECT_STATE_PRECONDITION] =
@@ -271,6 +292,10 @@ pub(super) fn bind_live_plan_preconditions(
     live_preconditions: &LivePlanPreconditions,
 ) -> Result<()> {
     for (name, precondition) in [
+        (
+            super::pages_projects::STATE_PRECONDITION,
+            &live_preconditions.pages_production_variables_state,
+        ),
         ("entitlement", &live_preconditions.entitlement),
         ("zone_account", &live_preconditions.zone_account),
         (
@@ -493,7 +518,7 @@ pub(super) fn prepare_pages_source_remote_precondition(
     capability: &CapabilityV1,
     input: &CallInput,
 ) -> Result<Option<Value>> {
-    if !should_bind_pages_project_absence(capability) {
+    if !super::entitlement_state::is_git_pages_project_create(capability) {
         return Ok(None);
     }
     let graph = discover_registered(store)?;
@@ -684,6 +709,9 @@ pub(super) fn prepend_prepared_plan_evidence(
     live_preconditions: LivePlanPreconditions,
 ) {
     for (_, evidence) in [
+        live_preconditions.pages_project_absence,
+        live_preconditions.pages_deployment_project_state,
+        live_preconditions.pages_production_variables_state,
         live_preconditions.entitlement,
         live_preconditions.zone_account,
         live_preconditions.global_warp_override_state,

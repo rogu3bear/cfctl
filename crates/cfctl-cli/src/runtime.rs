@@ -38,6 +38,8 @@ mod live_state_contracts;
 mod mutation_input;
 mod oauth_state;
 mod pages_deployment;
+mod pages_direct_proof;
+mod pages_projects;
 mod pages_source;
 mod plan_commands;
 mod plan_create;

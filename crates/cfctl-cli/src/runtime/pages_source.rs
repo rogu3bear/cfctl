@@ -420,7 +420,7 @@ pub(super) fn plan_impact(
     let workspace_impact = graph.impact_for(&workspace_resource_keys);
     let local_artifact_paths = plan_local_artifact_paths(capability, input)?;
     let mut affected_repositories = workspace_impact.affected_repositories.clone();
-    if should_bind_pages_project_absence(capability) {
+    if super::entitlement_state::is_git_pages_project_create(capability) {
         let source_repository = registered_pages_source_repository(&graph, input)?;
         affected_repositories.push(source_repository.path.display().to_string());
     }

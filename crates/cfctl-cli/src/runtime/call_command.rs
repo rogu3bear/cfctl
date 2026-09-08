@@ -385,6 +385,12 @@ pub(super) async fn call_command(
         adapter_targets.insert("security_action".to_owned(), security_action);
     }
     if let Some(secret_body) = &prepared.secret_body {
+        if super::pages_projects::applies(&capability) {
+            adapter_targets.insert(
+                "pages_production_variables".to_owned(),
+                cfctl_cloudflare::pages_projects::variable_target(secret_body)?,
+            );
+        }
         let reference = format!("plan-input/{}", uuid::Uuid::new_v4());
         let content_hash = hash_value(secret_body)?;
         secrets.put(&reference, &serde_json::to_string(secret_body)?)?;

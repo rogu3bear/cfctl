@@ -396,9 +396,15 @@ pub(super) fn apply_zone_account_response(
 }
 
 pub(super) fn should_bind_pages_project_absence(capability: &CapabilityV1) -> bool {
-    capability.id == PROJECT_CREATE_CAPABILITY_ID
-        && capability.method == "POST"
+    matches!(
+        capability.id.as_str(),
+        PROJECT_CREATE_CAPABILITY_ID | cfctl_core::pages_projects::CREATE_ID
+    ) && capability.method == "POST"
         && capability.path == "/accounts/{account_id}/pages/projects"
+}
+
+pub(super) fn is_git_pages_project_create(capability: &CapabilityV1) -> bool {
+    capability.id == PROJECT_CREATE_CAPABILITY_ID && should_bind_pages_project_absence(capability)
 }
 
 pub(super) fn pages_project_name(input: &CallInput) -> Result<&str> {
@@ -497,7 +503,8 @@ pub(super) async fn read_live_pages_project_absence(
             credential,
         )
         .await?;
-    let receipt = apply_pages_project_absence_response(account_id, project_name, &response)?;
+    let mut receipt = apply_pages_project_absence_response(account_id, project_name, &response)?;
+    receipt["target_capability_id"] = json!(capability.id);
     let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
@@ -549,6 +556,7 @@ pub(super) fn plan_requires_live_credential(
     adapter_targets: &Value,
 ) -> bool {
     super::access_create::applies(capability)
+        || super::pages_projects::applies(capability)
         || should_bind_pages_project_absence(capability)
         || pages_deployment::binds_project_state(capability)
         || worker_deployment::target(adapter_targets).is_some()

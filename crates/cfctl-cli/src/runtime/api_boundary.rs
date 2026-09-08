@@ -648,6 +648,10 @@ pub(super) async fn verify_api_plan(
     execution_input: &CallInput,
     credential: &AuthCredential,
 ) -> Result<ApiVerificationOutcome> {
+    if let Some(outcome) = super::pages_projects::persist_ambiguous_response(store, plan, response)?
+    {
+        return Ok(outcome);
+    }
     if !response.success {
         if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID
             && (response.status == 429 || response.status >= 500)
@@ -769,6 +773,7 @@ pub(super) fn verification_outcome(
             object.insert("readback".to_owned(), redacted);
         }
     }
+    super::pages_direct_proof::attach_verification_context(store, plan, &mut verification_value)?;
     let evidence =
         Some(store.write_observation_evidence(
             EvidenceClass::PostChangeVerification,
