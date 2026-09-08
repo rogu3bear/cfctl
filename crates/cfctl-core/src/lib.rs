@@ -132,6 +132,8 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
                     CommandNodeV1::leaf("private-activate"),
                     CommandNodeV1::leaf("private-history"),
                     CommandNodeV1::leaf("private-preview"),
+                    CommandNodeV1::leaf("private-rebind"),
+                    CommandNodeV1::leaf("private-rebind-preview"),
                     CommandNodeV1::leaf("recover"),
                     CommandNodeV1::branch("recover-plan", EVIDENCE_KEY_RECOVERY_PLAN_COMMANDS),
                     CommandNodeV1::leaf("recover-preview"),
