@@ -2,3 +2,9 @@
 # fingerprint suppresses only the reviewed historical finding, not the rule,
 # file, or commit.
 5a3bed583e757d4350fbb4887ed472f26a2301ac:crates/cfctl-cli/src/runtime.rs:generic-api-key:3134
+
+# Non-secret R2 object names in local capture, restore and recovery fixtures.
+# These exact historical findings do not exclude a rule, path or commit.
+a6e2d3c012c438bd95a5700a012715399b738500:crates/cfctl-cli/src/runtime/r2_recovery_tests.rs:generic-api-key:96
+a6e2d3c012c438bd95a5700a012715399b738500:crates/cfctl-cli/src/runtime/r2_restore_tests.rs:generic-api-key:110
+a6e2d3c012c438bd95a5700a012715399b738500:crates/cfctl-cloudflare/src/r2_restore_tests.rs:generic-api-key:17
