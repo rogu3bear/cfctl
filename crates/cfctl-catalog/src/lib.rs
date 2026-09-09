@@ -39,6 +39,7 @@ use thiserror::Error;
 
 mod access_create;
 mod pages_projects;
+mod worker_frozen_upload;
 mod workspace_d1_qualification;
 use access_create::finalize_access_application_create_contract;
 pub use access_create::{ACCESS_APP_CREATE_OWNED_ID, access_application_create_owned_schema};
@@ -2207,6 +2208,7 @@ fn ingest_wrangler_versions_upload_help(
             contract: None,
         })
         .collect();
+        worker_frozen_upload::attach(&mut capability);
         snapshot
             .capabilities
             .insert(capability.id.clone(), capability);

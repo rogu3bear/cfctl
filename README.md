@@ -520,6 +520,10 @@ installation does not qualify a public prebuilt binary.
 
 ### Worker module identity
 
+For an already-built Worker, use the optional
+[frozen-artifact upload mode](docs/worker-frozen-artifact-upload.md) to bind the
+complete artifact manifest and suppress the custom build during version upload.
+
 Use the [immutable Worker module digest read](docs/worker-version-artifact-digest.md)
 when a release needs version-bound module hashes without retaining deployed source.
 It does not qualify active traffic or static assets.

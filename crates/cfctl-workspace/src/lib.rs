@@ -672,7 +672,16 @@ pub fn load_wrangler_config_snapshot(path: &Path) -> Result<WranglerConfigSnapsh
         path: path.display().to_string(),
         source,
     })?;
-    let text = std::str::from_utf8(&content).map_err(|_| {
+    parse_wrangler_config_snapshot(path, &content)
+}
+
+/// Interpret already-captured bytes without reopening the config path. Frozen
+/// artifact admission uses this after descriptor-relative no-follow capture.
+pub fn parse_wrangler_config_snapshot(
+    path: &Path,
+    content: &[u8],
+) -> Result<WranglerConfigSnapshot> {
+    let text = std::str::from_utf8(content).map_err(|_| {
         WorkspaceError::DiscoveryInvariant(format!(
             "Wrangler configuration `{}` is not valid UTF-8",
             path.display()
@@ -701,7 +710,7 @@ pub fn load_wrangler_config_snapshot(path: &Path) -> Result<WranglerConfigSnapsh
     }?;
     Ok(WranglerConfigSnapshot {
         document,
-        content_hash: hash_bytes(&content),
+        content_hash: hash_bytes(content),
     })
 }
 

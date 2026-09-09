@@ -3,6 +3,7 @@
 pub mod d1_read_inventory;
 mod email_routing;
 pub mod pages_projects;
+pub mod worker_frozen_upload;
 pub use email_routing::{
     EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH,
     EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_RULES_LIST_PATH,

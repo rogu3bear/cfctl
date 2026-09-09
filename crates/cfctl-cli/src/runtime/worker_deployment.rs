@@ -91,7 +91,7 @@ pub(super) fn prepare_target(
         return prepare_rollback_target(capability, input).map(Some);
     }
     let config = canonical_config(input)?;
-    let snapshot = load_wrangler_config_snapshot(&config)?;
+    let snapshot = super::worker_frozen_upload::config_snapshot(capability, input, &config)?;
     let document = &snapshot.document;
     let service_name = validated_service_name(document, input)?;
     let repository = repository_owning_path(graph, &config).ok_or_else(|| {
@@ -243,6 +243,7 @@ pub(super) fn prepare_target(
         CliError::Input("Worker deployment operation is not an object".to_owned())
     })?;
     target_object.extend(operation_object.clone());
+    super::worker_frozen_upload::attach(capability, input, &snapshot, &mut target)?;
     Ok(Some(target))
 }
 

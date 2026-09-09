@@ -203,6 +203,8 @@ mod acceptance_rectification;
 mod d1_restore_proof;
 mod pages_and_delegated;
 mod pages_setup;
+mod worker_frozen_contracts;
+mod worker_frozen_upload;
 use pages_and_delegated::*;
 mod import_admission;
 mod import_lineage;
