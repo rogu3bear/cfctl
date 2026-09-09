@@ -18,6 +18,7 @@ mod catalog_commands;
 mod cloudflare_api;
 mod compensation;
 mod credential_resolution;
+mod d1_restore_proof;
 mod delegated_execution;
 mod delegated_read;
 mod docs_commands;

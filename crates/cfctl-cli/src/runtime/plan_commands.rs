@@ -326,6 +326,19 @@ pub(super) fn show_plan(store: &StateStore, selector: &PlanSelector) -> Result<R
         );
         result["private_restore_verification"] = projection;
         Some(state)
+    } else if plan.capability.id == super::d1_restore_proof::RESTORE_ID {
+        let (projection, state) = super::d1_restore_proof::inspect(
+            store,
+            &plan,
+            plan_v2.map(Box::as_ref),
+            matches!(
+                record,
+                StoredPlanRecord::ProjectionDrift { .. }
+                    | StoredPlanRecord::RequiredSidecarMissing(_)
+            ),
+        );
+        result["d1_restore_verification"] = projection;
+        Some(state)
     } else {
         None
     };

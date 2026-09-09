@@ -603,13 +603,38 @@ then reads the current bookmark again and verifies that it equals the returned
 restore bookmark.
 
 The receipt binds target, expected, pre-restore, returned, previous, and
-post-restore bookmarks; source operation/evidence linkage; the closed request
-digest; provider response metadata; and performed/verified truth. Cloudflare
+post-restore bookmarks; caller-supplied source operation/evidence references;
+the closed request digest; provider response metadata; and performed/verified truth. Cloudflare
 documents no incremental restore operation charge, but restoring overwrites
 the database and cancels in-flight queries. Undo is never automatic: create a
 new `d1-restore-exact-bookmark` plan targeting the prior receipt's
 `previous_bookmark`, bind a fresh expected current bookmark, review it, and
 approve it separately.
+
+For historical authentication, `cfctl plans show <operation-id> --json` and
+`cfctl plans status <operation-id> --json` expose
+`result.d1_restore_verification`. Require `qualified: true` and
+`qualification: "authenticated_restore_verification"`. This read-only projection
+authenticates the Apply and PostChangeVerification evidence, their exact
+operation, plan, execution pins, account/database, caller inputs, and the native
+approval/consumption/boundary checkpoint chain. It also checks the successful
+closed lifecycle and the pre/expected and post/returned bookmark comparisons.
+The projection includes `binding`, `bookmarks`, and the two evidence descriptors
+under `evidence.apply` and `evidence.verification`. Missing, tampered, wrongly
+classed or mismatched evidence fails qualification with a `reason`; historical
+receipts without the operation-bound signed context cannot qualify and are not
+retrofitted. Envelope verification follows this inspection, not the plan status.
+
+The signed verification-attempt checkpoint hash authenticates the earlier
+boundary-attempt timestamp in the returned plan's journal. Identical Apply
+bytes can reuse an older immutable descriptor, so its `generated_at` is not the
+execution time of the current restore. Historical plan expiry or a later catalog,
+build or credential generation does not grant or remove this historical proof.
+Inspection performs no provider requests, catalog refresh or journal writes.
+The source operation/evidence fields authenticate only the caller's exact
+inputs; export lineage, retained export bytes/custody, current provider state,
+writer exclusion and changed-state rollback require separate evidence. This
+projection grants no write authority.
 
 Logs Engine retrieval is the one reserved-header exception and remains
 operation-specific. Supply a mode-0600 JSON bundle containing exactly

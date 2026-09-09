@@ -774,6 +774,7 @@ pub(super) fn verification_outcome(
         }
     }
     super::pages_direct_proof::attach_verification_context(store, plan, &mut verification_value)?;
+    super::d1_restore_proof::attach_verification_context(store, plan, &mut verification_value)?;
     let evidence =
         Some(store.write_observation_evidence(
             EvidenceClass::PostChangeVerification,
