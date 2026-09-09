@@ -153,7 +153,7 @@ impl Fixture {
     async fn new() -> Self {
         let root = tempfile::tempdir().expect("restore fixture root");
         let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
-        let plan = executed_plan(&store).await;
+        let plan = Box::pin(executed_plan(&store)).await;
         Self { root, store, plan }
     }
 
@@ -411,7 +411,7 @@ async fn d1_restore_proof_rejects_cross_operation_authenticated_receipts_even_wi
     let first_operation = fixture.plan.operation_id.clone();
     let first_apply = fixture.apply().0;
     let (first_descriptor, first_verification) = fixture.verification();
-    fixture.plan = executed_plan(&fixture.store).await;
+    fixture.plan = Box::pin(executed_plan(&fixture.store)).await;
     assert_ne!(fixture.plan.operation_id, first_operation);
     // Content-addressed Apply bytes may be identical across executions. Fresh
     // operation-bound verification still qualifies the second native execution.
@@ -450,7 +450,7 @@ async fn d1_restore_proof_rejects_fabricated_operation_and_every_rebound_plan_id
             "operation" => forged.plan.operation_id = Uuid::new_v4().to_string(),
             "input" => forged.plan.input["body"]["source_operation_id"] = json!("borrowed-source"),
             "database" => {
-                forged.plan.input["selectors"]["database_id"] = json!(Uuid::new_v4().to_string())
+                forged.plan.input["selectors"]["database_id"] = json!(Uuid::new_v4().to_string());
             }
             "account" => {
                 forged.plan.account_id = "c".repeat(32);
@@ -467,14 +467,14 @@ async fn d1_restore_proof_rejects_fabricated_operation_and_every_rebound_plan_id
                     .clone_from(&forged.plan.catalog_hash);
             }
             "build" => {
-                forged.pins.build_identity_hash = hash_value(&json!("other-build")).expect("hash")
+                forged.pins.build_identity_hash = hash_value(&json!("other-build")).expect("hash");
             }
             "authority" => {
                 forged.pins.authority_hash =
-                    Some(hash_value(&json!("other-authority")).expect("hash"))
+                    Some(hash_value(&json!("other-authority")).expect("hash"));
             }
             "capability" => {
-                forged.plan.capability.description = Some("different contract identity".to_owned())
+                forged.plan.capability.description = Some("different contract identity".to_owned());
             }
             "request_hash" => forged.plan.input["if_match"] = json!("different-request"),
             _ => unreachable!(),
@@ -677,7 +677,7 @@ async fn d1_restore_proof_requires_verified_closed_lifecycle_and_exact_terminal_
                     .plan_status = PlanStatus::Failed;
             }
             "prefix" => {
-                fixture.plan.transaction_journal[1].recorded_at += ChronoDuration::nanoseconds(1)
+                fixture.plan.transaction_journal[1].recorded_at += ChronoDuration::nanoseconds(1);
             }
             "chronology" => {
                 fixture
@@ -685,7 +685,7 @@ async fn d1_restore_proof_requires_verified_closed_lifecycle_and_exact_terminal_
                     .transaction_journal
                     .last_mut()
                     .expect("closed checkpoint")
-                    .recorded_at = fixture.plan.created_at - ChronoDuration::seconds(1)
+                    .recorded_at = fixture.plan.created_at - ChronoDuration::seconds(1);
             }
             field => {
                 let key = if field == "terminal-state" {
