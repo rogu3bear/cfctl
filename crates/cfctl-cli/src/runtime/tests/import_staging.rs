@@ -1,5 +1,204 @@
 use super::*;
 
+struct ExportCoverageFixture {
+    _root: tempfile::TempDir,
+    store: StorageStateStore,
+    input: CallInput,
+    envelope: ResultEnvelopeV2,
+}
+
+fn export_coverage_fixture() -> ExportCoverageFixture {
+    let root = tempfile::tempdir().expect("runtime root");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
+    let mut catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+    store
+        .write_json(&store.paths().catalog_file(), &catalog)
+        .expect("seed catalog");
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"ca30e922fda7f5578e49873542e4aaca",
+            "database_id":"15dc8c91-cba5-4ba8-9e5b-a06cf7e6bf15",
+        }),
+        query: json!({}),
+        ..CallInput::default()
+    };
+    let generation = "22222222-2222-4222-8222-222222222222";
+    let mut profile = ProfileMetadata::new(
+        "profile-a",
+        ProfileKind::ApiToken,
+        input.selectors["account_id"].as_str(),
+    );
+    profile.credential_generation_id = Some(generation.to_owned());
+    let mut profiles = ProfilesConfig::default();
+    profiles.profiles.insert(profile.id.clone(), profile);
+    profiles.save(&store).expect("current profile");
+    let result = json!({
+        "success":true,
+        "status":200,
+        "result": {
+            "output_file":{
+                "sha256":format!("sha256:{}", "a".repeat(64)),
+                "complete":true,
+                "hash_matches":true,
+            },
+            "provider":{"at_bookmark":"pre-import-bookmark"},
+        }
+    });
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &result)
+        .expect("export evidence");
+    let mut envelope = ResultEnvelopeV2::success("call", result).with_evidence(evidence);
+    envelope.performed = true;
+    envelope.profile_id = Some("profile-a".to_owned());
+    envelope.account_id = input.selectors["account_id"].as_str().map(str::to_owned);
+    record_operational_proof(
+        &store,
+        &catalog,
+        catalog.get("d1-full-export").expect("D1 export"),
+        &input,
+        Some(generation),
+        &envelope,
+    )
+    .expect("real governed export proof producer");
+    ExportCoverageFixture {
+        _root: root,
+        store,
+        input,
+        envelope,
+    }
+}
+
+#[tokio::test]
+async fn d1_export_coverage_supplies_the_exact_import_anchor() {
+    let fixture = export_coverage_fixture();
+    let coverage = Box::pin(catalog_command(&fixture.store, CatalogCommand::Coverage))
+        .await
+        .expect("public catalog coverage");
+    assert!(coverage.ok);
+    let rows = coverage.result["operational_proof"]["latest_scoped_observations"]
+        .as_array()
+        .expect("public observation rows");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["credential_generation_current"], true);
+    assert_eq!(row["catalog_current"], true);
+    assert_eq!(
+        row["evidence"]["content_hash"],
+        fixture.envelope.evidence[0].content_hash
+    );
+    let binding: D1FullExportGovernedExecutionBindingV1 = serde_json::from_value(
+        row.get("d1_full_export_execution")
+            .expect("public coverage must expose the original governed export binding")
+            .clone(),
+    )
+    .expect("unchanged typed export binding");
+    assert_eq!(
+        binding.manifest_evidence_hash,
+        row["evidence"]["content_hash"]
+    );
+    assert_eq!(binding.catalog_hash, row["catalog_hash"]);
+    assert_eq!(binding.request_hash, row["input_hash"]);
+    assert_eq!(binding.profile_id, row["profile_id"]);
+    assert_eq!(
+        binding.credential_generation_id,
+        row["credential_generation_id"]
+    );
+    let context = ImportPrerequisiteContext {
+        profile_id: row["profile_id"].as_str().expect("profile"),
+        credential_generation_id: row["credential_generation_id"].as_str(),
+        catalog_hash: row["catalog_hash"].as_str().expect("catalog"),
+        import_operation_id: None,
+        before: fixture.envelope.generated_at + ChronoDuration::seconds(1),
+    };
+    // Every recovery-anchor input comes from the public row, never the proof index.
+    let mut input = fixture.input.clone();
+    input.body = Some(json!({
+        "pre_recovery_anchor_operation_id":binding.operation_id,
+        "pre_recovery_anchor_evidence_hash":binding.manifest_evidence_hash,
+        "pre_recovery_anchor_output_sha256":binding.output_file_sha256,
+        "pre_recovery_anchor_bookmark_hash":binding.at_bookmark_hash,
+    }));
+    validate_reviewed_git_import_prerequisites(&fixture.store, &input, context)
+        .expect("public row supplies the exact authentic import anchor");
+    input.body.as_mut().expect("anchor body")["pre_recovery_anchor_operation_id"] =
+        json!(Uuid::new_v4().to_string());
+    let error = validate_reviewed_git_import_prerequisites(&fixture.store, &input, context)
+        .expect_err("substituted UUID cannot qualify with the same evidence");
+    assert!(
+        error
+            .to_string()
+            .contains("exactly one completed governed D1 full-export anchor")
+    );
+    let repeated = Box::pin(catalog_command(&fixture.store, CatalogCommand::Coverage))
+        .await
+        .expect("repeat public projection");
+    assert_eq!(
+        repeated.result["operational_proof"]["latest_scoped_observations"],
+        json!(rows)
+    );
+    assert_eq!(
+        coverage.result["operational_proof"]["proof_projection"]["limit"],
+        512
+    );
+    assert!(fixture.envelope.operation_id.is_none());
+}
+
+fn export_coverage_fixture_proof(store: &StorageStateStore) -> (PathBuf, Value) {
+    // Adversarial edits below touch only this test's isolated temporary index.
+    let paths = fs::read_dir(store.paths().data_dir.join("evidence-index"))
+        .expect("test proof directory")
+        .map(|entry| entry.expect("test proof entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1);
+    let document = serde_json::from_slice(&fs::read(&paths[0]).expect("test proof bytes"))
+        .expect("authenticated test proof document");
+    (paths[0].clone(), document)
+}
+
+#[tokio::test]
+async fn d1_export_coverage_rejects_invalid_authenticated_proof() {
+    let fixture = export_coverage_fixture();
+    let (path, mut document) = export_coverage_fixture_proof(&fixture.store);
+    document["payload"]["d1_full_export_execution"]["operation_id"] =
+        json!(Uuid::new_v4().to_string());
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&document).expect("tampered document"),
+    )
+    .expect("tamper isolated test proof");
+    let error = Box::pin(catalog_command(&fixture.store, CatalogCommand::Coverage))
+        .await
+        .expect_err("tampered binding must never enter public coverage");
+    assert!(error.to_string().contains("candidate operational proof"));
+}
+
+#[tokio::test]
+async fn d1_export_coverage_omits_unauthenticated_proof() {
+    let fixture = export_coverage_fixture();
+    let (path, document) = export_coverage_fixture_proof(&fixture.store);
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&document["payload"]).expect("unauthenticated document"),
+    )
+    .expect("strip authentication from isolated test proof");
+    let coverage = Box::pin(catalog_command(&fixture.store, CatalogCommand::Coverage))
+        .await
+        .expect("unauthenticated history remains nonqualifying");
+    let proof = &coverage.result["operational_proof"];
+    assert_eq!(proof["latest_scoped_observations"], json!([]));
+    assert_eq!(proof["proof_projection"]["legacy_nonqualifying_count"], 1);
+    assert_eq!(proof["proof_projection"]["limit"], 512);
+    assert_eq!(proof["proof_count"], 0);
+}
+
 #[test]
 pub(super) fn d1_full_export_runtime_records_the_exact_bookmark_anchor_receipt() {
     let root = tempfile::tempdir().expect("runtime root");

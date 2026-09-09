@@ -492,6 +492,23 @@ relative path, Git blob, SHA-256, byte count, account, database, selected
 profile generation, catalog, and the exact pre-import full-export recovery
 anchor into the immutable plan:
 
+Retrieve that anchor with `cfctl catalog coverage --json`. In
+`result.operational_proof.latest_scoped_observations`, select the row whose
+`evidence.content_hash` exactly matches the completed export receipt, then
+check its account, profile, credential generation, catalog, and input identity
+against the intended export call. Both `credential_generation_current` and
+`catalog_current` must be true. The optional `d1_full_export_execution` field
+contains the original authenticated binding: use its `operation_id`,
+`manifest_evidence_hash`, `output_file_sha256`, and `at_bookmark_hash` for the
+four corresponding inputs below. Keep the stored UUID unchanged; projecting
+the binding creates no new export ID and rewrites no stored proof.
+
+Coverage retains at most the newest 512 authenticated proofs and shows the
+latest observation per scope and input. Inspect `proof_projection.truncated`;
+if the exact export row is absent, do not substitute another observation or
+invent an operation ID. A present row still has to satisfy the import's exact
+target, context, completion, and chronology checks.
+
 ```bash
 printf '%s' \
   '{"pre_recovery_anchor_operation_id":"<export-operation-uuid>","pre_recovery_anchor_evidence_hash":"sha256:<export-evidence>","pre_recovery_anchor_output_sha256":"sha256:<export-file>","pre_recovery_anchor_bookmark_hash":"sha256:<bookmark-string>"}' |

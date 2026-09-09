@@ -75,7 +75,7 @@ pub(crate) fn operational_proof_coverage(
     let latest_rows = latest
         .values()
         .map(|proof| {
-            json!({
+            let mut observation = json!({
                 "capability_id": proof.capability_id,
                 "account_id": proof.account_id,
                 "profile_id": proof.profile_id,
@@ -87,7 +87,11 @@ pub(crate) fn operational_proof_coverage(
                 "outcome": proof.outcome,
                 "observed_at": proof.observed_at,
                 "evidence": proof.evidence,
-            })
+            });
+            if let Some(binding) = proof.d1_full_export_governed_execution() {
+                observation["d1_full_export_execution"] = json!(binding);
+            }
+            observation
         })
         .collect::<Vec<_>>();
     let current_catalog_successes = proofs
