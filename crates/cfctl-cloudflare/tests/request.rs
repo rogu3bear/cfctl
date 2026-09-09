@@ -1051,6 +1051,94 @@ fn d1_restore_exact_bookmark_capability() -> CapabilityV1 {
     capability
 }
 
+#[test]
+fn d1_restore_encodes_only_target_bookmark_in_bodyless_post() {
+    let capability = d1_restore_exact_bookmark_capability();
+    let bookmark = "checkpoint/+?&=#% end";
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":bookmark,
+            "expected_current_bookmark":bookmark,
+            "source_operation_id":"source-op",
+            "source_evidence_hash":format!("sha256:{}", "a".repeat(64))
+        })),
+        ..CallInput::default()
+    };
+    let builder =
+        RequestBuilder::new("https://api.example.invalid/client/v4").expect("request builder");
+    let request = builder
+        .build_unchecked(&capability, &input)
+        .expect("same-bookmark restore request");
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        request.url.query(),
+        Some("bookmark=checkpoint%2F%2B%3F%26%3D%23%25+end")
+    );
+    assert_eq!(
+        request.url.query_pairs().into_owned().collect::<Vec<_>>(),
+        vec![("bookmark".to_owned(), bookmark.to_owned())]
+    );
+    assert!(request.url.fragment().is_none());
+    assert!(request.body.is_none());
+    assert!(request.text_body.is_none());
+    assert!(request.binary_body.is_none());
+    assert_eq!(
+        request.headers[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert!(matches!(
+        builder.build(&capability, &input),
+        Err(CloudflareError::ApprovedPlanRequired(_))
+    ));
+}
+
+#[test]
+fn d1_restore_rejects_caller_query_and_changes_to_closed_public_body() {
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":format!("sha256:{}", "a".repeat(64))
+        })),
+        ..CallInput::default()
+    };
+    let builder =
+        RequestBuilder::new("https://api.example.invalid/client/v4").expect("request builder");
+    let mut invalid = input.clone();
+    invalid.query = json!({"bookmark":"override"});
+    assert!(builder.build_unchecked(&capability, &invalid).is_err());
+    for field in ["timestamp", "sql", "import", "url"] {
+        let mut invalid = input.clone();
+        invalid.body.as_mut().expect("body")[field] = json!("not-admitted");
+        assert!(builder.build_unchecked(&capability, &invalid).is_err());
+    }
+    for field in [
+        "target_bookmark",
+        "expected_current_bookmark",
+        "source_operation_id",
+        "source_evidence_hash",
+    ] {
+        let mut invalid = input.clone();
+        invalid
+            .body
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("body object")
+            .remove(field);
+        assert!(builder.build_unchecked(&capability, &invalid).is_err());
+    }
+}
+
 #[tokio::test]
 async fn d1_restore_prechecks_posts_once_and_postchecks_exact_returned_bookmark() {
     let (address, server) = json_response_sequence_server(vec![
@@ -1130,10 +1218,16 @@ async fn d1_restore_prechecks_posts_once_and_postchecks_exact_returned_bookmark(
     let requests = server.await.expect("server");
     assert_eq!(requests.len(), 3);
     assert!(requests[0].starts_with("GET "));
-    assert!(requests[1].starts_with("POST "));
+    assert_eq!(
+        requests[1].lines().next(),
+        Some(
+            "POST /accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-3333-4444-555555555555/time_travel/restore?bookmark=target-1 HTTP/1.1"
+        )
+    );
     assert!(requests[2].starts_with("GET "));
-    assert!(requests[1].contains(r#"{"bookmark":"target-1"}"#));
+    assert_eq!(requests[1].split_once("\r\n\r\n").expect("POST body").1, "");
     assert!(!requests[1].contains("source_operation_id"));
+    assert!(!requests[1].contains("source_evidence_hash"));
     assert!(!requests[1].contains("expected_current_bookmark"));
 }
 

@@ -593,9 +593,10 @@ planning. Review and explicitly approve the exact operation ID before
 
 At execution, cfctl reads the database's current time-travel bookmark and
 fails before the mutation unless it exactly equals
-`expected_current_bookmark`. It then sends exactly one restore POST containing
-only `{"bookmark":"<target_bookmark>"}`. A rate limit, provider error,
-timeout, or uncertain transport outcome is not retried; inspect the original
+`expected_current_bookmark`. It then sends exactly one restore POST with the
+URL-encoded `bookmark=<target_bookmark>` query parameter and no request body.
+A rate limit, provider error, timeout, or uncertain transport outcome is not
+retried; inspect the original
 operation with `plans status`/`plans rectify`. A successful provider response
 must include non-empty `bookmark`, `message`, and `previous_bookmark`. cfctl
 then reads the current bookmark again and verifies that it equals the returned

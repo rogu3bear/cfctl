@@ -510,7 +510,12 @@ impl RequestBuilder {
                 .and_then(|body| body.get("target_bookmark"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| CloudflareError::MissingRequestBody(capability.id.clone()))?;
-            (Some(serde_json::json!({"bookmark":target})), None)
+            url.query_pairs_mut().append_pair("bookmark", target);
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            (None, None)
         } else if capability.mln_0143_data_invariants.is_some() {
             (
                 Some(render_mln_0143_data_invariants_body(
