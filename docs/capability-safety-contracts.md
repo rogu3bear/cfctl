@@ -64,6 +64,18 @@ still require separate governed D1 introspection. Missing, substituted, or
 ambiguous evidence remains unresolved. MLNavigator imports retain their own
 migration-specific post-import proof requirements.
 
+Generic terminal reconciliation validates the original repository identity,
+commit/path/blob, byte hashes and private staged file against the authenticated
+plan and its direct provider-complete checkpoint. It does not require today's checkout HEAD,
+cleanliness or source file to match that historical import. Missing original
+objects, changed repository identity or damaged staging still fail closed.
+This historical-source path is used only by the local terminal rectifier;
+execution, upload, ingest, poll admission and other existing proof consumers
+retain their current-checkout checks. Advancing source never grants execution
+of an old plan, and historical completion never qualifies current schema state.
+Completion available only through a poll-child chain retains the existing
+current-checkout validation; that recovery case is not relaxed here.
+
 Trusted native import admission permits descriptive pricing-reference enrichment
 while comparing every other capability field exactly, including cost decisions,
 entitlements, request contracts, and verification. Original catalog and plan pins

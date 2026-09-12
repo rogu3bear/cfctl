@@ -1104,11 +1104,26 @@ pub(super) fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> 
     Ok(())
 }
 
+pub(super) fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
+    validate_reviewed_git_stage_authority(plan, true)
+}
+
+/// Only terminal generic-import reconciliation may use historical source bytes.
+/// This is not admission for a new upload, ingest, or poll operation.
+pub(super) fn validate_completed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
+    if plan.capability.id != "d1-import-database" {
+        return Err(CliError::Input(
+            "historical source validation requires a completed generic import".to_owned(),
+        ));
+    }
+    validate_reviewed_git_stage_authority(plan, false)
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "execution-time authority revalidates Git, target, content, and private-stage identities as one fail-closed boundary"
+    reason = "source authority joins original Git, target, content, and private-stage identities; execution also requires the current checkout"
 )]
-pub(super) fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
+fn validate_reviewed_git_stage_authority(plan: &PlanV1, current_checkout: bool) -> Result<()> {
     let contract = plan
         .capability
         .d1_approved_mln_import
@@ -1166,10 +1181,6 @@ pub(super) fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Re
     let remote = git_authority_output(&canonical_root, &["remote", "get-url", "origin"])?;
     let blob_spec = format!("{head}:{relative}");
     let observed_blob = git_authority_output(&canonical_root, &["rev-parse", &blob_spec])?;
-    let status = git_authority_output(
-        &canonical_root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
     let observed_common =
         git_authority_output(&canonical_root, &["rev-parse", "--git-common-dir"])?;
     let observed_common = if Path::new(&observed_common).is_absolute() {
@@ -1177,24 +1188,35 @@ pub(super) fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Re
     } else {
         canonical_root.join(observed_common)
     };
-    let source_path = canonical_root.join(relative);
     let source_bytes = git_authority_bytes(&canonical_root, &["cat-file", "blob", blob])?;
-    let worktree_bytes = fs::read(&source_path).map_err(|source| CliError::Io {
-        path: source_path.display().to_string(),
-        source,
-    })?;
     if canonical_root != root
         || fs::canonicalize(observed_common).ok().as_ref() != Some(&canonical_common)
         || normalize_reviewed_git_repository_id(&remote)?.as_str() != repository_id
-        || git_authority_output(&canonical_root, &["rev-parse", "HEAD"])? != head
         || observed_blob != blob
-        || !status.is_empty()
-        || source_bytes != worktree_bytes
     {
         return Err(CliError::Input(
-            "reviewed Git source authority changed after planning; do not execute the import"
-                .to_owned(),
+            "reviewed Git repository or original source object authority changed".to_owned(),
         ));
+    }
+    if current_checkout {
+        let source_path = canonical_root.join(relative);
+        let worktree_bytes = fs::read(&source_path).map_err(|source| CliError::Io {
+            path: source_path.display().to_string(),
+            source,
+        })?;
+        if git_authority_output(&canonical_root, &["rev-parse", "HEAD"])? != head
+            || !git_authority_output(
+                &canonical_root,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )?
+            .is_empty()
+            || source_bytes != worktree_bytes
+        {
+            return Err(CliError::Input(
+                "reviewed Git source authority changed after planning; do not execute the import"
+                    .to_owned(),
+            ));
+        }
     }
     let bytes = staged
         .get("bytes")

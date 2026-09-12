@@ -2,7 +2,7 @@ use super::api_boundary::{
     boundary_response_artifact, secret_sink_artifact, verification_outcome,
     verification_response_artifact,
 };
-use super::import_lineage::exact_durable_provider_complete_boundary;
+use super::import_lineage::exact_completed_reviewed_import_boundary;
 use super::plan_commands::{persist_transaction_stage, persist_transaction_stage_with_artifact};
 use super::prelude::{
     CliError, CloudflareResponseV1, PlanStatus, PlanV1, Result, ResultEnvelopeV2, StateStore,
@@ -35,7 +35,7 @@ pub(super) fn rectify_completed_reviewed_import(
             "reviewed import is not at an authentic recoverable completion boundary".to_owned(),
         ));
     }
-    let completion = exact_durable_provider_complete_boundary(store, &plan.operation_id)?;
+    let completion = exact_completed_reviewed_import_boundary(store, &plan.operation_id)?;
     let boundary = plan
         .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
         .ok_or_else(|| CliError::Input("import apply boundary is missing".to_owned()))?;

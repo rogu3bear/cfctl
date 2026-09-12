@@ -3,6 +3,7 @@ use super::import_planning::ImportPrerequisiteContext;
 use super::import_planning::validate_approved_mln_import_prerequisites;
 use super::import_resume::exact_durable_resume_provider_complete_boundary;
 use super::import_resume::exact_resume_poll_exhaustion;
+use super::import_resume::validate_completed_reviewed_git_stage_authority;
 use super::import_resume::validate_managed_reviewed_git_stage_authority;
 use super::prelude::{
     BTreeMap, BTreeSet, CallInput, CapabilityV1, CatalogSnapshot, CliError, PlanStatus, PlanV1,
@@ -52,16 +53,29 @@ pub(super) fn native_import_contract_matches(
     contract == *trusted
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "trusted root admission joins native request, governed prerequisites, source, and stage"
-)]
 pub(super) fn validate_trusted_root_import_plan(
     store: &StateStore,
     plan_v2: &PlanV2,
 ) -> Result<()> {
+    validate_root_import_plan(store, plan_v2, false)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "trusted root admission joins native request, governed prerequisites, source, and stage"
+)]
+fn validate_root_import_plan(
+    store: &StateStore,
+    plan_v2: &PlanV2,
+    historical_completion: bool,
+) -> Result<()> {
     plan_v2.validate()?;
     let plan = &plan_v2.plan;
+    if historical_completion && plan.capability.id != "d1-import-database" {
+        return Err(CliError::Input(
+            "historical completion is restricted to generic imports".to_owned(),
+        ));
+    }
     let trusted = trusted_native_capability(&plan.capability.id)?;
     if !native_import_contract_matches(&plan.capability, &trusted)
         || plan_v2.pins.catalog_hash != plan.catalog_hash
@@ -75,7 +89,12 @@ pub(super) fn validate_trusted_root_import_plan(
         plan.capability.id.as_str(),
         "d1-import-database" | "d1-apply-reviewed-schema-migration"
     ) {
-        return validate_trusted_reviewed_git_root_plan(store, plan_v2, &trusted);
+        return validate_trusted_reviewed_git_root_plan(
+            store,
+            plan_v2,
+            &trusted,
+            historical_completion,
+        );
     }
     let contract = trusted
         .d1_approved_mln_import
@@ -176,10 +195,11 @@ pub(super) fn validate_trusted_root_import_plan(
     Ok(())
 }
 
-pub(super) fn validate_trusted_reviewed_git_root_plan(
+fn validate_trusted_reviewed_git_root_plan(
     store: &StateStore,
     plan_v2: &PlanV2,
     trusted: &CapabilityV1,
+    historical_completion: bool,
 ) -> Result<()> {
     let plan = &plan_v2.plan;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
@@ -219,7 +239,11 @@ pub(super) fn validate_trusted_reviewed_git_root_plan(
             before: plan.created_at,
         },
     )?;
-    validate_managed_reviewed_git_stage_authority(plan)
+    if historical_completion {
+        validate_completed_reviewed_git_stage_authority(plan)
+    } else {
+        validate_managed_reviewed_git_stage_authority(plan)
+    }
 }
 
 #[expect(
@@ -367,13 +391,30 @@ pub(super) fn validate_canonical_poll_child_lifecycle(
     }
 }
 
+pub(super) fn exact_durable_provider_complete_boundary(
+    store: &StateStore,
+    operation_id: &str,
+) -> Result<DurableProviderCompleteBoundary> {
+    durable_provider_complete_boundary(store, operation_id, false)
+}
+
+/// Historical completion proof for the local-only generic terminal rectifier.
+/// All execution, MLN, planning and poll callers retain the strict entry above.
+pub(super) fn exact_completed_reviewed_import_boundary(
+    store: &StateStore,
+    operation_id: &str,
+) -> Result<DurableProviderCompleteBoundary> {
+    durable_provider_complete_boundary(store, operation_id, true)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one fail-closed join authenticates every stored-plan, stage, ingest, and terminal receipt field"
 )]
-pub(super) fn exact_durable_provider_complete_boundary(
+fn durable_provider_complete_boundary(
     store: &StateStore,
     operation_id: &str,
+    historical_completion: bool,
 ) -> Result<DurableProviderCompleteBoundary> {
     let StoredPlanRecord::Current(plan_v2) = store.load_stored_plan_record(operation_id)? else {
         return Err(CliError::Input(
@@ -381,7 +422,7 @@ pub(super) fn exact_durable_provider_complete_boundary(
         ));
     };
     let plan = &plan_v2.plan;
-    validate_trusted_root_import_plan(store, &plan_v2)?;
+    validate_root_import_plan(store, &plan_v2, historical_completion)?;
     if plan.operation_id != operation_id
         || plan.profile_id.is_empty()
         || plan.catalog_hash.is_empty()

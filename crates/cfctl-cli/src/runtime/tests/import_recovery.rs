@@ -1,6 +1,9 @@
 use super::*;
 use crate::runtime::import_rectification::rectify_completed_reviewed_import;
 
+#[path = "import_recovery_source.rs"]
+mod source;
+
 fn prepared_import() -> (ExportCoverageFixture, PlanV1) {
     let fixture = export_coverage_fixture();
     let store = &fixture.store;
