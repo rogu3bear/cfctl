@@ -58,10 +58,21 @@ pub(super) async fn rectify_plan(
     clippy::too_many_lines,
     reason = "recovery dispatch preserves each capability's exact compensation contract"
 )]
-async fn rectify_loaded_plan(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+pub(super) async fn rectify_loaded_plan(
+    store: &StateStore,
+    plan: &mut PlanV1,
+) -> Result<ResultEnvelopeV2> {
     ensure_capability_execution_supported(plan)?;
     if plan.capability.id == cfctl_core::r2_restore::RESTORE_ID {
         return super::r2_restore_execution::rectify(store, plan).await;
+    }
+    if plan.capability.id == "d1-import-database" {
+        let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+        let init_only = checkpoints.len() == 1
+            && checkpoints[0].1.get("step").and_then(Value::as_str) == Some("init_response");
+        if !init_only {
+            return super::import_rectification::rectify_completed_reviewed_import(store, plan);
+        }
     }
     if plan.capability.d1_approved_mln_import.is_some() {
         return rectify_approved_mln_import(store, plan);

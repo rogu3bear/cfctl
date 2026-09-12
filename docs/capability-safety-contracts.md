@@ -52,3 +52,20 @@
 - Non-selector PUT/PATCH settings receive the same clean-GET field proof only when the official request schema is a non-empty object, the same product exposes GET at the identical path, and an official successful GET schema declares every writable field under `result`. Array/bulk bodies, partial response schemas, and cross-product path collisions remain blocked. No automatic restoration is claimed without a hash-bound pre-change snapshot.
 - Generic create operations receive a lifecycle contract only when an official successful-response schema declares a string `result.id`, every planned request field is declared by the readback response, the POST is path-only, and the same product exposes exactly one path-only direct-child resource path with both GET and DELETE operations. The plan hash binds that path, identity selector, response pointer, read/delete capability IDs, and canonical field allowlist. Runtime rejects query controls and unbound body fields before mutation; verification reads the returned ID without forwarding the mutation conditional header. Rectification can only derive a separate delete plan from the hash-bound response receipt, and it refuses catalog IDs that no longer resolve to the exact bound DELETE path. Ambiguous paths, controlled operations, and undocumented response identities remain blocked.
 - Git-integrated Pages production deployment is a dedicated bodyless create contract, not a generic-create exception. It is exposed only while the exact Pages Write POST, returned deployment ID, production-stage response fields, and exact deployment GET and DELETE companions retain their reviewed shapes. Verification polls the returned ID within a fixed bound and requires matching project identity, production environment, and terminal success. The operation has no direct API charge but can create downstream Pages build, Functions, and bandwidth usage. Traffic restoration is a separate reviewed Pages rollback; it cannot erase the deployment, reverse Functions side effects, or refund usage.
+
+### Reviewed-Git D1 import completion recovery
+
+`plans rectify` can close an interrupted `d1-import-database` operation from
+its authenticated original PlanV2, exact accepted-ingest and provider-complete
+checkpoints, matching durable apply response, and completed secret sink. It
+performs no provider requests and never repeats init, upload, ingest, or SQL.
+Completion proves the provider imported the reviewed source; schema semantics
+still require separate governed D1 introspection. Missing, substituted, or
+ambiguous evidence remains unresolved. MLNavigator imports retain their own
+migration-specific post-import proof requirements.
+
+Trusted native import admission permits descriptive pricing-reference enrichment
+while comparing every other capability field exactly, including cost decisions,
+entitlements, request contracts, and verification. Original catalog and plan pins
+remain unchanged. Completion-validation failures append a forward recovery
+checkpoint and retain the original failure and crossed-boundary disclosure.

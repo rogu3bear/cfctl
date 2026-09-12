@@ -38,6 +38,20 @@ pub(super) fn trusted_native_capability(capability_id: &str) -> Result<Capabilit
         })
 }
 
+/// Pricing citations are descriptive catalog enrichment, not execution authority.
+/// Every other field, including all cost and entitlement decisions, stays exact.
+pub(super) fn native_import_contract_matches(
+    actual: &CapabilityV1,
+    trusted: &CapabilityV1,
+) -> bool {
+    let mut contract = actual.clone();
+    contract
+        .cost
+        .references
+        .clone_from(&trusted.cost.references);
+    contract == *trusted
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "trusted root admission joins native request, governed prerequisites, source, and stage"
@@ -49,7 +63,7 @@ pub(super) fn validate_trusted_root_import_plan(
     plan_v2.validate()?;
     let plan = &plan_v2.plan;
     let trusted = trusted_native_capability(&plan.capability.id)?;
-    if plan.capability != trusted
+    if !native_import_contract_matches(&plan.capability, &trusted)
         || plan_v2.pins.catalog_hash != plan.catalog_hash
         || plan.precondition_hashes.get("catalog") != Some(&plan.catalog_hash)
     {

@@ -33,6 +33,7 @@ mod health_commands;
 mod import_failures;
 mod import_lineage;
 mod import_planning;
+mod import_rectification;
 mod import_resume;
 mod keys_commands;
 mod live_state_contracts;

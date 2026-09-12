@@ -1,7 +1,10 @@
 use super::*;
 
+#[path = "import_recovery.rs"]
+mod recovery;
+
 struct ExportCoverageFixture {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     store: StorageStateStore,
     input: CallInput,
     envelope: ResultEnvelopeV2,
@@ -19,6 +22,15 @@ fn export_coverage_fixture() -> ExportCoverageFixture {
         capabilities: BTreeMap::new(),
     };
     ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+    cfctl_catalog::attach_official_product_knowledge(&mut catalog, &cfctl_catalog::OfficialTextFeedsV1 {
+        fetched_at: Utc::now(),
+        docs_index_url: "https://developers.cloudflare.com/llms.txt".to_owned(),
+        docs_index: String::new(),
+        product_indexes: BTreeMap::from([("https://developers.cloudflare.com/d1/llms.txt".to_owned(),
+            "# D1\n- [Pricing](https://developers.cloudflare.com/d1/platform/pricing/index.md)\n- [FAQs](https://developers.cloudflare.com/d1/reference/faq/index.md)".to_owned())]),
+        unread_product_indexes: BTreeMap::new(),
+        changelog_url: String::new(), changelog: String::new(),
+    }).expect("official product enrichment");
     store
         .write_json(&store.paths().catalog_file(), &catalog)
         .expect("seed catalog");
@@ -69,7 +81,7 @@ fn export_coverage_fixture() -> ExportCoverageFixture {
     )
     .expect("real governed export proof producer");
     ExportCoverageFixture {
-        _root: root,
+        root,
         store,
         input,
         envelope,

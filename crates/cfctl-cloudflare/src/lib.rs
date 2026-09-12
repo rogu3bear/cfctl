@@ -11409,7 +11409,8 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     }
 }
 
-fn verify_reviewed_git_import_completion(
+/// Verifies an existing reviewed-Git import receipt without any provider request.
+pub fn verify_reviewed_git_import_completion(
     plan: &PlanV1,
     apply_response: &CloudflareResponseV1,
 ) -> Result<OperationVerificationV1> {

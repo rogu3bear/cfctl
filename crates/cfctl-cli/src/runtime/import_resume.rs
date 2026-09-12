@@ -843,6 +843,15 @@ pub(super) async fn execute_approved_mln_import_plan(
                     .to_owned(),
             )
         })?;
+    let canonical = store.load_plan_v2(&plan.operation_id)?;
+    validate_trusted_root_import_plan(store, &canonical)?;
+    if canonical.plan.content_hash != plan.content_hash
+        || canonical.plan.capability != plan.capability
+    {
+        return Err(CliError::Input(
+            "import execution differs from its canonical PlanV2".to_owned(),
+        ));
+    }
     validate_managed_mln_stage_authority(plan)?;
     let checkpoint_operation_id = plan.operation_id.clone();
     let response = match Box::pin(executor.execute_d1_approved_mln_import(
@@ -873,30 +882,22 @@ pub(super) async fn execute_approved_mln_import_plan(
             ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
         };
     if !response.success {
-        if !matches!(
-            plan.status,
-            PlanStatus::RectificationRequired | PlanStatus::Failed
-        ) {
-            plan.status = PlanStatus::RectificationRequired;
-        }
-        store.save_plan(plan)?;
+        let error = persist_import_verification_failure(store, plan, CliError::Input(
+            "Cloudflare did not complete the approved import; preserve all checkpoints and do not replay".to_owned(),
+        ));
         return Ok(post_boundary_failure_envelope(
             plan,
             response_value,
             Some(apply_evidence),
             lineage_evidence,
-            &CliError::Input(
-                "Cloudflare did not complete the approved import; preserve all checkpoints and do not replay"
-                    .to_owned(),
-            ),
+            &error,
             true,
             "the import boundary was crossed but provider completion was not proven",
         ));
     }
     if let Err(error) = exact_durable_provider_complete_boundary(store, plan.operation_id.as_str())
     {
-        plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
+        let error = persist_import_verification_failure(store, plan, error);
         return Ok(post_boundary_failure_envelope(
             plan,
             response_value,
@@ -1273,4 +1274,29 @@ pub(super) fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Re
         }
     }
     Ok(())
+}
+
+/// Append recovery status without rewriting the already-durable provider history.
+pub(super) fn persist_import_verification_failure(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    error: CliError,
+) -> CliError {
+    let mut recovery = plan.clone();
+    if recovery.status != PlanStatus::Failed {
+        recovery.status = PlanStatus::RectificationRequired;
+    }
+    match persist_transaction_stage(
+        store,
+        &mut recovery,
+        TransactionStageV1::VerificationAttemptPersisted,
+    ) {
+        Ok(()) => {
+            *plan = recovery;
+            error
+        }
+        Err(persistence) => CliError::Input(format!(
+            "{error}; import recovery checkpoint could not be persisted: {persistence}; do not replay"
+        )),
+    }
 }
