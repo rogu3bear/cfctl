@@ -1,9 +1,12 @@
-use super::api_boundary::{boundary_response_artifact, secret_sink_artifact};
+use super::api_boundary::{
+    boundary_response_artifact, secret_sink_artifact, verification_outcome,
+    verification_response_artifact,
+};
 use super::import_lineage::exact_durable_provider_complete_boundary;
 use super::plan_commands::{persist_transaction_stage, persist_transaction_stage_with_artifact};
 use super::prelude::{
-    CliError, CloudflareResponseV1, EvidenceClass, PlanStatus, PlanV1, Result, ResultEnvelopeV2,
-    StateStore, TransactionStageV1, Value, VerificationState, json,
+    CliError, CloudflareResponseV1, PlanStatus, PlanV1, Result, ResultEnvelopeV2, StateStore,
+    TransactionStageV1, Value, VerificationState, json,
 };
 use cfctl_cloudflare::verify_reviewed_git_import_completion;
 
@@ -72,10 +75,8 @@ pub(super) fn rectify_completed_reviewed_import(
             TransactionStageV1::VerificationAttemptPersisted,
         )?;
     }
-    let evidence =
-        store.write_observation_evidence(EvidenceClass::PostChangeVerification, &result)?;
-    let verification_artifact = json!({"state":"passed", "evidence_hash":evidence.content_hash,
-        "provider_complete_evidence_hash":completion.evidence_hash});
+    let outcome = verification_outcome(store, plan, verification)?;
+    let verification_artifact = verification_response_artifact(&outcome)?;
     if verified {
         if plan.transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
             != Some(&verification_artifact)
@@ -85,7 +86,6 @@ pub(super) fn rectify_completed_reviewed_import(
             ));
         }
     } else {
-        plan.status = PlanStatus::Verified;
         persist_transaction_stage_with_artifact(
             store,
             plan,
@@ -96,7 +96,8 @@ pub(super) fn rectify_completed_reviewed_import(
     if plan.transaction_stage != TransactionStageV1::Closed {
         persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
     }
-    let mut envelope = ResultEnvelopeV2::success("plans rectify", result).with_evidence(evidence);
+    let mut envelope = ResultEnvelopeV2::success("plans rectify", result);
+    envelope.evidence.extend(outcome.evidence);
     envelope.performed = false;
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());

@@ -11449,7 +11449,10 @@ pub fn verify_reviewed_git_import_completion(
         && apply_response.errors.is_empty()
         && receipt.get("provider").and_then(Value::as_str) == Some("cloudflare")
         && receipt.get("effect").and_then(Value::as_str) == Some("d1_import_provider_complete")
-        && receipt.get("response_action").and_then(Value::as_str) == Some("poll")
+        && matches!(
+            receipt.get("response_action").and_then(Value::as_str),
+            Some("poll" | "ingest")
+        )
         && receipt.get("no_replay").and_then(Value::as_bool) == Some(true)
         && receipt.get("provider_status").and_then(Value::as_str) == Some("complete")
         && receipt.get("provider_success").and_then(Value::as_bool) == Some(true)

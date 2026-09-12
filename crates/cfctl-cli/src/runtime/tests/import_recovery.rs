@@ -94,13 +94,19 @@ fn prepared_import() -> (ExportCoverageFixture, PlanV1) {
 
 fn complete_import(store: &StorageStateStore, plan: &mut PlanV1, drift: &str) {
     let stage = &plan.targets["adapter"]["approved_mln_import"];
-    let ingest = json!({"schema_version":1,"operation_id":plan.operation_id,
+    let mut ingest = json!({"schema_version":1,"operation_id":plan.operation_id,
         "step":"ingest_response","performed":true,"rectification_required":false,
         "receipt":{"http_status":200,"success":true,"response_action":"ingest",
             "provider":"cloudflare","effect":"d1_import_ingest_accepted",
             "migration_id":stage["migration_id"],"target":stage["target"],
             "plan_input_hash":hash_value(&plan.input).expect("input hash"),"no_replay":false,
             "result":{"type":"import","status":"active","success":true,"at_bookmark":"before"},"errors":[]}});
+    if drift.starts_with("immediate_ingest") {
+        ingest["receipt"]["no_replay"] = json!(true);
+        ingest["receipt"]["result"]["status"] = json!("complete");
+        ingest["receipt"]["result"]["at_bookmark"] = json!("after");
+        ingest["receipt"]["result"]["result"] = json!({"final_bookmark":"after"});
+    }
     if drift != "missing_ingest" {
         persist_poll_lineage_checkpoint(store, &plan.operation_id, &ingest);
     }
@@ -112,6 +118,10 @@ fn complete_import(store: &StorageStateStore, plan: &mut PlanV1, drift: &str) {
         "plan_input_hash":hash_value(&plan.input).expect("input hash"),"prerequisites":plan.input["body"],
         "at_bookmark":"before","final_bookmark":"after","provider_status":"complete",
         "provider_success":true,"state":"provider_complete"});
+    if drift.starts_with("immediate_ingest") {
+        receipt["response_action"] = json!("ingest");
+        receipt["at_bookmark"] = json!("after");
+    }
     if drift == "source" {
         receipt["source_sha256"] = json!("sha256:substituted");
     }
@@ -126,7 +136,10 @@ fn complete_import(store: &StorageStateStore, plan: &mut PlanV1, drift: &str) {
     if drift == "duplicate_completion" {
         persist_poll_lineage_checkpoint(store, &plan.operation_id, &completion);
     }
-    if drift == "apply_substitution" {
+    if matches!(
+        drift,
+        "apply_substitution" | "immediate_ingest_substitution"
+    ) {
         receipt["final_bookmark"] = json!("other");
     }
     let response = CloudflareResponseV1 {
@@ -244,6 +257,7 @@ fn reviewed_import_rejects_incomplete_or_substituted_completion_without_mutation
         "source",
         "target",
         "apply_substitution",
+        "immediate_ingest_substitution",
         "missing_apply",
         "sink",
     ] {
@@ -354,5 +368,134 @@ async fn reviewed_import_preserves_effect_when_recovery_persistence_fails() {
             .read_d1_import_checkpoints(&plan.operation_id)
             .expect("unchanged provider history"),
         checkpoints
+    );
+}
+
+#[tokio::test]
+async fn reviewed_import_recovers_normal_verification_and_immediate_ingest() {
+    for action in ["poll", "immediate_ingest"] {
+        let (fixture, mut plan) = prepared_import();
+        complete_import(&fixture.store, &mut plan, action);
+        let boundary = plan
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("boundary");
+        let apply_hash = boundary["apply_evidence_hash"]
+            .as_str()
+            .expect("apply hash");
+        let response = serde_json::from_value(
+            fixture
+                .store
+                .read_evidence_value(apply_hash)
+                .expect("apply"),
+        )
+        .expect("response");
+        let verification =
+            cfctl_cloudflare::verify_reviewed_git_import_completion(&plan, &response)
+                .expect("normal verifier");
+        assert!(verification.passed, "{action}");
+        persist_transaction_stage(
+            &fixture.store,
+            &mut plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )
+        .expect("normal verification attempt");
+        let outcome =
+            verification_outcome(&fixture.store, &mut plan, verification).expect("normal outcome");
+        persist_transaction_stage_with_artifact(
+            &fixture.store,
+            &mut plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            verification_response_artifact(&outcome).expect("normal artifact"),
+        )
+        .expect("normal response persisted before crash");
+        let journal = plan.transaction_journal.clone();
+        let checkpoints = fixture
+            .store
+            .read_d1_import_checkpoints(&plan.operation_id)
+            .expect("provider checkpoints");
+        let result = rectify_loaded_plan(&fixture.store, &mut plan)
+            .await
+            .expect("recover normal verification before Closed");
+        assert!(result.ok);
+        assert!(!result.performed);
+        assert_eq!(
+            &plan.transaction_journal[..journal.len()],
+            journal.as_slice()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .read_d1_import_checkpoints(&plan.operation_id)
+                .expect("unchanged checkpoints"),
+            checkpoints
+        );
+        let closed = plan.clone();
+        assert!(
+            rectify_loaded_plan(&fixture.store, &mut plan)
+                .await
+                .expect("repeated recovery")
+                .ok
+        );
+        assert_eq!(plan, closed);
+    }
+    let (fixture, mut plan) = prepared_import();
+    complete_import(&fixture.store, &mut plan, "immediate_ingest");
+    assert!(
+        rectify_loaded_plan(&fixture.store, &mut plan)
+            .await
+            .expect("immediate ingest at saved sink")
+            .ok
+    );
+}
+
+#[tokio::test]
+async fn reviewed_import_rejects_substituted_saved_verification() {
+    let (fixture, mut plan) = prepared_import();
+    complete_import(&fixture.store, &mut plan, "none");
+    let boundary = plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .expect("boundary");
+    let response = serde_json::from_value(
+        fixture
+            .store
+            .read_evidence_value(
+                boundary["apply_evidence_hash"]
+                    .as_str()
+                    .expect("apply hash"),
+            )
+            .expect("apply"),
+    )
+    .expect("response");
+    let verification = cfctl_cloudflare::verify_reviewed_git_import_completion(&plan, &response)
+        .expect("normal verification");
+    persist_transaction_stage(
+        &fixture.store,
+        &mut plan,
+        TransactionStageV1::VerificationAttemptPersisted,
+    )
+    .expect("attempt");
+    let outcome = verification_outcome(&fixture.store, &mut plan, verification).expect("outcome");
+    let mut artifact = verification_response_artifact(&outcome).expect("artifact");
+    artifact["basis_hash"] = json!(format!("sha256:{}", "e".repeat(64)));
+    persist_transaction_stage_with_artifact(
+        &fixture.store,
+        &mut plan,
+        TransactionStageV1::VerificationResponsePersisted,
+        artifact,
+    )
+    .expect("isolated substituted artifact");
+    let before = plan.clone();
+    assert!(
+        rectify_loaded_plan(&fixture.store, &mut plan)
+            .await
+            .is_err()
+    );
+    assert_eq!(plan, before);
+    assert_eq!(
+        fixture
+            .store
+            .load_plan(&plan.operation_id)
+            .expect("saved state"),
+        before
     );
 }
