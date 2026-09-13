@@ -1,9 +1,7 @@
 //! Cloudflare capability catalog normalization and indexing.
 
 mod request_schema;
-use request_schema::{
-    MAX_REQUEST_SCHEMA_CONTRACT_DEPTH, normalize_request_schema_contract, request_schema_contract,
-};
+use request_schema::{normalize_request_schema_contract, request_schema_contract};
 mod email_preferences;
 mod persisted_rulesets;
 mod response_selection;
@@ -18253,6 +18251,12 @@ struct AccessApplicationLoginMethodsContractSpec {
     request_schema: Value,
 }
 
+// Source compatibility walks reference and composition edges as well as value
+// nesting. Keep its bounded traversal separate from the normalized request-body
+// depth (16): the official Access policy reaches scalar email fields at hop 16.
+// Active-reference tracking still rejects cycles; deeper source graphs fail closed.
+const MAX_ACCESS_SOURCE_SCHEMA_DEPTH: usize = 32;
+
 fn access_application_source_request_body_compatible(
     document: &Value,
     source_schema: &Value,
@@ -18362,7 +18366,7 @@ fn source_schema_declares_top_level_field(
     depth: usize,
     active_references: &mut BTreeSet<String>,
 ) -> bool {
-    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+    if depth >= MAX_ACCESS_SOURCE_SCHEMA_DEPTH {
         return false;
     }
     let Some(source) = source_schema.as_object() else {
@@ -18421,7 +18425,7 @@ fn source_schema_accepts_curated(
     depth: usize,
     active_references: &mut BTreeSet<String>,
 ) -> bool {
-    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+    if depth >= MAX_ACCESS_SOURCE_SCHEMA_DEPTH {
         return false;
     }
     let Some(source) = source_schema.as_object() else {
@@ -18605,7 +18609,7 @@ fn source_schema_is_provably_disjoint(
     depth: usize,
     active_references: &mut BTreeSet<String>,
 ) -> bool {
-    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+    if depth >= MAX_ACCESS_SOURCE_SCHEMA_DEPTH {
         return false;
     }
     let Some(source) = source_schema.as_object() else {

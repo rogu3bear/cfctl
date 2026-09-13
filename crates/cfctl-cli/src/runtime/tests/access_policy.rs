@@ -401,6 +401,47 @@ pub(super) fn access_human_policy_body_preserves_live_state_and_applies_narrow_e
 }
 
 #[test]
+pub(super) fn access_human_policy_email_addition_preserves_owners_and_optional_absence() {
+    let mut live = access_human_policy_live_result();
+    live["include"] = json!([
+        {"email":{"email":"owner-one@example.com"}},
+        {"email":{"email":"owner-two@example.com"}}
+    ]);
+    live["exclude"] = json!([]);
+    live.as_object_mut().expect("policy").remove("mfa_config");
+    let prior = super::access_human_policy_prior_state(&live).expect("prior policy");
+    let mut include = live["include"].as_array().expect("owners").clone();
+    include.push(json!({"email":{"email":"new-owner@example.com"}}));
+    let input = CallInput {
+        body: Some(json!({"include":include})),
+        ..CallInput::default()
+    };
+    let desired = super::access_human_policy_desired_changes(&input).expect("email addition");
+    let body = super::access_human_policy_mutable_body(&live, &desired).expect("full PUT body");
+    assert_eq!(body["include"].as_array().expect("new owners").len(), 3);
+    for owner in live["include"].as_array().expect("original owners") {
+        assert!(
+            body["include"]
+                .as_array()
+                .expect("new owners")
+                .contains(owner)
+        );
+    }
+    assert!(
+        body["include"]
+            .as_array()
+            .expect("new owners")
+            .contains(&json!({"email":{"email":"new-owner@example.com"}}))
+    );
+    assert!(body.get("mfa_config").is_none());
+    for (field, value) in prior.as_object().expect("prior object") {
+        if field != "include" {
+            assert_eq!(body.get(field), Some(value), "preserve {field}");
+        }
+    }
+}
+
+#[test]
 pub(super) fn access_human_policy_body_replaces_only_requested_mfa_state() {
     let input = CallInput {
         body: Some(json!({
