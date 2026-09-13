@@ -74,6 +74,10 @@ mod v1_migration;
 mod worker_custom_domain;
 mod worker_deployment;
 mod worker_deployment_artifact;
+mod worker_frozen_config;
+mod worker_frozen_files;
+mod worker_frozen_modules;
+mod worker_frozen_upload;
 mod workspace_commands;
 mod workspace_d1_evidence;
 mod workspace_d1_migration;
@@ -84,6 +88,7 @@ mod workspace_d1_reply_admission;
 mod workspace_d1_transition;
 mod workspace_reply_subdomain_ingress;
 mod workspace_state;
+mod wrangler_producer;
 
 use agent_commands::agents_command;
 use auth_commands::auth_command;

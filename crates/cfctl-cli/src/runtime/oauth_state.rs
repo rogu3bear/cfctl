@@ -111,6 +111,24 @@ pub(super) fn is_oauth_client_create_operation_identity(capability: &CapabilityV
         && capability.permissions == ["OAuth Client Write", "OAuth Client Read"]
 }
 
+pub(super) fn oauth_client_mutable_fields(capability: &CapabilityV1) -> Vec<String> {
+    let mut fields = OAUTH_CLIENT_MUTABLE_FIELDS
+        .iter()
+        .filter(|field| capability.method != "POST" || **field != "visibility")
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+    if capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/properties/optional_scopes"))
+        .is_some()
+    {
+        fields.push("optional_scopes".to_owned());
+    }
+    fields.sort();
+    fields
+}
+
 pub(super) fn is_oauth_client_create_capability(capability: &CapabilityV1) -> bool {
     is_oauth_client_create_operation_identity(capability)
         && capability.risk == RiskClass::IdentityOrOwnership
@@ -130,13 +148,7 @@ pub(super) fn is_oauth_client_create_capability(capability: &CapabilityV1) -> bo
                 && selector.required
                 && selector.value_type == "string"
         })
-        && capability.request_object_fields()
-            == Some(
-                OAUTH_CLIENT_MUTABLE_FIELDS[..12]
-                    .iter()
-                    .map(|field| (*field).to_owned())
-                    .collect(),
-            )
+        && capability.request_object_fields() == Some(oauth_client_mutable_fields(capability))
         && capability.request_schema.as_ref().is_some_and(|schema| {
             schema.get("type").and_then(Value::as_str) == Some("object")
                 && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
@@ -151,11 +163,7 @@ pub(super) fn is_oauth_client_create_capability(capability: &CapabilityV1) -> bo
                 && created.response_result_identity_pointer == "/client_id"
                 && created.read_capability_id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
                 && created.delete_capability_id == "oauth-clients-delete"
-                && created.verified_response_fields
-                    == OAUTH_CLIENT_MUTABLE_FIELDS[..12]
-                        .iter()
-                        .map(|field| (*field).to_owned())
-                        .collect::<Vec<_>>()
+                && created.verified_response_fields == oauth_client_mutable_fields(capability)
         })
         && !capability.rollback.supported
         && capability.rollback.strategy.is_none()
@@ -187,13 +195,7 @@ pub(super) fn is_oauth_client_update_capability(capability: &CapabilityV1) -> bo
                     && selector.value_type == "string"
             })
         })
-        && capability.request_object_fields()
-            == Some(
-                OAUTH_CLIENT_MUTABLE_FIELDS
-                    .iter()
-                    .map(|field| (*field).to_owned())
-                    .collect(),
-            )
+        && capability.request_object_fields() == Some(oauth_client_mutable_fields(capability))
         && capability.request_schema.as_ref().is_some_and(|schema| {
             schema.get("type").and_then(Value::as_str) == Some("object")
                 && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
@@ -206,11 +208,7 @@ pub(super) fn is_oauth_client_update_capability(capability: &CapabilityV1) -> bo
         && capability.same_path_read.as_ref().is_some_and(|read| {
             read.path == OAUTH_CLIENT_DETAIL_PATH
                 && read.read_capability_id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
-                && read.verified_response_fields
-                    == OAUTH_CLIENT_MUTABLE_FIELDS
-                        .iter()
-                        .map(|field| (*field).to_owned())
-                        .collect::<Vec<_>>()
+                && read.verified_response_fields == oauth_client_mutable_fields(capability)
         })
         && !capability.rollback.supported
         && capability.rollback.strategy.is_none()
@@ -223,6 +221,29 @@ pub(super) fn is_oauth_client_update_capability(capability: &CapabilityV1) -> bo
 
 pub(super) fn should_bind_oauth_client_update_state(capability: &CapabilityV1) -> bool {
     is_oauth_client_update_capability(capability) && capability.mutating
+}
+
+fn validate_merged_optional_scopes(
+    capability: &CapabilityV1,
+    planned: &serde_json::Map<String, Value>,
+    prior: &Value,
+) -> Result<()> {
+    if capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/properties/optional_scopes"))
+        .is_some()
+        && (planned.contains_key("scopes") || planned.contains_key("optional_scopes"))
+    {
+        let empty = json!([]);
+        let scopes = planned.get("scopes").or_else(|| prior.get("scopes"));
+        let optional = planned
+            .get("optional_scopes")
+            .or_else(|| prior.get("optional_scopes"))
+            .unwrap_or(&empty);
+        cfctl_cloudflare::validate_oauth_optional_scope_selection(scopes, optional)?;
+    }
+    Ok(())
 }
 
 pub(super) fn apply_oauth_client_update_state_response(
@@ -291,6 +312,7 @@ pub(super) fn apply_oauth_client_update_state_response(
                 .to_owned(),
         ));
     }
+    validate_merged_optional_scopes(capability, planned, &response.result)?;
     if planned
         .iter()
         .all(|(field, value)| response.result.get(field) == Some(value))
@@ -303,9 +325,9 @@ pub(super) fn apply_oauth_client_update_state_response(
 
     let mut prior_state = serde_json::Map::new();
     let mut absent_fields = Vec::new();
-    for field in OAUTH_CLIENT_MUTABLE_FIELDS {
-        if let Some(value) = response.result.get(field) {
-            prior_state.insert(field.to_owned(), value.clone());
+    for field in oauth_client_mutable_fields(capability) {
+        if let Some(value) = response.result.get(&field) {
+            prior_state.insert(field, value.clone());
         } else {
             absent_fields.push(field);
         }

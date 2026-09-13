@@ -2,6 +2,8 @@
 mod access_create;
 pub mod d1_read_inventory;
 mod d1_sql;
+mod oauth_scopes;
+pub use oauth_scopes::validate_oauth_optional_scope_selection;
 pub mod pages_projects;
 mod r2_private;
 pub mod r2_recovery;
@@ -12554,6 +12556,7 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())?;
+    oauth_scopes::validate_request(capability, input)?;
     validate_d1_full_export_contract(capability, input)?;
     validate_d1_restore_exact_bookmark_contract(capability, input)?;
     validate_d1_approved_mln_import_contract(capability, input)?;

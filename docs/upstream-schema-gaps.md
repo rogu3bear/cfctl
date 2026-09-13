@@ -5,8 +5,10 @@
 when the schema does not carry the metadata cfctl needs to govern a mutation
 **fail-closed** — required permission scope, and a bounded/known incremental
 cost. cfctl will **not fabricate** either: a guessed permission or price is
-worse than an honest block. Two upstream gaps, neither of which cfctl can
-safely close on its own, account for **83%** of blocked capabilities.
+worse than an honest block. In the frozen July snapshot below, two upstream
+metadata gaps accounted for **83%** of blocked capabilities. Later schema
+changes can also expose local parser and classifier mismatches; those require
+source repairs, not invented permissions or prices.
 
 This document exists to be filed against `cloudflare/api-schemas`. It is not a
 coverage report — **`cfctl catalog coverage` owns the current numbers and
@@ -126,3 +128,55 @@ boundaries are not repaired with synthetic endpoints:
 
 See [`telemetry-control-plane.md`](telemetry-control-plane.md) for the typed
 protocol and lifecycle contracts.
+
+## September 2026 schema compatibility repairs
+
+The request-body importer resolves bounded local OpenAPI references before
+normalizing validation constraints and the required-body flag. Missing,
+external, malformed, cyclic, or over-depth request-body references fail closed.
+Lifecycle predicates use the same response-reference resolver as the response
+decoder, so response indirection does not discard identity or readback fields.
+This repairs metadata extraction; it does not supply missing operation authority.
+
+The existing Access service-token create/update workflow accepts the reviewed
+boolean `enabled` field only with companion readback. KV namespace creation
+accepts the current schema while retaining a closed, title-only body;
+jurisdiction selection still needs its separate private-beta qualification.
+Email Sending similarly retains the preview-only update, prior-state snapshot,
+recovery, and exact-zone entitlement probe when upstream adds recipient
+suppression settings. Those delivery changes are outside the preview workflow.
+OAuth `optional_scopes` uses the request, snapshot, and verification constraints
+in [the capability safety contracts](capability-safety-contracts.md).
+
+R2 bucket creation recognizes the documented US jurisdiction and preserves its
+header in exact-resource readback. FedRAMP creation remains outside this
+workflow because access requires separate Enterprise qualification. The direct
+PutBucket ceiling is USD 9.00: Cloudflare rounds operations up to a whole
+million-request billing unit, and a single operation can cross that boundary at
+the higher Infrequent Access rate. This is a conservative direct-operation
+bound, not a prorated invoice estimate or a bound on later storage and usage.
+See [R2 data location](https://developers.cloudflare.com/r2/reference/data-location/)
+and [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
+
+Queue metrics selects the declared JSON representation with `Accept:
+application/json`; an SSE response is rejected. Account and zone entitlement
+reads accept complete HTTP 200 JSON envelopes. Their documented HTTP 204
+cancellation is incomplete evidence and fails response admission, rather than
+becoming an empty entitlement result. Neither read supplies an undocumented
+product-to-subscription mapping or proves a different operation is entitled.
+Streams, binary output, bulk-item outcomes, and asynchronous terminal states
+still require their own response and verification contracts.
+
+Persisted WAF workflows omit and reject caller-supplied `dry_run`, whose preview
+semantics cannot satisfy persisted-state verification. Raw rules, SQL, token
+replacement, secret-bearing Logpush replacement, and independent Queue
+acknowledgment remain restricted. Their guides lead to the existing governed
+alternative before generic pricing advice. A linked guide preserves its own
+contract gaps and approval lifecycle. The legacy name-addressed Pipeline PUT
+also stays blocked; the current `/pipelines/v1/pipelines` API is a separate
+generation, so migration must be established before planning a replacement.
+
+Regression fixtures retain transitive local references from the official
+OpenAPI observed on 2026-09-09, identify its SHA-256, and omit example values.
+Catalog and loopback tests establish local behavior only. Installed catalog
+adoption, account qualification, and provider execution remain distinct.

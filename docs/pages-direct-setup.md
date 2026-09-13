@@ -115,3 +115,18 @@ The upstream contracts are documented by Cloudflare's
 [project creation API](https://developers.cloudflare.com/api/resources/pages/subresources/projects/methods/create/),
 [project update API](https://developers.cloudflare.com/api/resources/pages/subresources/projects/methods/edit/),
 and [Pages Functions bindings](https://developers.cloudflare.com/pages/functions/bindings/).
+
+### Project configuration observations
+
+The exact `pages-project-get-project` GET now adds `configuration_metadata` to
+its governed read receipt. This versioned projection retains typed deployment
+booleans, preview mode and branch/path pattern records, plus D1/R2 binding
+identities and variable name/type metadata for production, preview and the
+returned top-level object. Missing, null, observed-empty and unknown/malformed
+fields remain distinct. Variable values are never included.
+
+This is observed provider configuration only: it does not resolve inheritance,
+prove coverage of other binding types or verify effective preview isolation.
+Public flag/origin comparisons are not admitted by this projection; their
+expectations belong to the consuming application. The enclosing read receipt
+provides account, credential, catalog, timestamp and evidence identity.

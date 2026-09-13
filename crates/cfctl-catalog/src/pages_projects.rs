@@ -31,8 +31,8 @@ pub(super) fn finalize(document: &Value, capabilities: &mut BTreeMap<String, Cap
             .get("paths")
             .and_then(|paths| paths.get(path))
             .and_then(|item| item.get(method.to_ascii_lowercase()));
-        let source_schema =
-            operation.and_then(|operation| request_schema_contract(document, operation));
+        let source_schema = operation
+            .and_then(|operation| request_schema_contract(document, operation).ok().flatten());
         let creating = id == contract::CREATE_ID;
         let supported = capability.method == method
             && capability.path == path

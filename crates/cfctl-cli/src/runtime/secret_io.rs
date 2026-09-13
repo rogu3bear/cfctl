@@ -368,7 +368,19 @@ pub(super) fn redact_secret_result(value: &Value) -> Value {
 
 pub(super) fn redact_response_for_capability(capability: &CapabilityV1, value: &Value) -> Value {
     if is_pages_project_response(capability) {
-        return redact_secret_result(&cfctl_core::pages_projects::redact_response(value));
+        let mut safe = redact_secret_result(&cfctl_core::pages_projects::redact_response(value));
+        if capability.id == cfctl_core::pages_projects::READ_ID
+            && capability.method == "GET"
+            && capability.path == cfctl_core::pages_projects::DETAIL
+            && value.get("success") == Some(&Value::Bool(true))
+            && let Some(object) = safe.as_object_mut()
+        {
+            object.insert(
+                "configuration_metadata".to_owned(),
+                cfctl_core::pages_projects::configuration_metadata(&value["result"]),
+            );
+        }
+        return safe;
     }
     if capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID {
         let error_codes = value

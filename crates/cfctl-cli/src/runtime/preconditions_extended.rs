@@ -20,6 +20,7 @@ use super::live_state_contracts::should_bind_same_path_prior_state;
 use super::live_state_contracts::should_bind_warp_connector_configuration_state;
 use super::live_state_contracts::should_bind_web_analytics_rum_state;
 use super::oauth_state::is_oauth_client_update_capability;
+use super::oauth_state::oauth_client_mutable_fields;
 use super::oauth_state::oauth_client_secret_expected_prior_state;
 use super::oauth_state::read_live_oauth_client_secret_state;
 use super::oauth_state::read_live_oauth_client_update_state;
@@ -33,7 +34,6 @@ use super::plan_secret::DNS_RECORD_STATE_PRECONDITION;
 use super::plan_secret::OAUTH_CLIENT_DETAIL_PATH;
 use super::plan_secret::OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID;
 use super::plan_secret::OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION;
-use super::plan_secret::OAUTH_CLIENT_MUTABLE_FIELDS;
 use super::plan_secret::OAUTH_CLIENT_UPDATE_STATE_PRECONDITION;
 use super::plan_secret::SAME_PATH_PRIOR_STATE_PRECONDITION;
 use super::plan_secret::SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY;
@@ -443,10 +443,7 @@ pub(super) fn validate_oauth_client_update_state_receipt(
     let mut projected_fields = prior_state.keys().cloned().collect::<Vec<_>>();
     projected_fields.extend(absent_fields.iter().cloned());
     projected_fields.sort();
-    let expected_fields = OAUTH_CLIENT_MUTABLE_FIELDS
-        .iter()
-        .map(|field| (*field).to_owned())
-        .collect::<Vec<_>>();
+    let expected_fields = oauth_client_mutable_fields(&plan.capability);
     let exact = receipt.as_object().is_some_and(|object| object.len() == 12)
         && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
         && receipt.get("source_capability_id").and_then(Value::as_str)

@@ -1,5 +1,7 @@
 //! Closed Pages setup contracts shared by discovery, admission and verification.
+mod configuration;
 use crate::{AdapterStatus, CapabilityV1, EffectClass, ResponseBodyModeV1, RiskClass, hash_value};
+pub use configuration::configuration_metadata;
 use serde_json::{Map, Value, json};
 
 pub const CREATE_ID: &str = "pages-project-create-direct-upload";

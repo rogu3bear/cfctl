@@ -623,6 +623,10 @@ pub(super) fn guide_next_action(
         };
     }
 
+    if let Some(action) = restricted_operation_guidance(capability) {
+        return action;
+    }
+
     let gaps = capability.mutation_contract_gaps();
     let blocked_text = format!(
         "{} {}",
@@ -705,6 +709,88 @@ pub(super) fn guide_next_action(
         summary: summary.to_owned(),
         argv,
     }
+}
+
+fn restricted_operation_guidance(capability: &CapabilityV1) -> Option<GuideActionV1> {
+    if capability.adapter_status != AdapterStatus::Blocked
+        || !capability
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("blocked by design"))
+    {
+        return None;
+    }
+    let alternative = match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.path.as_str(),
+    ) {
+        (
+            "queues-pull-messages",
+            "POST",
+            "/accounts/{account_id}/queues/{queue_id}/messages/pull",
+        )
+        | (
+            "queues-ack-messages",
+            "POST",
+            "/accounts/{account_id}/queues/{queue_id}/messages/ack",
+        ) => "events-consume-queue-batch",
+        ("createZoneRuleset", "POST", "/zones/{zone_id}/rulesets") => {
+            "security-response-create-empty-custom-ruleset"
+        }
+        ("createZoneRulesetRule", "POST", "/zones/{zone_id}/rulesets/{ruleset_id}/rules") => {
+            "security-response-create-expiring-waf-rule"
+        }
+        (
+            "analytics-engine-sql-query-post",
+            "POST",
+            "/accounts/{account_id}/analytics_engine/sql",
+        ) => "analytics-engine-sql-query-get",
+        (
+            "accounts-logs-explorer-query-get",
+            "GET",
+            "/accounts/{account_id}/logs/explorer/query/sql",
+        ) => "accounts-logs-explorer-query-post",
+        ("zones-logs-explorer-query-get", "GET", "/zones/{zone_id}/logs/explorer/query/sql") => {
+            "zones-logs-explorer-query-post"
+        }
+        (
+            "put-accounts-account_id-logpush-jobs-job_id",
+            "PUT",
+            "/accounts/{account_id}/logpush/jobs/{job_id}",
+        ) => "logpush-account-job-settings-update",
+        (
+            "put-zones-zone_id-logpush-jobs-job_id",
+            "PUT",
+            "/zones/{zone_id}/logpush/jobs/{job_id}",
+        ) => "logpush-zone-job-settings-update",
+        ("account-api-tokens-update-token", "PUT", "/accounts/{account_id}/tokens/{token_id}")
+        | ("user-api-tokens-update-token", "PUT", "/user/tokens/{token_id}") => {
+            return Some(GuideActionV1 {
+                summary: "Generic token replacement remains reserved. Start with the fresh account permission inventory, then use the inventory-bound keys workflow and its own hash-bound approval.".to_owned(),
+                argv: ["cfctl", "keys", "permissions", "--account", "<account_id>", "--json"].map(str::to_owned).to_vec(),
+            });
+        }
+        (
+            "putV4AccountsByAccount_idPipelinesByPipeline_name_deprecated",
+            "PUT",
+            "/accounts/{account_id}/pipelines/{pipeline_name}",
+        ) => {
+            return Some(GuideActionV1 {
+                summary: "Keep the legacy Pipeline update blocked. Inspect the current API generation and its migration requirements; the legacy name and current pipeline ID are not interchangeable, and replacement still needs its own plan.".to_owned(),
+                argv: ["cfctl", "catalog", "search", "Pipelines", "--json"].map(str::to_owned).to_vec(),
+            });
+        }
+        _ => return None,
+    };
+    Some(GuideActionV1 {
+        summary: format!(
+            "The generic operation remains restricted. Inspect `{alternative}` and satisfy its own selectors, contract gaps, and approval requirements before preparing an operation."
+        ),
+        argv: ["cfctl", "guide", alternative, "--json"]
+            .map(str::to_owned)
+            .to_vec(),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

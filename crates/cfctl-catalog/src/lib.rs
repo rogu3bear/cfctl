@@ -1,5 +1,13 @@
 //! Cloudflare capability catalog normalization and indexing.
 
+mod request_schema;
+use request_schema::{
+    MAX_REQUEST_SCHEMA_CONTRACT_DEPTH, normalize_request_schema_contract, request_schema_contract,
+};
+mod email_preferences;
+mod persisted_rulesets;
+mod response_selection;
+
 mod r2_private;
 use r2_private::finalize_r2_private_file_upload_contract;
 mod artifact_digest;
@@ -39,6 +47,7 @@ use thiserror::Error;
 
 mod access_create;
 mod pages_projects;
+mod worker_frozen_upload;
 mod workspace_d1_qualification;
 use access_create::finalize_access_application_create_contract;
 pub use access_create::{ACCESS_APP_CREATE_OWNED_ID, access_application_create_owned_schema};
@@ -461,6 +470,16 @@ pub enum CatalogError {
     InvalidParameter(String),
     #[error("duplicate `{location}` parameter `{name}`")]
     DuplicateParameter { location: String, name: String },
+    #[error("unsupported OpenAPI request body reference `{0}`")]
+    UnsupportedRequestBodyReference(String),
+    #[error("OpenAPI request body reference `{0}` does not resolve")]
+    UnresolvedRequestBodyReference(String),
+    #[error("OpenAPI request body reference depth exceeds the safety limit at `{0}`")]
+    RequestBodyReferenceDepth(String),
+    #[error(
+        "OpenAPI request body must resolve to an object with content and a boolean required flag"
+    )]
+    InvalidRequestBodyObject,
     #[error("unsupported OpenAPI response reference `{0}`")]
     UnsupportedResponseReference(String),
     #[error("OpenAPI response reference `{0}` does not resolve")]
@@ -2207,6 +2226,7 @@ fn ingest_wrangler_versions_upload_help(
             contract: None,
         })
         .collect();
+        worker_frozen_upload::attach(&mut capability);
         snapshot
             .capabilities
             .insert(capability.id.clone(), capability);
@@ -2568,7 +2588,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect();
-            capability.request_schema = request_schema_contract(document, operation);
+            capability.request_schema = request_schema_contract(document, operation)?;
             capability.response_contract =
                 success_response_contract(document, operation, capability.mutating)?;
             capability.entitlement.plans = operation_object
@@ -2611,6 +2631,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
 /// promoted when their current operation identity still matches; GraphQL and
 /// native workflows are additive, fixed-document capabilities.
 pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    persisted_rulesets::restrict_dry_run(snapshot);
     finalize_event_subscription_lifecycle(snapshot);
     finalize_realtimekit_webhook_lifecycle(snapshot);
     reserve_queue_message_operations_for_event_consumer(snapshot);
@@ -4358,7 +4379,7 @@ fn block_deprecated_pipeline_update(snapshot: &mut CatalogSnapshot) {
     };
     capability.adapter_status = AdapterStatus::Blocked;
     capability.blocked_reason = Some(
-        "blocked by design: Cloudflare Pipelines SQL configuration is immutable; replace it through separately reviewed delete and create plans instead of modeling this deprecated PUT as an update"
+        "blocked by design: this deprecated name-addressed Pipeline PUT has no governed snapshot, verification, or recovery contract. The current /pipelines/v1/pipelines API is a different generation; inspect its catalog guide and the official migration requirements before preparing any replacement"
             .to_owned(),
     );
 }
@@ -8484,6 +8505,7 @@ fn attach_email_sending_entitlement(capability: &mut CapabilityV1) {
     reason = "Email Sending preview, lifecycle, DNS repair, permissions, cost, and live entitlement form one fail-closed provider contract"
 )]
 fn finalize_email_sending_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    email_preferences::restrict_preview_update(capabilities);
     for id in [
         "email-sending-subdomains-list-sending-subdomains",
         "email-sending-subdomains-get-sending-subdomain",
@@ -8741,6 +8763,8 @@ fn apply_post_normalization_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
+    response_selection::finalize_queue_metrics(document, capabilities);
+    response_selection::finalize_entitlement_reads(document, capabilities);
     finalize_pages_deployment_id_selector_contracts(capabilities);
     finalize_pages_production_deployment_contract(document, capabilities);
     finalize_worker_script_secret_contracts(document, capabilities);
@@ -8956,21 +8980,14 @@ fn finalize_pages_production_deployment_contract(
         ["id", "environment", "project_name"]
             .iter()
             .all(|field| success_response_declares_result_string_field(document, operation, field))
-            && operation
-                .get("responses")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flatten()
-                .filter(|(status, _)| status.starts_with('2'))
-                .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-                .any(|schema| {
-                    schema_declares_string_path(
-                        document,
-                        schema,
-                        &["result", "latest_stage", "status"],
-                        0,
-                    )
-                })
+            && success_response_schemas(document, operation).any(|schema| {
+                schema_declares_string_path(
+                    document,
+                    schema,
+                    &["result", "latest_stage", "status"],
+                    0,
+                )
+            })
     });
     let Some(create) = capabilities.get_mut(PAGES_DEPLOYMENT_CREATE_CAPABILITY_ID) else {
         return;
@@ -10493,13 +10510,7 @@ fn classify_exact_resource_contracts(
 /// not-found), which is the one signal the terminal-literal path shape cannot
 /// distinguish on its own.
 fn success_response_result_is_single_object(document: &Value, operation: &Value) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+    success_response_schemas(document, operation)
         .any(|schema| schema_result_is_object_not_array(document, schema, 0))
 }
 
@@ -11201,24 +11212,6 @@ pub async fn fetch_official(client: &reqwest::Client) -> Result<CatalogSnapshot>
     normalize_openapi(&document)
 }
 
-fn request_schema_contract(document: &Value, operation: &Value) -> Option<Value> {
-    let schema = operation.pointer("/requestBody/content/application~1json/schema")?;
-    let mut active_references = BTreeSet::new();
-    let mut contract =
-        normalize_request_schema_contract(document, schema, 0, &mut active_references)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-    contract.insert(
-        "x-cfctl-body-required".to_owned(),
-        operation
-            .pointer("/requestBody/required")
-            .cloned()
-            .unwrap_or(Value::Bool(false)),
-    );
-    Some(Value::Object(contract))
-}
-
 fn success_response_contract(
     document: &Value,
     operation: &Value,
@@ -11314,155 +11307,20 @@ fn resolve_local_response<'a>(
     resolve_local_response(document, resolved, depth + 1)
 }
 
-const MAX_REQUEST_SCHEMA_CONTRACT_DEPTH: usize = 16;
-
-fn normalize_request_schema_contract(
-    document: &Value,
-    schema: &Value,
-    depth: usize,
-    active_references: &mut BTreeSet<String>,
-) -> Value {
-    let reference = schema
-        .get("$ref")
-        .and_then(Value::as_str)
-        .filter(|reference| reference.starts_with("#/"));
-    let inserted_reference =
-        reference.is_some_and(|reference| active_references.insert(reference.to_owned()));
-    if reference.is_some() && !inserted_reference {
-        return Value::Object(Map::new());
-    }
-    let resolved = resolve_local_schema(document, schema);
-    let mut contract = Map::new();
-    copy_request_schema_value_constraints(resolved, &mut contract);
-    copy_request_schema_required(document, resolved, &mut contract);
-    if let Some(additional) = resolved.get("additionalProperties") {
-        let additional = if additional.is_object() {
-            if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
-                normalize_request_schema_contract(
-                    document,
-                    additional,
-                    depth + 1,
-                    active_references,
-                )
-            } else {
-                Value::Object(Map::new())
-            }
-        } else {
-            additional.clone()
-        };
-        contract.insert("additionalProperties".to_owned(), additional);
-    }
-    if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
-        for composition in ["allOf", "oneOf", "anyOf"] {
-            if let Some(members) = resolved.get(composition).and_then(Value::as_array) {
-                contract.insert(
-                    composition.to_owned(),
-                    Value::Array(
-                        members
-                            .iter()
-                            .map(|member| {
-                                normalize_request_schema_contract(
-                                    document,
-                                    member,
-                                    depth + 1,
-                                    active_references,
-                                )
-                            })
-                            .collect(),
-                    ),
-                );
-            }
-        }
-        if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
-            let properties = properties
-                .iter()
-                .filter(|(_, property)| !request_property_is_read_only(document, property))
-                .map(|(name, property)| {
-                    (
-                        name.clone(),
-                        normalize_request_schema_contract(
-                            document,
-                            property,
-                            depth + 1,
-                            active_references,
-                        ),
-                    )
-                })
-                .collect();
-            contract.insert("properties".to_owned(), Value::Object(properties));
-        }
-        if let Some(items) = resolved.get("items") {
-            contract.insert(
-                "items".to_owned(),
-                normalize_request_schema_contract(document, items, depth + 1, active_references),
-            );
-        }
-    }
-    if inserted_reference && let Some(reference) = reference {
-        active_references.remove(reference);
-    }
-    Value::Object(contract)
-}
-
-fn copy_request_schema_value_constraints(resolved: &Value, contract: &mut Map<String, Value>) {
-    for key in [
-        "type",
-        "writeOnly",
-        "enum",
-        "format",
-        "nullable",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minLength",
-        "maxLength",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-    ] {
-        if let Some(value) = resolved.get(key) {
-            contract.insert(key.to_owned(), value.clone());
-        }
-    }
-    if let Some(multiple) = resolved
-        .get("multipleOf")
-        .filter(|value| value.as_f64().is_some_and(|multiple| multiple > 0.0))
-    {
-        contract.insert("multipleOf".to_owned(), multiple.clone());
-    }
-}
-
-fn copy_request_schema_required(
-    document: &Value,
-    resolved: &Value,
-    contract: &mut Map<String, Value>,
-) {
-    let Some(required) = resolved.get("required").and_then(Value::as_array) else {
-        return;
-    };
-    let properties = resolved.get("properties").and_then(Value::as_object);
-    let writable_required = required
-        .iter()
-        .filter(|entry| {
-            entry.as_str().is_none_or(|name| {
-                properties
-                    .and_then(|properties| properties.get(name))
-                    .is_none_or(|property| !request_property_is_read_only(document, property))
-            })
-        })
-        .cloned()
-        .collect();
-    contract.insert("required".to_owned(), Value::Array(writable_required));
-}
-
-fn request_property_is_read_only(document: &Value, property: &Value) -> bool {
-    resolve_local_schema(document, property)
-        .get("readOnly")
-        .and_then(Value::as_bool)
-        == Some(true)
+// normalize_openapi validates response references before any lifecycle predicate
+// runs. Reuse that resolver so indirection cannot discard verification fields.
+fn success_response_schemas<'a>(
+    document: &'a Value,
+    operation: &'a Value,
+) -> impl Iterator<Item = &'a Value> {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| is_success_response_status(status))
+        .filter_map(|(_, response)| resolve_local_response(document, response, 0).ok())
+        .filter_map(|response| response.pointer("/content/application~1json/schema"))
 }
 
 fn success_response_declares_result_string_field(
@@ -11470,13 +11328,7 @@ fn success_response_declares_result_string_field(
     operation: &Value,
     field: &str,
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+    success_response_schemas(document, operation)
         .any(|schema| schema_declares_string_path(document, schema, &["result", field], 0))
 }
 
@@ -11487,27 +11339,20 @@ fn success_response_declares_complete_collection(
     identity_field: &str,
     verified_item_fields: &[&str],
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            schema_declares_result_array_string_field(document, schema, identity_field, 0)
-                && (verified_item_fields.is_empty()
-                    || schema_declares_result_array_item_fields(
-                        document,
-                        schema,
-                        verified_item_fields,
-                        0,
-                    ))
-                && (!requires_page_number_completion
-                    || [["result_info", "page"], ["result_info", "total_pages"]]
-                        .iter()
-                        .all(|path| schema_declares_numeric_path(document, schema, path, 0)))
-        })
+    success_response_schemas(document, operation).any(|schema| {
+        schema_declares_result_array_string_field(document, schema, identity_field, 0)
+            && (verified_item_fields.is_empty()
+                || schema_declares_result_array_item_fields(
+                    document,
+                    schema,
+                    verified_item_fields,
+                    0,
+                ))
+            && (!requires_page_number_completion
+                || [["result_info", "page"], ["result_info", "total_pages"]]
+                    .iter()
+                    .all(|path| schema_declares_numeric_path(document, schema, path, 0)))
+    })
 }
 
 fn schema_declares_result_array_item_fields(
@@ -11703,18 +11548,11 @@ fn success_response_declares_result_fields(
     operation: &Value,
     fields: &[&str],
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            fields
-                .iter()
-                .all(|field| schema_declares_path(document, schema, &["result", *field], 0))
-        })
+    success_response_schemas(document, operation).any(|schema| {
+        fields
+            .iter()
+            .all(|field| schema_declares_path(document, schema, &["result", *field], 0))
+    })
 }
 
 fn success_response_omits_or_marks_write_only_result_fields(
@@ -11722,19 +11560,12 @@ fn success_response_omits_or_marks_write_only_result_fields(
     operation: &Value,
     fields: &[&str],
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            fields.iter().all(|field| {
-                schema_path_write_only_state(document, schema, &["result", *field], 0)
-                    .is_none_or(|write_only| write_only)
-            })
+    success_response_schemas(document, operation).any(|schema| {
+        fields.iter().all(|field| {
+            schema_path_write_only_state(document, schema, &["result", *field], 0)
+                .is_none_or(|write_only| write_only)
         })
+    })
 }
 
 fn schema_path_write_only_state(
@@ -11788,18 +11619,11 @@ fn success_response_declares_result_field_union(
     operation: &Value,
     fields: &[&str],
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            fields.iter().all(|field| {
-                schema_declares_path_in_union(document, schema, &["result", *field], 0)
-            })
-        })
+    success_response_schemas(document, operation).any(|schema| {
+        fields
+            .iter()
+            .all(|field| schema_declares_path_in_union(document, schema, &["result", *field], 0))
+    })
 }
 
 fn schema_declares_path_in_union(
@@ -12908,15 +12732,20 @@ fn workers_kv_namespace_selectors_supported(
 }
 
 fn workers_kv_namespace_title_request_supported(capability: &CapabilityV1) -> bool {
-    capability.request_schema.as_ref()
-        == Some(&serde_json::json!({
-            "type": "object",
-            "required": ["title"],
-            "properties": {
-                "title": {"maxLength": 512, "type": "string"}
-            },
-            "x-cfctl-body-required": true
-        }))
+    let mut expected = serde_json::json!({
+        "type":"object", "required":["title"],
+        "properties":{"title":{"maxLength":512,"type":"string"}},
+        "x-cfctl-body-required":true
+    });
+    if capability.request_schema.as_ref() == Some(&expected) {
+        return true;
+    }
+    if capability.id != "workers-kv-namespace-create-a-namespace" {
+        return false;
+    }
+    expected["properties"]["jurisdiction"] =
+        serde_json::json!({"enum":["eu","fedramp","us"],"type":"string"});
+    capability.request_schema.as_ref() == Some(&expected)
 }
 
 fn workers_kv_namespace_references() -> Vec<KnowledgeReferenceV1> {
@@ -13003,6 +12832,21 @@ fn classify_workers_kv_namespace_operation(
     }
 }
 
+fn restrict_kv_namespace_to_default_jurisdiction(capability: &mut CapabilityV1) {
+    // Jurisdictions are a private beta. Keep the existing public,
+    // title-only workflow until that entitlement has its own proof.
+    if let Some(schema) = capability.request_schema.as_mut() {
+        schema["additionalProperties"] = Value::Bool(false);
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.remove("jurisdiction");
+        }
+    }
+    capability.description = Some(format!(
+        "{} The governed create workflow accepts title only; jurisdiction selection requires separate private-beta entitlement and immutable-location verification.",
+        capability.description.as_deref().unwrap_or_default()
+    ));
+}
+
 fn finalize_workers_kv_namespace_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
@@ -13063,6 +12907,7 @@ fn finalize_workers_kv_namespace_contracts(
         classify_workers_kv_namespace_operation(capability, kind);
         match kind {
             WorkersKvNamespaceOperationKind::Create => {
+                restrict_kv_namespace_to_default_jurisdiction(capability);
                 capability.created_resource = Some(CreatedResourceContractV1 {
                     detail_path: WORKERS_KV_NAMESPACE_DETAIL_PATH.to_owned(),
                     identity_selector: "namespace_id".to_owned(),
@@ -13679,16 +13524,9 @@ fn success_response_result_field_boolean_annotation(
     field: &str,
     annotation: &str,
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            schema_path_boolean_annotation(document, schema, &["result", field], annotation, 0)
-        })
+    success_response_schemas(document, operation).any(|schema| {
+        schema_path_boolean_annotation(document, schema, &["result", field], annotation, 0)
+    })
 }
 
 fn schema_path_boolean_annotation(
@@ -13779,8 +13617,8 @@ fn oauth_client_collection_selectors_supported(capability: &CapabilityV1) -> boo
         })
 }
 
-fn oauth_client_configuration_properties() -> Value {
-    serde_json::json!({
+fn oauth_client_configuration_properties(optional_scopes: bool) -> Value {
+    let mut properties = serde_json::json!({
         "allowed_cors_origins":{"items":{"type":"string"},"type":"array"},
         "client_name":{"type":"string"},
         "client_uri":{"type":"string"},
@@ -13793,13 +13631,38 @@ fn oauth_client_configuration_properties() -> Value {
         "scopes":{"items":{"type":"string"},"type":"array"},
         "token_endpoint_auth_method":{"enum":["none","client_secret_basic","client_secret_post"],"type":"string"},
         "tos_uri":{"type":"string"}
-    })
+    });
+    if optional_scopes {
+        properties["optional_scopes"] =
+            serde_json::json!({"type":"array","items":{"type":"string"}});
+    }
+    properties
 }
 
-fn oauth_client_upstream_create_schema() -> Value {
+fn oauth_client_has_optional_scopes(capability: &CapabilityV1) -> bool {
+    capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/allOf/0/properties/optional_scopes"))
+        .is_some()
+}
+
+fn oauth_client_configuration_fields(optional_scopes: bool) -> Vec<String> {
+    let mut fields = OAUTH_CLIENT_CONFIGURATION_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+    if optional_scopes {
+        fields.push("optional_scopes".to_owned());
+    }
+    fields.sort();
+    fields
+}
+
+fn oauth_client_upstream_create_schema(optional_scopes: bool) -> Value {
     serde_json::json!({
         "allOf":[
-            {"properties":oauth_client_configuration_properties(),"type":"object"},
+            {"properties":oauth_client_configuration_properties(optional_scopes),"type":"object"},
             {
                 "required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"],
                 "type":"object"
@@ -13809,28 +13672,28 @@ fn oauth_client_upstream_create_schema() -> Value {
     })
 }
 
-fn oauth_client_upstream_update_schema() -> Value {
+fn oauth_client_upstream_update_schema(optional_scopes: bool) -> Value {
     serde_json::json!({
         "allOf":[
-            {"properties":oauth_client_configuration_properties(),"type":"object"},
+            {"properties":oauth_client_configuration_properties(optional_scopes),"type":"object"},
             {"properties":{"visibility":{"enum":["public"],"type":"string"}},"type":"object"}
         ],
         "x-cfctl-body-required":true
     })
 }
 
-fn oauth_client_closed_create_schema() -> Value {
+fn oauth_client_closed_create_schema(optional_scopes: bool) -> Value {
     serde_json::json!({
         "type":"object",
         "additionalProperties":false,
         "required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"],
-        "properties":oauth_client_configuration_properties(),
+        "properties":oauth_client_configuration_properties(optional_scopes),
         "x-cfctl-body-required":true
     })
 }
 
-fn oauth_client_closed_update_schema() -> Value {
-    let mut properties = oauth_client_configuration_properties();
+fn oauth_client_closed_update_schema(optional_scopes: bool) -> Value {
+    let mut properties = oauth_client_configuration_properties(optional_scopes);
     properties["visibility"] = serde_json::json!({"enum":["public"],"type":"string"});
     serde_json::json!({
         "type":"object",
@@ -14015,18 +13878,30 @@ fn finalize_oauth_client_create_update_contracts(
                 )
         });
 
+    let optional_scopes_read_supported = document
+        .pointer("/paths/~1accounts~1{account_id}~1oauth_clients~1{oauth_client_id}/get")
+        .is_some_and(|operation| {
+            success_response_declares_result_fields(document, operation, &["optional_scopes"])
+        });
     finalize_oauth_client_create_contract(
         capabilities,
         companions_supported && create_response_supported,
+        optional_scopes_read_supported,
     );
-    finalize_oauth_client_update_contract(capabilities, companions_supported);
+    finalize_oauth_client_update_contract(
+        capabilities,
+        companions_supported,
+        optional_scopes_read_supported,
+    );
 }
 
 fn finalize_oauth_client_create_contract(
     capabilities: &mut BTreeMap<String, CapabilityV1>,
     companions_supported: bool,
+    optional_scopes_read_supported: bool,
 ) {
     if let Some(capability) = capabilities.get_mut(OAUTH_CLIENT_CREATE_CAPABILITY_ID) {
+        let optional_scopes = oauth_client_has_optional_scopes(capability);
         let create_supported = capability.id == OAUTH_CLIENT_CREATE_CAPABILITY_ID
             && capability.method == "POST"
             && capability.path == OAUTH_CLIENT_COLLECTION_PATH
@@ -14035,17 +13910,21 @@ fn finalize_oauth_client_create_contract(
             && capability.permissions == ["OAuth Client Write"]
             && oauth_client_collection_selectors_supported(capability)
             && oauth_client_all_plan_entitlement_supported(capability)
-            && capability.request_schema.as_ref() == Some(&oauth_client_upstream_create_schema())
+            && capability.request_schema.as_ref()
+                == Some(&oauth_client_upstream_create_schema(optional_scopes))
             && capability
                 .response_contract
                 .as_ref()
                 .is_some_and(oauth_client_json_response_supported);
-        if create_supported && companions_supported {
+        if create_supported
+            && companions_supported
+            && (!optional_scopes || optional_scopes_read_supported)
+        {
             capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            capability.request_schema = Some(oauth_client_closed_create_schema());
+            capability.request_schema = Some(oauth_client_closed_create_schema(optional_scopes));
             capability.risk = RiskClass::IdentityOrOwnership;
             capability.effect = EffectClass::IdentityOrOwnership;
             classify_oauth_client_cost_and_entitlement(capability);
@@ -14055,10 +13934,7 @@ fn finalize_oauth_client_create_contract(
                 response_result_identity_pointer: "/client_id".to_owned(),
                 read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
                 delete_capability_id: OAUTH_CLIENT_DELETE_CAPABILITY_ID.to_owned(),
-                verified_response_fields: OAUTH_CLIENT_CONFIGURATION_FIELDS
-                    .iter()
-                    .map(|field| (*field).to_owned())
-                    .collect(),
+                verified_response_fields: oauth_client_configuration_fields(optional_scopes),
             });
             capability.verification.required = true;
             "created_resource_contains_planned_fields_by_returned_id"
@@ -14084,14 +13960,12 @@ fn finalize_oauth_client_create_contract(
 fn finalize_oauth_client_update_contract(
     capabilities: &mut BTreeMap<String, CapabilityV1>,
     companions_supported: bool,
+    optional_scopes_read_supported: bool,
 ) {
     if let Some(capability) = capabilities.get_mut(OAUTH_CLIENT_UPDATE_CAPABILITY_ID) {
-        let update_fields = OAUTH_CLIENT_CONFIGURATION_FIELDS
-            .iter()
-            .copied()
-            .chain(["visibility"])
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let optional_scopes = oauth_client_has_optional_scopes(capability);
+        let mut update_fields = oauth_client_configuration_fields(optional_scopes);
+        update_fields.push("visibility".to_owned());
         let update_supported = capability.id == OAUTH_CLIENT_UPDATE_CAPABILITY_ID
             && capability.method == "PATCH"
             && capability.path == OAUTH_CLIENT_DETAIL_PATH
@@ -14100,17 +13974,21 @@ fn finalize_oauth_client_update_contract(
             && capability.permissions == ["OAuth Client Write"]
             && oauth_client_selectors_supported(capability)
             && oauth_client_all_plan_entitlement_supported(capability)
-            && capability.request_schema.as_ref() == Some(&oauth_client_upstream_update_schema())
+            && capability.request_schema.as_ref()
+                == Some(&oauth_client_upstream_update_schema(optional_scopes))
             && capability
                 .response_contract
                 .as_ref()
                 .is_some_and(oauth_client_json_response_supported);
-        if update_supported && companions_supported {
+        if update_supported
+            && companions_supported
+            && (!optional_scopes || optional_scopes_read_supported)
+        {
             capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            capability.request_schema = Some(oauth_client_closed_update_schema());
+            capability.request_schema = Some(oauth_client_closed_update_schema(optional_scopes));
             capability.risk = RiskClass::IdentityOrOwnership;
             capability.effect = EffectClass::IdentityOrOwnership;
             classify_oauth_client_cost_and_entitlement(capability);
@@ -14765,8 +14643,8 @@ fn r2_bucket_selectors_supported(capability: &CapabilityV1, includes_bucket_name
                         "Jurisdiction where objects in this bucket are guaranteed to be stored.",
                     )
                 && selector.contract.as_ref().is_some_and(|contract| {
-                    contract.schema
-                        == serde_json::json!({"enum":["default","eu","fedramp"],"type":"string"})
+                    (contract.schema == serde_json::json!({"enum":["default","eu","fedramp"],"type":"string"})
+                        || contract.schema == serde_json::json!({"enum":["default","eu","us","fedramp"],"type":"string"}))
                         && contract.query.is_none()
                 })
         })
@@ -14814,12 +14692,12 @@ fn classify_r2_bucket_create(capability: &mut CapabilityV1) {
     capability.effect = EffectClass::ReversibleWrite;
     capability.cost.incremental = true;
     capability.cost.currency = Some("USD".to_owned());
-    capability.cost.maximum = Some(0.000_009);
+    capability.cost.maximum = Some(9.0);
     capability.cost.known = true;
     capability.cost.billing_model = BillingModelV1::UsageBased;
     capability.cost.exposure = CostExposureV1::DownstreamUsage;
     capability.cost.basis = Some(
-        "Cloudflare classifies PutBucket as one Class A operation; the ceiling uses the current higher Infrequent Access rate of USD 9.00 per million requests, while later storage, data retrieval, and Class A/Class B operations remain usage-billed"
+        "Cloudflare classifies PutBucket as one Class A operation and rounds usage up to whole million-request billing units; a single request can cross a unit boundary, so the direct incremental ceiling is one higher Infrequent Access unit of USD 9.00, without assuming remaining free usage. Later storage, data retrieval, and Class A/Class B operations remain usage-billed"
             .to_owned(),
     );
     capability.cost.references = r2_bucket_references();
@@ -14966,6 +14844,21 @@ fn finalize_r2_bucket_create_contract(
     }
 
     classify_r2_bucket_create(capability);
+    // FedRAMP access requires separate Enterprise qualification. Keep its
+    // existing-resource reads/deletes available, but do not infer create access.
+    if let Some(selector) = capability
+        .selectors
+        .iter_mut()
+        .find(|selector| selector.name == "cf-r2-jurisdiction")
+        && let Some(contract) = selector.contract.as_mut()
+        && let Some(values) = contract
+            .schema
+            .get_mut("enum")
+            .and_then(Value::as_array_mut)
+    {
+        values.retain(|value| value.as_str() != Some("fedramp"));
+    }
+    capability.description = Some("Creates a new R2 bucket in the default, EU, or US jurisdiction. FedRAMP creation requires separately qualified Enterprise access.".to_owned());
     if !annotate_r2_bucket_verification_projection(capability) {
         capability.adapter_status = AdapterStatus::Blocked;
         capability.blocked_reason =
@@ -15605,16 +15498,30 @@ fn access_service_token_update_contract_supported(capability: &CapabilityV1) -> 
         })
 }
 
+// Credential version and previous-secret expiry remain exclusive to rotation.
+// The enabled flag has ordinary boolean readback and keeps identity approval.
+fn access_service_token_closed_request(capability: &CapabilityV1, require_name: bool) -> Value {
+    let mut schema = serde_json::json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{"duration":{"type":"string"},"name":{"type":"string"}},
+        "x-cfctl-body-required":true
+    });
+    if require_name {
+        schema["required"] = serde_json::json!(["name"]);
+    }
+    if capability
+        .request_schema
+        .as_ref()
+        .and_then(|source| source.pointer("/properties/enabled"))
+        == Some(&serde_json::json!({"type":"boolean"}))
+    {
+        schema["properties"]["enabled"] = serde_json::json!({"type":"boolean"});
+    }
+    schema
+}
+
 fn classify_access_service_token_update(capability: &mut CapabilityV1) {
-    capability.request_schema = Some(serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "duration": {"type": "string"},
-            "name": {"type": "string"}
-        },
-        "x-cfctl-body-required": true
-    }));
+    capability.request_schema = Some(access_service_token_closed_request(capability, false));
     capability.risk = RiskClass::IdentityOrOwnership;
     capability.effect = EffectClass::IdentityOrOwnership;
     apply_access_service_token_commercial_contract(capability);
@@ -15641,16 +15548,7 @@ fn classify_access_service_token_create_contract(
             continue;
         };
 
-        capability.request_schema = Some(serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["name"],
-            "properties": {
-                "duration": {"type": "string"},
-                "name": {"type": "string"}
-            },
-            "x-cfctl-body-required": true
-        }));
+        capability.request_schema = Some(access_service_token_closed_request(capability, true));
         capability.risk = RiskClass::SecretSensitive;
         capability.effect = EffectClass::IdentityOrOwnership;
         apply_access_service_token_commercial_contract(capability);
@@ -15887,7 +15785,10 @@ fn access_service_token_source_create_request_supported(capability: &CapabilityV
         .is_some_and(|value_type| value_type != "object")
         || schema.get("required") != Some(&serde_json::json!(["name"]))
         || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
-        || properties.len() != 4
+        || properties.len() != 4 + usize::from(properties.contains_key("enabled"))
+        || properties
+            .get("enabled")
+            .is_some_and(|field| field != &serde_json::json!({"type":"boolean"}))
     {
         return false;
     }
@@ -15911,7 +15812,10 @@ fn access_service_token_source_update_request_supported(capability: &CapabilityV
         .is_some_and(|value_type| value_type != "object")
         || schema.get("required").is_some()
         || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
-        || properties.len() != 4
+        || properties.len() != 4 + usize::from(properties.contains_key("enabled"))
+        || properties
+            .get("enabled")
+            .is_some_and(|field| field != &serde_json::json!({"type":"boolean"}))
     {
         return false;
     }
@@ -17331,17 +17235,10 @@ fn schema_contains_result_reference(schema: &Value, reference: &str, depth: usiz
             })
 }
 
-fn operation_returns_zone_setting(operation: &Value) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            schema_contains_result_reference(schema, "#/components/schemas/zones_setting", 0)
-        })
+fn operation_returns_zone_setting(document: &Value, operation: &Value) -> bool {
+    success_response_schemas(document, operation).any(|schema| {
+        schema_contains_result_reference(schema, "#/components/schemas/zones_setting", 0)
+    })
 }
 
 fn websocket_source_operations_supported(document: &Value) -> bool {
@@ -17363,8 +17260,8 @@ fn websocket_source_operations_supported(document: &Value) -> bool {
             .pointer("/requestBody/content/application~1json/schema/$ref")
             .and_then(Value::as_str)
             == Some("#/components/schemas/zones_zone_settings_single_request")
-        && operation_returns_zone_setting(read)
-        && operation_returns_zone_setting(update)
+        && operation_returns_zone_setting(document, read)
+        && operation_returns_zone_setting(document, update)
         && websocket_setting_schema_supported(document)
 }
 
@@ -18132,16 +18029,9 @@ fn success_response_declares_access_application_variant_field(
     app_type: &str,
     field: &str,
 ) -> bool {
-    operation
-        .get("responses")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(status, _)| status.starts_with('2'))
-        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| {
-            access_application_response_declares_variant_field(document, schema, app_type, field, 0)
-        })
+    success_response_schemas(document, operation).any(|schema| {
+        access_application_response_declares_variant_field(document, schema, app_type, field, 0)
+    })
 }
 
 fn access_application_response_declares_variant_field(
@@ -21275,7 +21165,7 @@ mod control_plane_overlay_tests {
                 .get("putV4AccountsByAccount_idPipelinesByPipeline_name_deprecated")
                 .and_then(|capability| capability.blocked_reason.as_deref())
                 .unwrap_or_default()
-                .contains("delete and create")
+                .contains("different generation")
         );
     }
 }

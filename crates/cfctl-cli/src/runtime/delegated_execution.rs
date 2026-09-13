@@ -307,8 +307,20 @@ pub(super) async fn run_delegated_plan_boundary(
         pages_deployment::validate_bound_producer(&plan.capability, adapter_targets)?;
     }
     let planned_config = worker_deployment::planned_config_execution(adapter_targets)?;
+    let frozen = super::worker_frozen_upload::stage(&plan.capability, input, adapter_targets)?;
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
         run_quick_tunnel(store, plan, input).await?
+    } else if let Some(frozen) = &frozen {
+        super::governed_cli::run_delegated_cli_with_frozen_artifact(
+            &plan.capability,
+            input,
+            credential,
+            Some(&plan.account_id),
+            &store.paths().cache_dir,
+            planned_config.as_ref(),
+            frozen,
+        )
+        .await?
     } else {
         run_delegated_cli_with_private_config_identity(
             &plan.capability,

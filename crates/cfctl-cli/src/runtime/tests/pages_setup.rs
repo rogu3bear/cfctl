@@ -661,3 +661,34 @@ async fn pages_setup_uncertain_http_status_requires_rectification_without_verifi
         );
     }
 }
+
+#[test]
+fn pages_configuration_metadata_survives_receipt_redaction_without_variable_values() {
+    let mut cap = capability(false);
+    cap.id = contract::READ_ID.into();
+    cap.method = "GET".into();
+    cap.mutating = false;
+    let raw = json!({"success":true,"status":200,"result":{"name":"fixture",
+        "source":{"config":{"preview_branch_includes":["preview/*"]}},
+        "deployment_configs":{"preview":{"env_vars":{"ACCESS_AUD":{"type":"secret_text","value":"CANARY_PRIVATE"}}}}}});
+    let projected = redact_response_for_capability(&cap, &raw);
+    let store_root = tempfile::tempdir().expect("receipt root");
+    let store = StateStore::open(RuntimePaths::from_root(store_root.path())).expect("store");
+    let evidence = store
+        .write_observation_evidence(EvidenceClass::LiveRead, &projected)
+        .expect("receipt");
+    let stored = store
+        .read_evidence_value(&evidence.content_hash)
+        .expect("stored receipt");
+    assert_eq!(
+        stored["configuration_metadata"]["triggers"]["preview_branch_includes"]["observed"][0]["pattern"],
+        "preview/*"
+    );
+    let envelope = ResultEnvelopeV2::success("call", projected).with_evidence(evidence);
+    let rendered = serde_json::to_string(&envelope).expect("public envelope");
+    assert!(!rendered.contains("CANARY_PRIVATE"));
+    assert!(!stored.to_string().contains("CANARY_PRIVATE"));
+    let failed =
+        redact_response_for_capability(&cap, &json!({"success":false,"result":raw["result"]}));
+    assert!(failed.get("configuration_metadata").is_none());
+}

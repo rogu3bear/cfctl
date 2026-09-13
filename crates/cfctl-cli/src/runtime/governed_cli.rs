@@ -20,6 +20,15 @@ const WRANGLER_CACHE_SUBDIRECTORY: &str = "wrangler";
 const DELEGATED_CLI_TIMEOUT: Duration = Duration::from_mins(2);
 const WRANGLER_DEPLOY_TIMEOUT: Duration = Duration::from_mins(10);
 
+#[cfg(test)]
+tokio::task_local! {
+    // Causal real-tool tests add an OS network sandbox and --dry-run after
+    // admission. The immutable input, staging, and producer checks still run.
+    pub(super) static FROZEN_TRANSPORT_TEST_LAUNCHER: std::path::PathBuf;
+    pub(super) static FROZEN_TRANSPORT_TEST_TIMEOUT: Duration;
+    pub(super) static FROZEN_TRANSPORT_TEST_STAGE_RECEIPT: std::path::PathBuf;
+}
+
 pub(super) fn execute_governed_ui_plan(
     store: &StateStore,
     plan: &mut PlanV1,
@@ -101,6 +110,7 @@ pub(super) async fn run_delegated_cli(
         interpreter_override,
         governed_delegated_cli_timeout(&capability.id),
         None,
+        None,
     )
     .await
 }
@@ -129,6 +139,7 @@ pub(super) async fn run_delegated_cli_with_private_config_identity(
         interpreter_override,
         governed_delegated_cli_timeout(&capability.id),
         planned_config,
+        None,
     )
     .await
 }
@@ -158,6 +169,7 @@ pub(super) async fn run_delegated_cli_with_timeout(
         interpreter_override,
         timeout,
         None,
+        None,
     )
     .await
 }
@@ -180,10 +192,26 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
     interpreter_override: Option<&Path>,
     timeout: Duration,
     planned_config: Option<&worker_deployment::PlannedConfigExecution>,
+    frozen_artifact: Option<&super::worker_frozen_upload::BoundFrozenArtifact>,
 ) -> Result<Value> {
     let bound_private_config =
         worker_deployment::bind_private_config_for_execution(capability, input, planned_config)?;
     let mut execution_input = input.clone();
+    let frozen_requested = super::worker_frozen_upload::requested(capability, input)?;
+    if frozen_requested != frozen_artifact.is_some() {
+        return Err(CliError::Input(
+            "frozen Worker execution requires the exact admitted private artifact stage".to_owned(),
+        ));
+    }
+    if frozen_requested {
+        // This is cfctl policy, not a Wrangler command-line option.
+        execution_input.selectors = json!({});
+        execution_input
+            .query
+            .as_object_mut()
+            .ok_or_else(|| CliError::Input("Worker upload query must be an object".to_owned()))?
+            .remove("artifact_mode");
+    }
     if let Some(bound) = &bound_private_config {
         if private_config_argument_is_ambiguous(&execution_input) {
             return Err(CliError::Input(
@@ -199,6 +227,9 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
                 "config".to_owned(),
                 Value::String(bound.path().display().to_string()),
             );
+    }
+    if let Some(frozen) = frozen_artifact {
+        execution_input.query["config"] = json!(frozen.config());
     }
     let mut path_parts = capability.path.split_whitespace();
     let program = path_parts
@@ -249,7 +280,7 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
     command = command
         .args(cli_input_arguments(&execution_input.selectors)?)
         .args(cli_input_arguments(&execution_input.query)?);
-    if pages_deployment::binds_artifact(capability) {
+    if pages_deployment::binds_artifact(capability) || frozen_requested {
         // cfctl already produced and hash-bound the closed worker bundle. A
         // second Wrangler bundle would reopen ambient project resolution.
         command = command.arg("--no-bundle");
@@ -269,6 +300,17 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
     for (name, value) in governed_cli_workspace_env(program, account_id, cache_dir) {
         command = command.env(name, value);
     }
+    if let Some(frozen) = frozen_artifact {
+        // No ambient Wrangler login, cache, config, dotenv, or diagnostic path
+        // survives into the isolated artifact transaction.
+        command = command
+            .env("HOME", frozen.directory())
+            .env("XDG_CONFIG_HOME", frozen.directory())
+            .env(WRANGLER_CACHE_ENV, frozen.directory().join("cache"))
+            .env("WRANGLER_LOG_PATH", frozen.directory().join("wrangler.log"))
+            .env("WRANGLER_SEND_METRICS", "false")
+            .env("CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV", "false");
+    }
     if let Some(path) = &wrangler_output_path {
         command = command.env("WRANGLER_OUTPUT_FILE_PATH", path);
     }
@@ -279,6 +321,9 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
             .env("CLOUDFLARE_API_KEY", key),
     };
     let label = capability.path.clone();
+    if let Some(frozen) = frozen_artifact {
+        frozen.validate_ready(capability, input)?;
+    }
     let running = command
         .start()
         .await
@@ -298,9 +343,17 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
             timeout_seconds: timeout.as_secs(),
         });
     }
-    let private_projection = bound_private_config.as_ref().map(|bound| {
-        private_wrangler_projection(&capability.id, output.is_success(), output.stdout(), bound)
-    });
+    let private_projection = if let Some(frozen) = frozen_artifact {
+        Some(frozen_wrangler_projection(
+            output.is_success(),
+            output.stdout(),
+            frozen,
+        ))
+    } else {
+        bound_private_config.as_ref().map(|bound| {
+            private_wrangler_projection(&capability.id, output.is_success(), output.stdout(), bound)
+        })
+    };
     let (stdout, stderr) = if private_projection.is_some() {
         (String::new(), String::new())
     } else {
@@ -342,6 +395,62 @@ pub(super) fn governed_delegated_cli_timeout(capability_id: &str) -> Duration {
     } else {
         DELEGATED_CLI_TIMEOUT
     }
+}
+
+pub(super) async fn run_delegated_cli_with_frozen_artifact(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+    account_id: Option<&str>,
+    cache_dir: &Path,
+    planned_config: Option<&worker_deployment::PlannedConfigExecution>,
+    frozen: &super::worker_frozen_upload::BoundFrozenArtifact,
+) -> Result<Value> {
+    let program = frozen.executable()?;
+    let interpreter = frozen.interpreter()?;
+    let timeout = governed_delegated_cli_timeout(&capability.id);
+    #[cfg(test)]
+    let (program, interpreter) = FROZEN_TRANSPORT_TEST_LAUNCHER
+        .try_with(Clone::clone)
+        .map_or((program, interpreter), |launcher| (launcher, None));
+    #[cfg(test)]
+    let timeout = FROZEN_TRANSPORT_TEST_TIMEOUT
+        .try_with(|timeout| *timeout)
+        .unwrap_or(timeout);
+    #[cfg(test)]
+    if let Ok(path) = FROZEN_TRANSPORT_TEST_STAGE_RECEIPT.try_with(Clone::clone) {
+        fs::write(&path, frozen.config().as_os_str().as_encoded_bytes())
+            .map_err(|source| cli_io(&path, source))?;
+    }
+    run_delegated_cli_with_timeout_and_private_config_identity(
+        capability,
+        input,
+        credential,
+        account_id,
+        cache_dir,
+        Some(&program),
+        interpreter.as_deref(),
+        timeout,
+        planned_config,
+        Some(frozen),
+    )
+    .await
+}
+
+fn frozen_wrangler_projection(
+    success: bool,
+    stdout: &[u8],
+    frozen: &super::worker_frozen_upload::BoundFrozenArtifact,
+) -> Result<Value> {
+    let version_id = if success {
+        Some(projected_version_id(&String::from_utf8_lossy(stdout), "Worker Version ID:")
+            .ok_or_else(|| CliError::Input(
+                "frozen Wrangler subprocess succeeded without its required typed version identity".to_owned()
+            ))?)
+    } else {
+        None
+    };
+    frozen.public_receipt(version_id.as_deref())
 }
 
 pub(super) async fn run_quick_tunnel(

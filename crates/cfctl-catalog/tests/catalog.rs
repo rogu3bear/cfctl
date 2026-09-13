@@ -3,6 +3,12 @@
 #[path = "catalog/pages_projects.rs"]
 mod pages_projects;
 
+#[path = "catalog/schema_references.rs"]
+mod schema_references;
+
+#[path = "catalog/schema_drift.rs"]
+mod schema_drift;
+
 use std::collections::BTreeMap;
 
 use cfctl_catalog::{
@@ -952,7 +958,7 @@ fn r2_bucket_create_has_paid_ceiling_exact_readback_and_reviewed_empty_bucket_co
     assert!(create.cost.known);
     assert!(create.cost.incremental);
     assert_eq!(create.cost.currency.as_deref(), Some("USD"));
-    assert_eq!(create.cost.maximum, Some(0.000_009));
+    assert_eq!(create.cost.maximum, Some(9.0));
     assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
     assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
     assert_eq!(create.entitlement.available, Some(true));
