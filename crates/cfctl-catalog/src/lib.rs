@@ -44,7 +44,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 mod access_create;
+mod pages_artifact;
 mod pages_projects;
+pub use pages_artifact::capability as pages_artifact_reproduction_capability;
 mod worker_frozen_upload;
 mod workspace_d1_qualification;
 use access_create::finalize_access_application_create_contract;
@@ -2143,6 +2145,7 @@ pub fn ingest_wrangler_pages_deploy_help(
         contract: None,
     })
     .collect();
+    pages_artifact::add_archive_selector(&mut capability);
     snapshot
         .capabilities
         .insert(capability.id.clone(), capability);
@@ -2663,6 +2666,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
     for capability in vec![
+        pages_artifact::capability(),
         workspace_d1_qualification_observer_capability(),
         workspace_d1_qualification_producer_capability(),
         worker_deployment_plan_capability(),

@@ -1,5 +1,43 @@
 # Direct-upload Pages project setup
 
+## Deploy an immutable artifact while development advances
+
+The optional `artifact_receipt` query selector on `wrangler.pages-deploy`
+selects immutable-artifact mode. Without it, the existing clean registered
+checkout HEAD/branch requirements remain unchanged. It never treats a supplied
+commit string or matching archive manifest as proof of a build.
+
+`cfctl guide pages-artifact-reproduce --json` describes the local producer.
+Call it with a JSON body containing `repository`, `commit`, `tree`, `account_id`,
+`project_name`, `branch`, `artifact_directory`, `artifact_manifest_sha256`, and
+`esbuild_package`. Paths must be canonical absolute paths without symlinks.
+The package is an existing local npm darwin-arm64 esbuild 0.28.2 tarball; this
+operation does not download or install dependencies. The current recipe supports
+only the exact admitted script/package/lock hashes declared in
+`crates/cfctl-core/src/pages_artifact.rs`. Other recipes and platforms fail closed.
+
+The native producer reads Git objects from the registered logical repository,
+extracts declared materials privately, copies public files and invokes the
+lock-integrity-verified compiler with fixed arguments and a cleared environment.
+It executes no repository scripts. Every compiler input must belong to the
+declared Git materials; reproduced output must equal the complete retained
+manifest. The result is authenticated `local_proof` of a **fresh reproduction**,
+not retrospective authentication of an earlier build. Ordinary evidence imports
+cannot stamp the native producer origin. Failure issues no qualifying receipt.
+
+Use the returned evidence content hash as `--query artifact_receipt=sha256:...`
+alongside the usual artifact directory, project, branch and commit selectors.
+The plan binds that receipt, logical repository, account, production target,
+source tree, complete artifact and deployment producer. Current development
+HEAD/dirt is not consumed as archive source; registration, affected resource
+links, other repositories, credentials and live target preconditions remain
+checked. Missing proof, changed inputs or private-stage drift refuse execution.
+Receipt reuse requires the same native producer implementation and cfctl build.
+
+Approval, one-use execution, exact deployment readback and uncertain-outcome
+rectification retain their existing rules. Restoration still requires a separate
+reviewed plan for a proven prior artifact; no automatic rollback is added.
+
 The generated catalog exposes two bounded setup operations when the official
 Pages request, permission and readback schemas support them. The existing
 `pages-project-create-project` capability retains its Git-integration contract;

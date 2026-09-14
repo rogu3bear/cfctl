@@ -598,7 +598,7 @@ pub(super) async fn run_plan(
     )
     .await?;
     let graph = discover_registered(store)?;
-    pages_deployment::validate_bound_plan(&graph, &plan, &execution_input)?;
+    pages_deployment::validate_bound_plan(store, &graph, &plan, &execution_input)?;
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
@@ -707,7 +707,7 @@ pub(super) async fn run_plan_under_standing_authority(
     )
     .await?;
     let graph = discover_registered(store)?;
-    pages_deployment::validate_bound_plan(&graph, &plan, &execution_input)?;
+    pages_deployment::validate_bound_plan(store, &graph, &plan, &execution_input)?;
     validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     authorize_standing_execution(&authority_snapshot, &plan, &execution_input)?;
     let standing_evidence =

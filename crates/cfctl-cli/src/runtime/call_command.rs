@@ -71,6 +71,7 @@ pub(super) async fn call_command(
     let catalog = if workspace_read.is_some()
         || arguments.capability_id == cfctl_core::r2_recovery::VERIFY_ID
         || arguments.capability_id == cfctl_core::r2_restore::RESTORE_ID
+        || arguments.capability_id == cfctl_core::pages_artifact::PRODUCER_ID
     {
         cached.ok_or_else(|| {
             CliError::Input(
@@ -179,6 +180,34 @@ pub(super) async fn call_command(
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    if capability.id == cfctl_core::pages_artifact::PRODUCER_ID {
+        if arguments.profile.is_some()
+            || arguments.account.is_some()
+            || arguments.out.is_some()
+            || arguments.value_out.is_some()
+            || arguments.source_file.is_some()
+            || !prepared
+                .input
+                .query
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            || !prepared
+                .input
+                .selectors
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            || capability != cfctl_catalog::pages_artifact_reproduction_capability()
+        {
+            return Err(super::pages_reproduction_process::rejected());
+        }
+        let request = serde_json::from_value(
+            prepared
+                .input
+                .body
+                .ok_or_else(super::pages_reproduction_process::rejected)?,
+        )?;
+        return super::pages_reproduction::run(store, &discover_registered(store)?, request);
+    }
     if is_r2_capture && (arguments.out.is_none() || arguments.value_out.is_some()) {
         return Err(CliError::Input(
             "private R2 capture requires --out <new-private-directory>".into(),
@@ -324,7 +353,7 @@ pub(super) async fn call_command(
     let mut adapter_targets = Map::new();
     if pages_deployment::binds_artifact(&capability) {
         let graph = discover_registered(store)?;
-        let target = pages_deployment::prepare_target(&graph, &capability, &prepared.input)?
+        let target = pages_deployment::prepare_target(store, &graph, &capability, &prepared.input)?
             .ok_or_else(|| {
                 CliError::Input("Pages deployment target could not be derived".to_owned())
             })?;

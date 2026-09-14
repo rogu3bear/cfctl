@@ -2,6 +2,7 @@
 
 pub mod d1_read_inventory;
 mod email_routing;
+pub mod pages_artifact;
 pub mod pages_projects;
 pub mod worker_frozen_upload;
 pub use email_routing::{

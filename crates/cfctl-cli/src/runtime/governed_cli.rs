@@ -277,6 +277,12 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
     } else {
         None
     };
+    if pages_deployment::binds_artifact(capability) {
+        // Local admission metadata is never a Wrangler flag.
+        if let Some(query) = execution_input.query.as_object_mut() {
+            query.remove("artifact_receipt");
+        }
+    }
     command = command
         .args(cli_input_arguments(&execution_input.selectors)?)
         .args(cli_input_arguments(&execution_input.query)?);

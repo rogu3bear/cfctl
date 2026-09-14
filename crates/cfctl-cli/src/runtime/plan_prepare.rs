@@ -47,7 +47,6 @@ use super::r2_credentials::should_bind_r2_parent_token;
 use super::secret_io::preflight_secret_sink;
 use super::workspace_d1_qualification;
 use super::workspace_state::discover_registered;
-use super::workspace_state::workspace_precondition_hashes_for_scope;
 use super::{pages_deployment, worker_custom_domain, worker_deployment};
 use crate::build_identity::current_build_info;
 use cfctl_core::hash_value;
@@ -544,6 +543,7 @@ pub(super) fn persist_prepared_plan(
         account_id,
     } = authority;
     validate_api_token_creation_contract(&capability, &input, &adapter_targets, account_id)?;
+    super::pages_immutable::validate_account(&adapter_targets, account_id)?;
     validate_prepared_r2_parent_token_contract(
         &capability,
         &input,
@@ -597,12 +597,14 @@ pub(super) fn persist_prepared_plan(
         plan.precondition_hashes
             .insert(SOURCE_REMOTE_PRECONDITION.to_owned(), hash_value(snapshot)?);
     }
-    plan.precondition_hashes
-        .extend(workspace_precondition_hashes_for_scope(
+    plan.precondition_hashes.extend(
+        super::workspace_state::workspace_precondition_hashes_for_archive_scope(
             store,
             &impact.affected_repositories,
             &impact.local_artifact_paths,
-        )?);
+            super::pages_immutable::plan_repository(&plan),
+        )?,
+    );
     workspace_d1_qualification::bind_plan_evidence_hashes(&mut plan, &adapter_targets)?;
     plan.affected_repositories = impact.affected_repositories;
     plan.affected_resources = impact.affected_resources;

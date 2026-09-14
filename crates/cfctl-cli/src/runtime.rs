@@ -41,7 +41,12 @@ mod mutation_input;
 mod oauth_state;
 mod pages_deployment;
 mod pages_direct_proof;
+mod pages_immutable;
 mod pages_projects;
+mod pages_reproduction;
+mod pages_reproduction_process;
+#[cfg(test)]
+mod pages_reproduction_tests;
 mod pages_source;
 mod plan_commands;
 mod plan_create;

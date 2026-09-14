@@ -120,7 +120,7 @@ fn artifact_root(input: &CallInput) -> Result<PathBuf, CliError> {
     Ok(canonical)
 }
 
-fn reject_symlink_components(path: &Path) -> Result<(), CliError> {
+pub(super) fn reject_symlink_components(path: &Path) -> Result<(), CliError> {
     if path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
@@ -545,6 +545,7 @@ fn transport_manifest(artifact: &Value, worker_bundle: Option<&Value>) -> Result
 }
 
 pub(super) fn prepare_target(
+    store: &cfctl_storage::StateStore,
     graph: &WorkspaceGraph,
     capability: &CapabilityV1,
     input: &CallInput,
@@ -553,61 +554,65 @@ pub(super) fn prepare_target(
         return Ok(None);
     }
     let root = artifact_root(input)?;
-    let repository = repository_owning_path(graph, &root).ok_or_else(|| {
-        CliError::Input(format!(
-            "Pages deployment artifact `{}` is not owned by a registered repository",
-            root.display()
-        ))
-    })?;
-    if repository.git.dirty {
-        return Err(CliError::Input(format!(
-            "Pages deployment repository `{}` is dirty; commit the reviewed source before planning",
-            repository.path.display()
-        )));
-    }
-    let source_sha = repository
-        .git
-        .head
-        .as_deref()
-        .filter(|value| full_git_sha(value))
-        .ok_or_else(|| {
-            CliError::Input("Pages deployment repository has no canonical full Git HEAD".to_owned())
+    let immutable = super::pages_immutable::requested(input);
+    let source = if immutable {
+        super::pages_immutable::source(store, graph, input)?
+    } else {
+        let repository = repository_owning_path(graph, &root).ok_or_else(|| {
+            CliError::Input(format!(
+                "Pages deployment artifact `{}` is not owned by a registered repository",
+                root.display()
+            ))
         })?;
-    let branch = repository
-        .git
-        .branch
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            CliError::Input(
-                "Pages deployment repository must be attached to one named branch".to_owned(),
-            )
-        })?;
-    let planned_sha = input.query.get("commit_hash").and_then(Value::as_str);
-    if planned_sha != Some(source_sha) {
-        return Err(CliError::Input(format!(
-            "Pages deployment commit_hash must equal the registered repository HEAD `{source_sha}`"
-        )));
-    }
-    let planned_branch = input.query.get("branch").and_then(Value::as_str);
-    if planned_branch != Some(branch) {
-        return Err(CliError::Input(format!(
-            "Pages deployment branch must equal the registered repository branch `{branch}`"
-        )));
-    }
+        if repository.git.dirty {
+            return Err(CliError::Input(format!(
+                "Pages deployment repository `{}` is dirty; commit the reviewed source before planning",
+                repository.path.display()
+            )));
+        }
+        let source_sha = repository
+            .git
+            .head
+            .as_deref()
+            .filter(|value| full_git_sha(value))
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Pages deployment repository has no canonical full Git HEAD".to_owned(),
+                )
+            })?;
+        let branch = repository
+            .git
+            .branch
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Pages deployment repository must be attached to one named branch".to_owned(),
+                )
+            })?;
+        let planned_sha = input.query.get("commit_hash").and_then(Value::as_str);
+        if planned_sha != Some(source_sha) {
+            return Err(CliError::Input(format!(
+                "Pages deployment commit_hash must equal the registered repository HEAD `{source_sha}`"
+            )));
+        }
+        let planned_branch = input.query.get("branch").and_then(Value::as_str);
+        if planned_branch != Some(branch) {
+            return Err(CliError::Input(format!(
+                "Pages deployment branch must equal the registered repository branch `{branch}`"
+            )));
+        }
+        json!({"repository": repository.path, "commit":source_sha, "branch":branch})
+    };
     let artifact = manifest(&root)?;
     let producer = wrangler_producer(capability)?;
     let worker_bundle =
         build_worker_bundle(&root, &artifact, &producer)?.map(|(contract, _bytes)| contract);
     let transport_manifest = transport_manifest(&artifact, worker_bundle.as_ref())?;
     Ok(Some(json!({
-        "schema_version": 1,
+        "schema_version": if immutable { 2 } else { 1 },
         "project_name": project_name(capability, input)?,
-        "source": {
-            "repository": repository.path,
-            "commit": source_sha,
-            "branch": branch,
-        },
+        "source": source,
         "artifact": artifact,
         "provider_request": {
             "producer": producer,
@@ -846,6 +851,7 @@ pub(super) fn validate_staged_artifact(
 }
 
 pub(super) fn validate_bound_plan(
+    store: &cfctl_storage::StateStore,
     graph: &WorkspaceGraph,
     plan: &PlanV1,
     input: &CallInput,
@@ -860,7 +866,8 @@ pub(super) fn validate_bound_plan(
         }
         return Ok(());
     };
-    let current = prepare_target(graph, &plan.capability, input)?.ok_or_else(|| {
+    super::pages_immutable::validate_account(adapter, &plan.account_id)?;
+    let current = prepare_target(store, graph, &plan.capability, input)?.ok_or_else(|| {
         CliError::Input("Pages direct-upload target could not be recomputed".to_owned())
     })?;
     if &current != expected {

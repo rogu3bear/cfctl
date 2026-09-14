@@ -406,6 +406,7 @@ pub(super) fn plan_impact(
     });
     let graph = discover_registered(store)?;
     let mut affected_resources = Vec::new();
+    let archive = super::pages_immutable::for_impact(store, &graph, capability, input, account_id)?;
     if let Some(selectors) = selector_map {
         for (key, value) in selectors {
             if let Some(value) = value.as_str() {
@@ -425,13 +426,11 @@ pub(super) fn plan_impact(
         affected_repositories.push(source_repository.path.display().to_string());
     }
     for artifact in &local_artifact_paths {
-        let repository = repository_owning_path(&graph, artifact).ok_or_else(|| {
-            CliError::Input(format!(
-                "local deployment artifact `{}` is not owned by a registered repository",
-                artifact.display()
-            ))
-        })?;
-        affected_repositories.push(repository.path.display().to_string());
+        affected_repositories.push(super::pages_immutable::artifact_repository(
+            &graph,
+            artifact,
+            archive.as_ref(),
+        )?);
     }
     affected_repositories.sort();
     affected_repositories.dedup();
@@ -447,8 +446,57 @@ pub(super) fn plan_impact(
         .iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    append_local_artifact_diffs(&graph, &local_artifact_paths, &mut local_diffs)?;
-    for repository_id in &affected_repositories {
+    super::pages_immutable::append_impact_diffs(
+        &graph,
+        &local_artifact_paths,
+        input,
+        archive.as_ref(),
+        &mut local_diffs,
+    )?;
+    append_repository_config_diffs(
+        &graph,
+        &affected_repositories,
+        archive.as_ref().map(|p| p.request.repository.as_str()),
+        &mut local_diffs,
+    );
+    local_diffs.sort_by_key(|value| value["path"].as_str().unwrap_or_default().to_owned());
+    let policy = ImpactContext {
+        affected_repositories: affected_repositories.len(),
+        affected_resources: affected_resources.len(),
+        dependent_configurations: local_diffs.len(),
+        has_unmanaged_dependencies: workspace_impact.has_unmanaged_dependencies,
+        has_dirty_overlap: affected_repositories.iter().any(|repository_id| {
+            if archive
+                .as_ref()
+                .is_some_and(|p| &p.request.repository == repository_id)
+            {
+                return false;
+            }
+            graph
+                .repository(repository_id)
+                .is_some_and(|repository| repository.git.dirty)
+        }),
+        selector_ambiguous: missing_required,
+    };
+    Ok(PlannedImpact {
+        policy,
+        affected_repositories,
+        affected_resources,
+        local_diffs,
+        local_artifact_paths,
+    })
+}
+
+fn append_repository_config_diffs(
+    graph: &WorkspaceGraph,
+    affected_repositories: &[String],
+    immutable_repository: Option<&str>,
+    local_diffs: &mut Vec<Value>,
+) {
+    for repository_id in affected_repositories {
+        if immutable_repository == Some(repository_id.as_str()) {
+            continue;
+        }
         let Some(repository) = graph.repository(repository_id) else {
             continue;
         };
@@ -467,26 +515,6 @@ pub(super) fn plan_impact(
             }
         }
     }
-    local_diffs.sort_by_key(|value| value["path"].as_str().unwrap_or_default().to_owned());
-    let policy = ImpactContext {
-        affected_repositories: affected_repositories.len(),
-        affected_resources: affected_resources.len(),
-        dependent_configurations: local_diffs.len(),
-        has_unmanaged_dependencies: workspace_impact.has_unmanaged_dependencies,
-        has_dirty_overlap: affected_repositories.iter().any(|repository_id| {
-            graph
-                .repository(repository_id)
-                .is_some_and(|repository| repository.git.dirty)
-        }),
-        selector_ambiguous: missing_required,
-    };
-    Ok(PlannedImpact {
-        policy,
-        affected_repositories,
-        affected_resources,
-        local_diffs,
-        local_artifact_paths,
-    })
 }
 
 pub(super) fn append_local_artifact_diffs(

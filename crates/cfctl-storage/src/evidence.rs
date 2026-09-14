@@ -106,8 +106,30 @@ impl StateStore {
     /// writes of the same body reuse the first immutable descriptor; a caller
     /// cannot relabel identical bytes under a different evidence class.
     pub fn write_evidence(&self, class: EvidenceClass, value: &Value) -> Result<EvidenceV1> {
+        self.write_evidence_with_origin(class, value, Value::Null)
+    }
+
+    /// Native producer boundary only. Generic writes cannot stamp this origin.
+    pub fn write_pages_reproduction(
+        &self,
+        receipt: &cfctl_core::pages_artifact::ReproductionReceiptV1,
+    ) -> Result<EvidenceV1> {
+        self.write_evidence_with_origin(
+            EvidenceClass::LocalProof,
+            &serde_json::to_value(receipt)?,
+            json!({"native_producer":cfctl_core::pages_artifact::PRODUCER_ID,"version":1}),
+        )
+    }
+
+    fn write_evidence_with_origin(
+        &self,
+        class: EvidenceClass,
+        value: &Value,
+        origin: Value,
+    ) -> Result<EvidenceV1> {
         let _lifecycle = self.lock_evidence_lifecycle()?;
-        let (evidence, body_digest) = self.write_evidence_body(class, value)?;
+        let (mut evidence, body_digest) = self.write_evidence_body(class, value)?;
+        evidence.metadata = origin;
         let content_hash = evidence.content_hash.clone();
 
         let descriptor_path = evidence_descriptor_path(&self.paths, &body_digest);
@@ -177,6 +199,7 @@ impl StateStore {
         if stored.class != class
             || stored.content_hash != content_hash
             || stored.path != evidence.path
+            || stored.metadata != evidence.metadata
         {
             return Err(unsafe_managed_document(descriptor_path, conflict));
         }
@@ -1135,7 +1158,10 @@ where
 fn validate_descriptor(descriptor: &EvidenceDescriptorV1, expected_body_path: &Path) -> Result<()> {
     if descriptor.schema_version != 1
         || Path::new(&descriptor.path) != expected_body_path
-        || descriptor.metadata != Value::Null
+        || (descriptor.metadata != Value::Null
+            && !(descriptor.class == EvidenceClass::LocalProof
+                && descriptor.metadata
+                    == json!({"native_producer":cfctl_core::pages_artifact::PRODUCER_ID,"version":1})))
     {
         return Err(unsafe_managed_document(
             expected_body_path,

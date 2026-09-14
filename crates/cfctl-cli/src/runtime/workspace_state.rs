@@ -36,12 +36,38 @@ pub(super) fn discover_registered(store: &StateStore) -> Result<WorkspaceGraph> 
     Ok(WorkspaceGraph::discover(&roots)?)
 }
 
+#[cfg(test)]
 pub(super) fn workspace_precondition_hashes_for_scope(
     store: &StateStore,
     affected_repositories: &[String],
     local_artifact_paths: &[PathBuf],
 ) -> Result<BTreeMap<String, String>> {
-    let graph = discover_registered(store)?;
+    workspace_precondition_hashes_for_archive_scope(
+        store,
+        affected_repositories,
+        local_artifact_paths,
+        None,
+    )
+}
+
+pub(super) fn workspace_precondition_hashes_for_archive_scope(
+    store: &StateStore,
+    affected_repositories: &[String],
+    local_artifact_paths: &[PathBuf],
+    immutable_repository: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    let mut graph = discover_registered(store)?;
+    if let Some(id) = immutable_repository {
+        let repository = graph
+            .repositories
+            .iter_mut()
+            .find(|r| r.path.to_str() == Some(id))
+            .ok_or_else(super::pages_reproduction_process::rejected)?;
+        // This mode consumes the receipt's immutable source, not working bytes.
+        // Keep registered paths and resource links, plus every other repository.
+        repository.git = cfctl_workspace::GitStateV1::default();
+        repository.configs.clear();
+    }
     let repository_ids = affected_repositories
         .iter()
         .cloned()
@@ -91,6 +117,7 @@ pub(super) fn workspace_precondition_hashes_for_scope(
     );
     for path in repositories
         .into_iter()
+        .filter(|r| r.path.to_str() != immutable_repository)
         .flat_map(|repository| &repository.cloudflare_configs)
     {
         let content = fs::read_to_string(path).map_err(|source| cli_io(path, source))?;
@@ -232,17 +259,18 @@ pub(super) fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> 
     r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let graph = discover_registered(store)?;
-    pages_deployment::validate_bound_plan(&graph, plan, &input)?;
+    pages_deployment::validate_bound_plan(store, &graph, plan, &input)?;
     let local_artifact_paths = plan
         .precondition_hashes
         .keys()
         .filter_map(|name| name.strip_prefix("source_artifact:"))
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let mut current = workspace_precondition_hashes_for_scope(
+    let mut current = workspace_precondition_hashes_for_archive_scope(
         store,
         &plan.affected_repositories,
         &local_artifact_paths,
+        super::pages_immutable::plan_repository(plan),
     )?;
     if let Some(source_remote) = current_pages_source_remote_precondition(store, plan)? {
         current.insert(SOURCE_REMOTE_PRECONDITION.to_owned(), source_remote);
