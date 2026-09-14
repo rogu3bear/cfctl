@@ -169,7 +169,10 @@ fn token_cap(id: &str, path: &str) -> CapabilityV1 {
 fn fixture(stale_token: bool) -> Fixture {
     let root = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in("/private/tmp")
+        .tempdir_in(
+            std::fs::canonicalize(std::env::temp_dir())
+                .expect("canonical platform temporary directory"),
+        )
         .expect("isolated fixture");
     let initial = StateStore::open(RuntimePaths::from_root(root.path())).expect("state");
     fs::set_permissions(&initial.paths().data_dir, fs::Permissions::from_mode(0o700))

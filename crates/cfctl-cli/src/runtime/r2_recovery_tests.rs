@@ -7,7 +7,11 @@ use sha2::{Digest, Sha256};
 
 #[test]
 fn replaced_capture_parent_is_rejected_before_creating_a_child() {
-    let root = tempfile::tempdir_in("/private/tmp").expect("root");
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .expect("root");
     let parent_path = root.path().join("custody");
     let parent = PrivateDirectory::create(&parent_path).expect("parent");
     fs::rename(&parent_path, root.path().join("displaced-custody")).expect("replace parent");
@@ -20,7 +24,11 @@ fn replaced_capture_parent_is_rejected_before_creating_a_child() {
 #[test]
 fn replaced_parent_after_creation_blocks_private_capture_writes() {
     use cfctl_cloudflare::r2_recovery::CaptureFiles;
-    let root = tempfile::tempdir_in("/private/tmp").expect("root");
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .expect("root");
     let parent_path = root.path().join("custody");
     let parent = PrivateDirectory::create(&parent_path).expect("parent");
     let child = parent.create_new_directory("snapshot").expect("child");
@@ -33,7 +41,11 @@ fn replaced_parent_after_creation_blocks_private_capture_writes() {
 
 #[test]
 fn equivalent_window_encodings_produce_the_same_proof_input() {
-    let root = tempfile::tempdir_in("/private/tmp").expect("root");
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .expect("root");
     let mut snapshot = cfctl_catalog::CatalogSnapshot {
         schema_version: 1,
         generated_at: Utc::now(),
@@ -116,7 +128,11 @@ fn fixture(directory: &PrivateDirectory) -> cfctl_core::r2_recovery::CaptureRece
 #[test]
 fn same_private_files_detect_tampering_links_and_permissions() {
     for mode in ["tamper", "metadata", "symlink", "hardlink", "permissions"] {
-        let root = tempfile::tempdir_in("/private/tmp").expect("root");
+        let root = tempfile::tempdir_in(
+            std::fs::canonicalize(std::env::temp_dir())
+                .expect("canonical platform temporary directory"),
+        )
+        .expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
         let directory = PrivateDirectory::open(root.path()).expect("directory");
         let receipt = fixture(&directory);
@@ -152,7 +168,11 @@ fn same_private_files_detect_tampering_links_and_permissions() {
 
 #[test]
 fn self_authored_manifest_is_not_provider_capture_authority() {
-    let root = tempfile::tempdir_in("/private/tmp").expect("root");
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .expect("root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
     let mut snapshot = cfctl_catalog::CatalogSnapshot {
         schema_version: 1,
@@ -185,7 +205,11 @@ fn native_capture_provenance_joins_exact_target_window_and_private_files() {
         hash_value,
     };
     use std::sync::Arc;
-    let root = tempfile::tempdir_in("/private/tmp").expect("root");
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .expect("root");
     let initial = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
     let manager = Arc::new(
         EvidenceKeyManager::new(

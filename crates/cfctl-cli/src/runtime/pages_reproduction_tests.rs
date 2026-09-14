@@ -46,7 +46,11 @@ fn fixture() -> (
     WorkspaceGraph,
     ReproductionReceiptV1,
 ) {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .unwrap();
     let repo = root.path().join("repo");
     fs::create_dir(&repo).unwrap();
     fs::write(repo.join("README"), "fixture").unwrap();
@@ -329,6 +333,7 @@ fn archive_impact_and_preconditions_preserve_registration_without_working_head()
 
 /// Runs the real integrity-pinned compiler against a separately supplied,
 /// immutable source/archive. Never contacts Cloudflare or edits that checkout.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test]
 #[ignore = "requires a local lock-verified darwin-arm64 esbuild package and admitted immutable archive request"]
 async fn real_reproduction_to_authenticated_prepare_and_run_admission() {
@@ -337,7 +342,11 @@ async fn real_reproduction_to_authenticated_prepare_and_run_admission() {
         &std::env::var("CFCTL_PAGES_REPRODUCTION_REQUEST").expect("exact request JSON"),
     )
     .unwrap();
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = tempfile::tempdir_in(
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical platform temporary directory"),
+    )
+    .unwrap();
     let store =
         super::tests::authenticated_test_store(RuntimePaths::from_root(&root.path().join("state")));
     let mut graph = graph(Path::new(&request.repository));
