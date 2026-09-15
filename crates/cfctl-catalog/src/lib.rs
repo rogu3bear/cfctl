@@ -1,5 +1,6 @@
 //! Cloudflare capability catalog normalization and indexing.
 
+mod d1_reconciliation;
 mod request_schema;
 use request_schema::{normalize_request_schema_contract, request_schema_contract};
 mod email_preferences;
@@ -2666,6 +2667,11 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// operation. These capabilities compile closed inputs into fixed requests;
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    for capability in d1_reconciliation::capabilities() {
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
     for capability in vec![
         pages_artifact::capability(),
         workspace_d1_qualification_observer_capability(),

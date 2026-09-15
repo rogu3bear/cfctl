@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "qualification": "authenticated_same_checkpoint_content_reconciliation",
+  "qualified": true,
+  "verification_strategy": "d1_authenticated_complete_export_bytes_equal",
+  "reconciliation_id": "00000000-0000-4000-8000-000000000008",
+  "restore_operation_id": "00000000-0000-4000-8000-000000000001",
+  "historical_restore": {
+    "binding": {
+      "schema_version": 1,
+      "operation_id": "00000000-0000-4000-8000-000000000001",
+      "capability_id": "d1-restore-exact-bookmark",
+      "capability_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "plan_content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pins_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "profile_id": "recovery",
+      "credential_generation_id": "00000000-0000-4000-8000-000000000010",
+      "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "database_id": "00000000-0000-4000-8000-000000000020",
+      "catalog_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "build_identity_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "targets_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "request_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "request_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "caller_inputs": {
+        "target_bookmark": "historical-target",
+        "expected_current_bookmark": "historical-target",
+        "source_operation_id": "00000000-0000-4000-8000-000000000004",
+        "source_evidence_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "apply_evidence_hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "verification_attempt_checkpoint_hash": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "bookmarks": {
+      "target_bookmark": "historical-target",
+      "expected_current_bookmark": "historical-target",
+      "pre_restore_bookmark": "historical-target",
+      "returned_bookmark": "historical-target",
+      "previous_bookmark": "previous",
+      "post_restore_bookmark": "after-restore"
+    },
+    "original_verification_state": "failed",
+    "evidence": {
+      "apply": {
+        "content_hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "class": "apply",
+        "generated_at": "2026-09-15T07:37:51Z"
+      },
+      "verification": {
+        "content_hash": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        "class": "post_change_verification",
+        "generated_at": "2026-09-15T07:37:52Z"
+      }
+    },
+    "boundary_at": "2026-09-15T07:37:50Z",
+    "verification_at": "2026-09-15T07:37:52Z"
+  },
+  "source_export": {
+    "binding": {
+      "schema_version": 1,
+      "operation_id": "00000000-0000-4000-8000-000000000004",
+      "capability_id": "d1-full-export",
+      "catalog_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "target_scope_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "output_file_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "at_bookmark_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "manifest_evidence_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "request_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "profile_id": "recovery",
+      "credential_generation_id": "00000000-0000-4000-8000-000000000010",
+      "completion_status": "completed",
+      "completed_at": "2026-09-15T07:36:55Z"
+    },
+    "evidence": {
+      "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "class": "live_read",
+      "generated_at": "2026-09-15T07:36:55Z"
+    },
+    "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "database_id": "00000000-0000-4000-8000-000000000020",
+    "bookmark": "historical-target",
+    "output": {
+      "sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "bytes": 4096,
+      "complete": true,
+      "hash_matches": true,
+      "private_file_custody_verified": true
+    }
+  },
+  "historical_post_export": {
+    "binding": {
+      "schema_version": 1,
+      "operation_id": "00000000-0000-4000-8000-000000000002",
+      "capability_id": "d1-full-export",
+      "catalog_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "target_scope_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "output_file_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "at_bookmark_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "manifest_evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "request_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "profile_id": "recovery",
+      "credential_generation_id": "00000000-0000-4000-8000-000000000010",
+      "completion_status": "completed",
+      "completed_at": "2026-09-15T07:46:27Z"
+    },
+    "evidence": {
+      "content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "class": "live_read",
+      "generated_at": "2026-09-15T07:46:27Z"
+    },
+    "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "database_id": "00000000-0000-4000-8000-000000000020",
+    "bookmark": "historical-post",
+    "output": {
+      "sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "bytes": 4096,
+      "complete": true,
+      "hash_matches": true,
+      "private_file_custody_verified": true
+    }
+  },
+  "current_export": {
+    "binding": {
+      "schema_version": 1,
+      "operation_id": "00000000-0000-4000-8000-000000000003",
+      "capability_id": "d1-full-export",
+      "catalog_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "target_scope_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "output_file_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "at_bookmark_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "manifest_evidence_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "request_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "profile_id": "recovery",
+      "credential_generation_id": "00000000-0000-4000-8000-000000000011",
+      "completion_status": "completed",
+      "completed_at": "2026-09-15T10:01:00Z"
+    },
+    "evidence": {
+      "content_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "class": "live_read",
+      "generated_at": "2026-09-15T10:01:00Z"
+    },
+    "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "database_id": "00000000-0000-4000-8000-000000000020",
+    "bookmark": "current",
+    "output": {
+      "sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "bytes": 4096,
+      "complete": true,
+      "hash_matches": true,
+      "private_file_custody_verified": true
+    }
+  },
+  "release_binding": {
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "deploy_artifact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "declaration_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "window": {
+      "window_id": "00000000-0000-4000-8000-000000000009",
+      "opened_at": "2026-09-15T10:00:00Z",
+      "expires_at": "2026-09-15T10:15:00Z"
+    }
+  },
+  "comparison": {
+    "source_equals_historical_post": true,
+    "source_equals_current": true,
+    "sql_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "bytes": 4096
+  },
+  "limits": {
+    "provider_requests": 0,
+    "original_operation_reclassified": false,
+    "historical_rehearsal": true,
+    "current_snapshot_contents_equal": true,
+    "continuous_closure_observed": false,
+    "changed_state_rollback_qualified": false,
+    "application_admission_qualified": false,
+    "write_authority_granted": false
+  }
+}

@@ -590,6 +590,17 @@ pub(super) async fn execute_read(
     r2_credentials: Option<&R2LogRetrievalCredentials>,
     reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
+    if capability.id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID {
+        return super::d1_failed_query::execute(
+            store,
+            catalog,
+            input,
+            requested_profile,
+            requested_account,
+            output_path,
+        )
+        .await;
+    }
     if capability.workspace_d1_read_inventory.is_some() {
         if r2_credentials.is_some() || reply_admission_source.is_some() {
             return Err(CliError::Input(

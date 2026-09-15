@@ -1,5 +1,7 @@
 //! `SQLite`-authorized, immutable read populations and their sole Executor path.
+mod diagnostic;
 mod execution;
+pub use diagnostic::FailedQueryDiagnostic;
 mod parameters;
 pub use execution::{PrivateD1ReadResult, qualify_private_receipt, validate_result};
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
 pub mod d1_read_inventory;
+pub mod d1_reconciliation;
 mod email_routing;
 pub mod pages_artifact;
 pub mod pages_projects;

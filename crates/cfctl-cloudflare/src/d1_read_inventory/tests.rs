@@ -1,4 +1,5 @@
 #![allow(clippy::expect_used)]
+mod diagnostic;
 mod private_output;
 mod reconciliation;
 use super::*;
