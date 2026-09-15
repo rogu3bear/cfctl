@@ -62,7 +62,7 @@ pub(super) fn restore_definition(plan: &PlanV1, receipt: &Value) -> Result<Value
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
-    use super::*;
+    use super::{CallInput, CapabilityV1, PlanV1, rule};
     use cfctl_core::{
         AdapterStatus, EffectClass, ResponseBodyModeV1, ResponseContractV1, RiskClass,
         SamePathReadContractV1, SelectorV1, hash_value,

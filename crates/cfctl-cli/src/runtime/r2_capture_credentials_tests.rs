@@ -1,7 +1,14 @@
 //! Current read qualification must not weaken restore's write gate.
 use super::super::super::r2_restore_credentials::{qualify, qualify_capture};
-use super::*;
-use cfctl_core::r2_recovery::CaptureRequestV2;
+use super::{Fixture, fixture, proof};
+use cfctl_cloudflare::CallInput;
+use cfctl_core::{
+    r2_recovery::{CaptureRequestV2, CaptureWindowV1},
+    r2_restore::RestoreRequestV1,
+};
+use chrono::{Duration, Utc};
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 fn request(fixture: &Fixture) -> (CaptureRequestV2, RestoreRequestV1) {
     let restore: RestoreRequestV1 =
