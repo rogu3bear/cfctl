@@ -1,0 +1,16 @@
+{
+  "restore_operation_id": "00000000-0000-4000-8000-000000000001",
+  "historical_post_export_evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "current_export_evidence_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "release_binding": {
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "deploy_artifact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "declaration_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "window": {
+      "window_id": "00000000-0000-4000-8000-000000000009",
+      "opened_at": "2026-09-15T10:00:00Z",
+      "expires_at": "2026-09-15T10:15:00Z"
+    }
+  }
+}

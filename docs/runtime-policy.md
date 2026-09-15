@@ -334,3 +334,51 @@ transition snapshot, the preview shows all rules, and confirmation re-admits
 unchanged rules under a fresh local bundle. Old approval metadata is not
 copied. An interrupted staged bundle/pointer publication resumes the same new
 bundle; malformed or drifted rules fail before runtime selection changes.
+
+## D1 failed verification and content reconciliation
+
+The exact-bookmark restore producer signs execution provenance for successful
+and failed verification, including verifier errors. This binds the operation,
+plan/pins, account/database, credential generation, apply evidence and execution
+checkpoint. Signing a failure preserves its identity; it does not qualify the
+restore or authorize another attempt. Older failures without that signed
+context remain unqualified. Self-hashed plans and journals cannot reconstruct
+missing authenticated execution history.
+
+`cfctl guide d1-reconcile-same-checkpoint-restore --json` describes a local
+read-only proof for a failed same-checkpoint rehearsal. Its request selects the
+original operation, an authenticated complete post-rehearsal export, a fresh
+complete export, and an exact release binding with a window of at most 900
+seconds. The original source export must precede the execution, the historical
+post-export must follow verification and precede the new window, and the
+current export must finish inside it. All three retained private SQL files
+must be complete and byte-identical. Their signed lineage must join the exact
+account/database and original checkpoint; current credentials/catalog are
+checked separately from historical generations. Missing files, changed bytes,
+unbound failures, expired windows and changed current custody fail closed.
+
+The new post-change-verification evidence establishes complete content equality
+under those conditions. It leaves `plans show` and `plans status` reporting the
+original failure. It proves neither continuous closure between observations nor
+changed-state rollback, application admission or write authority. The consuming
+application must independently qualify its fresh full readiness population,
+other storage, fencing and build artifacts. `plans rectify` directs exact-bookmark
+restores to this explicit inspection route instead of generic creation
+compensation; it never automatically replays the restore.
+
+## Private diagnostic for a rejected registered D1 query
+
+`cfctl guide workspace-d1-diagnose-failed-query --json` describes one bounded
+read of an exact rejected query from an authenticated incomplete inventory
+receipt. The caller supplies that evidence hash, registered capability/query
+IDs, the current expected credential generation, explicit matching profile
+and account, and a new absolute `--out` path in a private directory.
+
+The registered inventory and SQL hash must still match the failed receipt.
+Arbitrary SQL, parameterized/private-output inventories, redirects and automatic
+retries are refused. At most 65,536 response bytes go to the new private file;
+public evidence contains the HTTP status, numeric provider error codes and
+response hash, never the provider message or raw bytes. A partial transport,
+sink failure, truncation or custody drift produces an incomplete diagnostic
+with `performed: true`; preserve it rather than retrying automatically. A
+diagnostic never qualifies the entire readiness population.

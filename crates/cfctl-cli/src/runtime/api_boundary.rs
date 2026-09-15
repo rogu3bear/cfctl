@@ -804,14 +804,17 @@ pub(super) fn verification_error_outcome(
 ) -> Result<ApiVerificationOutcome> {
     let basis = format!("operation-specific verifier failed: {verification_error}");
     plan.status = PlanStatus::RectificationRequired;
-    let evidence = Some(store.write_observation_evidence(
-        EvidenceClass::PostChangeVerification,
-        &json!({
-            "strategy": plan.capability.verification.strategy,
-            "passed": false,
-            "error": verification_error.to_string(),
-        }),
-    )?);
+    let mut verification_value = json!({
+        "strategy": plan.capability.verification.strategy,
+        "passed": false,
+        "error": verification_error.to_string(),
+    });
+    super::d1_restore_proof::attach_verification_context(store, plan, &mut verification_value)?;
+    let evidence =
+        Some(store.write_observation_evidence(
+            EvidenceClass::PostChangeVerification,
+            &verification_value,
+        )?);
     Ok(ApiVerificationOutcome {
         state: VerificationState::Failed,
         basis: basis.clone(),

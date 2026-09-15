@@ -72,6 +72,8 @@ pub(super) async fn call_command(
         || arguments.capability_id == cfctl_core::r2_recovery::VERIFY_ID
         || arguments.capability_id == cfctl_core::r2_restore::RESTORE_ID
         || arguments.capability_id == cfctl_core::pages_artifact::PRODUCER_ID
+        || arguments.capability_id == cfctl_core::d1_reconciliation::RECONCILE_ID
+        || arguments.capability_id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID
     {
         cached.ok_or_else(|| {
             CliError::Input(
@@ -177,9 +179,10 @@ pub(super) async fn call_command(
         && !is_d1_full_export
         && !is_r2_capture
         && !private_d1
+        && capability.id != cfctl_core::d1_reconciliation::DIAGNOSTIC_ID
     {
         return Err(CliError::Input(
-            "`--out` is restricted to bounded analytics, governed R2 log retrieval, D1 full export, and private R2 capture"
+            "`--out` is restricted to governed bounded reads, D1 exports/diagnostics, and private R2 capture"
                 .to_owned(),
         ));
     }
@@ -190,6 +193,15 @@ pub(super) async fn call_command(
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    if capability.id == cfctl_core::d1_reconciliation::RECONCILE_ID {
+        if arguments.profile.is_some()
+            || arguments.account.is_some()
+            || arguments.value_out.is_some()
+        {
+            return Err(CliError::Input("local reconciliation derives identities from authenticated evidence and accepts no credential selection".into()));
+        }
+        return super::d1_reconciliation::reconcile(store, &catalog, &prepared.input);
+    }
     if capability.id == cfctl_core::pages_artifact::PRODUCER_ID {
         if arguments.profile.is_some()
             || arguments.account.is_some()

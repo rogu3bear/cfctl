@@ -125,6 +125,28 @@ fn successful(response: &CloudflareResponseV1) -> bool {
     response.success && (200..300).contains(&response.status) && response.errors.is_empty()
 }
 
+fn restore_receipt(plan: &PlanV2, apply: &CloudflareResponseV1) -> Checked<Value> {
+    for field in ["bookmark", "previous_bookmark", "message"] {
+        if apply.result[field].as_str().is_none_or(str::is_empty) {
+            return Err("incomplete_restore_response");
+        }
+    }
+    let input = plan_input(plan)?;
+    let body = input.body.as_ref().ok_or("missing_restore_input")?;
+    Ok(json!({
+        "target_bookmark":body["target_bookmark"],
+        "expected_current_bookmark":body["expected_current_bookmark"],
+        "pre_restore_bookmark":body["expected_current_bookmark"],
+        "returned_bookmark":apply.result["bookmark"],
+        "previous_bookmark":apply.result["previous_bookmark"],
+        "source_operation_id":body["source_operation_id"],
+        "source_evidence_hash":body["source_evidence_hash"],
+        "request_digest":hash_value(body).map_err(|_| "invalid_request_digest")?,
+        "provider_message":apply.result["message"],
+        "post_retry_count":0,"performed":true,"verified":false,
+    }))
+}
+
 fn bookmarks(
     plan: &PlanV2,
     apply: &CloudflareResponseV1,
@@ -138,25 +160,9 @@ fn bookmarks(
     {
         return Err("restore_verification_did_not_pass");
     }
-    for field in ["bookmark", "previous_bookmark", "message"] {
-        if apply.result[field].as_str().is_none_or(str::is_empty) {
-            return Err("incomplete_restore_response");
-        }
-    }
     let input = plan_input(plan)?;
     let body = input.body.as_ref().ok_or("missing_restore_input")?;
-    let receipt = json!({
-        "target_bookmark":body["target_bookmark"],
-        "expected_current_bookmark":body["expected_current_bookmark"],
-        "pre_restore_bookmark":body["expected_current_bookmark"],
-        "returned_bookmark":apply.result["bookmark"],
-        "previous_bookmark":apply.result["previous_bookmark"],
-        "source_operation_id":body["source_operation_id"],
-        "source_evidence_hash":body["source_evidence_hash"],
-        "request_digest":hash_value(body).map_err(|_| "invalid_request_digest")?,
-        "provider_message":apply.result["message"],
-        "post_retry_count":0,"performed":true,"verified":false,
-    });
+    let receipt = restore_receipt(plan, apply)?;
     let mut readback_receipt = receipt.clone();
     readback_receipt["post_restore_bookmark"] = verification.readback.result["bookmark"].clone();
     readback_receipt["verified"] = json!(true);
@@ -216,7 +222,7 @@ pub(super) fn attach_verification_context(
     plan: &PlanV1,
     verification: &mut Value,
 ) -> Result<()> {
-    if plan.capability.id != RESTORE_ID || verification["passed"] != true {
+    if plan.capability.id != RESTORE_ID {
         return Ok(());
     }
     let bind = || -> Checked<Value> {
@@ -236,9 +242,22 @@ pub(super) fn attach_verification_context(
             return Err("restore_verification_producer_mismatch");
         }
         let (descriptor, apply) = authenticated_apply(store, &current.plan)?;
-        let observed: OperationVerificationV1 = serde_json::from_value(verification.clone())
-            .map_err(|_| "invalid_verification_body")?;
-        bookmarks(&current, &apply, &observed)?;
+        if verification["strategy"] != STRATEGY {
+            return Err("unsupported_restore_verification_strategy");
+        }
+        // Authentication records what this execution observed, including a
+        // failure. It does not turn failure into a qualified restore.
+        if verification.get("readback").is_some() {
+            let observed: OperationVerificationV1 = serde_json::from_value(verification.clone())
+                .map_err(|_| "invalid_verification_body")?;
+            if observed.passed {
+                bookmarks(&current, &apply, &observed)?;
+            }
+        } else if verification["passed"] != false
+            || verification["error"].as_str().is_none_or(str::is_empty)
+        {
+            return Err("invalid_verification_failure");
+        }
         provenance(&current, &descriptor.content_hash)
     };
     verification[CONTEXT] = bind().map_err(|reason| {
@@ -252,6 +271,119 @@ pub(super) fn attach_verification_context(
 fn evidence_projection(evidence: &EvidenceV1) -> Value {
     json!({"content_hash":evidence.content_hash,"class":evidence.class,
         "generated_at":evidence.generated_at})
+}
+
+/// Authenticate the failed historical execution without changing its outcome.
+/// Used only by the separate complete-content reconciliation producer.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the failed historical execution gate explicitly joins signed context, response annotations and journal chronology"
+)]
+pub(super) fn failed_reconciliation_history(store: &StateStore, plan: &PlanV2) -> Result<Value> {
+    let bind = || -> Checked<Value> {
+        let input = plan_input(plan)?;
+        let body = input.body.as_ref().ok_or("missing_restore_input")?;
+        if plan.plan.status != PlanStatus::RectificationRequired
+            || plan.plan.cancelled_at.is_some()
+            || plan
+                .plan
+                .approval
+                .as_ref()
+                .is_none_or(|approval| approval.approved_content_hash != plan.plan.content_hash)
+            || body["target_bookmark"] != body["expected_current_bookmark"]
+        {
+            return Err("not_a_failed_same_checkpoint_restore");
+        }
+        for stage in [
+            TransactionStageV1::BoundaryAttemptPersisted,
+            TransactionStageV1::BoundaryResponsePersisted,
+            TransactionStageV1::VerificationAttemptPersisted,
+            TransactionStageV1::VerificationResponsePersisted,
+        ] {
+            if plan
+                .plan
+                .transaction_journal
+                .iter()
+                .filter(|entry| entry.stage == stage)
+                .count()
+                != 1
+            {
+                return Err("ambiguous_restore_execution");
+            }
+        }
+        let (apply_descriptor, apply) = authenticated_apply(store, &plan.plan)?;
+        let terminal = plan
+            .plan
+            .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
+            .ok_or("missing_verification_reference")?;
+        let hash = terminal["evidence_hash"]
+            .as_str()
+            .ok_or("missing_verification_evidence")?;
+        let (descriptor, value) = store
+            .load_evidence_value(hash)
+            .map_err(|_| "verification_evidence_unavailable_or_unauthenticated")?;
+        // Failed records from older builds omitted this MAC-covered binding.
+        // Self-hashed plans and source-export receipts cannot recreate it.
+        if value.get(CONTEXT) != Some(&provenance(plan, &apply_descriptor.content_hash)?) {
+            return Err("historical_failed_restore_missing_authenticated_execution_binding");
+        }
+        let verification: OperationVerificationV1 =
+            serde_json::from_value(value).map_err(|_| "invalid_verification_body")?;
+        if !successful(&apply)
+            || !successful(&verification.readback)
+            || verification.passed
+            || verification.strategy != STRATEGY
+            || verification.correlated_resource_id.is_some()
+            || descriptor.class != EvidenceClass::PostChangeVerification
+            || terminal["state"] != "failed"
+            || !terminal["resource_id"].is_null()
+            || terminal["basis_hash"]
+                != hash_value(&json!(verification.basis)).map_err(|_| "invalid_basis")?
+        {
+            return Err("not_an_authenticated_failed_bookmark_verification");
+        }
+        let receipt = restore_receipt(plan, &apply)?;
+        let post = verification.readback.result["bookmark"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("missing_post_restore_bookmark")?;
+        let mut expected_readback = receipt.clone();
+        expected_readback["post_restore_bookmark"] = json!(post);
+        if apply.result["_cfctl"] != receipt
+            || verification.readback.result["_cfctl"] != expected_readback
+        {
+            return Err("failed_readback_annotation_mismatch");
+        }
+        let observed = json!({
+            "target_bookmark":body["target_bookmark"],
+            "expected_current_bookmark":body["expected_current_bookmark"],
+            "pre_restore_bookmark":receipt["pre_restore_bookmark"],
+            "returned_bookmark":apply.result["bookmark"],
+            "previous_bookmark":apply.result["previous_bookmark"],
+            "post_restore_bookmark":post,
+        });
+        let attempt = execution_prefix(&plan.plan)?;
+        let persisted = checkpoint(
+            &plan.plan,
+            TransactionStageV1::VerificationResponsePersisted,
+        )?;
+        if descriptor.generated_at < attempt.recorded_at
+            || descriptor.generated_at > persisted.recorded_at
+            || persisted.plan_status != PlanStatus::RectificationRequired
+        {
+            return Err("failed_verification_chronology_mismatch");
+        }
+        Ok(
+            json!({"binding":provenance(plan, &apply_descriptor.content_hash)?,
+            "bookmarks":observed,"original_verification_state":"failed",
+            "evidence":{"apply":evidence_projection(&apply_descriptor),"verification":evidence_projection(&descriptor)},
+            "boundary_at":checkpoint(&plan.plan, TransactionStageV1::BoundaryAttemptPersisted)?.recorded_at,
+            "verification_at":descriptor.generated_at}),
+        )
+    };
+    bind().map_err(|reason| {
+        CliError::Input(format!("D1 historical reconciliation rejected: {reason}"))
+    })
 }
 
 fn historical_proof(store: &StateStore, plan: &PlanV2) -> Checked<Value> {

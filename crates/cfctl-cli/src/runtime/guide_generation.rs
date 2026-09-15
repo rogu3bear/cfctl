@@ -510,6 +510,21 @@ pub(super) fn is_domain_like(token: &str) -> bool {
 }
 
 pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
+    if capability.id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID {
+        return argv(&[
+            "cfctl",
+            "call",
+            &capability.id,
+            "--profile",
+            "<registered-profile>",
+            "--account",
+            "<registered-account-id>",
+            "--body-stdin",
+            "--out",
+            "<new-file-in-owned-mode-0700-directory>",
+            "--json",
+        ]);
+    }
     if matches!(
         capability.id.as_str(),
         "account-api-tokens-create-token" | "user-api-tokens-create-token"

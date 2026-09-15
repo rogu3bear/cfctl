@@ -92,6 +92,18 @@ pub(super) async fn rectify_loaded_plan(
     if workspace_d1_projection_rectification_eligible(plan) {
         return rectify_workspace_d1_projection(store, plan).await;
     }
+    if plan.capability.d1_restore_exact_bookmark.is_some() {
+        return Ok(ResultEnvelopeV2::success(
+            "plans rectify",
+            json!({
+                "operation_id":plan.operation_id,"original_status":plan.status,"original_operation_reclassified":false,
+                "provider_requests":0,"write_authority_granted":false,
+                "next_action":{"capability_id":cfctl_core::d1_reconciliation::RECONCILE_ID,
+                    "summary":"Preserve this failed restore. For same-checkpoint content reconciliation, bind authenticated historical/current complete exports and a fresh release window through the generated guide. Do not replay or automatically compensate.",
+                    "argv":["cfctl","guide",cfctl_core::d1_reconciliation::RECONCILE_ID,"--json"]}
+            }),
+        ));
+    }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, plan)?;
     if let Some(mut request) = compensation_request(plan)? {
         let catalog = ensure_catalog(store).await?;

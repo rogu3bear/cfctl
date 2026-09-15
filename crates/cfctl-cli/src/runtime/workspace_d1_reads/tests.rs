@@ -1,4 +1,5 @@
 #![allow(clippy::expect_used)]
+mod diagnostic;
 mod private_output;
 use super::*;
 use cfctl_core::d1_read_inventory::{D1ReadQueryResultV1, D1ReadStatusV1};

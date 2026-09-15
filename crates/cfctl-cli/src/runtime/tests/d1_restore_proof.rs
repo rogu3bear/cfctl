@@ -1,4 +1,5 @@
 use super::*;
+mod failed_reconciliation;
 
 const RESTORE_ID: &str = "d1-restore-exact-bookmark";
 const CONTEXT: &str = "d1_restore_execution";
@@ -33,6 +34,10 @@ fn input() -> CallInput {
 }
 
 fn pending_plan(store: &StorageStateStore) -> PlanV1 {
+    pending_plan_with_input(store, &input())
+}
+
+fn pending_plan_with_input(store: &StorageStateStore, input: &CallInput) -> PlanV1 {
     let catalog = catalog();
     let mut plan = PlanV1::draft(
         "restore-fixture",
@@ -42,7 +47,7 @@ fn pending_plan(store: &StorageStateStore) -> PlanV1 {
         json!({"account_id":ACCOUNT,"database_id":DATABASE}),
     )
     .expect("draft restore");
-    plan.input = serde_json::to_value(input()).expect("input JSON");
+    plan.input = serde_json::to_value(input).expect("input JSON");
     "api_token".clone_into(&mut plan.permission_lane);
     plan.refresh_hash().expect("input-bound plan");
     plan.approve(true, None).expect("explicit restore approval");
@@ -74,6 +79,14 @@ impl Drop for MockServer {
 }
 
 async fn mock_server() -> (String, MockServer) {
+    mock_server_with_results(vec![
+        json!({"bookmark":"current-bookmark"}),
+        json!({"bookmark":"returned-bookmark","previous_bookmark":"previous-bookmark", "message":"restored"}),
+        json!({"bookmark":"returned-bookmark"}),
+    ]).await
+}
+
+async fn mock_server_with_results(results: Vec<Value>) -> (String, MockServer) {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -85,12 +98,7 @@ async fn mock_server() -> (String, MockServer) {
     let task = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(10), async move {
             let mut requests = Vec::new();
-            for result in [
-                json!({"bookmark":"current-bookmark"}),
-                json!({"bookmark":"returned-bookmark","previous_bookmark":"previous-bookmark",
-                    "message":"restored"}),
-                json!({"bookmark":"returned-bookmark"}),
-            ] {
+            for result in results {
                 let (mut stream, _) = listener.accept().await.expect("mock connection");
                 let mut request = Vec::new();
                 while !request.windows(4).any(|window| window == b"\r\n\r\n") {
