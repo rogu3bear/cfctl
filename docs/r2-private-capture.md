@@ -12,20 +12,69 @@ must already be an owned mode-0700 custody root with a canonical path. Every
 snapshot is new; existing files and directories are never replaced. This is
 private backup material and belongs outside task outputs and repository files.
 
-The body is `CaptureWindowV1`: `window_id` is a canonical UUID; `opened_at` and
-`expires_at` are RFC3339 timestamps describing at most 900 seconds; and
-`recovery_binding_sha256` is the raw lowercase SHA-256 of the application's
-exact recovery declaration. That hash binds a declaration without qualifying
-its D1, writer or retention claims. Caller booleans cannot enable recovery.
+The closed body is `CaptureRequestV2`:
 
-The executor makes two complete whole-bucket enumerations around the object
-reads. Both passes share ten pages of 100 objects. Each inventory has a maximum
-of 1000 objects and 300,000,000 bytes; reads must match enumerated size and ETag.
-The total ten-page limit can prevent a larger inventory from completing both
-passes. It is never raised implicitly. Each listing response has a 2 MiB bound;
-the retained manifest has a 20 MiB bound. Missing terminal pagination, duplicate
-keys, repeated/missing cursors, changed metadata/population, stream errors,
-deadline or resource exhaustion all fail. Requests do not retry or redirect.
+```json
+{
+  "schema_version": 2,
+  "window": {
+    "window_id": "<canonical UUID>",
+    "opened_at": "<RFC3339>",
+    "expires_at": "<RFC3339>",
+    "recovery_binding_sha256": "<64 lowercase hex characters>"
+  },
+  "token_verification_evidence_hash": "sha256:<digest>",
+  "token_policy_evidence_hash": "sha256:<digest>"
+}
+```
+
+The four-field window remains `CaptureWindowV1`, at most 900 seconds. Its hash
+binds the application's recovery declaration without qualifying D1, writers or
+retention. Old flat-window requests reject with migration guidance. CF's next
+fresh preparation input must change; existing application manifest consumers do
+not need a source change. Never rewrite or replay historical failed windows.
+
+Capture requires an account-owned API-token profile pinned to the exact account
+and generation, with authenticated account-token verification and policy reads
+from the current build/catalog, no older than five minutes. The token must be
+active throughout the window. Account-scoped Workers R2 Storage Read suffices;
+an already-held Write grant includes read but capture never widens permissions.
+Restore retains its separate Write gate. User-owned, bucket-item S3-only,
+conditional and temporary-session policies, or nondefault jurisdiction are not
+supported by this combined adapter. No token mint/renewal occurs during capture.
+The existing signer derives its signing material internally; no separate secret
+or token ID is accepted in the request. [R2 authentication](https://developers.cloudflare.com/r2/api/tokens/).
+
+S3 ListObjectsV2 supplies two whole-bucket inventories. Before body reads and
+after the final inventory, REST exact-member prefix reads require one exact key
+and preserve the entire returned metadata record. Bounded collateral prefix
+records are allowed; missing or duplicate exact members fail. REST pagination
+absence/null is irrelevant to this positive member lookup and never proves
+bucket completeness. S3/REST key, ETag, size, modification instant and storage
+class must agree; both inventories and both complete metadata observations must
+match. No timestamp tolerance or metadata defaults are invented.
+
+The S3 query is closed to `list-type=2`, `max-keys=100`, `encoding-type=url`, and
+a provider-issued continuation token. URI-encoded keys decode exactly once;
+continuation tokens stay opaque. Strict XML accepts namespace-equivalent names,
+optional declaration, and equivalent empty elements; optional echoes are checked
+only when present. One explicit IsTruncated=false with no nonempty next token is
+required to finish. True requires a fresh bounded token, regardless of row count.
+Malformed XML (including HTTP 200), DTD/custom entities, unknown shapes, duplicate
+fields/keys, filters, or ambiguous terminal evidence fail closed. [S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/),
+[ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html).
+
+Both inventories share ten pages of 100 objects: the existing 1000-object
+admission ceiling permits at most 500 objects to complete both passes. Body
+reads share 300,000,000 bytes. P list + 2N metadata + N body requests are bounded
+at 3010 attempts; each XML/metadata response is at most 2 MiB, aggregate XML at
+20 MiB and aggregate metadata at 40 MiB including collateral rows. Each retained
+metadata pass and the complete manifest are bounded at 20 MiB. Ordinary R2
+request/retrieval usage applies to all these reads. No bucket or policy is created.
+Requests run serially without retry, redirect, decompression or fallback, with
+60-second per-request limits inside the unchanged absolute window. Bounds and
+final post-I/O time are checked before a success receipt; encoded bounds do not
+promise an OS RSS limit or forcibly preempt filesystem sync.
 
 Zero-byte objects and a terminal empty bucket are valid capture populations.
 Absence/null HTTP metadata remains absent/null. The entire provider list record,
@@ -35,7 +84,12 @@ refused. The manifest records `last_modified` and any additional provider
 version/upload observation actually returned; cfctl invents none. Two matching
 observations do not establish a writer-controlled interval.
 
-`manifest.json` and generated `object-NNNN.bin` files use mode 0600. Keys never
+`manifest.json`, a bounded 4 KiB private `request.json` companion, and generated
+`object-NNNN.bin` files use mode 0600. The companion reconstructs the exact v2
+input hash for authenticated verification and follows captures into private
+restore staging. Its removal or alteration cannot downgrade v2 proof to v1.
+Historical captures without it retain their flat-window verification path;
+manifest/receipt/verifier outputs remain version 1. Keys never
 become local filesystem paths. Every file is re-read before publication of the
 capture receipt. Failed capture may leave private partial files, but never a
 complete authenticated success receipt. Preserve that residue for diagnosis;
@@ -74,11 +128,11 @@ null before each request and records actual received headers; it is not a claim
 that the whole capture succeeded. Top-level `status: 0` is synthetic and is
 explicitly marked `status_is_provider_response: false`.
 
-Stages distinguish initial inventory, object reads, final inventory, manifest,
+Stages distinguish initial/final inventories and metadata passes, object reads, manifest,
 and local verification. Reasons distinguish transport, HTTP response, body read
-or bound, JSON, envelope, pagination metadata/cursor/terminal evidence, object
+or bound, JSON/XML, envelope, pagination metadata/cursor/terminal evidence, object
 identity/size, storage, drift, and window failures. Private bodies, keys, URLs,
 provider messages, and credentials never enter these diagnostics. A diagnostic
 from a later request cannot establish the cause of a historical failed capture.
-Missing/null pagination remains incomplete; this reporting change adds no empty
-bucket shortcut or permission to retry.
+Missing S3 terminal evidence remains incomplete. Diagnostics confer no permission
+to retry or reuse expired windows.

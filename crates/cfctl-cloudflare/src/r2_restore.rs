@@ -102,7 +102,7 @@ impl Executor {
         })
     }
 
-    fn restore_transport(&self) -> S3Transport {
+    pub(crate) fn private_r2_transport(&self) -> S3Transport {
         let transport = S3Transport::new(self.client.clone());
         #[cfg(test)]
         let transport = {
@@ -192,7 +192,7 @@ impl Executor {
         list_url: &Url,
         progress: &RestoreProgress,
     ) -> Result<CloudflareResponseV1> {
-        let transport = self.restore_transport();
+        let transport = self.private_r2_transport();
         let key = selection.source.provider_metadata["key"]
             .as_str()
             .ok_or_else(rejected)?;
@@ -330,7 +330,7 @@ impl Executor {
         let list_url = self.builder.build_unchecked(&plan.capability, input)?.url;
         tokio::time::timeout(Duration::from_mins(15), async {
             let progress = RestoreProgress::default();
-            let transport = self.restore_transport();
+            let transport = self.private_r2_transport();
             let key = selection.source.provider_metadata["key"].as_str().ok_or_else(rejected)?;
             let target = S3Target { account: &selection.account_id, bucket: &selection.bucket_name, key };
             let seen = self.restore_object_digest(&transport, &target, None, token_id, credential, &progress).await?;
@@ -366,10 +366,7 @@ impl Executor {
         credential: &AuthCredential,
         progress: &RestoreProgress,
     ) -> Result<Value> {
-        let mut url = base.clone();
-        url.query_pairs_mut()
-            .append_pair("prefix", key)
-            .append_pair("per_page", "100");
+        let url = crate::r2_metadata::member_url(base, key);
         let outgoing = apply_credential(
             self.client.get(url.clone()).timeout(Duration::from_mins(1)),
             credential,
@@ -386,24 +383,7 @@ impl Executor {
             return Err(rejected());
         }
         let value: Value = serde_json::from_slice(&body).map_err(|_| rejected())?;
-        if value["success"] != true || value["errors"].as_array().is_none_or(|e| !e.is_empty()) {
-            return Err(rejected());
-        }
-        let records = value["result"]
-            .as_array()
-            .filter(|r| r.len() <= 100)
-            .ok_or_else(rejected)?;
-        // This read identifies a returned exact member. It never asserts that
-        // this prefix page is a complete bucket inventory or proves absence.
-        let matching = records
-            .iter()
-            .filter(|r| r["key"] == key)
-            .collect::<Vec<_>>();
-        if matching.len() != 1 {
-            return Err(rejected());
-        }
-        cfctl_core::r2_recovery::validate_object(matching[0]).map_err(|_| rejected())?;
-        Ok(matching[0].clone())
+        crate::r2_metadata::exact_member(&value, key).map_err(|_| rejected())
     }
 
     async fn restore_object_digest(

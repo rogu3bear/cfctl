@@ -1,4 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "r2_capture_credentials_tests.rs"]
+mod capture_credentials_tests;
 #[path = "r2_restore_projection_tests.rs"]
 mod projection_tests;
 use super::super::prelude::{
@@ -88,6 +90,7 @@ fn snapshot(
     name: &str,
     bytes: &[u8],
     when: DateTime<Utc>,
+    v2: bool,
 ) -> (PathBuf, CaptureRefV1) {
     let path = root.join(name);
     let dir = PrivateDirectory::create(&path).expect("snapshot");
@@ -124,10 +127,20 @@ fn snapshot(
         .write_all(&encoded)
         .expect("manifest");
     let receipt = manifest.receipt(hex::encode(Sha256::digest(&encoded)));
+    let body = if v2 {
+        let body = json!({"schema_version":2,"window":manifest.window,"token_verification_evidence_hash":format!("sha256:{}","c".repeat(64)),"token_policy_evidence_hash":format!("sha256:{}","d".repeat(64))});
+        dir.create_new_file("request.json")
+            .unwrap()
+            .write_all(&serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        body
+    } else {
+        json!(manifest.window)
+    };
     let input = CallInput {
         selectors: json!({"account_id":manifest.account_id,"bucket_name":manifest.bucket_name}),
         query: json!({}),
-        body: Some(serde_json::to_value(&manifest.window).expect("window")),
+        body: Some(body),
         ..CallInput::default()
     };
     let evidence_hash = proof(
@@ -166,7 +179,7 @@ fn token_cap(id: &str, path: &str) -> CapabilityV1 {
     clippy::too_many_lines,
     reason = "one isolated fixture records native historical capture provenance and independent current token provenance before exercising ordinary staging"
 )]
-fn fixture(stale_token: bool) -> Fixture {
+fn fixture_version(stale_token: bool, v2: bool) -> Fixture {
     let root = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(
@@ -240,6 +253,7 @@ fn fixture(stale_token: bool) -> Fixture {
         "original",
         b"%PDF",
         Utc::now() - Duration::days(30),
+        v2,
     );
     let (current_path, current_capture) = snapshot(
         root.path(),
@@ -248,6 +262,7 @@ fn fixture(stale_token: bool) -> Fixture {
         "current",
         b"CURR",
         Utc::now() - Duration::seconds(1),
+        v2,
     );
     let verified_input = CallInput {
         selectors: json!({"account_id":"a".repeat(32)}),
@@ -322,6 +337,18 @@ fn fixture(stale_token: bool) -> Fixture {
         input,
         sources,
     }
+}
+
+fn fixture(stale_token: bool) -> Fixture {
+    fixture_version(stale_token, false)
+}
+
+#[test]
+fn v2_captures_remain_usable_through_private_restore_staging() {
+    let f = fixture_version(false, true);
+    let plan = prepared(&f);
+    load_with_secrets(&f.store, &plan, true, &f.secrets)
+        .expect("v2 companions survive private staging");
 }
 
 fn prepared(f: &Fixture) -> PlanV1 {

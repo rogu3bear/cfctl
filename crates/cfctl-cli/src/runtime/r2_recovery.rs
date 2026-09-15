@@ -2,7 +2,7 @@
 use super::{CliError, Result};
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor,
-    r2_recovery::{CaptureFiles, CaptureProgress, CaptureReason, CaptureStage},
+    r2_recovery::{CaptureDiagnosticV1, CaptureFiles, CaptureReason, CaptureStage},
 };
 use cfctl_core::{
     CapabilityV1, EvidenceClass, OperationalProofOutcomeV1, ResultEnvelopeV2, VerificationState,
@@ -41,9 +41,10 @@ pub(super) async fn capture(
     capability: &CapabilityV1,
     input: &CallInput,
     credential: &cfctl_auth::AuthCredential,
+    token_id: &str,
     path: &Path,
 ) -> Result<CloudflareResponseV1> {
-    preflight_capture(capability, input, path)?;
+    let expected_request = preflight_capture(capability, input, path)?;
     let parent = path.parent().ok_or_else(private_failure)?;
     // The owner selects an existing protected custody root. This command does
     // not create a destination, change its permissions, or grant retention.
@@ -58,12 +59,25 @@ pub(super) async fn capture(
     let files = CaptureDirectory(child, parent);
     let progress = cfctl_cloudflare::r2_recovery::CaptureProgress::default();
     let captured = executor
-        .capture_private_r2_bucket_with_progress(capability, input, credential, &files, &progress)
+        .capture_private_r2_bucket_with_progress(
+            capability, input, credential, token_id, &files, &progress,
+        )
         .await;
     let checked = captured.map_err(CliError::from).and_then(|receipt| {
         progress.stage(CaptureStage::LocalVerification);
         progress.expect(CaptureReason::LocalIntegrity);
         verify_private_files(&files.0, &receipt)?;
+        let request_bytes = files
+            .0
+            .read("request.json", contract::MAX_REQUEST_BYTES)
+            .map_err(|_| private_failure())?
+            .ok_or_else(private_failure)?;
+        let persisted_request: contract::CaptureRequestV2 =
+            serde_json::from_slice(&request_bytes).map_err(|_| private_failure())?;
+        if persisted_request != expected_request {
+            return Err(private_failure().into());
+        }
+
         progress.expect(CaptureReason::WindowExpired);
         receipt.window.validate(chrono::Utc::now()).map_err(|_| {
             CliError::Input("private capture verification exceeded its window".into())
@@ -81,19 +95,19 @@ pub(super) async fn capture(
             cf_ray: None,
         }),
         Err(error) if progress.requests() == 0 => Err(error),
-        Err(_) => Ok(incomplete_response(&progress)),
+        Err(_) => Ok(incomplete_response(progress.diagnostic())),
     }
 }
 
-fn incomplete_response(progress: &CaptureProgress) -> CloudflareResponseV1 {
+fn incomplete_response(diagnostic: CaptureDiagnosticV1) -> CloudflareResponseV1 {
     CloudflareResponseV1 {
         // The native operation has no single provider response. Real status, if
         // observed, is tied to its request ordinal in the diagnostic below.
         status: 0,
         success: false,
         result: json!({"capture_complete":false, "body_returned":false, "recovery_ready":false,
-            "attempted_provider_requests":progress.requests(), "diagnostic":"private_capture_incomplete",
-            "status_is_provider_response":false, "failure":progress.diagnostic(),
+            "attempted_provider_requests":diagnostic.request_ordinal, "diagnostic":"private_capture_incomplete",
+            "status_is_provider_response":false, "failure":diagnostic,
             "next_action":"preserve private partial files; inspect the window, bounds and provider contract before a separately admitted attempt"}),
         errors: vec![],
         result_info: None,
@@ -106,14 +120,18 @@ pub(super) fn preflight_capture(
     cap: &CapabilityV1,
     input: &CallInput,
     path: &Path,
-) -> Result<contract::CaptureWindowV1> {
+) -> Result<contract::CaptureRequestV2> {
     if !contract::capability_matches(cap) {
         return Err(private_failure().into());
     }
     cfctl_cloudflare::validate_request_contract(cap, input)?;
-    let window: contract::CaptureWindowV1 =
-        serde_json::from_value(input.body.clone().ok_or_else(private_failure)?)
-            .map_err(|_| private_failure())?;
+    let window: contract::CaptureRequestV2 =
+        serde_json::from_value(input.body.clone().ok_or_else(private_failure)?).map_err(|_| {
+            CliError::Input(
+                "private capture requires version 2 with nested window and token evidence hashes"
+                    .into(),
+            )
+        })?;
     window
         .validate(chrono::Utc::now())
         .map_err(|_| CliError::Input("invalid or expired private capture window".into()))?;
@@ -239,10 +257,30 @@ pub(super) fn verify(
     {
         return Err(rejected());
     }
+    normalized_private_path(path)?;
+    let directory = PrivateDirectory::open(path).map_err(|_| private_failure())?;
+    let original_body = if let Some(bytes) = directory
+        .read("request.json", contract::MAX_REQUEST_BYTES)
+        .map_err(|_| rejected())?
+    {
+        let capture: contract::CaptureRequestV2 =
+            serde_json::from_slice(&bytes).map_err(|_| rejected())?;
+        capture
+            .validate(receipt.started_at)
+            .map_err(|_| rejected())?;
+        if capture.window != receipt.window {
+            return Err(rejected());
+        }
+        serde_json::to_value(capture)?
+    } else {
+        // Legacy captures have only the original flat window request. Removing
+        // a v2 companion cannot downgrade it: its authenticated input hash differs.
+        serde_json::to_value(&receipt.window)?
+    };
     let original_input = CallInput {
         selectors: input.selectors.clone(),
         query: json!({}),
-        body: Some(serde_json::to_value(&receipt.window)?),
+        body: Some(original_body),
         ..CallInput::default()
     };
     let input_hash = hash_value(&serde_json::to_value(original_input)?)?;
@@ -265,8 +303,6 @@ pub(super) fn verify(
     if matching.len() != 1 {
         return Err(rejected());
     }
-    normalized_private_path(path)?;
-    let directory = PrivateDirectory::open(path).map_err(|_| private_failure())?;
     verify_private_files(&directory, &receipt)?;
     let proof = matching[0];
     let mut envelope = ResultEnvelopeV2::success(

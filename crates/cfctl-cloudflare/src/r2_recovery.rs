@@ -2,13 +2,13 @@
 //! it cannot establish writer exclusion or make REST replacement safe.
 use super::{
     CallInput, CloudflareError, Executor, Result, apply_credential, exact_private_object_etag,
-    read_bounded_body,
 };
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
     CapabilityV1, SelectorV1,
     r2_recovery::{
-        self as contract, CaptureManifestV1, CaptureReceiptV1, CaptureWindowV1, CapturedObjectV1,
+        self as contract, CaptureManifestV1, CaptureReceiptV1, CaptureRequestV2, CaptureWindowV1,
+        CapturedObjectV1,
     },
 };
 use chrono::Utc;
@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use std::{collections::BTreeMap, fs::File, io::Write, time::Duration};
 use uuid::Uuid;
+
+mod inventory;
+mod s3_inventory;
 
 /// Storage owns the private directory and descriptor-relative, create-only
 /// files. The provider owns streaming and completeness, never path custody.
@@ -34,7 +37,9 @@ pub enum CaptureStage {
     #[default]
     Preflight,
     InitialInventory,
+    InitialMetadata,
     ObjectRead,
+    FinalMetadata,
     FinalInventory,
     Manifest,
     LocalVerification,
@@ -50,6 +55,8 @@ pub enum CaptureReason {
     BodyRead,
     BodyLimit,
     Json,
+    Xml,
+    RequestBounds,
     Envelope,
     ObjectMetadata,
     PopulationBounds,
@@ -100,12 +107,17 @@ impl CaptureProgress {
         self.update(|d| d.reason = reason);
     }
 
-    fn begin_request(&self) {
+    fn begin_request(&self) -> Result<()> {
+        self.expect(CaptureReason::RequestBounds);
+        if self.requests() >= contract::MAX_REQUESTS {
+            return Err(failure("private capture request budget exhausted"));
+        }
         self.update(|d| {
             d.request_ordinal += 1;
             d.provider_http_status = None;
             d.reason = CaptureReason::Transport;
         });
+        Ok(())
     }
 
     fn observed_status(&self, status: u16) {
@@ -126,7 +138,7 @@ impl CaptureProgress {
     }
 }
 
-fn failure(message: &'static str) -> CloudflareError {
+pub(crate) fn failure(message: &'static str) -> CloudflareError {
     CloudflareError::InvalidRequestBody(message.into())
 }
 
@@ -140,12 +152,14 @@ impl Executor {
         capability: &CapabilityV1,
         input: &CallInput,
         credential: &AuthCredential,
+        token_id: &str,
         files: &dyn CaptureFiles,
     ) -> Result<CaptureReceiptV1> {
         self.capture_private_r2_bucket_with_progress(
             capability,
             input,
             credential,
+            token_id,
             files,
             &CaptureProgress::default(),
         )
@@ -157,6 +171,7 @@ impl Executor {
         capability: &CapabilityV1,
         input: &CallInput,
         credential: &AuthCredential,
+        token_id: &str,
         files: &dyn CaptureFiles,
         progress: &CaptureProgress,
     ) -> Result<CaptureReceiptV1> {
@@ -170,15 +185,27 @@ impl Executor {
         {
             return Err(failure("private R2 capture contract or input drifted"));
         }
-        let window: CaptureWindowV1 = serde_json::from_value(
+        let request: CaptureRequestV2 = serde_json::from_value(
             input
                 .body
                 .clone()
-                .ok_or_else(|| failure("private capture window required"))?,
+                .ok_or_else(|| failure("private capture version 2 request required"))?,
         )
-        .map_err(|_| failure("invalid private capture window"))?;
+        .map_err(|_| {
+            failure("private capture requires version 2 window and token evidence hashes")
+        })?;
         progress.expect(CaptureReason::WindowExpired);
-        window.validate(Utc::now()).map_err(failure)?;
+        request.validate(Utc::now()).map_err(failure)?;
+        if token_id.len() != 32
+            || !token_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(failure(
+                "private capture requires qualified current token identity",
+            ));
+        }
+        let window = request.window;
         // Compilation validates selectors and the closed input schema. The
         // window body is local context and never travels to Cloudflare.
         progress.expect(CaptureReason::RequestContract);
@@ -193,6 +220,7 @@ impl Executor {
                 capability,
                 input,
                 credential,
+                token_id,
                 files,
                 window,
                 request.url,
@@ -219,16 +247,34 @@ impl Executor {
         capability: &CapabilityV1,
         input: &CallInput,
         credential: &AuthCredential,
+        token_id: &str,
         files: &dyn CaptureFiles,
         window: CaptureWindowV1,
         list_url: url::Url,
         progress: &CaptureProgress,
     ) -> Result<CaptureReceiptV1> {
         let started_at = Utc::now();
-        let mut pages = 0;
+        let mut budget = inventory::Budget::default();
+        let account = input.selectors["account_id"]
+            .as_str()
+            .ok_or_else(|| failure("missing account"))?;
+        let bucket = input.selectors["bucket_name"]
+            .as_str()
+            .ok_or_else(|| failure("missing bucket"))?;
+        let transport = self.private_r2_transport();
+        let context = inventory::InventoryContext {
+            transport: &transport,
+            account,
+            bucket,
+            token_id,
+            credential,
+            progress,
+        };
         progress.stage(CaptureStage::InitialInventory);
+        let initial = context.read(&mut budget).await?;
+        progress.stage(CaptureStage::InitialMetadata);
         let original = self
-            .capture_r2_inventory(&list_url, credential, &mut pages, progress)
+            .capture_metadata(&list_url, credential, &initial, &mut budget, progress)
             .await?;
         let mut objects = Vec::new();
         let mut total_bytes = 0_u64;
@@ -319,14 +365,26 @@ impl Executor {
             });
         }
         progress.stage(CaptureStage::FinalInventory);
-        let final_inventory = self
-            .capture_r2_inventory(&list_url, credential, &mut pages, progress)
+        let final_inventory = context.read(&mut budget).await?;
+        progress.expect(CaptureReason::InventoryDrift);
+        if initial != final_inventory {
+            return Err(failure(
+                "private bucket population or identity drifted during capture",
+            ));
+        }
+        progress.stage(CaptureStage::FinalMetadata);
+        let final_metadata = self
+            .capture_metadata(
+                &list_url,
+                credential,
+                &final_inventory,
+                &mut budget,
+                progress,
+            )
             .await?;
         progress.expect(CaptureReason::InventoryDrift);
-        if original != final_inventory {
-            return Err(failure(
-                "private bucket population or metadata drifted during capture",
-            ));
+        if original != final_metadata {
+            return Err(failure("private object metadata drifted during capture"));
         }
         progress.expect(CaptureReason::WindowExpired);
         window.validate(Utc::now()).map_err(failure)?;
@@ -346,7 +404,7 @@ impl Executor {
             window,
             started_at,
             completed_at: Utc::now(),
-            list_pages: pages,
+            list_pages: budget.pages,
             total_bytes,
             objects,
         };
@@ -358,10 +416,22 @@ impl Executor {
             return Err(failure("private manifest byte budget exhausted"));
         }
         progress.expect(CaptureReason::Storage);
+        // The v1 manifest stays unchanged. This private companion reconstructs
+        // the exact v2 input hash for authenticated historical verification.
+        let request = serde_json::to_vec(&input.body)
+            .map_err(|_| failure("private request encoding failed"))?;
+        if request.len() as u64 > contract::MAX_REQUEST_BYTES {
+            return Err(failure("private request bound exceeded"));
+        }
+        let mut request_file = files.create_new("request.json")?;
+        request_file.write_all(&request).map_err(io_failure)?;
+        request_file.sync_all().map_err(io_failure)?;
         let mut file = files.create_new("manifest.json")?;
         file.write_all(&encoded).map_err(io_failure)?;
         file.sync_all().map_err(io_failure)?;
         files.sync()?;
+        progress.expect(CaptureReason::WindowExpired);
+        manifest.window.validate(Utc::now()).map_err(failure)?;
         Ok(manifest.receipt(hex::encode(Sha256::digest(&encoded))))
     }
 
@@ -379,7 +449,7 @@ impl Executor {
                 .timeout(Duration::from_mins(1)),
             credential,
         )?;
-        progress.begin_request();
+        progress.begin_request()?;
         let response = outgoing
             .send()
             .await
@@ -394,106 +464,51 @@ impl Executor {
         Ok(response)
     }
 
-    async fn capture_r2_inventory(
+    async fn capture_metadata(
         &self,
         base: &url::Url,
         credential: &AuthCredential,
-        pages: &mut u32,
+        inventory: &BTreeMap<String, s3_inventory::Object>,
+        budget: &mut inventory::Budget,
         progress: &CaptureProgress,
     ) -> Result<BTreeMap<String, Value>> {
-        let mut objects = BTreeMap::new();
-        let mut cursors = std::collections::BTreeSet::new();
-        let mut cursor = String::new();
-        let mut bytes = 0_u64;
-        loop {
-            progress.expect(CaptureReason::PaginationBounds);
-            if *pages >= contract::MAX_PAGES {
-                return Err(failure("private capture list-page budget exhausted"));
-            }
-            *pages += 1;
-            let mut url = base.clone();
-            url.query_pairs_mut()
-                .append_pair("per_page", &contract::PAGE_SIZE.to_string());
-            if !cursor.is_empty() {
-                url.query_pairs_mut().append_pair("cursor", &cursor);
-            }
-            let response = self.capture_get(&url, credential, progress).await?;
-            progress.expect(CaptureReason::BodyRead);
-            let (body, truncated) = read_bounded_body(response, 2 * 1024 * 1024)
-                .await
-                .map_err(|_| failure("private enumeration response failed"))?;
+        let mut records = BTreeMap::new();
+        let mut retained = 0_u64;
+        for (key, identity) in inventory {
             progress.expect(CaptureReason::BodyLimit);
-            if truncated {
-                return Err(failure(
-                    "private enumeration response exceeded its byte bound",
-                ));
+            if budget.metadata_bytes >= contract::MAX_METADATA_BYTES {
+                return Err(failure("private metadata byte budget exhausted"));
             }
+            let url = crate::r2_metadata::member_url(base, key);
+            let response = self.capture_get(&url, credential, progress).await?;
+            let body = inventory::bounded_response(
+                response,
+                &mut budget.metadata_bytes,
+                contract::MAX_METADATA_BYTES,
+                progress,
+            )
+            .await?;
             progress.expect(CaptureReason::Json);
-            let page: Value = serde_json::from_slice(&body)
-                .map_err(|_| failure("invalid private enumeration response"))?;
-            progress.expect(CaptureReason::Envelope);
-            let rows = page["result"]
-                .as_array()
-                .ok_or_else(|| failure("private enumeration omitted its object population"))?;
-            if page["success"] != true
-                || page["errors"].as_array().is_none_or(|e| !e.is_empty())
-                || rows.len() > contract::PAGE_SIZE as usize
-            {
-                return Err(failure("private enumeration response contract failed"));
+            let value = crate::r2_metadata::strict_json(&body)
+                .map_err(|_| failure("invalid private metadata JSON"))?;
+            progress.expect(CaptureReason::ObjectMetadata);
+            let record = crate::r2_metadata::exact_member(&value, key)?;
+            progress.expect(CaptureReason::ObjectIdentity);
+            if !identity.matches(&record) {
+                return Err(failure("S3 and REST object identities disagree"));
             }
-            for row in rows {
-                progress.expect(CaptureReason::ObjectMetadata);
-                contract::validate_object(row).map_err(failure)?;
-                let key = row["key"]
-                    .as_str()
-                    .ok_or_else(|| failure("private object key missing"))?;
-                progress.expect(CaptureReason::PopulationBounds);
-                bytes = bytes
-                    .checked_add(
-                        row["size"]
-                            .as_u64()
-                            .ok_or_else(|| failure("private object size missing"))?,
-                    )
-                    .filter(|n| *n <= contract::MAX_BYTES)
-                    .ok_or_else(|| failure("private capture byte budget exhausted"))?;
-                if objects.insert(key.into(), row.clone()).is_some()
-                    || objects.len() > contract::MAX_OBJECTS
-                {
-                    return Err(failure(
-                        "private enumeration repeated a key or exceeded its population bound",
-                    ));
-                }
-            }
-            progress.expect(CaptureReason::PaginationMetadata);
-            let info = &page["result_info"];
-            if info["per_page"] != contract::PAGE_SIZE
-                || info["delimited"].as_array().is_none_or(|d| !d.is_empty())
-            {
-                return Err(failure(
-                    "private enumeration lacks unfiltered pagination evidence",
-                ));
-            }
-            progress.expect(CaptureReason::PaginationCursor);
-            let next = info["cursor"]
-                .as_str()
-                .ok_or_else(|| failure("private enumeration cursor is missing"))?;
-            progress.expect(CaptureReason::PaginationTerminal);
-            match info["is_truncated"].as_bool() {
-                Some(false) if next.is_empty() => return Ok(objects),
-                Some(true)
-                    if !next.is_empty()
-                        && next.len() <= 8192
-                        && cursors.insert(next.to_owned()) =>
-                {
-                    cursor = next.into();
-                }
-                _ => {
-                    return Err(failure(
-                        "private enumeration lacks terminal evidence or repeats a cursor",
-                    ));
-                }
-            }
+            progress.expect(CaptureReason::ManifestBounds);
+            retained = retained
+                .checked_add(
+                    serde_json::to_vec(&record)
+                        .map_err(|_| failure("private metadata encoding failed"))?
+                        .len() as u64,
+                )
+                .filter(|n| *n <= contract::MAX_MANIFEST_BYTES)
+                .ok_or_else(|| failure("private metadata retention budget exhausted"))?;
+            records.insert(key.clone(), record);
         }
+        Ok(records)
     }
 }
 

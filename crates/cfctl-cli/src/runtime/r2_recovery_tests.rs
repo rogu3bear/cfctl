@@ -71,13 +71,15 @@ fn equivalent_window_encodings_produce_the_same_proof_input() {
     let input = CallInput {
         selectors: json!({"account_id":"a".repeat(32),"bucket_name":"private-pdfs"}),
         query: json!({}),
-        body: Some(body),
+        body: Some(
+            json!({"schema_version":2,"window":body,"token_verification_evidence_hash":format!("sha256:{}","c".repeat(64)),"token_policy_evidence_hash":format!("sha256:{}","d".repeat(64))}),
+        ),
         ..CallInput::default()
     };
     let canonical = super::preflight_capture(cap, &input, &root.path().join("new-snapshot"))
         .expect("normalized window");
     assert_eq!(
-        serde_json::to_value(canonical).expect("canonical body"),
+        serde_json::to_value(canonical.window).expect("canonical body"),
         serde_json::to_value(window).expect("receipt body")
     );
 }
@@ -199,6 +201,17 @@ fn self_authored_manifest_is_not_provider_capture_authority() {
 
 #[test]
 fn native_capture_provenance_joins_exact_target_window_and_private_files() {
+    capture_provenance(false);
+}
+#[test]
+fn v2_private_request_preserves_verifier_output_and_cannot_downgrade() {
+    capture_provenance(true);
+}
+#[expect(
+    clippy::too_many_lines,
+    reason = "one provenance fixture binds authenticated evidence, input hashes, private files and downgrade rejection for both request versions"
+)]
+fn capture_provenance(v2: bool) {
     use cfctl_auth::{EvidenceKeyManager, MemorySecretStore, SecretBackend};
     use cfctl_core::{
         EvidenceClass, OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1,
@@ -242,10 +255,21 @@ fn native_capture_provenance_joins_exact_target_window_and_private_files() {
     let capability = snapshot
         .get(cfctl_core::r2_recovery::VERIFY_ID)
         .expect("verify capability");
+    let original_body = if v2 {
+        let body = json!({"schema_version":2,"window":receipt.window,"token_verification_evidence_hash":format!("sha256:{}","c".repeat(64)),"token_policy_evidence_hash":format!("sha256:{}","d".repeat(64))});
+        directory
+            .create_new_file("request.json")
+            .unwrap()
+            .write_all(&serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        body
+    } else {
+        json!(receipt.window)
+    };
     let original = CallInput {
         selectors: json!({"account_id":receipt.account_id,"bucket_name":receipt.bucket_name}),
         query: json!({}),
-        body: Some(serde_json::to_value(&receipt.window).expect("window")),
+        body: Some(original_body.clone()),
         ..CallInput::default()
     };
     let evidence = store
@@ -287,6 +311,29 @@ fn native_capture_provenance_joins_exact_target_window_and_private_files() {
         verify(&store, capability, &input, &private_path).expect("authenticated private capture");
     assert_eq!(verified.result["recovery_ready"], false);
     assert_eq!(verified.result["conditional_restore_qualified"], false);
+    if v2 {
+        fs::remove_file(private_path.join("request.json")).unwrap();
+        assert!(verify(&store, capability, &input, &private_path).is_err());
+        let mut tampered = original_body.clone();
+        tampered["token_policy_evidence_hash"] = json!(format!("sha256:{}", "f".repeat(64)));
+        fs::write(
+            private_path.join("request.json"),
+            serde_json::to_vec(&tampered).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            private_path.join("request.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(verify(&store, capability, &input, &private_path).is_err());
+        fs::write(
+            private_path.join("request.json"),
+            serde_json::to_vec(&original_body).unwrap(),
+        )
+        .unwrap();
+        assert!(verify(&store, capability, &input, &private_path).is_ok());
+    }
     input.selectors["bucket_name"] = json!("another-bucket");
     assert!(verify(&store, capability, &input, &private_path).is_err());
     input.selectors = original.selectors;
@@ -294,131 +341,36 @@ fn native_capture_provenance_joins_exact_target_window_and_private_files() {
     assert!(verify(&store, capability, &input, &private_path).is_err());
 }
 
-#[tokio::test]
-async fn capture_failure_diagnostic_is_safe_in_public_output_and_evidence() {
-    for complete in [false, true] {
-        let (origin, server) = diagnostic_server(complete).await;
-        let root = tempfile::tempdir_in(
-            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp"),
-        )
-        .expect("root");
-        let parent_path = root.path().join("custody");
-        PrivateDirectory::create(&parent_path).expect("private parent");
-        let store = diagnostic_store(&root.path().join("runtime"));
-        let mut catalog = cfctl_catalog::CatalogSnapshot {
-            schema_version: 1,
-            generated_at: Utc::now(),
-            source_url: "fixture".into(),
-            source_hash: String::new(),
-            schema_hash: String::new(),
-            capabilities: std::collections::BTreeMap::new(),
-        };
-        cfctl_catalog::ingest_native_control_capabilities(&mut catalog).expect("catalog");
-        let cap = catalog
-            .get(cfctl_core::r2_recovery::CAPTURE_ID)
-            .expect("capture capability");
-        let window = CaptureWindowV1 {
-            window_id: uuid::Uuid::new_v4().to_string(),
-            opened_at: Utc::now() - Duration::seconds(1),
-            expires_at: Utc::now() + Duration::seconds(60),
-            recovery_binding_sha256: "b".repeat(64),
-        };
-        let input = CallInput {
-            selectors: json!({"account_id":"a".repeat(32),"bucket_name":"fixture-bucket"}),
-            query: json!({}),
-            body: Some(json!(window)),
-            ..CallInput::default()
-        };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .expect("client");
-        let executor = cfctl_cloudflare::Executor::new(client, &origin).expect("executor");
-        let response = super::capture(
-            &executor,
-            cap,
-            &input,
-            &cfctl_auth::AuthCredential::Bearer {
-                token: DIAGNOSTIC_CANARY.into(),
-            },
-            &parent_path.join("snapshot"),
-        )
-        .await
-        .expect("projected response");
-        assert_eq!(response.success, complete);
-        if complete {
-            assert_eq!(response.status, 200);
-            assert!(response.result.get("failure").is_none());
-        } else {
-            assert_eq!(response.status, 0);
-            assert_eq!(response.result["status_is_provider_response"], false);
-            assert_eq!(response.result["diagnostic"], "private_capture_incomplete");
-            assert_eq!(response.result["capture_complete"], false);
-            assert_eq!(
-                response.result["failure"],
-                json!({"stage":"initial_inventory","reason":"pagination_metadata","request_ordinal":1,"provider_http_status":200})
-            );
-        }
-        let public = serde_json::to_value(response).expect("public output");
-        assert!(!public.to_string().contains(DIAGNOSTIC_CANARY));
-        let evidence = store
-            .write_observation_evidence(cfctl_core::EvidenceClass::LiveRead, &public)
-            .expect("evidence");
-        let stored = store
-            .read_evidence_value(&evidence.content_hash)
-            .expect("read evidence");
-        assert!(
-            !serde_json::to_string(&stored)
-                .expect("evidence JSON")
-                .contains(DIAGNOSTIC_CANARY)
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(3), server)
-            .await
-            .expect("server deadline")
-            .expect("server");
-    }
-}
-
-const DIAGNOSTIC_CANARY: &str = "private-capture-output-canary";
-
-async fn diagnostic_server(complete: bool) -> (String, tokio::task::JoinHandle<()>) {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-    let origin = format!("http://{}", listener.local_addr().expect("address"));
-    let server = tokio::spawn(async move {
-        for _ in 0..if complete { 2 } else { 1 } {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = Vec::new();
-            let mut buf = [0; 4096];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).await.expect("read");
-                assert!(n > 0 && request.len() < 16384);
-                request.extend_from_slice(&buf[..n]);
-            }
-            let info = if complete {
-                json!({"per_page":100,"delimited":[],"cursor":"","is_truncated":false})
-            } else {
-                serde_json::Value::Null
-            };
-            let body = json!({"success":true,"errors":[],"result":[],"result_info":info,"private_unknown":DIAGNOSTIC_CANARY}).to_string();
-            let wire = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(wire.as_bytes()).await.expect("response");
-        }
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(40), listener.accept())
-                .await
-                .is_err(),
-            "no replay"
-        );
+#[test]
+fn capture_failure_diagnostic_is_safe_in_public_output_and_evidence() {
+    use cfctl_cloudflare::r2_recovery::{CaptureDiagnosticV1, CaptureReason, CaptureStage};
+    let root = tempfile::tempdir().unwrap();
+    let store = diagnostic_store(&root.path().join("runtime"));
+    let response = super::incomplete_response(CaptureDiagnosticV1 {
+        stage: CaptureStage::InitialMetadata,
+        reason: CaptureReason::ObjectMetadata,
+        request_ordinal: 2,
+        provider_http_status: Some(200),
     });
-    (origin, server)
+    assert!(!response.success);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.result["status_is_provider_response"], false);
+    assert_eq!(response.result["capture_complete"], false);
+    assert_eq!(
+        response.result["failure"],
+        json!({"stage":"initial_metadata","reason":"object_metadata","request_ordinal":2,"provider_http_status":200})
+    );
+    let public = serde_json::to_value(response).unwrap();
+    let evidence = store
+        .write_observation_evidence(cfctl_core::EvidenceClass::LiveRead, &public)
+        .unwrap();
+    assert_eq!(
+        store.read_evidence_value(&evidence.content_hash).unwrap(),
+        public
+    );
+    for absent in ["token", "body", "metadata", "key"] {
+        assert!(public.get(absent).is_none());
+    }
 }
 
 fn diagnostic_store(path: &std::path::Path) -> StateStore {

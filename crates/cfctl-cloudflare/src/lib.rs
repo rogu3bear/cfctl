@@ -5,6 +5,7 @@ mod d1_sql;
 mod oauth_scopes;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;
 pub mod pages_projects;
+mod r2_metadata;
 mod r2_private;
 pub mod r2_recovery;
 pub mod r2_restore;

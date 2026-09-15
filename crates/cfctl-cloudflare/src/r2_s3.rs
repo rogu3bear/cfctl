@@ -83,6 +83,53 @@ impl S3Transport {
         // No retry, redirect, alternative endpoint or response-bearing error.
         self.client.execute(request).await.map_err(|_| rejected())
     }
+    /// Capture-only `ListObjectsV2`. No caller-controlled query or endpoint.
+    pub(crate) async fn list(
+        &self,
+        account: &str,
+        bucket: &str,
+        cursor: Option<&str>,
+        token_id: &str,
+        credential: &AuthCredential,
+    ) -> Result<Response> {
+        let token = credential.bearer_token().ok_or_else(rejected)?;
+        if token_id.len() != 32 || !token_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(rejected());
+        }
+        let mut url = target_url(&S3Target {
+            account,
+            bucket,
+            key: "list-validation",
+        })?;
+        url.set_path(&format!("/{bucket}"));
+        let query = list_query(cursor)?;
+        url.set_query(Some(&query));
+        #[cfg(test)]
+        let url = self.test_origin.as_ref().map_or(url.clone(), |origin| {
+            let mut test = origin.clone();
+            test.set_path(url.path());
+            test.set_query(url.query());
+            test
+        });
+        let mut request = Request::new(Method::GET, url.clone());
+        *request.timeout_mut() = Some(std::time::Duration::from_mins(1));
+        request
+            .headers_mut()
+            .insert("accept-encoding", HeaderValue::from_static("identity"));
+        sign(
+            &mut request,
+            token_id,
+            &hex::encode(Sha256::digest(token.as_bytes())),
+            "auto",
+            Utc::now(),
+            &hex::encode(Sha256::digest([])),
+        )?;
+        let response = self.client.execute(request).await.map_err(|_| rejected())?;
+        if response.url() != &url {
+            return Err(rejected());
+        }
+        Ok(response)
+    }
 }
 
 fn target_url(target: &S3Target<'_>) -> Result<Url> {
@@ -127,6 +174,34 @@ fn encode_key(key: &str) -> String {
         }
     }
     encoded
+}
+
+fn list_query(cursor: Option<&str>) -> Result<String> {
+    let mut query = String::new();
+    if let Some(cursor) = cursor {
+        if cursor.is_empty() || cursor.len() > cfctl_core::r2_recovery::MAX_CURSOR_BYTES {
+            return Err(rejected());
+        }
+        query.push_str("continuation-token=");
+        query.push_str(&encode_key(cursor).replace('/', "%2F"));
+        query.push('&');
+    }
+    query.push_str("encoding-type=url&list-type=2&max-keys=100");
+    Ok(query)
+}
+
+/// A query can enter the signer only if it is exactly the closed list query.
+fn canonical_query(url: &Url) -> Result<String> {
+    let Some(query) = url.query() else {
+        return Ok(String::new());
+    };
+    let pairs = url.query_pairs().collect::<Vec<_>>();
+    let cursor = pairs.iter().find(|(name, _)| name == "continuation-token");
+    let expected = list_query(cursor.map(|(_, value)| value.as_ref()))?;
+    if query != expected || url.path().split('/').count() != 2 || url.fragment().is_some() {
+        return Err(rejected());
+    }
+    Ok(expected)
 }
 
 fn hmac(key: &[u8], message: &[u8]) -> Result<Vec<u8>> {
@@ -179,11 +254,9 @@ fn sign(
         headers.push_str(value);
         headers.push('\n');
     }
-    if request.url().query().is_some() {
-        return Err(rejected());
-    }
+    let query = canonical_query(request.url())?;
     let canonical_request = format!(
-        "{}\n{}\n\n{headers}\n{names}\n{payload_hash}",
+        "{}\n{}\n{query}\n{headers}\n{names}\n{payload_hash}",
         request.method(),
         request.url().path()
     );
@@ -208,8 +281,42 @@ fn sign(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn bucket_query_is_closed_sorted_and_exactly_encoded() {
+        let cursor = "opaque /+%=雪";
+        let query = list_query(Some(cursor)).unwrap();
+        assert_eq!(
+            query,
+            "continuation-token=opaque%20%2F%2B%25%3D%E9%9B%AA&encoding-type=url&list-type=2&max-keys=100"
+        );
+        let url = Url::parse(&format!("https://example.test/bucket?{query}")).unwrap();
+        assert_eq!(canonical_query(&url).unwrap(), query);
+        for suffix in ["&prefix=hidden", "&max-keys=100", "&delimiter=%2F"] {
+            assert!(canonical_query(&Url::parse(&format!("{url}{suffix}")).unwrap()).is_err());
+        }
+        assert!(
+            canonical_query(
+                &Url::parse(
+                    "https://example.test/bucket/object?encoding-type=url&list-type=2&max-keys=100"
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            canonical_query(
+                &Url::parse(
+                    "https://example.test/bucket?max-keys=100&list-type=2&encoding-type=url"
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
+        assert!(list_query(Some("")).is_err());
+    }
+
     #[test]
     fn aws_published_get_object_signature_vector() {
         let mut request = Request::new(

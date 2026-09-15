@@ -15,6 +15,41 @@ pub const MAX_OBJECTS: usize = 1000;
 pub const MAX_SECONDS: i64 = 900;
 pub const MAX_MANIFEST_BYTES: u64 = 20 * 1024 * 1024;
 
+pub const MAX_REQUESTS: u32 = 3010;
+pub const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_XML_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_METADATA_BYTES: u64 = 40 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: u64 = 4096;
+pub const MAX_CURSOR_BYTES: usize = 8192;
+
+/// Capture v2 joins S3 inventory and REST metadata under current read credentials.
+/// Historical manifests and receipts remain version 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRequestV2 {
+    pub schema_version: u32,
+    pub window: CaptureWindowV1,
+    pub token_verification_evidence_hash: String,
+    pub token_policy_evidence_hash: String,
+}
+impl CaptureRequestV2 {
+    pub fn validate(&self, now: DateTime<Utc>) -> Result<(), &'static str> {
+        if self.schema_version != 2
+            || [
+                &self.token_verification_evidence_hash,
+                &self.token_policy_evidence_hash,
+            ]
+            .iter()
+            .any(|hash| !hash.strip_prefix("sha256:").is_some_and(is_sha256))
+        {
+            return Err(
+                "private capture requires version 2 window and current token evidence hashes",
+            );
+        }
+        self.window.validate(now)
+    }
+}
+
 /// Hash of the application's exact D1/writer/retention declaration. This is a
 /// join key, not an assertion that cfctl has qualified that declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

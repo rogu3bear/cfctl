@@ -310,6 +310,16 @@ fn copy_snapshot(
         .map_err(|_| rejected())?;
     file.write_all(&encoded).map_err(|_| rejected())?;
     file.sync_all().map_err(|_| rejected())?;
+    if let Some(request) = source
+        .read("request.json", cfctl_core::r2_recovery::MAX_REQUEST_BYTES)
+        .map_err(|_| rejected())?
+    {
+        let mut file = target
+            .create_new_file("request.json")
+            .map_err(|_| rejected())?;
+        file.write_all(&request).map_err(|_| rejected())?;
+        file.sync_all().map_err(|_| rejected())?;
+    }
     source.sync().map_err(|_| rejected())?;
     target.sync().map_err(|_| rejected())?;
     Ok(())

@@ -16,7 +16,7 @@ pub(super) fn capture_capability() -> CapabilityV1 {
         "GET",
         OBJECTS_PATH,
     );
-    cap.description = Some("Capture the entire bucket to a new private directory with --out. Two complete enumerations share ten pages of 100 objects; all object reads share 300000000 bytes and a caller-bound window of at most 900 seconds. Retains all returned metadata privately and checks ETag, size and population drift. No retries, truncation, public bytes, restore, or writer/retention/D1 qualification.".into());
+    cap.description = Some("Capture the entire bucket to a new private directory with --out. Version 2 requires fresh authenticated account-token identity and account-scoped R2 read-policy evidence. Two explicit-terminal S3 ListObjectsV2 inventories share ten pages of 100 objects (at most 500 objects in two passes); REST exact-member reads preserve and compare all returned metadata before and after body capture. P+3N requests are bounded at 3010 attempts, with 2 MiB per XML/metadata response, 20 MiB aggregate XML and 40 MiB aggregate metadata; all object reads share 300000000 bytes and a caller-bound window of at most 900 seconds. Retains all returned metadata privately and checks ETag, size and population drift. No retries, truncation, public bytes, restore, or writer/retention/D1 qualification.".into());
     cap.product = "R2 Object".into();
     cap.source = "cfctl native private R2 capture adapter".into();
     cap.account_scope = "account".into();
@@ -42,12 +42,20 @@ pub(super) fn capture_capability() -> CapabilityV1 {
     }).to_vec();
     cap.request_schema = Some(json!({
         "type":"object", "additionalProperties":false,
-        "required":["window_id","opened_at","expires_at","recovery_binding_sha256"],
+        "required":["schema_version","window","token_verification_evidence_hash","token_policy_evidence_hash"],
         "properties":{
-            "window_id":{"type":"string","format":"uuid"},
-            "opened_at":{"type":"string","format":"date-time"},
-            "expires_at":{"type":"string","format":"date-time"},
-            "recovery_binding_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+            "schema_version":{"const":2},
+            "token_verification_evidence_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+            "token_policy_evidence_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+            "window":{"type":"object","additionalProperties":false,
+                "required":["window_id","opened_at","expires_at","recovery_binding_sha256"],
+                "properties":{
+                    "window_id":{"type":"string","format":"uuid"},
+                    "opened_at":{"type":"string","format":"date-time"},
+                    "expires_at":{"type":"string","format":"date-time"},
+                    "recovery_binding_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+                }
+            }
         }
     }));
     cap.response_contract = Some(ResponseContractV1 {
@@ -57,7 +65,7 @@ pub(super) fn capture_capability() -> CapabilityV1 {
     });
     zero_direct_usage_cost(
         &mut cap,
-        "bounded R2 Class A list and Class B object reads incur ordinary operation usage; no provider configuration or storage creation",
+        "P S3 list + 2N REST metadata + N body reads (P+3N, at most 3010 attempts) incur ordinary R2 Class A/B operation and applicable retrieval usage; no provider configuration or storage creation",
         vec![official_reference(
             "R2 pricing",
             "https://developers.cloudflare.com/r2/pricing/",

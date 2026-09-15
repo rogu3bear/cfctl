@@ -25,6 +25,56 @@ pub(super) fn qualify(
     request: &RestoreRequestV1,
     window_end: DateTime<Utc>,
 ) -> Result<String> {
+    qualify_policy(
+        store,
+        catalog,
+        profile,
+        account,
+        [
+            &request.token_verification_evidence_hash,
+            &request.token_policy_evidence_hash,
+        ],
+        window_end,
+        ReadPolicy::RestoreWrite,
+    )
+}
+
+pub(super) fn qualify_capture(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    profile: &ProfileMetadata,
+    account: &str,
+    request: &cfctl_core::r2_recovery::CaptureRequestV2,
+) -> Result<String> {
+    request.validate(Utc::now()).map_err(|_| rejected())?;
+    qualify_policy(
+        store,
+        catalog,
+        profile,
+        account,
+        [
+            &request.token_verification_evidence_hash,
+            &request.token_policy_evidence_hash,
+        ],
+        request.window.expires_at,
+        ReadPolicy::CaptureRead,
+    )
+}
+
+enum ReadPolicy {
+    RestoreWrite,
+    CaptureRead,
+}
+
+fn qualify_policy(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    profile: &ProfileMetadata,
+    account: &str,
+    evidence: [&str; 2],
+    window_end: DateTime<Utc>,
+    required: ReadPolicy,
+) -> Result<String> {
     check_profile(profile, account)?;
     let now = Utc::now();
     let input = CallInput {
@@ -36,7 +86,7 @@ pub(super) fn qualify(
         store,
         catalog,
         profile,
-        &request.token_verification_evidence_hash,
+        evidence[0],
         VERIFY_PATH,
         &input,
         now,
@@ -51,7 +101,7 @@ pub(super) fn qualify(
         store,
         catalog,
         profile,
-        &request.token_policy_evidence_hash,
+        evidence[1],
         POLICY_PATH,
         &policy_input,
         now,
@@ -60,20 +110,36 @@ pub(super) fn qualify(
         return Err(rejected());
     }
     let policies = policy["policies"].as_array().ok_or_else(rejected)?;
+    if matches!(required, ReadPolicy::CaptureRead)
+        && policies.iter().any(|p| {
+            p.as_object().is_none_or(|map| {
+                map.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "id" | "effect" | "resources" | "permission_groups"
+                    )
+                })
+            })
+        })
+    {
+        return Err(rejected());
+    }
     if policies.iter().any(|p| p["effect"] != "allow") {
         return Err(rejected());
     }
-    // This first adapter supports a qualified account-owned Storage Write
-    // policy only. Bucket-item and user-token policy languages are not guessed.
+    // Only supported account-owned allow policies. Capture accepts read without
+    // weakening restore's write requirement or guessing bucket/user policies.
     let account_resource = format!("com.cloudflare.api.account.{account}");
     let allowed = policies.iter().any(|p| {
         p["resources"]
             .get(&account_resource)
             .is_some_and(|scope| scope == "*")
             && p["permission_groups"].as_array().is_some_and(|groups| {
-                groups
-                    .iter()
-                    .any(|group| group["name"] == "Workers R2 Storage Write")
+                groups.iter().any(|group| {
+                    group["name"] == "Workers R2 Storage Write"
+                        || (matches!(required, ReadPolicy::CaptureRead)
+                            && group["name"] == "Workers R2 Storage Read")
+                })
             })
     });
     if !allowed {

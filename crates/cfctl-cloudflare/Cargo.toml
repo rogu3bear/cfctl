@@ -19,6 +19,7 @@ http.workspace = true
 libc.workspace = true
 md-5.workspace = true
 memchr.workspace = true
+quick-xml.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 rusqlite.workspace = true
 serde.workspace = true

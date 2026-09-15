@@ -696,6 +696,32 @@ pub(super) async fn execute_read(
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
+    let capture_token_id = if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
+        let capture_request = serde_json::from_value(
+            input
+                .body
+                .clone()
+                .ok_or_else(|| CliError::Input("private capture request required".into()))?,
+        )?;
+        let account = account_id
+            .as_deref()
+            .ok_or_else(|| CliError::Input("private capture account required".into()))?;
+        if input.selectors["account_id"].as_str() != Some(account) {
+            return Err(CliError::Input(
+                "private capture account selectors disagree".into(),
+            ));
+        }
+        let token_id = super::r2_restore_credentials::qualify_capture(
+            store,
+            catalog,
+            profile,
+            account,
+            &capture_request,
+        )?;
+        Some(token_id)
+    } else {
+        None
+    };
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(
         if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
@@ -711,6 +737,9 @@ pub(super) async fn execute_read(
             capability,
             input,
             &credential,
+            capture_token_id
+                .as_deref()
+                .ok_or_else(|| CliError::Input("qualified capture identity required".into()))?,
             output_path.ok_or_else(|| {
                 CliError::Input("private capture output directory required".into())
             })?,
