@@ -1,7 +1,7 @@
 //! `SQLite`-authorized, immutable read populations and their sole Executor path.
 mod execution;
 mod parameters;
-pub use execution::validate_result;
+pub use execution::{PrivateD1ReadResult, qualify_private_receipt, validate_result};
 #[cfg(test)]
 mod tests;
 
@@ -146,7 +146,12 @@ pub fn validate(capability: &CapabilityV1, input: &CallInput) -> Result<Validate
 }
 
 /// Also used by the Executor to revalidate immutable input at its boundary.
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordinary and committed-private bounds belong to the same complete pre-credential compiler gate"
+)]
 pub fn validate_inventory(inventory: &D1ReadInventoryV1) -> Result<()> {
+    validate_private_disposition(inventory)?;
     let queries = &inventory.queries;
     let witness_count: usize = queries.iter().map(|q| q.witnesses.len()).sum();
     if inventory.schema_version != 1
@@ -183,7 +188,12 @@ pub fn validate_inventory(inventory: &D1ReadInventoryV1) -> Result<()> {
             || !(1..=1000).contains(&query.output.max_rows)
             || query.output.min_rows > query.output.max_rows
             || query.parameters.len() > 16
-            || !(512..=65_536).contains(&query.output.max_bytes)
+            || !(512..=if inventory.private_output.is_some() {
+                cfctl_core::d1_read_inventory::D1_PRIVATE_MAX_BYTES
+            } else {
+                65_536
+            })
+                .contains(&query.output.max_bytes)
             || query.output.columns.is_empty()
             || query.output.columns.len() > 64
         {
@@ -224,7 +234,16 @@ pub fn validate_inventory(inventory: &D1ReadInventoryV1) -> Result<()> {
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>();
         if expected.iter().copied().collect::<BTreeSet<_>>().len() != expected.len()
-            || query.output.columns.iter().any(|c| !valid_column(c))
+            || query.output.columns.iter().any(|c| {
+                !valid_column(
+                    c,
+                    if inventory.private_output.is_some() {
+                        query.output.max_bytes
+                    } else {
+                        8192
+                    },
+                )
+            })
         {
             return Err(invalid("read output column policy invalid"));
         }
@@ -475,12 +494,40 @@ fn add_metadata_tables(tables: &mut BTreeMap<String, BTreeSet<String>>) {
     }
 }
 
-fn valid_column(column: &D1ReadColumnV1) -> bool {
+fn validate_private_disposition(inventory: &D1ReadInventoryV1) -> Result<()> {
+    use cfctl_core::d1_read_inventory::{D1_PRIVATE_FORMAT, D1_PRIVATE_MAX_BYTES};
+    let Some(private) = &inventory.private_output else {
+        return Ok(());
+    };
+    if private.schema_version != 1
+        || private.format != D1_PRIVATE_FORMAT
+        || !private.require_primary
+        || !(1..=D1_PRIVATE_MAX_BYTES).contains(&private.max_artifact_bytes)
+        || inventory.queries.len() != 1
+        || !(1..=30).contains(&inventory.limits.max_elapsed_seconds)
+    {
+        return Err(invalid("private read disposition or population invalid"));
+    }
+    let query = &inventory.queries[0];
+    if !query.parameters.is_empty()
+        || !query.requires.is_empty()
+        || query.output.min_rows != 1
+        || query.output.max_rows != 1
+        || inventory.limits.max_total_response_bytes != query.output.max_bytes
+    {
+        return Err(invalid(
+            "private read requires one independent query and one row",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_column(column: &D1ReadColumnV1, maximum: u64) -> bool {
     !column.name.is_empty()
         && column.name.len() <= 128
         && !column.name.chars().any(char::is_control)
         && match column.kind {
-            D1ReadValueKindV1::Text => column.max_bytes.is_some_and(|n| (1..=8192).contains(&n)),
+            D1ReadValueKindV1::Text => column.max_bytes.is_some_and(|n| (1..=maximum).contains(&n)),
             _ => column.max_bytes.is_none(),
         }
         && (column.kind == D1ReadValueKindV1::Integer

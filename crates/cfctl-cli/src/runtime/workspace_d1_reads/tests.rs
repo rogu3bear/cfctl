@@ -1,4 +1,5 @@
 #![allow(clippy::expect_used)]
+mod private_output;
 use super::*;
 use cfctl_core::d1_read_inventory::{D1ReadQueryResultV1, D1ReadStatusV1};
 use cfctl_storage::RuntimePaths;
@@ -118,7 +119,7 @@ fn result(validated: &ValidatedD1ReadInventory) -> D1ReadInventoryResultV1 {
     }).collect();
     D1ReadInventoryResultV1 {
         schema_version: 1,
-        compiler_version: 1,
+        compiler_version: cfctl_core::d1_read_inventory::D1_READ_COMPILER_VERSION,
         inventory_sha256: validated.call().inventory_sha256.clone(),
         read_complete: true,
         attempted_queries: 2,
@@ -250,6 +251,7 @@ async fn bad_final_query_is_refused_before_missing_profile_or_credential_access(
         &input,
         Some("example-read"),
         Some(&"a".repeat(32)),
+        None,
     )
     .await
     .expect_err("final DELETE is rejected locally");
@@ -306,7 +308,7 @@ fn reconciliation_result(validated: &ValidatedD1ReadInventory) -> D1ReadInventor
         .collect::<Vec<_>>();
     D1ReadInventoryResultV1 {
         schema_version: 1,
-        compiler_version: 1,
+        compiler_version: cfctl_core::d1_read_inventory::D1_READ_COMPILER_VERSION,
         inventory_sha256: validated.call().inventory_sha256.clone(),
         read_complete: true,
         attempted_queries: 3,

@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const D1_READ_PACK_PATH: &str = ".cfctl/operations/d1-reads.toml";
-pub const D1_READ_COMPILER_VERSION: u8 = 1;
+pub const D1_READ_COMPILER_VERSION: u8 = 2;
+pub const D1_PRIVATE_MAX_BYTES: u64 = 8_388_608;
+pub const D1_PRIVATE_FORMAT: &str = "workspace_d1_private_read_v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,7 +37,7 @@ pub struct D1ReadColumnV1 {
     pub name: String,
     pub kind: D1ReadValueKindV1,
     pub nullable: bool,
-    /// Required for text; forbidden for other kinds. Always at most 8192.
+    /// Required for text; forbidden for other kinds. Ordinary reads cap at 8192.
     pub max_bytes: Option<u64>,
     /// Optional finite value allowlist, applied before any durable observation.
     pub allowed_values: Option<Vec<Value>>,
@@ -132,6 +134,57 @@ pub struct D1ReadInventoryV1 {
     pub functions: Vec<String>,
     pub limits: D1ReadLimitsV1,
     pub queries: Vec<D1ReadQueryV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_output: Option<Box<D1PrivateOutputV1>>,
+}
+
+/// Only a committed disposition can select confidential output or larger bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1PrivateOutputV1 {
+    pub schema_version: u8,
+    pub format: String,
+    pub max_artifact_bytes: u64,
+    pub require_primary: bool,
+}
+
+/// Intentionally no Debug: provider rows belong only in the private artifact.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1PrivateReadArtifactV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    pub binding: D1PrivateReadBindingV1,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    pub transport: D1PrivateReadTransportV1,
+    pub provider_response: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1PrivateReadBindingV1 {
+    pub contract: WorkspaceD1ReadInventoryContractV1,
+    pub capability_id: String,
+    pub catalog_schema_hash: String,
+    pub contract_sha256: String,
+    pub build: crate::BuildInfoV1,
+    pub profile_id: String,
+    pub credential_generation_id: uuid::Uuid,
+    pub query_id: String,
+    pub query_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1PrivateReadTransportV1 {
+    pub http_status: u16,
+    pub response_bytes: u64,
+    pub content_encoding: String,
+    pub attempted_queries: u64,
+    pub read_complete: bool,
+    pub served_by_primary: bool,
+    pub application_predicates_evaluated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,6 +2,7 @@
 use cfctl_auth::ProfileKind;
 use cfctl_cloudflare::d1_read_inventory::{self, ValidatedD1ReadInventory};
 use cfctl_core::d1_read_inventory::D1ReadInventoryResultV1;
+mod private_output;
 
 use super::{
     cloudflare_api::BASE_URL,
@@ -22,6 +23,7 @@ pub(super) async fn execute(
     input: &CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
+    output_path: Option<&std::path::Path>,
 ) -> Result<ExecutedRead> {
     // Both current source and the complete SQL/output population are checked
     // before selecting a profile or touching its credential store.
@@ -33,6 +35,7 @@ pub(super) async fn execute(
         ));
     }
     let validated = d1_read_inventory::validate(&current, input)?;
+    let destination = private_output::prepare(&validated, output_path)?;
     let operation = &validated.contract().operation;
     if requested_profile != Some(operation.profile_id.as_str())
         || requested_account != Some(operation.account_id.as_str())
@@ -56,6 +59,27 @@ pub(super) async fn execute(
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, BASE_URL)?;
     let started_at = Utc::now();
+    if let Some(destination) = destination {
+        let result = executor
+            .execute_private_d1_read(&validated, &credential, || {
+                reacquire(store, &validated, profile).map_err(|_| {
+                    CloudflareError::InvalidRequestBody(
+                        "reviewed read owner or credential changed".into(),
+                    )
+                })
+            })
+            .await?;
+        return private_output::persist(
+            store,
+            catalog,
+            capability,
+            &validated,
+            profile,
+            started_at,
+            result,
+            &destination,
+        );
+    }
     let result = executor
         .execute_d1_read_inventory(&validated, &credential, || {
             reacquire(store, &validated, profile).map_err(|_| {
@@ -97,6 +121,11 @@ fn persist(
     started_at: chrono::DateTime<Utc>,
     result: &D1ReadInventoryResultV1,
 ) -> Result<ExecutedRead> {
+    if validated.contract().inventory.private_output.is_some() {
+        return Err(CliError::Input(
+            "private read cannot enter ordinary evidence".into(),
+        ));
+    }
     d1_read_inventory::validate_result(validated, result)?;
     let contract = validated.contract();
     let generation = credential_generation_for_read(profile)?;

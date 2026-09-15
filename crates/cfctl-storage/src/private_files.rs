@@ -24,7 +24,119 @@ pub struct PrivateDirectory {
     directory: fs::File,
 }
 
+/// Publication may have succeeded before a later custody check failed. Callers
+/// must report that distinction and must never remove/replay an uncertain file.
+#[derive(Debug)]
+pub struct PrivatePublicationError {
+    pub published: bool,
+}
+
 impl PrivateDirectory {
+    /// Read-only preflight; any existing entry, including a dangling link, fails.
+    pub fn require_new_file(&self, name: &str) -> cfctl_auth::Result<()> {
+        Self::name(name)?;
+        self.validate_address()?;
+        if self.path.canonicalize().map_err(|_| failure())? != self.path {
+            return Err(failure());
+        }
+        match rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            _ => Err(failure()),
+        }
+    }
+
+    /// Stage and verify complete bytes, then atomically publish without replacing
+    /// any existing entry. The caller's deadline covers the entire local phase.
+    pub fn publish_new_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(), PrivatePublicationError> {
+        self.publish_with_deadline_check(name, bytes, || std::time::Instant::now() < deadline)
+    }
+
+    fn publish_with_deadline_check(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mut in_time: impl FnMut() -> bool,
+    ) -> std::result::Result<(), PrivatePublicationError> {
+        let mut published = false;
+        let temporary = format!(".staged-{}", Uuid::new_v4());
+        let mut staged_identity = None;
+        let result = (|| -> cfctl_auth::Result<()> {
+            self.require_new_file(name)?;
+            if !in_time() {
+                return Err(failure());
+            }
+            let descriptor = openat(
+                &self.directory,
+                &temporary,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|_| failure())?;
+            let mut file = fs::File::from(descriptor);
+            let metadata = file.metadata().map_err(|_| failure())?;
+            staged_identity = Some((metadata.dev(), metadata.ino()));
+            Self::validate_file(&file, bytes.len() as u64)?;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| failure())?;
+            if self.read(&temporary, bytes.len() as u64)?.as_deref() != Some(bytes) {
+                return Err(failure());
+            }
+            self.require_new_file(name)?;
+            if !in_time() {
+                return Err(failure());
+            }
+            let named = rustix::fs::statat(
+                &self.directory,
+                &temporary,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| failure())?;
+            if stat_identity(&named) != (metadata.dev(), metadata.ino()) {
+                return Err(failure());
+            }
+            rustix::fs::renameat_with(
+                &self.directory,
+                &temporary,
+                &self.directory,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| failure())?;
+            published = true;
+            self.directory.sync_all().map_err(|_| failure())?;
+            if self.read(name, bytes.len() as u64)?.as_deref() != Some(bytes) {
+                return Err(failure());
+            }
+            Self::validate_file(&file, bytes.len() as u64)?;
+            if !in_time() {
+                return Err(failure());
+            }
+            Ok(())
+        })();
+        if result.is_err() && !published {
+            // Never clean an entry that no longer names this invocation's stage.
+            if let (Some(identity), Ok(named)) = (
+                staged_identity,
+                rustix::fs::statat(
+                    &self.directory,
+                    &temporary,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                ),
+            ) && identity == stat_identity(&named)
+            {
+                let _ =
+                    rustix::fs::unlinkat(&self.directory, &temporary, rustix::fs::AtFlags::empty());
+                let _ = self.directory.sync_all();
+            }
+        }
+        result.map_err(|_| PrivatePublicationError { published })
+    }
     /// A fresh capture directory is created relative to the retained custody
     /// descriptor. Replacing its named parent cannot redirect this operation.
     pub fn create_new_directory(&self, name: &str) -> cfctl_auth::Result<Self> {
@@ -246,6 +358,15 @@ impl PrivateDirectory {
     }
 }
 
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast,
+    reason = "macOS dev_t is signed while MetadataExt exposes its bits as u64; Linux already uses u64"
+)]
+fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino)
+}
+
 /// Explicit local authority; unlike fallback storage, every access is durable
 /// and validates private file custody. Debug never includes a secret value.
 #[derive(Debug, Clone)]
@@ -315,6 +436,120 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
             .expect("private fixture permissions");
         root
+    }
+
+    #[test]
+    fn atomic_publication_never_replaces_and_reads_back_complete_private_bytes() {
+        let root = private_root();
+        let path = root.path().canonicalize().expect("canonical");
+        let directory = PrivateDirectory::open(&path).expect("directory");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        directory.require_new_file("artifact").expect("absent");
+        directory
+            .publish_new_file("artifact", b"complete private data", deadline)
+            .expect("publish");
+        assert_eq!(
+            directory.read("artifact", 100).expect("read"),
+            Some(b"complete private data".to_vec())
+        );
+        assert!(
+            !directory
+                .publish_new_file("artifact", b"replacement", deadline)
+                .expect_err("no replace")
+                .published
+        );
+        assert_eq!(
+            fs::metadata(path.join("artifact"))
+                .expect("metadata")
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        symlink("missing", path.join("symlink")).expect("symlink");
+        assert!(directory.require_new_file("symlink").is_err());
+        fs::hard_link(path.join("artifact"), path.join("hard")).expect("link");
+        assert!(
+            !directory
+                .publish_new_file("hard", b"replacement", deadline)
+                .expect_err("hard link")
+                .published
+        );
+        assert!(
+            !directory
+                .publish_new_file("expired", b"private", std::time::Instant::now())
+                .expect_err("deadline")
+                .published
+        );
+        assert!(!path.join("expired").exists());
+        assert!(fs::read_dir(&path).expect("entries").all(|e| {
+            !e.expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staged-")
+        }));
+    }
+
+    #[test]
+    fn atomic_publication_refuses_replaced_parent_and_existing_target_race() {
+        let root = private_root();
+        let canonical = root.path().canonicalize().expect("canonical");
+        let path = canonical.join("private");
+        let directory = PrivateDirectory::create(&path).expect("directory");
+        directory.require_new_file("artifact").expect("preflight");
+        directory
+            .write("artifact", b"other invocation")
+            .expect("racing creator");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(
+            !directory
+                .publish_new_file("artifact", b"ours", deadline)
+                .expect_err("race")
+                .published
+        );
+        assert_eq!(
+            directory.read("artifact", 100).expect("read"),
+            Some(b"other invocation".to_vec())
+        );
+        fs::rename(&path, canonical.join("old")).expect("move");
+        PrivateDirectory::create(&path).expect("replacement");
+        assert!(
+            !directory
+                .publish_new_file("other", b"ours", deadline)
+                .expect_err("parent drift")
+                .published
+        );
+        assert!(!path.join("other").exists());
+    }
+
+    #[test]
+    fn publication_deadline_cleans_stage_but_preserves_post_publication_custody() {
+        let root = private_root();
+        let path = root.path().canonicalize().expect("canonical");
+        let directory = PrivateDirectory::open(&path).expect("directory");
+        for stop_at in [2, 3] {
+            let name = format!("artifact-{stop_at}");
+            let mut checks = 0;
+            let error = directory
+                .publish_with_deadline_check(&name, b"complete", || {
+                    checks += 1;
+                    checks < stop_at
+                })
+                .expect_err("deadline boundary");
+            assert_eq!(error.published, stop_at == 3);
+            assert_eq!(path.join(&name).exists(), stop_at == 3);
+            if error.published {
+                assert_eq!(
+                    directory.read(&name, 100).expect("readback"),
+                    Some(b"complete".to_vec())
+                );
+            }
+            assert!(fs::read_dir(&path).expect("entries").all(|e| {
+                !e.expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".staged-")
+            }));
+        }
     }
 
     #[test]

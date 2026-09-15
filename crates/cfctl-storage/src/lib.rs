@@ -3,7 +3,7 @@
 mod private_runtime;
 pub use private_runtime::*;
 mod private_files;
-pub use private_files::{PrivateDirectory, PrivateFileSecretStore};
+pub use private_files::{PrivateDirectory, PrivateFileSecretStore, PrivatePublicationError};
 mod private_authority;
 pub use private_authority::PrivateAuthorityRebindPreviewV1;
 mod evidence;

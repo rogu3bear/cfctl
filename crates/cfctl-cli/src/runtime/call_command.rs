@@ -162,11 +162,21 @@ pub(super) async fn call_command(
                 .to_owned(),
         ));
     }
+    let private_d1 = capability
+        .workspace_d1_read_inventory
+        .as_ref()
+        .is_some_and(|c| c.inventory.private_output.is_some());
+    if capability.workspace_d1_read_inventory.is_some()
+        && (arguments.value_out.is_some() || (private_d1 && arguments.out.is_none()))
+    {
+        return Err(CliError::Input("committed private D1 reads require --out <new-private-file>; --value-out is unsupported".into()));
+    }
     if arguments.out.is_some()
         && capability.analytics_query.is_none()
         && !is_r2_log_retrieval
         && !is_d1_full_export
         && !is_r2_capture
+        && !private_d1
     {
         return Err(CliError::Input(
             "`--out` is restricted to bounded analytics, governed R2 log retrieval, D1 full export, and private R2 capture"

@@ -534,7 +534,7 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
 
     if let Some(contract) = &capability.workspace_d1_read_inventory {
         let operation = &contract.operation;
-        return argv(&[
+        let mut command = argv(&[
             "cfctl",
             "call",
             &capability.id,
@@ -549,6 +549,13 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
             "--body-stdin",
             "--json",
         ]);
+        if contract.inventory.private_output.is_some() {
+            command.extend([
+                "--out".into(),
+                "<new-file-in-owned-mode-0700-directory>".into(),
+            ]);
+        }
+        return command;
     }
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
     for selector in capability

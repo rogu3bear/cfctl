@@ -591,7 +591,7 @@ pub(super) async fn execute_read(
     reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
     if capability.workspace_d1_read_inventory.is_some() {
-        if output_path.is_some() || r2_credentials.is_some() || reply_admission_source.is_some() {
+        if r2_credentials.is_some() || reply_admission_source.is_some() {
             return Err(CliError::Input(
                 "reviewed D1 reads do not accept alternate sinks or sources".into(),
             ));
@@ -603,6 +603,7 @@ pub(super) async fn execute_read(
             input,
             requested_profile,
             requested_account,
+            output_path,
         )
         .await;
     }

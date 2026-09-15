@@ -101,7 +101,7 @@ types, disallowed values, oversized strings or unexpected provider metadata
 are rejected **before durable observation persistence**. Rejected provider
 material is not included in errors or partial receipts.
 
-The compiler ceilings are 512 queries, 1024 witnesses, 8192 bytes per SQL
+The ordinary compiler ceilings are 512 queries, 1024 witnesses, 8192 bytes per SQL
 statement, 4 MiB total SQL, 1000 rows and 64 KiB per provider response, 16 MiB
 total provider response bytes and a 600-second run deadline. Each query's
 `max_rows` and `max_bytes` can lower its limits; `min_rows` declares its minimum
@@ -119,6 +119,81 @@ Cancelling the client also does not prove immediate server cancellation. An
 authority requiring an unestablished hard monetary bound must withhold that
 execution. See [D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
 and [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/).
+
+### Committed private output
+
+Compiler version 2 adds an optional, closed `private_output` disposition to
+`D1ReadInventoryV1`. Existing inventories omit it and keep all ordinary limits
+and output behavior. An older binary rejects the new field. The pack, source
+loader and inventory schema version remain version 1.
+
+```json
+"private_output": {
+  "schema_version": 1,
+  "format": "workspace_d1_private_read_v1",
+  "max_artifact_bytes": 8388608,
+  "require_primary": true
+}
+```
+
+This disposition requires exactly one query, one statement, no dependencies or
+parameters, and exactly one declared result row (`min_rows = max_rows = 1`).
+The existing SQL/function/column/witness rules still apply. The query's entire
+response bound may be 512 through 8,388,608 bytes; the total response bound must
+equal it. Each text-cell bound is positive and no greater than the response
+bound. The artifact bound is separately 1 through 8,388,608 bytes. Framing,
+escaping and source/identity bindings count: a payload that fits a cell can
+still exceed either outer bound. Oversize output fails; it is never truncated
+into success. The deadline is 1 through 30 seconds.
+
+For this disposition the existing `call` requires `--out <new-private-file>`.
+The destination parent must already exist as a canonical, owned mode-0700
+directory. Missing output, an existing entry, links, or incompatible output
+flags fail before credential access. `--out` cannot enable private mode or
+override committed bounds. `--value-out` is not supported on D1 reads.
+
+Private execution sends `Accept-Encoding: identity`, refuses nonidentity
+responses, disables retries and redirects explicitly, and requires HTTP 200,
+empty `errors` and `messages`, one qualified result set/row and
+`served_by_primary: true`. Missing or false primary metadata fails closed. No
+session/bookmark input or cross-request freshness fence is introduced. A
+successful read does not prove no later write occurred.
+
+Duplicate JSON object keys at every outer-response depth and trailing JSON
+input are rejected before qualification. The full qualified provider object is
+retained; outer whitespace is not preserved. Text cells are opaque, so an
+application's inner JSON text retains duplicate keys, malformed content and
+whitespace for its own validator. Failed provider bodies are discarded.
+
+The monotonic deadline covers request, body read, parse, qualification and
+artifact preparation/publication, with checks around bounded synchronous work.
+Cancellation ends client work, without promising immediate server cancellation.
+The body reader retains at most its declared bound and detects the first excess
+chunk before parsing; the HTTP/TLS stack may temporarily buffer a larger chunk.
+There is no pagination, continuation, scan ceiling or hard currency guarantee.
+
+`D1PrivateReadArtifactV1` contains version/kind, a typed binding to the complete
+workspace contract, capability/catalog/build/profile/credential/query identities,
+UTC start/completion timestamps, qualified transport metadata, and the full
+`provider_response`. The transport records one attempted query, identity
+encoding, primary execution and `application_predicates_evaluated: false`.
+Its schema is owned by the public Rust types linked above. Application policy,
+schema, SQL, history bounds and provenance validation remain with the source owner.
+
+Publication stages mode-0600 bytes within the pinned private directory, syncs
+and reads them back, then atomically renames without replacement. Existing
+secret-file replacement behavior is unchanged. Failed stages clean only this
+invocation's matching temporary entry. A failure after publication preserves the
+file for reconciliation and reports incomplete custody, never a qualified
+artifact or an automatic replay.
+
+Normal `ResultEnvelopeV2` output and observation evidence contain only fixed
+classifications, identity bindings, structural counts and artifact path/byte
+length/SHA256. Provider values, provider diagnostics and value-derived hashes
+are absent. `performed` reports whether dispatch was attempted; `read_complete`
+requires both transport qualification and verified artifact publication. The
+artifact hash is external to its own bytes. Application predicates still require
+the owner's separate validator, and any later mutation requires its own authority.
 
 ## Public call and caller result
 

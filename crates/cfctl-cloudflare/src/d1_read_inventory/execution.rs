@@ -9,9 +9,195 @@ use serde_json::{Value, json};
 use super::{ValidatedD1ReadInventory, invalid, parameters, validate_inventory, value_allowed};
 use crate::{AuthCredential, Executor, Result, apply_credential, read_bounded_body};
 
+/// Not serializable or Debug: raw provider material cannot become an ordinary receipt.
+pub struct PrivateD1ReadResult {
+    pub attempted: bool,
+    pub classification: &'static str,
+    pub http_status: Option<u16>,
+    pub response_bytes: u64,
+    pub rows_read: u64,
+    pub provider_response: Option<Value>,
+    pub deadline: Instant,
+}
+
+impl Executor {
+    /// One private request; its monotonic deadline continues through publication.
+    pub async fn execute_private_d1_read<F>(
+        &self,
+        validated: &ValidatedD1ReadInventory,
+        credential: &AuthCredential,
+        mut reacquire: F,
+    ) -> Result<PrivateD1ReadResult>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        validate_inventory(&validated.contract.inventory)?;
+        let inventory = &validated.contract.inventory;
+        if inventory.private_output.is_none() {
+            return Err(invalid("committed private disposition required"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(inventory.limits.max_elapsed_seconds);
+        let mut result = PrivateD1ReadResult {
+            attempted: false,
+            classification: "source_or_credential_drift",
+            http_status: None,
+            response_bytes: 0,
+            rows_read: 0,
+            provider_response: None,
+            deadline,
+        };
+        if reacquire().is_err() {
+            return Ok(result);
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            result.classification = "run_deadline";
+            return Ok(result);
+        }
+        result.attempted = true;
+        result.classification = "transport_or_response_rejected";
+        let response = self
+            .send_inventory_query(
+                validated,
+                &inventory.queries[0],
+                &[],
+                credential,
+                remaining,
+                Some(&client),
+            )
+            .await;
+        if Instant::now() >= deadline {
+            result.classification = "run_deadline";
+            return Ok(result);
+        }
+        if let Ok((status, bytes, body)) = response {
+            result.http_status = Some(status);
+            result.response_bytes = bytes;
+            result.classification = "provider_shape_or_output_policy_rejected";
+            if let Ok(rows_read) = qualify_private_receipt(validated, status, &body) {
+                if Instant::now() >= deadline {
+                    result.classification = "run_deadline";
+                } else if reacquire().is_err() {
+                    result.classification = "source_or_credential_drift";
+                } else {
+                    result.rows_read = rows_read;
+                    result.provider_response = Some(body);
+                    result.classification = "complete_read";
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+pub fn qualify_private_receipt(
+    validated: &ValidatedD1ReadInventory,
+    status: u16,
+    body: &Value,
+) -> Result<u64> {
+    validate_inventory(&validated.contract.inventory)?;
+    if validated.contract.inventory.private_output.is_none()
+        || body.pointer("/result/0/meta/served_by_primary") != Some(&Value::Bool(true))
+        || ["errors", "messages"].iter().any(|key| {
+            body.get(*key)
+                .and_then(Value::as_array)
+                .is_none_or(|a| !a.is_empty())
+        })
+    {
+        return Err(invalid("private response qualification rejected"));
+    }
+    let query = &validated.contract.inventory.queries[0];
+    if serde_json::to_vec(body)
+        .map_err(cfctl_core::CoreError::Serialization)?
+        .len() as u64
+        > query.output.max_bytes
+    {
+        return Err(invalid("private response byte bound rejected"));
+    }
+    qualify_receipt(query, status, body)
+        .map_err(|()| invalid("private response qualification rejected"))
+}
+
+/// Reject duplicate object keys at every depth and trailing input before Value
+/// construction can collapse keys. Strings (including application JSON TEXT)
+/// are opaque; serde's normal recursion limit remains enabled.
+fn strict_json(bytes: &[u8]) -> std::result::Result<Value, serde_json::Error> {
+    use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+    struct Strict(Value);
+    impl<'de> Deserialize<'de> for Strict {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct StrictVisitor;
+            impl<'de> Visitor<'de> for StrictVisitor {
+                type Value = Strict;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("duplicate-free JSON")
+                }
+                fn visit_bool<E: serde::de::Error>(
+                    self,
+                    v: bool,
+                ) -> std::result::Result<Strict, E> {
+                    Ok(Strict(json!(v)))
+                }
+                fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Strict, E> {
+                    Ok(Strict(json!(v)))
+                }
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Strict, E> {
+                    Ok(Strict(json!(v)))
+                }
+                fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Strict, E> {
+                    Ok(Strict(json!(v)))
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Strict, E> {
+                    Ok(Strict(json!(v)))
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Strict, E> {
+                    Ok(Strict(Value::Null))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut a: A,
+                ) -> std::result::Result<Strict, A::Error> {
+                    let mut v = Vec::new();
+                    while let Some(Strict(item)) = a.next_element()? {
+                        v.push(item);
+                    }
+                    Ok(Strict(Value::Array(v)))
+                }
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut a: A,
+                ) -> std::result::Result<Strict, A::Error> {
+                    let mut v = serde_json::Map::new();
+                    while let Some(key) = a.next_key::<String>()? {
+                        if v.contains_key(&key) {
+                            return Err(serde::de::Error::custom("duplicate JSON key"));
+                        }
+                        let Strict(item) = a.next_value()?;
+                        v.insert(key, item);
+                    }
+                    Ok(Strict(Value::Object(v)))
+                }
+            }
+            d.deserialize_any(StrictVisitor)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let Strict(value) = Strict::deserialize(&mut decoder)?;
+    decoder.end()?;
+    Ok(value)
+}
+
 impl Executor {
     /// Each query crosses the existing credential/HTTP boundary once. There is
     /// no pagination, retry, file sink or generic-SQL capability involved.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "retain the existing population gate and private-path refusal together"
+    )]
     pub async fn execute_d1_read_inventory<F>(
         &self,
         validated: &ValidatedD1ReadInventory,
@@ -22,6 +208,11 @@ impl Executor {
         F: FnMut() -> Result<()>,
     {
         validate_inventory(&validated.contract.inventory)?;
+        if validated.contract.inventory.private_output.is_some() {
+            return Err(invalid(
+                "private D1 reads require the private artifact execution path",
+            ));
+        }
         reacquire()?;
         let inventory = &validated.contract.inventory;
         let start = Instant::now();
@@ -98,7 +289,14 @@ impl Executor {
             }
             let timeout = remaining.min(Duration::from_secs(30));
             let response = self
-                .send_inventory_query(validated, query, &parameters.values, credential, timeout)
+                .send_inventory_query(
+                    validated,
+                    query,
+                    &parameters.values,
+                    credential,
+                    timeout,
+                    None,
+                )
                 .await;
             let observation = record_response(query, response, parameters.provenance, &mut result);
             if observation.status == D1ReadStatusV1::Rejected {
@@ -123,6 +321,7 @@ impl Executor {
         parameters: &[Value],
         credential: &AuthCredential,
         timeout: Duration,
+        private_client: Option<&reqwest::Client>,
     ) -> Result<(u16, u64, Value)> {
         let operation = &validated.contract.operation;
         let mut url = self.builder.base_url.clone();
@@ -142,16 +341,31 @@ impl Executor {
         }
         // upload_client is the existing non-redirecting Executor client. Both
         // authentication and body limits use the canonical shared primitives.
-        let outgoing = apply_credential(
-            self.upload_client
-                .post(url)
-                .timeout(timeout)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .json(&json!({"sql":query.sql,"params":parameters})),
-            credential,
-        )?;
+        let mut request = private_client
+            .unwrap_or(&self.upload_client)
+            .post(url)
+            .timeout(timeout)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&json!({"sql":query.sql,"params":parameters}));
+        if private_client.is_some() {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        let outgoing = apply_credential(request, credential)?;
         let response = outgoing.send().await?;
         let status = response.status().as_u16();
+        if private_client.is_some()
+            && (status != 200
+                || response
+                    .headers()
+                    .get_all(reqwest::header::CONTENT_ENCODING)
+                    .iter()
+                    .any(|v| {
+                        !v.to_str()
+                            .is_ok_and(|s| s.trim().eq_ignore_ascii_case("identity"))
+                    }))
+        {
+            return Ok((status, 0, Value::Null));
+        }
         let media = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -166,7 +380,11 @@ impl Executor {
             // Failure bodies can echo SQL or private data; never return them.
             return Ok((status, bytes.len() as u64, Value::Null));
         }
-        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let body = if private_client.is_some() {
+            strict_json(&bytes).unwrap_or(Value::Null)
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
         Ok((status, bytes.len() as u64, body))
     }
 }

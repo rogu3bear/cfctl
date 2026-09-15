@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "query_count": 1,
+  "witness_count": 1,
+  "tables": [
+    {
+      "name": "items",
+      "columns": [
+        "id",
+        "status"
+      ]
+    }
+  ],
+  "functions": [
+    "count"
+  ],
+  "limits": {
+    "max_total_response_bytes": 131072,
+    "max_elapsed_seconds": 30,
+    "stop_after_rows_read": 10000
+  },
+  "queries": [
+    {
+      "id": "table",
+      "sql": "SELECT name FROM sqlite_master WHERE type='table' AND name='items';",
+      "sha256": "sha256:899373db79aa0d9753d95e2ecdc063e7abe83471eb21673d05dfb19571bcf95c",
+      "phase": "prerequisites",
+      "requires": [],
+      "output": {
+        "columns": [
+          {
+            "name": "name",
+            "kind": "text",
+            "nullable": false,
+            "max_bytes": 65536,
+            "allowed_values": null
+          }
+        ],
+        "max_rows": 1,
+        "max_bytes": 131072,
+        "min_rows": 1
+      },
+      "witnesses": [
+        {
+          "id": "table",
+          "ordinal": 1,
+          "group": "example",
+          "source_reference": "source.txt"
+        }
+      ]
+    }
+  ],
+  "private_output": {
+    "schema_version": 1,
+    "format": "workspace_d1_private_read_v1",
+    "max_artifact_bytes": 262144,
+    "require_primary": true
+  }
+}

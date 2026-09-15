@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "kind": "workspace_d1_private_read_v1",
+  "binding": {
+    "contract": {
+      "repository_root": "/synthetic-owner",
+      "repository_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "repository_tree": "cccccccccccccccccccccccccccccccccccccccc",
+      "repository_origin": "https://example.invalid/source.git",
+      "operation_pack_sha256": "sha256:6f76d17533d909acd3ffd7052f72942a9c33683691c356869057572ad8aea2ac",
+      "operation": {
+        "id": "example.d1-read-inventory",
+        "title": "Read synthetic private data",
+        "description": "Synthetic wire example only",
+        "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "database_id": "11111111-2222-4333-8444-555555555555",
+        "profile_id": "example-read",
+        "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source": [
+          {
+            "path": "source.txt",
+            "sha256": "sha256:ec809354a9e458cfe45755e2a9887885b496d11957f67f8cd25daea5ba374985"
+          }
+        ],
+        "inventory_path": "inventory.json",
+        "inventory_sha256": "sha256:2e0681bdef4ddb982f45cb5fc4b1f89b9bf8ebdd3d4497e7a379f8b2890166db"
+      },
+      "inventory": {
+        "schema_version": 1,
+        "query_count": 1,
+        "witness_count": 1,
+        "tables": [
+          {
+            "name": "items",
+            "columns": [
+              "id",
+              "status"
+            ]
+          }
+        ],
+        "functions": [
+          "count"
+        ],
+        "limits": {
+          "max_total_response_bytes": 131072,
+          "max_elapsed_seconds": 30,
+          "stop_after_rows_read": 10000
+        },
+        "queries": [
+          {
+            "id": "table",
+            "sql": "SELECT name FROM sqlite_master WHERE type='table' AND name='items';",
+            "sha256": "sha256:899373db79aa0d9753d95e2ecdc063e7abe83471eb21673d05dfb19571bcf95c",
+            "phase": "prerequisites",
+            "requires": [],
+            "output": {
+              "columns": [
+                {
+                  "name": "name",
+                  "kind": "text",
+                  "nullable": false,
+                  "max_bytes": 65536,
+                  "allowed_values": null,
+                  "min_integer": null,
+                  "max_integer": null
+                }
+              ],
+              "max_rows": 1,
+              "max_bytes": 131072,
+              "min_rows": 1
+            },
+            "witnesses": [
+              {
+                "id": "table",
+                "ordinal": 1,
+                "group": "example",
+                "source_reference": "source.txt"
+              }
+            ],
+            "parameters": []
+          }
+        ],
+        "private_output": {
+          "schema_version": 1,
+          "format": "workspace_d1_private_read_v1",
+          "max_artifact_bytes": 262144,
+          "require_primary": true
+        }
+      }
+    },
+    "capability_id": "example.d1-read-inventory",
+    "catalog_schema_hash": "sha256:840bebb975367d841fd2b87a614277cafe9fa10cc5fc1504f94de072182910dd",
+    "contract_sha256": "sha256:6126ea8bd8842f10e3f2846eb8afe20c68db3459d7e04215974ffcd074d402af",
+    "build": {
+      "schema_version": 1,
+      "version": "1.3.1",
+      "git_commit": "df24bb7b4adbac3f4cab514defdca2d4595aeaba",
+      "identity_source": "git_checkout"
+    },
+    "profile_id": "example-read",
+    "credential_generation_id": "22222222-2222-4222-8222-222222222222",
+    "query_id": "table",
+    "query_sha256": "sha256:899373db79aa0d9753d95e2ecdc063e7abe83471eb21673d05dfb19571bcf95c"
+  },
+  "started_at": "2026-09-15T00:00:00Z",
+  "completed_at": "2026-09-15T00:00:01Z",
+  "transport": {
+    "http_status": 200,
+    "response_bytes": 273,
+    "content_encoding": "identity",
+    "attempted_queries": 1,
+    "read_complete": true,
+    "served_by_primary": true,
+    "application_predicates_evaluated": false
+  },
+  "provider_response": {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": [
+      {
+        "success": true,
+        "results": [
+          {
+            "name": " {\"duplicate\":1,\"duplicate\":2} synthetic 雪 "
+          }
+        ],
+        "meta": {
+          "rows_read": 1,
+          "rows_written": 0,
+          "changes": 0,
+          "changed_db": false,
+          "duration": 0.1,
+          "total_attempts": 1,
+          "served_by_primary": true
+        }
+      }
+    ]
+  }
+}
