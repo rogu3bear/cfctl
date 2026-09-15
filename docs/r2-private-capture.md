@@ -65,3 +65,20 @@ custom metadata and conditional replacement contract. The documented S3 and
 Workers binding interfaces are separate transports, not interchangeable headers
 on the existing REST route. [Conditional private restore](r2-private-restore.md)
 uses its own native S3 transport and consumed-plan contract.
+
+After an attempted request, an incomplete capture retains
+`diagnostic: private_capture_incomplete` and all existing incomplete flags. Its
+`failure` contains only closed `stage` and `reason` codes, the one-based
+`request_ordinal`, and optional `provider_http_status`. The status is reset to
+null before each request and records actual received headers; it is not a claim
+that the whole capture succeeded. Top-level `status: 0` is synthetic and is
+explicitly marked `status_is_provider_response: false`.
+
+Stages distinguish initial inventory, object reads, final inventory, manifest,
+and local verification. Reasons distinguish transport, HTTP response, body read
+or bound, JSON, envelope, pagination metadata/cursor/terminal evidence, object
+identity/size, storage, drift, and window failures. Private bodies, keys, URLs,
+provider messages, and credentials never enter these diagnostics. A diagnostic
+from a later request cannot establish the cause of a historical failed capture.
+Missing/null pagination remains incomplete; this reporting change adds no empty
+bucket shortcut or permission to retry.

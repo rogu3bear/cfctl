@@ -1,7 +1,8 @@
 //! Native private capture storage and authenticated local revalidation.
 use super::{CliError, Result};
 use cfctl_cloudflare::{
-    CallInput, CloudflareError, CloudflareResponseV1, Executor, r2_recovery::CaptureFiles,
+    CallInput, CloudflareError, CloudflareResponseV1, Executor,
+    r2_recovery::{CaptureFiles, CaptureProgress, CaptureReason, CaptureStage},
 };
 use cfctl_core::{
     CapabilityV1, EvidenceClass, OperationalProofOutcomeV1, ResultEnvelopeV2, VerificationState,
@@ -60,7 +61,10 @@ pub(super) async fn capture(
         .capture_private_r2_bucket_with_progress(capability, input, credential, &files, &progress)
         .await;
     let checked = captured.map_err(CliError::from).and_then(|receipt| {
+        progress.stage(CaptureStage::LocalVerification);
+        progress.expect(CaptureReason::LocalIntegrity);
         verify_private_files(&files.0, &receipt)?;
+        progress.expect(CaptureReason::WindowExpired);
         receipt.window.validate(chrono::Utc::now()).map_err(|_| {
             CliError::Input("private capture verification exceeded its window".into())
         })?;
@@ -77,17 +81,24 @@ pub(super) async fn capture(
             cf_ray: None,
         }),
         Err(error) if progress.requests() == 0 => Err(error),
-        Err(_) => Ok(CloudflareResponseV1 {
-            status: 0,
-            success: false,
-            result: json!({"capture_complete":false, "body_returned":false, "recovery_ready":false,
-                "attempted_provider_requests":progress.requests(), "diagnostic":"private_capture_incomplete",
-                "next_action":"preserve private partial files; inspect the window, bounds and provider contract before a separately admitted attempt"}),
-            errors: vec![],
-            result_info: None,
-            etag: None,
-            cf_ray: None,
-        }),
+        Err(_) => Ok(incomplete_response(&progress)),
+    }
+}
+
+fn incomplete_response(progress: &CaptureProgress) -> CloudflareResponseV1 {
+    CloudflareResponseV1 {
+        // The native operation has no single provider response. Real status, if
+        // observed, is tied to its request ordinal in the diagnostic below.
+        status: 0,
+        success: false,
+        result: json!({"capture_complete":false, "body_returned":false, "recovery_ready":false,
+            "attempted_provider_requests":progress.requests(), "diagnostic":"private_capture_incomplete",
+            "status_is_provider_response":false, "failure":progress.diagnostic(),
+            "next_action":"preserve private partial files; inspect the window, bounds and provider contract before a separately admitted attempt"}),
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
     }
 }
 

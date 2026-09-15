@@ -293,3 +293,151 @@ fn native_capture_provenance_joins_exact_target_window_and_private_files() {
     fs::write(private_path.join("object-0000.bin"), b"evil").expect("change captured bytes");
     assert!(verify(&store, capability, &input, &private_path).is_err());
 }
+
+#[tokio::test]
+async fn capture_failure_diagnostic_is_safe_in_public_output_and_evidence() {
+    for complete in [false, true] {
+        let (origin, server) = diagnostic_server(complete).await;
+        let root = tempfile::tempdir_in(
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp"),
+        )
+        .expect("root");
+        let parent_path = root.path().join("custody");
+        PrivateDirectory::create(&parent_path).expect("private parent");
+        let store = diagnostic_store(&root.path().join("runtime"));
+        let mut catalog = cfctl_catalog::CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".into(),
+            source_hash: String::new(),
+            schema_hash: String::new(),
+            capabilities: std::collections::BTreeMap::new(),
+        };
+        cfctl_catalog::ingest_native_control_capabilities(&mut catalog).expect("catalog");
+        let cap = catalog
+            .get(cfctl_core::r2_recovery::CAPTURE_ID)
+            .expect("capture capability");
+        let window = CaptureWindowV1 {
+            window_id: uuid::Uuid::new_v4().to_string(),
+            opened_at: Utc::now() - Duration::seconds(1),
+            expires_at: Utc::now() + Duration::seconds(60),
+            recovery_binding_sha256: "b".repeat(64),
+        };
+        let input = CallInput {
+            selectors: json!({"account_id":"a".repeat(32),"bucket_name":"fixture-bucket"}),
+            query: json!({}),
+            body: Some(json!(window)),
+            ..CallInput::default()
+        };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .expect("client");
+        let executor = cfctl_cloudflare::Executor::new(client, &origin).expect("executor");
+        let response = super::capture(
+            &executor,
+            cap,
+            &input,
+            &cfctl_auth::AuthCredential::Bearer {
+                token: DIAGNOSTIC_CANARY.into(),
+            },
+            &parent_path.join("snapshot"),
+        )
+        .await
+        .expect("projected response");
+        assert_eq!(response.success, complete);
+        if complete {
+            assert_eq!(response.status, 200);
+            assert!(response.result.get("failure").is_none());
+        } else {
+            assert_eq!(response.status, 0);
+            assert_eq!(response.result["status_is_provider_response"], false);
+            assert_eq!(response.result["diagnostic"], "private_capture_incomplete");
+            assert_eq!(response.result["capture_complete"], false);
+            assert_eq!(
+                response.result["failure"],
+                json!({"stage":"initial_inventory","reason":"pagination_metadata","request_ordinal":1,"provider_http_status":200})
+            );
+        }
+        let public = serde_json::to_value(response).expect("public output");
+        assert!(!public.to_string().contains(DIAGNOSTIC_CANARY));
+        let evidence = store
+            .write_observation_evidence(cfctl_core::EvidenceClass::LiveRead, &public)
+            .expect("evidence");
+        let stored = store
+            .read_evidence_value(&evidence.content_hash)
+            .expect("read evidence");
+        assert!(
+            !serde_json::to_string(&stored)
+                .expect("evidence JSON")
+                .contains(DIAGNOSTIC_CANARY)
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("server deadline")
+            .expect("server");
+    }
+}
+
+const DIAGNOSTIC_CANARY: &str = "private-capture-output-canary";
+
+async fn diagnostic_server(complete: bool) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        for _ in 0..if complete { 2 } else { 1 } {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.expect("read");
+                assert!(n > 0 && request.len() < 16384);
+                request.extend_from_slice(&buf[..n]);
+            }
+            let info = if complete {
+                json!({"per_page":100,"delimited":[],"cursor":"","is_truncated":false})
+            } else {
+                serde_json::Value::Null
+            };
+            let body = json!({"success":true,"errors":[],"result":[],"result_info":info,"private_unknown":DIAGNOSTIC_CANARY}).to_string();
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(wire.as_bytes()).await.expect("response");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), listener.accept())
+                .await
+                .is_err(),
+            "no replay"
+        );
+    });
+    (origin, server)
+}
+
+fn diagnostic_store(path: &std::path::Path) -> StateStore {
+    use cfctl_auth::{EvidenceKeyManager, MemorySecretStore, SecretBackend};
+    let initial = StateStore::open(RuntimePaths::from_root(path)).expect("store");
+    let manager = std::sync::Arc::new(
+        EvidenceKeyManager::new(
+            std::sync::Arc::new(MemorySecretStore::default()),
+            initial.evidence_location_identity(),
+            SecretBackend::Memory,
+        )
+        .expect("manager"),
+    );
+    let identity = format!("sha256:{}", "a".repeat(64));
+    manager.initialize(&identity).expect("key");
+    initial
+        .initialize_evidence_root_identity(&identity)
+        .expect("root identity");
+    initial
+        .with_evidence_authenticator(manager)
+        .expect("authenticated store")
+}
