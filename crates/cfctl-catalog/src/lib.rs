@@ -46,7 +46,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 mod access_create;
+mod farm_content_snapshot;
 mod pages_artifact;
+pub use farm_content_snapshot::capability as farm_content_snapshot_capability;
 mod pages_projects;
 pub use pages_artifact::capability as pages_artifact_reproduction_capability;
 mod worker_frozen_upload;
@@ -2677,6 +2679,7 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
     }
     for capability in vec![
         pages_artifact::capability(),
+        farm_content_snapshot::capability(),
         workspace_d1_qualification_observer_capability(),
         workspace_d1_qualification_producer_capability(),
         worker_deployment_plan_capability(),

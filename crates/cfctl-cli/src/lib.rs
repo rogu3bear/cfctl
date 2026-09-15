@@ -656,7 +656,7 @@ pub struct CallArgs {
         long,
         value_name = "NEW_PATH",
         conflicts_with = "value_out",
-        help = "Write bounded analytics/logs/D1 export to a new mode-0600 file, or private R2 capture to a new mode-0700 directory; return a hash receipt"
+        help = "Write bounded analytics/logs/D1 export/Farm provenance to a new mode-0600 file, or private R2 capture to a new mode-0700 directory; return a hash receipt"
     )]
     pub out: Option<PathBuf>,
     #[arg(

@@ -605,6 +605,16 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     if capability.d1_full_export.is_some() {
         argv.extend(["--out".to_owned(), "<new-mode-0600-sql-path>".to_owned()]);
     }
+    if capability.id == cfctl_core::farm_content_snapshot::CAPABILITY_ID {
+        argv.extend([
+            "--profile".to_owned(),
+            "<farm-d1-read-profile>".to_owned(),
+            "--account".to_owned(),
+            cfctl_core::farm_content_snapshot::ACCOUNT_ID.to_owned(),
+            "--out".to_owned(),
+            "<new-file-in-owned-mode-0700-directory>".to_owned(),
+        ]);
+    }
     argv.push("--json".to_owned());
     argv
 }

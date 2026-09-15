@@ -2,6 +2,7 @@
 mod access_create;
 pub mod d1_read_inventory;
 mod d1_sql;
+pub mod farm_content_snapshot;
 mod oauth_scopes;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;
 pub mod pages_projects;
