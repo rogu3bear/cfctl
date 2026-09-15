@@ -12,6 +12,7 @@ use chrono::Utc;
 pub(super) const RESTORE_ID: &str = "d1-restore-exact-bookmark";
 const STRATEGY: &str = "d1_current_bookmark_equals_restore_result_bookmark";
 const CONTEXT: &str = "d1_restore_execution";
+const UNQUALIFIED: &str = "d1_restore_execution_unqualified";
 type Checked<T> = std::result::Result<T, &'static str>;
 
 fn checkpoint(plan: &PlanV1, stage: TransactionStageV1) -> Checked<&TransactionCheckpointV1> {
@@ -260,11 +261,19 @@ pub(super) fn attach_verification_context(
         }
         provenance(&current, &descriptor.content_hash)
     };
-    verification[CONTEXT] = bind().map_err(|reason| {
-        CliError::Input(format!(
-            "D1 restore verification context is unqualified: {reason}"
-        ))
-    })?;
+    match bind() {
+        Ok(context) => verification[CONTEXT] = context,
+        // A failure stays durable even when its execution cannot be bound; the
+        // recorded reason leaves it unqualified and unreconcilable.
+        Err(reason) if verification["passed"] != true => {
+            verification[UNQUALIFIED] = json!(reason);
+        }
+        Err(reason) => {
+            return Err(CliError::Input(format!(
+                "D1 restore verification context is unqualified: {reason}"
+            )));
+        }
+    }
     Ok(())
 }
 

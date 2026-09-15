@@ -120,7 +120,6 @@ pub(super) async fn execute(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(reject)?;
-    let mut sink = directory.create_new_file(name)?;
     let secrets = platform_secrets(store);
     let credential = fresh_credential(profile, &secrets).await?;
     let executor = Executor::new(http_client()?, BASE_URL)?;
@@ -129,6 +128,7 @@ pub(super) async fn execute(
     {
         return Err(reject());
     }
+    let mut sink = directory.create_new_file(name)?;
     let started_at = Utc::now();
     let response = executor
         .diagnose_registered_d1_query(&validated, &request.query_id, &credential)

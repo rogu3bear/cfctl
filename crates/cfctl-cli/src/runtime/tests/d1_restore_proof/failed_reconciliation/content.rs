@@ -55,6 +55,19 @@ fn export(
     )
 }
 
+/// Object keys only, so the published examples track the producer's structure.
+fn field_shape(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, child)| (key.clone(), field_shape(child)))
+                .collect(),
+        ),
+        _ => Value::Null,
+    }
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -131,6 +144,19 @@ async fn d1_content_reconciliation_joins_native_failed_producer_and_private_expo
         false
     );
     assert_eq!(result.result["limits"]["write_authority_granted"], false);
+    let example: cfctl_core::d1_reconciliation::ReconcileRequest = serde_json::from_str(
+        include_str!("../../fixtures/d1-reconciliation-request.json"),
+    )
+    .expect("request example matches the closed contract");
+    crate::runtime::d1_reconciliation::validate_window(
+        &example.release_binding,
+        example.release_binding.window.opened_at,
+    )
+    .expect("request example window is admissible");
+    let documented: Value =
+        serde_json::from_str(include_str!("../../fixtures/d1-reconciliation-result.json"))
+            .expect("result example");
+    assert_eq!(field_shape(&documented), field_shape(&result.result));
     assert_eq!(
         fixture
             .store

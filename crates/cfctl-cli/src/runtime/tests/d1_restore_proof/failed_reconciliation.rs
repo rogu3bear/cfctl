@@ -76,6 +76,29 @@ async fn failed_restore_verifier_error_keeps_authenticated_execution_but_cannot_
     fixture.assert_unqualified("restore_lifecycle_not_verified_closed");
 }
 
+#[test]
+fn unbindable_failure_is_still_recorded_but_unbindable_success_fails_closed() {
+    let root = tempfile::tempdir().expect("root");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
+    // This plan never reached verification, so its execution cannot be bound.
+    let plan = pending_plan(&store);
+    let strategy = plan.capability.verification.strategy.clone();
+    let mut failure = json!({"strategy":strategy,"passed":false,"error":"verifier unavailable"});
+    crate::runtime::d1_restore_proof::attach_verification_context(&store, &plan, &mut failure)
+        .expect("failed verification stays recordable");
+    assert!(failure.get(CONTEXT).is_none());
+    assert_eq!(
+        failure["d1_restore_execution_unqualified"],
+        "restore_verification_producer_mismatch"
+    );
+    let mut success = json!({"strategy":strategy,"passed":true,"basis":"matched","readback":{}});
+    assert!(
+        crate::runtime::d1_restore_proof::attach_verification_context(&store, &plan, &mut success)
+            .is_err()
+    );
+    assert!(success.get(CONTEXT).is_none());
+}
+
 fn history(fixture: &Fixture) -> Result<Value> {
     let document = fixture
         .store
