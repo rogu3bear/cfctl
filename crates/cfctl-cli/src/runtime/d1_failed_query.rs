@@ -15,6 +15,22 @@ use cfctl_storage::PrivateDirectory;
 use sha2::{Digest, Sha256};
 use std::{io::Write, path::Path};
 
+#[cfg(test)]
+mod tests;
+
+fn retain_response(
+    directory: &PrivateDirectory,
+    name: &str,
+    sink: &mut std::fs::File,
+    bytes: &[u8],
+) -> bool {
+    sink.write_all(bytes).and_then(|()| sink.sync_all()).is_ok()
+        && directory.sync().is_ok()
+        && directory
+            .read(name, 65_536)
+            .is_ok_and(|retained| retained.as_deref() == Some(bytes))
+}
+
 fn reject() -> CliError {
     CliError::Input("D1 diagnostic requires authenticated rejected evidence, unchanged registered SQL and exact current account/profile/generation plus a new private --out file".into())
 }
@@ -127,10 +143,7 @@ pub(super) async fn execute(
         ),
         Err(_) => (None, Vec::new(), false, Vec::new(), false),
     };
-    let sink_complete = sink
-        .write_all(&bytes)
-        .and_then(|()| sink.sync_all())
-        .is_ok();
+    let sink_complete = retain_response(&directory, name, &mut sink, &bytes);
     let custody_current = directory.sync().is_ok()
         && load_workspace_capability(store, &capability.id)
             .is_ok_and(|current| current.as_ref() == Some(&capability))

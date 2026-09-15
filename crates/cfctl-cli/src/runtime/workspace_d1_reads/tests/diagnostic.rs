@@ -31,7 +31,7 @@ async fn diagnostic_rejects_rebound_or_unrejected_history_before_credentials_or_
     observation.rows_read = 1;
     let rejected = &mut observation.results[1];
     rejected.status = D1ReadStatusV1::Rejected;
-    rejected.classification = "provider_http_error".into();
+    rejected.classification = "provider_shape_or_output_policy_rejected".into();
     rejected.http_status = Some(400);
     rejected.rows_read = None;
     rejected.receipt = None;

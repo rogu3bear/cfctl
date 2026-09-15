@@ -182,7 +182,7 @@ pub(super) async fn call_command(
         && capability.id != cfctl_core::d1_reconciliation::DIAGNOSTIC_ID
     {
         return Err(CliError::Input(
-            "`--out` is restricted to governed bounded reads, D1 exports/diagnostics, and private R2 capture"
+            "`--out` is restricted to bounded analytics, governed R2 log retrieval, D1 full export/diagnostics, and private R2 capture"
                 .to_owned(),
         ));
     }
