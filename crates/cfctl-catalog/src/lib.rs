@@ -4,6 +4,7 @@ mod request_schema;
 use request_schema::{normalize_request_schema_contract, request_schema_contract};
 mod email_preferences;
 mod persisted_rulesets;
+mod response_header_rule;
 mod response_selection;
 
 mod r2_private;
@@ -4972,6 +4973,7 @@ fn finalize_telemetry_mutations(snapshot: &mut CatalogSnapshot) {
     finalize_logpush_lifecycle(snapshot);
     finalize_security_response_lifecycle(snapshot);
     finalize_custom_waf_ruleset_lifecycle(snapshot);
+    response_header_rule::finalize(snapshot);
     finalize_waf_security_response_lifecycle(snapshot);
     finalize_rate_limit_lifecycle(snapshot);
     finalize_notification_policy_lifecycle(snapshot);

@@ -71,6 +71,7 @@ mod r2_restore_projection;
 mod read_execution;
 mod rectification;
 mod registry_commands;
+mod response_header_rule;
 mod secret_io;
 mod security_action_input;
 mod security_action_state;

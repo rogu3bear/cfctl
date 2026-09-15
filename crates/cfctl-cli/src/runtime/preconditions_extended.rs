@@ -771,6 +771,9 @@ pub(super) fn validate_same_path_prior_state_receipt(
     plan: &PlanV1,
     receipt: &Value,
 ) -> Result<Value> {
+    if plan.capability.id == cfctl_core::response_header_rule::ID {
+        return super::response_header_rule::restore_definition(plan, receipt);
+    }
     let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
         CliError::Input(
             "same-path rollback plan omitted its hash-bound readback contract".to_owned(),
@@ -942,8 +945,9 @@ pub(super) fn validate_same_path_prior_state_receipt(
 }
 
 pub(super) fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
-    let declares_same_path_state = plan.capability.rollback.strategy.as_deref()
-        == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+    let declares_same_path_state = plan.capability.id == cfctl_core::response_header_rule::ID
+        || plan.capability.rollback.strategy.as_deref()
+            == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
         || (access_application_login_methods_contract_supported(&plan.capability)
             && !plan.capability.rollback.supported
             && plan.capability.rollback.strategy.is_none());

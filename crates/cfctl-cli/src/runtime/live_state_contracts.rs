@@ -403,6 +403,9 @@ pub(super) fn dns_record_routing_contract_supported(capability: &CapabilityV1) -
 }
 
 pub(super) fn should_bind_same_path_prior_state(capability: &CapabilityV1) -> bool {
+    if capability.id == cfctl_core::response_header_rule::ID {
+        return cfctl_core::response_header_rule::supported(capability);
+    }
     capability.mutating
         && matches!(capability.method.as_str(), "PATCH" | "PUT")
         && matches!(

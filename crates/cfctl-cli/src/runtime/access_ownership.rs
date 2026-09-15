@@ -443,6 +443,12 @@ pub(super) async fn read_live_same_path_prior_state(
     account_id: &str,
     credential: &AuthCredential,
 ) -> Result<(Value, EvidenceV1)> {
+    if capability.id == cfctl_core::response_header_rule::ID {
+        return super::response_header_rule::read_prior(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await;
+    }
     if !requires_same_path_state_precondition(capability) {
         return Err(CliError::Input(
             "mutation drifted from its governed same-path prior-state contract".to_owned(),

@@ -11,6 +11,7 @@ pub mod r2_recovery;
 pub mod r2_restore;
 mod r2_s3;
 mod read_dispatch;
+mod response_header_rule;
 use d1_sql::reviewed_schema_statement_count;
 mod worker_version_artifact;
 pub use access_create::{
@@ -4210,6 +4211,11 @@ impl Executor {
             .await;
         }
 
+        if strategy == cfctl_core::response_header_rule::VERIFY {
+            return self
+                .verify_response_header_rule(plan, apply_response, input, credential)
+                .await;
+        }
         if is_delete_verifier(strategy) {
             return self
                 .verify_resource_delete(plan, apply_response, input, credential)
@@ -12549,6 +12555,21 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    if capability.id == cfctl_core::response_header_rule::ID
+        && capability.verification.strategy == cfctl_core::response_header_rule::VERIFY
+        && (!cfctl_core::response_header_rule::supported(capability)
+            || input.if_match.is_some()
+            || input.if_none_match.is_some()
+            || !input
+                .body
+                .as_ref()
+                .is_some_and(cfctl_core::response_header_rule::valid_body))
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "targeted response-header rule request rejected".into(),
+        ));
+    }
+
     pages_projects::validate(capability, input)?;
     if capability.workspace_d1_read_inventory.is_some() {
         d1_read_inventory::validate(capability, input)?;
