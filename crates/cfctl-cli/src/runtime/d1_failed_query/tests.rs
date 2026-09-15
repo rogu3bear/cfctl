@@ -45,7 +45,7 @@ fn vanished_replaced_or_nonprivate_output_is_incomplete_after_fd_write() {
                     .expect("replacement body");
             }
             "public-mode" => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("mode drift")
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("mode drift");
             }
             "hardlink" => fs::hard_link(&path, root.path().join("alias.json")).expect("link drift"),
             _ => unreachable!(),
