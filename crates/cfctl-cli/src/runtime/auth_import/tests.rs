@@ -87,6 +87,54 @@ fn token_file() -> tempfile::NamedTempFile {
     file
 }
 
+fn accept_verification_stream(listener: &TcpListener) -> std::net::TcpStream {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("verification fixture did not receive request: {error}"),
+        }
+    };
+    // macOS inherits the listener's nonblocking mode on accepted sockets.
+    stream
+        .set_nonblocking(false)
+        .expect("blocking fixture stream");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bounded read");
+    stream
+}
+
+#[test]
+fn accepted_verification_stream_waits_for_delayed_header() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback fixture");
+    let address = listener.local_addr().expect("fixture address");
+    listener.set_nonblocking(true).expect("bounded listener");
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = accept_verification_stream(&listener);
+        accepted_tx.send(()).expect("accepted connection");
+        let mut first_header_byte = [0_u8];
+        stream
+            .read_exact(&mut first_header_byte)
+            .expect("wait for delayed header within existing timeout");
+        first_header_byte
+    });
+    let mut client = std::net::TcpStream::connect(address).expect("fixture connection");
+    accepted_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("server accepted before header was sent");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    client.write_all(b"G").expect("delayed header byte");
+    assert_eq!(server.join().expect("fixture read completed"), *b"G");
+}
+
 fn verification_server(status: u16, result: &Value) -> (Executor, JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback fixture");
     let address = listener.local_addr().expect("fixture address");
@@ -94,22 +142,7 @@ fn verification_server(status: u16, result: &Value) -> (Executor, JoinHandle<Str
     let body =
         json!({"success":status == 200,"errors":[],"messages":[],"result":result}).to_string();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("verification fixture did not receive request: {error}"),
-            }
-        };
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .expect("bounded read");
+        let mut stream = accept_verification_stream(&listener);
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
             let mut byte = [0_u8];
