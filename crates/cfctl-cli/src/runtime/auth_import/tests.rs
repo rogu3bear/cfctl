@@ -119,6 +119,11 @@ fn accepted_verification_stream_waits_for_delayed_header() {
     let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let mut stream = accept_verification_stream(&listener);
+        let flags = rustix::fs::fcntl_getfl(&stream).expect("accepted socket flags");
+        assert!(
+            !flags.contains(rustix::fs::OFlags::NONBLOCK),
+            "accepted fixture socket must be blocking before client data"
+        );
         accepted_tx.send(()).expect("accepted connection");
         let mut first_header_byte = [0_u8];
         stream
