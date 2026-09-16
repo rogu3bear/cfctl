@@ -11,9 +11,22 @@ use chrono::Utc;
 
 pub(super) const RESTORE_ID: &str = "d1-restore-exact-bookmark";
 const STRATEGY: &str = "d1_current_bookmark_equals_restore_result_bookmark";
-const CONTEXT: &str = "d1_restore_execution";
-const UNQUALIFIED: &str = "d1_restore_execution_unqualified";
+pub(super) const CONTEXT: &str = "d1_restore_execution";
+/// Rejections that mean the verification body itself violates its contract.
+/// These are refused outright; only store and lineage failures are recorded.
+const BODY_CONTRACT_REJECTIONS: [&str; 3] = [
+    "unsupported_restore_verification_strategy",
+    "invalid_verification_failure",
+    "invalid_verification_body",
+];
 type Checked<T> = std::result::Result<T, &'static str>;
+
+/// Only store and lineage rejections are recorded. A malformed verification
+/// body is refused outright, and a passing verification is never kept without
+/// its binding.
+pub(super) fn recordable(reason: &str, passed: bool) -> bool {
+    !passed && !BODY_CONTRACT_REJECTIONS.contains(&reason)
+}
 
 fn checkpoint(plan: &PlanV1, stage: TransactionStageV1) -> Checked<&TransactionCheckpointV1> {
     plan.transaction_journal
@@ -263,10 +276,11 @@ pub(super) fn attach_verification_context(
     };
     match bind() {
         Ok(context) => verification[CONTEXT] = context,
-        // A failure stays durable even when its execution cannot be bound; the
-        // recorded reason leaves it unqualified and unreconcilable.
-        Err(reason) if verification["passed"] != true => {
-            verification[UNQUALIFIED] = json!(reason);
+        // A failure stays durable even when its execution cannot be bound. The
+        // record is discriminated so every consumer reports this rejection
+        // instead of mistaking it for an unbound record from an older build.
+        Err(reason) if recordable(reason, verification["passed"] == true) => {
+            verification[CONTEXT] = json!({"bound": false, "reason": reason});
         }
         Err(reason) => {
             return Err(CliError::Input(format!(
@@ -275,6 +289,16 @@ pub(super) fn attach_verification_context(
         }
     }
     Ok(())
+}
+
+/// The recorded rejection when a failure was preserved without its binding.
+/// Qualification never reads this; it exists so callers can report the cause.
+pub(super) fn unqualified_reason(verification: &Value) -> Option<&str> {
+    let context = verification.get(CONTEXT)?;
+    if context.get("bound") != Some(&json!(false)) {
+        return None;
+    }
+    context.get("reason").and_then(Value::as_str)
 }
 
 fn evidence_projection(evidence: &EvidenceV1) -> Value {
@@ -331,6 +355,11 @@ pub(super) fn failed_reconciliation_history(store: &StateStore, plan: &PlanV2) -
         let (descriptor, value) = store
             .load_evidence_value(hash)
             .map_err(|_| "verification_evidence_unavailable_or_unauthenticated")?;
+        // A binding this producer rejected at execution is not the same thing
+        // as one an older build never wrote; report them apart.
+        if unqualified_reason(&value).is_some() {
+            return Err("historical_failed_restore_execution_binding_rejected_at_execution");
+        }
         // Failed records from older builds omitted this MAC-covered binding.
         // Self-hashed plans and source-export receipts cannot recreate it.
         if value.get(CONTEXT) != Some(&provenance(plan, &apply_descriptor.content_hash)?) {

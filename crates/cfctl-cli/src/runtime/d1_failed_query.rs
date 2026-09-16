@@ -120,6 +120,9 @@ pub(super) async fn execute(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(reject)?;
+    // Refuse an existing sink before any credential is unlocked or spent. The
+    // file is created only after the custody rechecks below.
+    directory.require_new_file(name)?;
     let secrets = platform_secrets(store);
     let credential = fresh_credential(profile, &secrets).await?;
     let executor = Executor::new(http_client()?, BASE_URL)?;

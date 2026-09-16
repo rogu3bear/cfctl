@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn diagnostic_guide_declares_the_explicit_target_and_private_sink() {
@@ -90,4 +91,73 @@ async fn diagnostic_rejects_rebound_or_unrejected_history_before_credentials_or_
         assert!(!output.exists());
         assert!(!store.paths().profiles_file().exists());
     }
+}
+
+#[tokio::test]
+async fn diagnostic_refuses_an_existing_private_sink_without_creating_or_replacing_it() {
+    let (owner, capability, input) = fixture(false);
+    let runtime = tempfile::tempdir().expect("runtime");
+    let store = super::super::super::tests::authenticated_test_store(RuntimePaths::from_root(
+        runtime.path(),
+    ));
+    store
+        .register_workspace(owner.path(), Some("a".repeat(32)))
+        .expect("register");
+    let validated = d1_read_inventory::validate(&capability, &input).expect("inventory");
+    let mut observation = result(&validated);
+    observation.read_complete = false;
+    observation.rows_read = 1;
+    let rejected = &mut observation.results[1];
+    rejected.status = D1ReadStatusV1::Rejected;
+    rejected.classification = "provider_shape_or_output_policy_rejected".into();
+    rejected.http_status = Some(400);
+    rejected.rows_read = None;
+    rejected.receipt = None;
+    let persisted = persist(
+        &store,
+        &catalog(),
+        &capability,
+        &validated,
+        &profile(),
+        Utc::now(),
+        &observation,
+    )
+    .expect("native incomplete observation");
+    let evidence = store
+        .write_observation_evidence(EvidenceClass::LiveRead, &persisted.envelope.result)
+        .expect("signed fixture");
+    let mut profiles = ProfilesConfig::default();
+    profiles.profiles.insert(profile().id.clone(), profile());
+    profiles.save(&store).expect("registered profile");
+    let private = tempfile::tempdir_in(runtime.path()).expect("private directory");
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private directory mode");
+    let output = private.path().join("response.json");
+    std::fs::write(&output, b"earlier diagnostic").expect("existing sink");
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))
+        .expect("existing sink mode");
+    let request = CallInput {
+        selectors: json!({}),
+        query: json!({}),
+        body: Some(json!({
+        "failed_evidence_hash":evidence.content_hash,"capability_id":capability.id,
+        "query_id":validated.contract().inventory.queries[1].id,
+        "expected_credential_generation_id":"22222222-2222-4222-8222-222222222222"})),
+        ..CallInput::default()
+    };
+    super::super::super::d1_failed_query::execute(
+        &store,
+        &catalog(),
+        &request,
+        Some("example-read"),
+        Some(&"a".repeat(32)),
+        Some(&output),
+    )
+    .await
+    .expect_err("an existing sink is never reused");
+    // The refusal neither truncates nor replaces the operator's earlier file.
+    assert_eq!(
+        std::fs::read(&output).expect("preserved sink"),
+        b"earlier diagnostic"
+    );
 }
