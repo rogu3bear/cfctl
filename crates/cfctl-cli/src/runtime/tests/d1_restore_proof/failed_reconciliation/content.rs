@@ -144,19 +144,17 @@ async fn d1_content_reconciliation_joins_native_failed_producer_and_private_expo
         false
     );
     assert_eq!(result.result["limits"]["write_authority_granted"], false);
-    let example: cfctl_core::d1_reconciliation::ReconcileRequest = serde_json::from_str(
-        include_str!("../../fixtures/d1-reconciliation-request.json"),
-    )
-    .expect("request example matches the closed contract");
-    crate::runtime::d1_reconciliation::validate_window(
-        &example.release_binding,
-        example.release_binding.window.opened_at,
-    )
-    .expect("request example window is admissible");
     let documented: Value =
         serde_json::from_str(include_str!("../../fixtures/d1-reconciliation-result.json"))
             .expect("result example");
     assert_eq!(field_shape(&documented), field_shape(&result.result));
+    // Identity and timing differ per run; the published safety claims must not.
+    for key in ["qualified", "verification_strategy", "qualification"] {
+        assert_eq!(documented[key], result.result[key], "{key}");
+    }
+    for (key, value) in documented["limits"].as_object().expect("documented limits") {
+        assert_eq!(value, &result.result["limits"][key], "limits.{key}");
+    }
     assert_eq!(
         fixture
             .store
@@ -191,4 +189,38 @@ async fn d1_content_reconciliation_joins_native_failed_producer_and_private_expo
     assert!(
         crate::runtime::d1_reconciliation::reconcile(&fixture.store, &catalog(), &request).is_err()
     );
+}
+
+#[test]
+fn documented_reconciliation_request_matches_the_published_contract() {
+    use cfctl_core::d1_reconciliation::{RECONCILE_ID, ReconcileRequest};
+    let source = include_str!("../../fixtures/d1-reconciliation-request.json");
+    let example: ReconcileRequest =
+        serde_json::from_str(source).expect("request example parses under the closed contract");
+    let catalog = catalog();
+    let capability = catalog.get(RECONCILE_ID).expect("native capability");
+    // `cfctl guide` publishes this schema, so the example must satisfy it.
+    cfctl_cloudflare::validate_request_contract(
+        capability,
+        &CallInput {
+            selectors: json!({}),
+            query: json!({}),
+            body: Some(serde_json::from_str(source).expect("request example body")),
+            ..CallInput::default()
+        },
+    )
+    .expect("request example satisfies the published request schema");
+    let window = &example.release_binding.window;
+    let midpoint = window.opened_at + (window.expires_at - window.opened_at) / 2;
+    crate::runtime::d1_reconciliation::validate_window(&example.release_binding, midpoint)
+        .expect("admissible partway through its own window");
+    for outside in [
+        window.expires_at,
+        window.opened_at - ChronoDuration::seconds(1),
+    ] {
+        assert!(
+            crate::runtime::d1_reconciliation::validate_window(&example.release_binding, outside)
+                .is_err()
+        );
+    }
 }

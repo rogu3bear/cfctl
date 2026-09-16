@@ -780,9 +780,19 @@ pub(super) fn verification_outcome(
             EvidenceClass::PostChangeVerification,
             &verification_value,
         )?);
+    // A preserved-but-unbound execution is reported, not left in evidence only.
+    let unqualified = super::d1_restore_proof::unqualified_reason(&verification_value);
     let error = (!verification.passed).then(|| ErrorV1 {
         code: "CFCTL_VERIFICATION_FAILED".to_owned(),
-        message: verification.basis.clone(),
+        message: unqualified.map_or_else(
+            || verification.basis.clone(),
+            |reason| {
+                format!(
+                    "{}; execution binding rejected: {reason}",
+                    verification.basis
+                )
+            },
+        ),
         next_step: Some(format!(
             "Inspect live state with `cfctl plans rectify {}` before any compensation.",
             plan.operation_id
@@ -815,13 +825,17 @@ pub(super) fn verification_error_outcome(
             EvidenceClass::PostChangeVerification,
             &verification_value,
         )?);
+    let message = super::d1_restore_proof::unqualified_reason(&verification_value).map_or_else(
+        || basis.clone(),
+        |reason| format!("{basis}; execution binding rejected: {reason}"),
+    );
     Ok(ApiVerificationOutcome {
         state: VerificationState::Failed,
-        basis: basis.clone(),
+        basis,
         evidence,
         error: Some(ErrorV1 {
             code: "CFCTL_VERIFICATION_ERROR".to_owned(),
-            message: basis,
+            message,
             next_step: Some(format!(
                 "Do not replay the mutation; run `cfctl plans rectify {}`.",
                 plan.operation_id

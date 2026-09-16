@@ -343,9 +343,13 @@ plan/pins, account/database, credential generation, apply evidence and execution
 checkpoint. Signing a failure preserves its identity; it does not qualify the
 restore or authorize another attempt. Older failures without that signed
 context remain unqualified. A new failure whose execution cannot be bound is
-still recorded, with the binding rejection reason in place of the context, and
-cannot be reconciled. Self-hashed plans and journals cannot reconstruct missing
-authenticated execution history.
+still recorded: `d1_restore_execution` becomes `{"bound": false, "reason":
+"<rejection>"}`, the envelope error carries that same reason, and
+reconciliation rejects it as a rejected binding rather than a missing one. A
+malformed verification body — wrong strategy, empty failure error, or a
+readback that will not deserialize — is refused instead of recorded.
+Self-hashed plans and journals cannot reconstruct missing authenticated
+execution history.
 
 `cfctl guide d1-reconcile-same-checkpoint-restore --json` describes a local
 read-only proof for a failed same-checkpoint rehearsal. Its request selects the
@@ -354,7 +358,8 @@ complete export, and an exact release binding with a window of at most 900
 seconds. The original source export must precede the execution, the historical
 post-export must follow verification and precede the new window, and the
 current export must finish inside it. All three retained private SQL files
-must be complete and byte-identical, and each must still sit in a caller-owned
+must be complete and byte-identical, and each must still be a mode-0600 file
+with exactly one link, owned by the calling user, inside a caller-owned
 mode-0700 directory. Their signed lineage must join the exact
 account/database and original checkpoint; current credentials/catalog are
 checked separately from historical generations. Missing files, changed bytes,

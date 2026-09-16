@@ -1,8 +1,8 @@
 use super::*;
+use crate::runtime::d1_restore_proof::CONTEXT;
 mod failed_reconciliation;
 
 const RESTORE_ID: &str = "d1-restore-exact-bookmark";
-const CONTEXT: &str = "d1_restore_execution";
 const ACCOUNT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DATABASE: &str = "11111111-1111-4111-8111-111111111111";
 
