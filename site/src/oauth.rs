@@ -24,6 +24,17 @@ pub fn validate_callback(states: &[String], codes: &[String], errors: &[String])
     CallbackResult::Success(format!("{state} {code}"))
 }
 
+/// `pagehide` always drops the one-time value. `pageshow` must not: browsers
+/// fire it on ordinary load as well as back-forward cache restore, and the
+/// ordinary load can run after the payload is shown. Restore is `persisted`.
+pub fn clears_sensitive_callback_on_page_event(event_type: &str, persisted: bool) -> bool {
+    match event_type {
+        "pagehide" => true,
+        "pageshow" => persisted,
+        _ => false,
+    }
+}
+
 fn valid_piece(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
@@ -86,5 +97,17 @@ mod tests {
             ),
             CallbackResult::OAuthError
         );
+    }
+
+    #[test]
+    fn ordinary_pageshow_keeps_the_payload_and_bfcache_restore_clears_it() {
+        assert!(clears_sensitive_callback_on_page_event("pagehide", false));
+        assert!(clears_sensitive_callback_on_page_event("pagehide", true));
+        assert!(!clears_sensitive_callback_on_page_event("pageshow", false));
+        assert!(clears_sensitive_callback_on_page_event("pageshow", true));
+        assert!(!clears_sensitive_callback_on_page_event(
+            "visibilitychange",
+            true
+        ));
     }
 }

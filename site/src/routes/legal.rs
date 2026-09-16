@@ -11,7 +11,7 @@ pub fn PrivacyPage() -> impl IntoView {
                 <h1>"The website does not build a profile of you."</h1>
                 <p>"The cfctl website requires no account, form submission, database, object storage, analytics, or third-party script."</p>
                 <p>"The CLI stores profiles, plans, catalogs, and redacted evidence locally. Credential values remain in the governed local credential backend or an explicit mode-0600 sink."</p>
-                <p>"The OAuth callback processes one bounded authorization response in your browser. It does not server-render, persist, analyze, or intentionally log callback values; the displayed value is cleared after copy, expiry, or page restoration."</p>
+                <p>"The OAuth callback processes one bounded authorization response in your browser. It does not server-render, persist, analyze, or intentionally log callback values; the displayed value is cleared after copy, expiry, navigation away, or when the browser restores this page from cache."</p>
                 <p>"Cloudflare may process ordinary request metadata under its platform policies. The callback route is configured no-store and no-referrer, and site-controlled observability is disabled."</p>
                 <p>"Last updated: August 5, 2026."</p>
             </main>
