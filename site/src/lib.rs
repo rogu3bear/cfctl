@@ -172,41 +172,47 @@ mod tests {
 
     #[test]
     fn callback_response_is_ephemeral_and_unframeable() {
-        let mut response = Response::new(Body::empty());
-        apply_response_headers(&mut response, "/oauth/callback").expect("valid headers");
-        let headers = response.headers();
+        for path in ["/oauth/callback", "/oauth/callback/"] {
+            let mut response = Response::new(Body::empty());
+            apply_response_headers(&mut response, path).expect("valid headers");
+            let headers = response.headers();
 
-        assert_eq!(
-            headers
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store, no-cache, max-age=0")
-        );
-        assert_eq!(
-            headers
-                .get(header::REFERRER_POLICY)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-referrer")
-        );
-        assert_eq!(
-            headers
-                .get("x-frame-options")
-                .and_then(|value| value.to_str().ok()),
-            Some("DENY")
-        );
-        assert_eq!(
-            headers
-                .get("strict-transport-security")
-                .and_then(|value| value.to_str().ok()),
-            Some("max-age=31536000")
-        );
-        let csp = headers
-            .get("content-security-policy")
-            .and_then(|value| value.to_str().ok())
-            .expect("CSP");
-        assert!(csp.contains("default-src 'self'"));
-        assert!(csp.contains("form-action 'none'"));
-        assert!(csp.contains("frame-ancestors 'none'"));
+            assert_eq!(
+                headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store, no-cache, max-age=0"),
+                "{path}"
+            );
+            assert_eq!(
+                headers
+                    .get(header::REFERRER_POLICY)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-referrer"),
+                "{path}"
+            );
+            assert_eq!(
+                headers
+                    .get("x-frame-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("DENY"),
+                "{path}"
+            );
+            assert_eq!(
+                headers
+                    .get("strict-transport-security")
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=31536000"),
+                "{path}"
+            );
+            let csp = headers
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .expect("CSP");
+            assert!(csp.contains("default-src 'self'"), "{path}");
+            assert!(csp.contains("form-action 'none'"), "{path}");
+            assert!(csp.contains("frame-ancestors 'none'"), "{path}");
+        }
     }
 
     #[test]
