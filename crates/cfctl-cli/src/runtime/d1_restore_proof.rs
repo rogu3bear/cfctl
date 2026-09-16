@@ -301,6 +301,17 @@ pub(super) fn unqualified_reason(verification: &Value) -> Option<&str> {
     context.get("reason").and_then(Value::as_str)
 }
 
+/// The rejection recorded against a preserved failure, for reporting after the
+/// execution itself. Qualification never consults it.
+pub(super) fn recorded_binding_rejection(store: &StateStore, plan: &PlanV1) -> Option<String> {
+    let hash = plan
+        .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)?
+        .get("evidence_hash")?
+        .as_str()?;
+    let (_, value) = store.load_evidence_value(hash).ok()?;
+    unqualified_reason(&value).map(str::to_owned)
+}
+
 fn evidence_projection(evidence: &EvidenceV1) -> Value {
     json!({"content_hash":evidence.content_hash,"class":evidence.class,
         "generated_at":evidence.generated_at})
