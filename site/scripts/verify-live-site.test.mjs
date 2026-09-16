@@ -27,6 +27,20 @@ function htmlResponse(body = "See the boundary before you cross it.", overrides 
   });
 }
 
+describe("callback live probes", () => {
+  test("covers both callback path spellings without rendering sentinels", () => {
+    const callbacks = ROUTES.filter((route) => route.callback);
+    expect(callbacks.map((route) => new URL(route.path, "https://example.invalid").pathname).sort()).toEqual([
+      "/oauth/callback",
+      "/oauth/callback/",
+    ]);
+    for (const route of callbacks) {
+      expect(route.path).toContain("cfctl-live-verifier-code-do-not-log");
+      expect(route.path).toContain("cfctl-live-verifier-state-do-not-log");
+    }
+  });
+});
+
 describe("production origin", () => {
   test("accepts only a bare https origin", () => {
     expect(productionOrigin("https://cfctl.com").origin).toBe("https://cfctl.com");

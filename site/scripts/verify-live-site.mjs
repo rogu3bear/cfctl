@@ -26,6 +26,12 @@ export const ROUTES = [
   { path: "/privacy", status: 200, marker: "The website does not build a profile of you." },
   { path: "/terms", status: 200, marker: "Review before authority. Verify after execution." },
   {
+    path: `/oauth/callback?code=${CALLBACK_CODE_SENTINEL}&state=${CALLBACK_STATE_SENTINEL}`,
+    status: 200,
+    marker: "OAuth callback · isolated route",
+    callback: true,
+  },
+  {
     path: `/oauth/callback/?code=${CALLBACK_CODE_SENTINEL}&state=${CALLBACK_STATE_SENTINEL}`,
     status: 200,
     marker: "OAuth callback · isolated route",
