@@ -199,3 +199,33 @@ async fn failed_restore_rejects_legacy_signed_failure_without_execution_binding(
             .contains("historical_failed_restore_missing_authenticated_execution_binding")
     );
 }
+
+#[tokio::test]
+async fn a_rejected_binding_is_reported_apart_from_one_an_older_build_never_wrote() {
+    let mut fixture = Box::pin(failed_fixture()).await;
+    let (_, mut verification) = fixture.verification();
+    verification[CONTEXT] = json!({"bound":false,"reason":"restore_plan_unavailable"});
+    let descriptor = fixture
+        .store
+        .write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)
+        .expect("signed rejected binding");
+    fixture
+        .plan
+        .transaction_artifacts
+        .get_mut(TransactionStageV1::VerificationResponsePersisted.as_str())
+        .expect("artifact")["evidence_hash"] = json!(descriptor.content_hash);
+    rehash_plan(&mut fixture.plan);
+    fixture.save();
+    assert_eq!(
+        crate::runtime::d1_restore_proof::recorded_binding_rejection(&fixture.store, &fixture.plan)
+            .as_deref(),
+        Some("restore_plan_unavailable")
+    );
+    // Reconciliation separates a rejected binding from a missing one.
+    assert!(
+        history(&fixture)
+            .expect_err("a rejected binding cannot reconcile")
+            .to_string()
+            .contains("execution_binding_rejected_at_execution")
+    );
+}
