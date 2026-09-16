@@ -1270,6 +1270,9 @@ fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
 }
 
 fn extract_cfctl_command_refs(path: &str, content: &str) -> Vec<CfctlReference> {
+    if path.starts_with("site/src/") && path_has_extension(path, "rs") {
+        return extract_site_rust_command_refs(content);
+    }
     if path_has_extension(path, "json") {
         let mut references = Vec::new();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
@@ -1284,6 +1287,80 @@ fn extract_cfctl_command_refs(path: &str, content: &str) -> Vec<CfctlReference> 
         return Vec::new();
     }
     extract_prose_command_refs(content, markdown, shell)
+}
+
+/// Published operator commands on the product site live in Rust string
+/// literals (`CommandBlock command=…` and `<code>…</code>`), which the
+/// markdown/shell extractor never sees. Scan only those surfaces so product
+/// names such as `aria-label="cfctl home"` are not treated as invocations.
+fn extract_site_rust_command_refs(content: &str) -> Vec<CfctlReference> {
+    site_published_command_literals(content)
+        .into_iter()
+        .filter_map(|literal| cfctl_command_ref(&literal))
+        .collect()
+}
+
+fn site_published_command_literals(content: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut search_from = 0;
+    while search_from < content.len() {
+        let rest = &content[search_from..];
+        let command_at = rest.find("command");
+        let code_at = rest.find("<code>");
+        let (relative, kind) = match (command_at, code_at) {
+            (Some(command), Some(code)) if command <= code => (command, "command"),
+            (Some(command), None) => (command, "command"),
+            (_, Some(code)) => (code, "code"),
+            (None, None) => break,
+        };
+        let marker_len = if kind == "command" {
+            "command".len()
+        } else {
+            "<code>".len()
+        };
+        let after_marker = content[search_from + relative + marker_len..].trim_start();
+        if kind == "command" {
+            if let Some(after_equals) = after_marker.strip_prefix('=') {
+                let after_equals = after_equals.trim_start();
+                if let Some((literal, consumed)) = parse_rust_string_literal(after_equals) {
+                    literals.push(literal);
+                    search_from = content.len() - after_equals.len() + consumed;
+                    continue;
+                }
+            } else {
+                search_from += relative + marker_len;
+                continue;
+            }
+        } else if let Some((literal, consumed)) = parse_rust_string_literal(after_marker) {
+            literals.push(literal);
+            search_from = content.len() - after_marker.len() + consumed;
+            continue;
+        }
+        search_from += relative + marker_len;
+    }
+    literals
+}
+
+fn parse_rust_string_literal(source: &str) -> Option<(String, usize)> {
+    let body = source.strip_prefix('"')?;
+    let mut decoded = String::new();
+    let mut chars = body.char_indices();
+    while let Some((index, character)) = chars.next() {
+        match character {
+            '"' => return Some((decoded, index + 2)),
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                decoded.push(match escaped {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+            }
+            other => decoded.push(other),
+        }
+    }
+    None
 }
 
 /// Extracts command references from markdown or shell text. Split out from the
@@ -4231,6 +4308,50 @@ mod tests {
     fn tracked_subcommand_references_bind_to_the_command_tree() {
         let result = verify_tracked_cfctl_command_references();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn site_rust_published_commands_bind_to_the_command_tree() {
+        let source = concat!(
+            r#"aria-label="cfctl home""#,
+            "\n",
+            r#"<CommandBlock command="cfctl doctor --json".to_owned()/>"#,
+            "\n",
+            r#"<code>"cfctl resolve \"list my Workers\" --json"</code>"#,
+            "\n",
+            r#"command="printf '%s' \"$CLOUDFLARE_API_TOKEN\" | cfctl auth import-api-token --profile production --account <account-id> --stdin".to_owned()"#,
+            "\n",
+        );
+        let pairs = extract_cfctl_command_refs("site/src/routes/start.rs", source)
+            .into_iter()
+            .map(|reference| (reference.verb, reference.path, reference.flags))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![
+                ("doctor".to_owned(), Vec::new(), vec!["json".to_owned()]),
+                ("resolve".to_owned(), Vec::new(), vec!["json".to_owned()]),
+                (
+                    "auth".to_owned(),
+                    vec!["import-api-token".to_owned()],
+                    vec![
+                        "profile".to_owned(),
+                        "account".to_owned(),
+                        "stdin".to_owned()
+                    ]
+                ),
+            ]
+        );
+        validate_command_refs("site/src/routes/start.rs", source)
+            .expect("current published site commands must exist on the parser");
+
+        let stale = r#"<CommandBlock command="cfctl surfaces list --json".to_owned()/>"#;
+        let error = validate_command_refs("site/src/routes/start.rs", stale)
+            .expect_err("a retired site command must fail closed");
+        assert!(
+            error.to_string().contains("non-v2 command"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
