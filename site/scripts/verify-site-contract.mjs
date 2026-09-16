@@ -33,7 +33,7 @@ const applicationSourceLower = applicationSource.toLowerCase();
 for (const route of ["start", "security", "privacy", "terms", "oauth", "callback"]) {
   if (!applicationSource.includes(`StaticSegment(\"${route}\")`)) throw new Error(`missing Leptos route segment: ${route}`);
 }
-for (const required of ["no-store, no-cache", "no-referrer", "content-security-policy", "strict-transport-security", "form-action 'none'", "frame-ancestors 'none'", "MAX_STATE_BYTES", "MAX_CODE_BYTES", "prefers-reduced-motion", "forced-colors"]) {
+for (const required of ["no-store, no-cache", "no-referrer", "content-security-policy", "strict-transport-security", "form-action 'none'", "frame-ancestors 'none'", "MAX_STATE_BYTES", "MAX_CODE_BYTES", "prefers-reduced-motion", "forced-colors", ":focus-visible", "min-width: 20rem", "clears_sensitive_callback_on_page_event", "pageshow"]) {
   if (!contractSource.includes(required)) throw new Error(`missing site contract: ${required}`);
 }
 for (const forbidden of ["leptos-cf", "TodoPage", "ContactPage", "WebSocketPair", "d1_databases", "google-analytics", "segment.com", "posthog", "<form"]) {

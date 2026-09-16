@@ -41,7 +41,7 @@ fn OAuthCallbackBridge() -> impl IntoView {
             let search = location.search().unwrap_or_default();
             let path = location
                 .pathname()
-                .unwrap_or_else(|_| "/oauth/callback/".to_owned());
+                .unwrap_or_else(|_| "/oauth/callback".to_owned());
             let _ = window.history().and_then(|history| {
                 history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&path))
             });
@@ -101,7 +101,15 @@ fn OAuthCallbackBridge() -> impl IntoView {
             timeout.forget();
 
             let page_clear = clear_sensitive;
-            let page_event = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| page_clear());
+            let page_event = Closure::<dyn FnMut(web_sys::Event)>::new(move |event| {
+                let persisted = event
+                    .dyn_ref::<web_sys::PageTransitionEvent>()
+                    .is_some_and(web_sys::PageTransitionEvent::persisted);
+                if crate::oauth::clears_sensitive_callback_on_page_event(&event.type_(), persisted)
+                {
+                    page_clear();
+                }
+            });
             let _ = window
                 .add_event_listener_with_callback("pagehide", page_event.as_ref().unchecked_ref());
             let _ = window
