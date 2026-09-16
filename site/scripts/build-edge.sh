@@ -7,6 +7,13 @@ EXPECTED_WORKER_BUILD_VERSION="0.7.5"
 
 cd "$SITE_ROOT"
 
+# Bind the build to the pinned tools rather than whatever a sibling repository
+# last installed into the shared ~/.cargo/bin. The checks below then verify the
+# resolution instead of an ambient binary.
+PATH="$(./scripts/ensure-pinned-cargo-tools.sh \
+  "$EXPECTED_CARGO_LEPTOS_VERSION" "$EXPECTED_WORKER_BUILD_VERSION"):$PATH"
+export PATH
+
 if [ "$(cargo leptos --version 2>/dev/null | awk '{print $2}')" != "$EXPECTED_CARGO_LEPTOS_VERSION" ]; then
   printf '[build-edge] cargo-leptos %s is required\n' "$EXPECTED_CARGO_LEPTOS_VERSION" >&2
   exit 1

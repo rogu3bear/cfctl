@@ -146,7 +146,7 @@ flowchart LR
 | Clipboard copy | Explicit button activation | DOM → OS clipboard → CLI | Clears value after successful copy | `site/src/routes/oauth_callback.rs` |
 | Static asset requests | Same-origin `/pkg/*` and allowlist | Browser → Assets binding | Content-hashed active assets | `site/scripts/write-worker-shim.mjs` |
 | Hydration bootstrap | Inline CSP-hashed module loader | SSR document → JS/WASM | Loads same-origin hashed artifacts and named islands | `site/src/app.rs::edge_hydration_script` |
-| Build inputs | Source, lockfile, toolchain | Developer/build host → artifact | Dependency and artifact substitution boundary | `site/Cargo.lock`, `site/scripts/build-edge.sh` |
+| Build inputs | Source, lockfile, toolchain | Developer/build host → artifact | Dependency and artifact substitution boundary; cargo-leptos, worker-build and wasm-bindgen resolve to repo-local pinned installs rather than the shared cargo bin | `site/Cargo.lock`, `site/scripts/build-edge.sh`, `site/scripts/ensure-pinned-cargo-tools.sh` |
 | Deployment | Approved provider mutation | Operator → cfctl → Cloudflare | Plan/apply/live proof are distinct | `site/SECURITY.md` |
 
 ## Top abuse paths
