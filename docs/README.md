@@ -32,7 +32,7 @@ contracts, procedures, and migration evidence. It does not grant authority.
 | [r2-private-capture.md](r2-private-capture.md) / [r2-private-restore.md](r2-private-restore.md) | private R2 capture and restore |
 | [worker-frozen-artifact-upload.md](worker-frozen-artifact-upload.md) / [worker-version-artifact-digest.md](worker-version-artifact-digest.md) | frozen Worker artifacts |
 | [workspace-d1-reads.md](workspace-d1-reads.md) / [workspace-d1-transitions-v3.md](workspace-d1-transitions-v3.md) | reviewed D1 inventories |
-| [workspace-operation-format.md](workspace-operation-format.md) | proposed pack contract (not implemented) |
+| [workspace-operation-format.md](workspace-operation-format.md) | in-progress pack contract (generic loader; typed evidence validators still win) |
 | [telemetry-control-plane.md](telemetry-control-plane.md) | bounded telemetry and security-response |
 | [response-header-rule-repair.md](response-header-rule-repair.md) | targeted header-rule repair |
 
