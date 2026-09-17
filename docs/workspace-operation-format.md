@@ -1,4 +1,4 @@
-# Workspace operation contract v2 (proposed)
+# Workspace operation contract v2 (in progress)
 
 Status: **in progress**. Generic loader exists in `cfctl-workspace` (`operation_pack.rs`). First cutover is `workspace_d1_evidence`; existing typed validators remain authoritative until the mapping table below has an owner and each predicate has passing semantic-equivalence tests.
 
