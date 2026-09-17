@@ -1163,6 +1163,7 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     seed_test_fallback_secret(runtime.path());
 
     let doctor = ProcessCommand::new(binary)
+        .current_dir(runtime.path())
         .env("CFCTL_HOME", runtime.path())
         .env("HOME", runtime.path())
         .env("PATH", binary_dir)
@@ -1576,6 +1577,7 @@ fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
     let binary_dir = binary.parent().expect("binary directory");
     seed_test_fallback_secret(runtime.path());
     let output = ProcessCommand::new(binary)
+        .current_dir(runtime.path())
         .env("CFCTL_HOME", runtime.path())
         .env("HOME", runtime.path())
         .env("PATH", binary_dir)
@@ -1675,6 +1677,7 @@ fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
     );
 
     let doctor = ProcessCommand::new(binary)
+        .current_dir(runtime.path())
         .env("CFCTL_HOME", runtime.path())
         .env("HOME", runtime.path())
         .env("PATH", binary_dir)

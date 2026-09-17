@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use cfctl_core::{BuildIdentitySourceV1, BuildInfoV1};
@@ -39,6 +40,7 @@ pub fn build_identity_is_healthy(build: &BuildInfoV1) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum PathBuildStateV1 {
     Current,
+    Stale,
     Missing,
     Uninspectable,
 }
@@ -87,20 +89,85 @@ pub fn inspect_path_build(running: &BuildInfoV1) -> PathBuildIdentityV1 {
         return classify_path_build(PathBuildProbeV1::Missing);
     };
     if same_file(&path, std::env::current_exe().ok().as_deref()) {
-        return PathBuildIdentityV1 {
-            schema_version: 1,
-            healthy: true,
-            state: PathBuildStateV1::Current,
-            path: Some(path),
-            build: Some(running.clone()),
-            detail: "PATH resolves to the running cfctl executable".to_owned(),
-        };
+        return same_executable_path_identity(
+            running,
+            path,
+            cfctl_source_head(std::env::current_dir().ok().as_deref()).as_deref(),
+        );
     }
     classify_path_build(PathBuildProbeV1::Uninspectable {
         path,
         detail: "PATH cfctl is a different executable and was not run; invoke it directly to inspect its build identity"
             .to_owned(),
     })
+}
+
+#[must_use]
+pub fn same_executable_path_identity(
+    running: &BuildInfoV1,
+    path: PathBuf,
+    source_head: Option<&str>,
+) -> PathBuildIdentityV1 {
+    let current = PathBuildIdentityV1 {
+        schema_version: 1,
+        healthy: true,
+        state: PathBuildStateV1::Current,
+        path: Some(path.clone()),
+        build: Some(running.clone()),
+        detail: "PATH resolves to the running cfctl executable".to_owned(),
+    };
+    if running.identity_source != BuildIdentitySourceV1::GitCheckout {
+        return current;
+    }
+    let Some(installed) = running.git_commit.as_deref() else {
+        return current;
+    };
+    let Some(head) = source_head else {
+        return current;
+    };
+    if installed == head {
+        return current;
+    }
+    PathBuildIdentityV1 {
+        schema_version: 1,
+        healthy: false,
+        state: PathBuildStateV1::Stale,
+        path: Some(path),
+        build: Some(running.clone()),
+        detail: "PATH git_commit differs from this cfctl checkout HEAD; rerun ./bootstrap.sh from a clean checkout".to_owned(),
+    }
+}
+
+fn cfctl_source_head(cwd: Option<&Path>) -> Option<String> {
+    let cwd = cwd?;
+    let toplevel = git_stdout(cwd, &["rev-parse", "--show-toplevel"])?;
+    let manifest = Path::new(&toplevel).join("crates/cfctl-cli/Cargo.toml");
+    let text = fs::read_to_string(manifest).ok()?;
+    if !text.contains("name = \"cfctl-cli\"") {
+        return None;
+    }
+    git_stdout(Path::new(&toplevel), &["rev-parse", "HEAD"])
+}
+
+fn git_stdout(cwd: &Path, arguments: &[&str]) -> Option<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(arguments);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 fn same_file(path: &Path, current: Option<&Path>) -> bool {

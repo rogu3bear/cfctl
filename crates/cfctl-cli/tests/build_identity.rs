@@ -1,6 +1,10 @@
 #![allow(clippy::expect_used)]
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -9,7 +13,7 @@ use cfctl_auth::{FileSecretStore, SecretStore};
 use cfctl_cli::{
     build_identity::{
         PathBuildProbeV1, PathBuildStateV1, build_identity_is_healthy, classify_path_build,
-        current_build_info,
+        current_build_info, same_executable_path_identity,
     },
     build_support::{ResolvedIdentitySource, build_identity_rerun_paths, resolve_build_identity},
 };
@@ -190,6 +194,41 @@ fn path_identity_classifies_missing_and_uninspectable() {
     );
 }
 
+#[test]
+fn same_path_git_checkout_is_stale_when_head_differs() {
+    let running = BuildInfoV1 {
+        schema_version: 1,
+        version: "test".to_owned(),
+        git_commit: Some(COMMIT_A.to_owned()),
+        identity_source: BuildIdentitySourceV1::GitCheckout,
+    };
+    let path = PathBuf::from("/Users/star/.local/bin/cfctl");
+    let current = same_executable_path_identity(&running, path.clone(), Some(COMMIT_A));
+    assert!(current.healthy);
+    assert_eq!(current.state, PathBuildStateV1::Current);
+
+    let stale = same_executable_path_identity(
+        &running,
+        path.clone(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert!(!stale.healthy);
+    assert_eq!(stale.state, PathBuildStateV1::Stale);
+    assert!(stale.detail.contains("checkout HEAD"));
+
+    let release = BuildInfoV1 {
+        identity_source: BuildIdentitySourceV1::ReleaseEnv,
+        ..running.clone()
+    };
+    let release_current = same_executable_path_identity(
+        &release,
+        path,
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert!(release_current.healthy);
+    assert_eq!(release_current.state, PathBuildStateV1::Current);
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_never_executes_a_different_path_cfctl() {
@@ -213,6 +252,7 @@ fn doctor_never_executes_a_different_path_cfctl() {
         let runtime = root.path().join(command);
         seed_test_fallback_secret(&runtime);
         let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
+            .current_dir(root.path())
             .env("CFCTL_HOME", &runtime)
             .env("CFCTL_TEST_MARKER", &marker)
             .env("PATH", &fake_bin)
@@ -250,6 +290,7 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
     seed_test_fallback_secret(&runtime);
 
     let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
+        .current_dir(root.path())
         .env("CFCTL_HOME", &runtime)
         .env("HOME", &runtime)
         .env("PATH", &linked_bin)
