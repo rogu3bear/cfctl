@@ -1,4 +1,9 @@
-//! Generic workspace-owned pack loader (`schema_version = 2`).
+//! Generic workspace-owned pack loader (`contract = "workspace_operation_v1"`).
+//!
+//! `schema_version = 2` is not a unique format name: typed D1 migration packs
+//! already use that integer. This loader claims a document only when it also
+//! declares `contract = "workspace_operation_v1"`. Other schema-2 documents
+//! return `Ok(None)` so the typed loaders keep them.
 //!
 //! cfctl binds registration, clean HEAD (for execute), the committed pack,
 //! and hashing. Application acceptance stays on existing typed validators
@@ -19,12 +24,14 @@ use super::{
 };
 
 const OPERATIONS_PREFIX: &str = ".cfctl/operations";
+const WORKSPACE_OPERATION_CONTRACT: &str = "workspace_operation_v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct PackV2 {
     schema_version: u8,
+    contract: String,
     operation: Vec<OperationV2>,
 }
 
@@ -232,10 +239,7 @@ fn pack_contains_id(bytes: &[u8], capability_id: &str) -> Result<bool> {
         .map_err(|_| invariant("committed operation pack is not UTF-8".to_owned()))?;
     let value: toml::Value = toml::from_str(text)
         .map_err(|error| invariant(format!("committed operation pack is invalid: {error}")))?;
-    Ok(value
-        .get("schema_version")
-        .and_then(toml::Value::as_integer)
-        == Some(2)
+    Ok(is_workspace_operation_document(&value)
         && value
             .get("operation")
             .and_then(toml::Value::as_array)
@@ -244,6 +248,14 @@ fn pack_contains_id(bytes: &[u8], capability_id: &str) -> Result<bool> {
                     operation.get("id").and_then(toml::Value::as_str) == Some(capability_id)
                 })
             }))
+}
+
+fn is_workspace_operation_document(value: &toml::Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        == Some(2)
+        && value.get("contract").and_then(toml::Value::as_str) == Some(WORKSPACE_OPERATION_CONTRACT)
 }
 
 fn bind_v2(
@@ -258,7 +270,7 @@ fn bind_v2(
             .map_err(|_| invariant("workspace operation pack is not UTF-8"))?,
     )
     .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
-    if pack.schema_version != 2 {
+    if pack.schema_version != 2 || pack.contract != WORKSPACE_OPERATION_CONTRACT {
         return Ok(None);
     }
     let Some(operation) = pack
@@ -405,6 +417,7 @@ mod tests {
     }
 
     const V2_EVIDENCE: &str = r#"schema_version = 2
+contract = "workspace_operation_v1"
 
 [[operation]]
 id = "star-maildesk-cf.d1-evidence-read"
@@ -452,6 +465,23 @@ columns = ["active_policy_digest"]
         )
         .expect("config");
         fs::write(root.path().join(".cfctl/operations/d1-evidence.toml"), pack).expect("pack");
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "fixture"]);
+        root
+    }
+
+    fn fixture_named(relative: &str, pack: &str) -> TempDir {
+        let root = tempfile::tempdir().expect("temp repository");
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "user.email", "test@example.com"]);
+        git(root.path(), &["config", "user.name", "Test"]);
+        git(
+            root.path(),
+            &["remote", "add", "origin", "https://example.com/mln-web.git"],
+        );
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().expect("pack parent")).expect("pack dir");
+        fs::write(&path, pack).expect("pack");
         git(root.path(), &["add", "."]);
         git(root.path(), &["commit", "-qm", "fixture"]);
         root
@@ -548,5 +578,49 @@ columns = ["active_policy_digest"]
         )
         .expect_err("policy/migration/reply stay on typed loaders");
         assert!(error.to_string().contains("no typed binder"), "{error}");
+    }
+
+    const MIGRATION_SCHEMA_V2: &str = r#"schema_version = 2
+
+[[operation]]
+id = "mln-web.founder-d1-migration-apply"
+title = "Apply one governed Founder D1 migration"
+description = "Apply one exact target after an exact remote baseline."
+authority = "cfctl_native_workspace_operation"
+manifest_path = ".control-plane/d1_migration_manifest.json"
+config_template = "workers/founder/wrangler.toml"
+account_id = "00000000-0000-0000-0000-000000000000"
+database_binding = "FOUNDER_DB"
+wrangler_version = "4.100.0"
+"#;
+
+    #[test]
+    fn migration_schema_v2_without_workspace_operation_contract_is_not_claimed() {
+        let root = fixture_named(".cfctl/operations/d1-migrations.toml", MIGRATION_SCHEMA_V2);
+        let claimed = load_selected(
+            &[root.path().to_path_buf()],
+            "mln-web.founder-d1-migration-apply",
+            WorkspaceOperationLoad::Inspect,
+        )
+        .expect("other schema-2 languages must not fail closed here");
+        assert!(claimed.is_none(), "typed migration packs stay unclaimed");
+    }
+
+    #[test]
+    fn declared_workspace_operation_contract_still_fails_closed_on_unknown_fields() {
+        let pack = V2_EVIDENCE.replace(
+            "contract = \"workspace_operation_v1\"\n",
+            "contract = \"workspace_operation_v1\"\nunexpected_field = true\n",
+        );
+        let root = fixture(&pack);
+        let error = crate::inspect_workspace_operation_capability(
+            &[root.path().to_path_buf()],
+            "star-maildesk-cf.d1-evidence-read",
+        )
+        .expect_err("declared workspace-operation packs stay deny_unknown_fields");
+        assert!(
+            error.to_string().contains("invalid") || error.to_string().contains("unknown"),
+            "{error}"
+        );
     }
 }

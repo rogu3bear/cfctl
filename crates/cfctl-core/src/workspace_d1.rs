@@ -413,9 +413,12 @@ impl WorkspaceD1MigrationContractV1 {
     }
 }
 
-/// v1 of the workspace-owned *contract type*, carried in pack `schema_version = 2`.
-/// cfctl fills these columns; application acceptance stays on typed validators
-/// until semantic equivalence tests pass (docs/workspace-operation-format.md).
+/// v1 of the workspace-owned *contract type*, carried in a pack that declares
+/// `contract = "workspace_operation_v1"` (pack `schema_version = 2`).
+/// The integer 2 is also used by typed D1 migration packs; the contract key
+/// is the format name. cfctl fills these columns; application acceptance stays
+/// on typed validators until semantic equivalence tests pass
+/// (docs/workspace-operation-format.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceOperationContractV1 {
