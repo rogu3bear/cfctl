@@ -96,8 +96,11 @@ Dashboard is an emergency human path; it is not P2-complete.
       Worker deploy lane, create the child token. Set
       `SINK=<new-mode-0600-path>`, then:
       `cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> --permission "Workers Scripts Read" --permission "Workers Scripts Write" --account ca30e922fda7f5578e49873542e4aaca --value-out "$SINK" --json`
-- [ ] Review that plan; approve and run the exact operation ID. The one-time
-      value goes only to the named `--value-out` file.
+- [ ] Review that mint plan. IdentityOrOwnership requires
+      `cfctl plans approve <operation-id> --yes` typed for that exact
+      operation id. Prior chat auto-approve or spearhead is not that id.
+      Then run `cfctl plans run <operation-id>` as a separate step. The
+      one-time value goes only to the named `--value-out` file.
 - [ ] Install the child, not the parent:
       `cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> --account ca30e922fda7f5578e49873542e4aaca --stdin --json < "$SINK"`
       then `cfctl auth use cfctl-site-release-<UTC-date> --json`.
