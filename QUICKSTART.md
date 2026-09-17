@@ -94,12 +94,28 @@ credential fallback behavior.
 
 ## Authenticate
 
-Simplest day-to-day lane — scoped API token from stdin, account pin required:
+The closed way to **create** a purpose-scoped token is `cfctl keys mint` with a
+qualified parent profile. `auth import-api-token` installs the child sink; it
+does not create the token. A Cloudflare Dashboard token is an emergency human
+path and is not P2-complete.
 
 ```bash
-printf '%s' "$CLOUDFLARE_API_TOKEN" | \
-  cfctl auth import-api-token --profile production --account <account-id> --stdin
-cfctl auth status production --json
+SINK=<new-mode-0600-path>
+cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> \
+  --permission "Workers Scripts Read" --permission "Workers Scripts Write" \
+  --account ca30e922fda7f5578e49873542e4aaca \
+  --value-out "$SINK" --json
+```
+
+Review the plan, approve the exact operation ID, and run it once. Then install
+and select the **child** profile from that sink:
+
+```bash
+cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> \
+  --account ca30e922fda7f5578e49873542e4aaca --stdin --json \
+  < "$SINK"
+cfctl auth use cfctl-site-release-<UTC-date> --json
+cfctl auth status cfctl-site-release-<UTC-date> --json
 ```
 
 A build wrapper such as the in-repo `./cfctl` shim can lose stdin to `cargo`;
