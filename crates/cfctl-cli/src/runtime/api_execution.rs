@@ -17,6 +17,7 @@ use super::prelude::{
     Value, VerificationState,
 };
 use super::r2_private_upload;
+use super::secret_io::preflight_secret_sink;
 use super::support::http_client;
 
 #[expect(
@@ -42,6 +43,7 @@ pub(super) async fn execute_api_plan(
         )
         .await;
     }
+    preflight_secret_sink(plan)?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
     let is_reviewed_schema_migration = plan.capability.id == "d1-apply-reviewed-schema-migration";
     if is_reviewed_schema_migration {

@@ -170,6 +170,9 @@ pub(super) fn api_plan_result_envelope(
         );
     }
     attach_mint_child_launch_lane(&mut result, plan);
+    if is_secret_output_plan(plan) {
+        result = redact_response_for_capability(&plan.capability, &result);
+    }
     if let Some(error) = finalization_error {
         let mut envelope = post_boundary_failure_envelope(
             plan,
