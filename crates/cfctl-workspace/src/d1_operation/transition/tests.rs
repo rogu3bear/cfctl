@@ -4,6 +4,7 @@
 )]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::wildcard_imports)]
 use super::*;
+use crate::WorkspaceOperationLoad;
 use crate::load_workspace_d1_migration_capability;
 use cfctl_core::workspace_d1::transition::{Assertions, Phase, Step};
 use serde_json::json;
@@ -143,11 +144,11 @@ fn fixture(count: u64) -> (tempfile::TempDir, Declaration) {
 #[test]
 fn v3_preserves_184_history_and_compiles_each_phase_without_source_rewrites() {
     let (root, mut op) = fixture(184);
-    let initial = compile(root.path(), &op).unwrap();
+    let initial = compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
     assert_eq!(initial.historical_sequences.len(), 171);
     for (position, target) in initial.scheduled_targets.iter().enumerate() {
         op.target = target.clone();
-        let compiled = compile(root.path(), &op).unwrap();
+        let compiled = compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
         compiled
             .validate_completed(
                 &op.transition_schedule[..position]
@@ -180,27 +181,27 @@ fn v3_rejects_wrong_identity_missing_gap_prerequisite_overflow_and_drift() {
     let (root, op) = fixture(184);
     let mut bad = op.clone();
     bad.target.sequence = 176;
-    assert!(compile(root.path(), &bad).is_err());
+    assert!(compile(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut bad = op.clone();
     bad.target.source.sha256 = format!("sha256:{}", "0".repeat(64));
-    assert!(compile(root.path(), &bad).is_err());
+    assert!(compile(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut bad = op.clone();
     bad.transition_schedule[3].deferred_sequences.clear();
-    assert!(compile(root.path(), &bad).is_err());
+    assert!(compile(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut bad = op.clone();
     bad.transition_schedule[0].required_completed_transition_sequences = vec![174];
-    assert!(compile(root.path(), &bad).is_err());
+    assert!(compile(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut bad = op.clone();
     bad.transition_schedule.remove(2);
-    assert!(compile(root.path(), &bad).is_err());
+    assert!(compile(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     fs::write(root.path().join("pre.sql"), "SELECT 0;\n").unwrap();
-    assert!(compile(root.path(), &op).is_err());
+    assert!(compile(root.path(), &op, WorkspaceOperationLoad::Execute).is_err());
     let (root, op) = fixture(257);
-    assert!(compile(root.path(), &op).is_err());
+    assert!(compile(root.path(), &op, WorkspaceOperationLoad::Execute).is_err());
 }
 
 fn operations(root: &Path, op: &Declaration) -> Vec<Declaration> {
-    compile(root, op)
+    compile(root, op, WorkspaceOperationLoad::Execute)
         .unwrap()
         .scheduled_targets
         .into_iter()
@@ -252,16 +253,23 @@ fn v3_real_loader_binds_every_target_in_one_frozen_pack_and_keeps_transport_bloc
 fn v3_frozen_pack_rejects_missing_duplicate_divergent_or_unbound_future_declarations() {
     let (root, op) = fixture(184);
     let declarations = operations(root.path(), &op);
-    assert!(compile_pack(root.path(), std::slice::from_ref(&op)).is_err());
+    assert!(
+        compile_pack(
+            root.path(),
+            std::slice::from_ref(&op),
+            WorkspaceOperationLoad::Execute
+        )
+        .is_err()
+    );
     let mut bad = declarations.clone();
     bad[1].target = bad[0].target.clone();
-    assert!(compile_pack(root.path(), &bad).is_err());
+    assert!(compile_pack(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut bad = declarations.clone();
     bad[1].transition_schedule[0].phase = Phase::PostDeploy;
-    assert!(compile_pack(root.path(), &bad).is_err());
+    assert!(compile_pack(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut bad = declarations;
     bad.last_mut().unwrap().assertions.preservation.sha256 = format!("sha256:{}", "0".repeat(64));
-    assert!(compile_pack(root.path(), &bad).is_err());
+    assert!(compile_pack(root.path(), &bad, WorkspaceOperationLoad::Execute).is_err());
     let mut value = serde_json::to_value(op).unwrap();
     value["approved"] = json!(true);
     assert!(serde_json::from_value::<Declaration>(value).is_err());

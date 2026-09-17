@@ -4,6 +4,7 @@ use cfctl_core::workspace_d1::transition::{
 };
 use serde::Deserialize;
 
+use super::super::operation_identity::WorkspaceOperationLoad;
 use super::{
     AdapterStatus, CapabilityV1, MigrationManifestV1, OperationDeclaration, PACK_RELATIVE_PATH,
     Result, RiskClass, WorkspaceD1MigrationContractV1, WorkspaceD1MigrationFileV1, capability,
@@ -42,6 +43,7 @@ pub(super) fn load(
     origin: String,
     pack_bytes: &[u8],
     pack_text: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     let pack: Pack = toml::from_str(pack_text)
         .map_err(|error| invariant(format!("V3 transition pack is invalid: {error}")))?;
@@ -63,11 +65,11 @@ pub(super) fn load(
     let Some(op) = pack.operation.iter().find(|op| op.id == capability_id) else {
         return Ok(None);
     };
-    let compiled = compile_pack(&repository.path, &pack.operation)?
+    let compiled = compile_pack(&repository.path, &pack.operation, mode)?
         .into_iter()
         .find(|c| c.declaration.id == capability_id)
         .ok_or_else(|| invariant("V3 selected operation was not compiled"))?;
-    let template = committed_file(&repository.path, &safe_relative(&op.config_template)?)?;
+    let template = committed_file(&repository.path, &safe_relative(&op.config_template)?, mode)?;
     let common = OperationDeclaration {
         id: op.id.clone(),
         title: op.title.clone(),
@@ -120,7 +122,11 @@ pub(super) fn load(
     Ok(Some(result))
 }
 
-fn compile_pack(repository: &Path, operations: &[Declaration]) -> Result<Vec<Compiled>> {
+fn compile_pack(
+    repository: &Path,
+    operations: &[Declaration],
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<Compiled>> {
     let first = operations
         .first()
         .ok_or_else(|| invariant("V3 pack is empty"))?;
@@ -153,16 +159,20 @@ fn compile_pack(repository: &Path, operations: &[Declaration]) -> Result<Vec<Com
     }
     operations
         .iter()
-        .map(|op| compile(repository, op))
+        .map(|op| compile(repository, op, mode))
         .collect()
 }
 
-fn bound_source(repository: &Path, source: &Source) -> Result<Vec<u8>> {
+fn bound_source(
+    repository: &Path,
+    source: &Source,
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<u8>> {
     if !canonical_digest(&source.sha256) || !lower_hex(&source.git_blob_oid, 40) {
         return Err(invariant("V3 source digest or Git blob is not canonical"));
     }
     let relative = safe_relative(&source.path)?;
-    let bytes = committed_file(repository, &relative)?;
+    let bytes = committed_file(repository, &relative, mode)?;
     let spec = format!("HEAD:{}", source.path);
     if sha256(&bytes) != source.sha256
         || git_optional(repository, &["rev-parse", "--verify", &spec])?.as_deref()
@@ -179,7 +189,7 @@ fn bound_source(repository: &Path, source: &Source) -> Result<Vec<u8>> {
     clippy::too_many_lines,
     reason = "one compiler binds historical identity, every scheduled SQL source and exact envelope segments without a partially admitted contract"
 )]
-fn compile(repository: &Path, op: &Declaration) -> Result<Compiled> {
+fn compile(repository: &Path, op: &Declaration, mode: WorkspaceOperationLoad) -> Result<Compiled> {
     if !valid_operation_id(&op.id)
         || op.title.trim().is_empty()
         || op.description.trim().is_empty()
@@ -191,10 +201,10 @@ fn compile(repository: &Path, op: &Declaration) -> Result<Compiled> {
         return Err(invariant("V3 operation identity or target is invalid"));
     }
     let manifest: MigrationManifestV1 =
-        serde_json::from_slice(&bound_source(repository, &op.manifest)?)
+        serde_json::from_slice(&bound_source(repository, &op.manifest, mode)?)
             .map_err(|error| invariant(format!("V3 manifest is invalid: {error}")))?;
     let history: HistoricalLedger =
-        serde_json::from_slice(&bound_source(repository, &op.historical_ledger)?)
+        serde_json::from_slice(&bound_source(repository, &op.historical_ledger, mode)?)
             .map_err(|error| invariant(format!("V3 historical ledger is invalid: {error}")))?;
     if manifest.manifest_version != 1
         || manifest.migrations.is_empty()
@@ -272,7 +282,7 @@ fn compile(repository: &Path, op: &Declaration) -> Result<Compiled> {
             git_blob_oid: git_optional(repository, &["rev-parse", "--verify", &spec])?
                 .ok_or_else(|| invariant("scheduled SQL has no committed blob"))?,
         };
-        bound_source(repository, &source)?;
+        bound_source(repository, &source, mode)?;
         scheduled_targets.push(Target {
             sequence: step.sequence,
             file: entry.file.clone(),
@@ -309,7 +319,7 @@ fn compile(repository: &Path, op: &Declaration) -> Result<Compiled> {
     let mut envelope = Vec::new();
     let mut segments = Vec::new();
     for source in sources {
-        let bytes = bound_source(repository, source)?;
+        let bytes = bound_source(repository, source, mode)?;
         if bytes.is_empty()
             || bytes.contains(&0)
             || std::str::from_utf8(&bytes).is_err()

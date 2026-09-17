@@ -7,7 +7,10 @@ use cfctl_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional};
+use super::{
+    RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional,
+    operation_identity::WorkspaceOperationLoad,
+};
 
 pub const CAPABILITY_ID: &str = "star-maildesk-cf.reply-subdomain-ingress-read";
 pub const ACTIVATE_CAPABILITY_ID: &str = "star-maildesk-cf.reply-subdomain-ingress-activate";
@@ -19,6 +22,14 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
+    load_selected(roots, capability_id, WorkspaceOperationLoad::Execute)
+}
+
+pub(super) fn load_selected(
+    roots: &[PathBuf],
+    capability_id: &str,
+    mode: WorkspaceOperationLoad,
+) -> Result<Option<CapabilityV1>> {
     if !matches!(capability_id, CAPABILITY_ID | ACTIVATE_CAPABILITY_ID) {
         return Ok(None);
     }
@@ -29,6 +40,7 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
     };
     let registered = roots
         .iter()
+        .filter(|path| path.is_dir())
         .map(|path| RegisteredRoot::new(path))
         .collect::<Vec<_>>();
     let graph = WorkspaceGraph::discover(&registered)?;
@@ -39,7 +51,7 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
         if !surface_path.is_file() || !consumer_path.is_file() {
             continue;
         }
-        if repository.git.dirty {
+        if mode.requires_clean_worktree() && repository.git.dirty {
             return Err(invariant(format!(
                 "reply-subdomain ingress authority repository `{}` must be clean",
                 repository.path.display()
@@ -54,8 +66,8 @@ pub fn load_workspace_reply_subdomain_ingress_capability(
         let origin = git_optional(&repository.path, &["config", "--get", "remote.origin.url"])?
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invariant("reply-subdomain ingress authority has no origin"))?;
-        let surface = committed_file(repository.path.as_path(), SURFACE_PATH)?;
-        let consumer = committed_file(repository.path.as_path(), CONSUMER_PATH)?;
+        let surface = committed_file(repository.path.as_path(), SURFACE_PATH, mode)?;
+        let consumer = committed_file(repository.path.as_path(), CONSUMER_PATH, mode)?;
         validate_surface(&surface, operation_kind)?;
         validate_consumer(&consumer, operation_kind)?;
         matches.push(capability(WorkspaceReplySubdomainIngressContractV1 {
@@ -264,7 +276,17 @@ fn validate_consumer(bytes: &[u8], operation_kind: &str) -> Result<()> {
     Ok(())
 }
 
-fn committed_file(root: &std::path::Path, relative: &str) -> Result<Vec<u8>> {
+fn committed_file(
+    root: &std::path::Path,
+    relative: &str,
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<u8>> {
+    let committed = git_blob(root, std::path::Path::new(relative))?.ok_or_else(|| {
+        invariant("reply-subdomain ingress authority input is not tracked at HEAD")
+    })?;
+    if !mode.requires_clean_worktree() {
+        return Ok(committed);
+    }
     let path = root.join(relative);
     let metadata = fs::symlink_metadata(&path).map_err(|error| super::io_error(&path, error))?;
     if metadata.file_type().is_symlink() {
@@ -273,9 +295,6 @@ fn committed_file(root: &std::path::Path, relative: &str) -> Result<Vec<u8>> {
         ));
     }
     let bytes = fs::read(&path).map_err(|error| super::io_error(&path, error))?;
-    let committed = git_blob(root, std::path::Path::new(relative))?.ok_or_else(|| {
-        invariant("reply-subdomain ingress authority input is not tracked at HEAD")
-    })?;
     if bytes != committed {
         return Err(invariant(
             "reply-subdomain ingress authority input differs from HEAD",

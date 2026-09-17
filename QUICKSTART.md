@@ -103,16 +103,17 @@ path and is not P2-complete.
 SINK=<new-mode-0600-path>
 cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> \
   --permission "Workers Scripts Read" --permission "Workers Scripts Write" \
-  --account ca30e922fda7f5578e49873542e4aaca \
+  --account <account-id> \
   --value-out "$SINK" --json
 ```
 
-Review the plan, approve the exact operation ID, and run it once. Then install
+Review the plan, approve the exact operation ID, and run it once. The apply
+envelope names the sink path; it does not carry the token value. Then install
 and select the **child** profile from that sink:
 
 ```bash
 cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> \
-  --account ca30e922fda7f5578e49873542e4aaca --stdin --json \
+  --account <account-id> --stdin --json \
   < "$SINK"
 cfctl auth use cfctl-site-release-<UTC-date> --json
 cfctl auth status cfctl-site-release-<UTC-date> --json

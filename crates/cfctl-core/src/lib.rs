@@ -36,7 +36,7 @@ pub use workspace_d1::{
     WorkspaceD1ManifestMigrationContractV1, WorkspaceD1MigrationContractV1,
     WorkspaceD1MigrationFileV1, WorkspaceD1MigrationLedgerEntryV1, WorkspaceD1OldWorkerCanaryV1,
     WorkspaceD1PolicyProjectionContractV1, WorkspaceD1ReplyAdmissionContractV1,
-    WorkspaceD1SchemaAssertionV1, WorkspaceD1ZeroDeltaComparisonV1,
+    WorkspaceD1SchemaAssertionV1, WorkspaceD1ZeroDeltaComparisonV1, WorkspaceOperationContractV1,
 };
 
 use std::{

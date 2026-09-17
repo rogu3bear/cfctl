@@ -1,10 +1,6 @@
 ---
 artifact: launch-checklist
-version: "3.0"
 status: active
-launch_candidate: cfctl-site Workers production closure
-integration_base: cee43d46aeee9dec0f76f223b613d069cef3e00a
-candidate_binding: exact-clean-pr-head-plus-terminal-receipts
 ---
 
 # `cfctl-site` production launch checklist
@@ -22,12 +18,12 @@ context but never authorize or prove the current candidate.
 
 | Field | Bound value |
 |---|---|
-| Repository | `/Users/star/dev/cloudflare` |
+| Repository | this checkout |
 | Integration branch | `main` |
 | Source candidate | Exact clean PR head, then exact merged `origin/main` readback |
-| Cloudflare account | `ca30e922fda7f5578e49873542e4aaca` |
+| Cloudflare account | the account the launch profile is pinned to |
 | Worker | `cfctl-site` |
-| Configuration | `/Users/star/dev/cloudflare/site/wrangler.toml` |
+| Configuration | `site/wrangler.toml` |
 | Runtime | Cloudflare Workers + Workers Assets |
 | First live target | The account-bound `workers.dev` hostname |
 | Branded production target | `cfctl.com`, attached only after `workers.dev` verification |
@@ -95,14 +91,14 @@ Dashboard is an emergency human path; it is not P2-complete.
 - [ ] From a parent profile that may mint (Account API Tokens Write), not a
       Worker deploy lane, create the child token. Set
       `SINK=<new-mode-0600-path>`, then:
-      `cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> --permission "Workers Scripts Read" --permission "Workers Scripts Write" --account ca30e922fda7f5578e49873542e4aaca --value-out "$SINK" --json`
+      `cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> --permission "Workers Scripts Read" --permission "Workers Scripts Write" --account <account-id> --value-out "$SINK" --json`
 - [ ] Review that mint plan. IdentityOrOwnership requires
       `cfctl plans approve <operation-id> --yes` typed for that exact
       operation id. Prior chat auto-approve or spearhead is not that id.
       Then run `cfctl plans run <operation-id>` as a separate step. The
       one-time value goes only to the named `--value-out` file.
 - [ ] Install the child, not the parent:
-      `cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> --account ca30e922fda7f5578e49873542e4aaca --stdin --json < "$SINK"`
+      `cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> --account <account-id> --stdin --json < "$SINK"`
       then `cfctl auth use cfctl-site-release-<UTC-date> --json`.
 - [ ] Select a profile owned by `cfctl-site`; do not reuse an AOS deployment
       profile merely because it points at the same account.

@@ -16,7 +16,9 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{Result, WorkspaceError, git_blob, git_optional};
+use super::{
+    Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
+};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-migrations.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
@@ -141,18 +143,23 @@ pub fn load_workspace_d1_migration_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+    load_selected(
+        &super::operation_identity::discover(roots)?,
+        capability_id,
+        WorkspaceOperationLoad::Execute,
+    )
 }
 
 pub(super) fn load_selected(
     candidates: &[PathBuf],
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     let repositories =
         super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
     let mut matches = Vec::new();
     for repository in &repositories {
-        if let Some(capability) = load_from_repository(repository, capability_id)? {
+        if let Some(capability) = load_from_repository(repository, capability_id, mode)? {
             matches.push(capability);
         }
     }
@@ -172,11 +179,12 @@ pub(super) fn load_selected(
 fn load_from_repository(
     repository: &super::RepositoryNode,
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     if !super::operation_identity::contains(&repository.path, PACK_RELATIVE_PATH, capability_id)? {
         return Ok(None);
     }
-    if repository.git.dirty {
+    if mode.requires_clean_worktree() && repository.git.dirty {
         return Err(invariant(format!(
             "workspace operation repository `{}` must be clean",
             repository.path.display()
@@ -191,7 +199,7 @@ fn load_from_repository(
     let origin = git_optional(&repository.path, &["config", "--get", "remote.origin.url"])?
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invariant("workspace operation repository has no origin"))?;
-    let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH))?;
+    let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH), mode)?;
     let pack_text = std::str::from_utf8(&pack_bytes)
         .map_err(|_| invariant("workspace operation pack is not UTF-8"))?;
     let pack_value: toml::Value = toml::from_str(pack_text)
@@ -208,6 +216,7 @@ fn load_from_repository(
             origin,
             &pack_bytes,
             pack_text,
+            mode,
         );
     }
     if pack_value
@@ -217,7 +226,15 @@ fn load_from_repository(
     {
         let pack: OperationPackV2 = toml::from_str(pack_text)
             .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
-        return load_manifest_operation(repository, capability_id, head, origin, &pack_bytes, pack);
+        return load_manifest_operation(
+            repository,
+            capability_id,
+            head,
+            origin,
+            &pack_bytes,
+            pack,
+            mode,
+        );
     }
     let pack: OperationPack = toml::from_str(pack_text)
         .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
@@ -246,10 +263,16 @@ fn load_from_repository(
     validate_operation(operation)?;
 
     let template_relative = safe_relative(&operation.config_template)?;
-    let template = committed_file(&repository.path, &template_relative)?;
+    let template = committed_file(&repository.path, &template_relative, mode)?;
     let migration_dir = safe_relative(&operation.migrations_dir)?;
     let production_config = safe_relative(&operation.production_config)?;
-    validate_closed_migration_directory(&repository.path, &migration_dir, &operation.migration)?;
+    if mode.requires_clean_worktree() {
+        validate_closed_migration_directory(
+            &repository.path,
+            &migration_dir,
+            &operation.migration,
+        )?;
+    }
     let mut migrations = Vec::new();
     let mut prior_path: Option<&str> = None;
     for migration in &operation.migration {
@@ -267,7 +290,7 @@ fn load_from_repository(
                 "workspace D1 migrations must be direct .sql children of migrations_dir",
             ));
         }
-        let bytes = committed_file(&repository.path, &relative)?;
+        let bytes = committed_file(&repository.path, &relative, mode)?;
         let observed = sha256(&bytes);
         if migration.sha256 != observed || !is_sha256(&migration.sha256) {
             return Err(invariant(format!(
@@ -315,6 +338,7 @@ fn load_manifest_operation(
     origin: String,
     pack_bytes: &[u8],
     pack: OperationPackV2,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     if pack.schema_version != 2 {
         return Err(invariant(
@@ -341,7 +365,7 @@ fn load_manifest_operation(
     validate_manifest_operation(operation)?;
 
     let manifest_relative = safe_relative(&operation.manifest_path)?;
-    let manifest_bytes = committed_file(&repository.path, &manifest_relative)?;
+    let manifest_bytes = committed_file(&repository.path, &manifest_relative, mode)?;
     let manifest: MigrationManifestV1 = serde_json::from_slice(&manifest_bytes)
         .map_err(|_| invariant("workspace D1 migration manifest is invalid"))?;
     if manifest.manifest_version != 1 {
@@ -456,7 +480,7 @@ fn load_manifest_operation(
     }
     for entry in &pending {
         let relative = migrations_dir.join(&entry.file);
-        let bytes = committed_file(&repository.path, &relative)?;
+        let bytes = committed_file(&repository.path, &relative, mode)?;
         if sha256(&bytes) != format!("sha256:{}", entry.sha256) {
             return Err(invariant(format!(
                 "workspace D1 deferred migration `{}` differs from its committed manifest identity",
@@ -464,7 +488,7 @@ fn load_manifest_operation(
             )));
         }
     }
-    let target_bytes = committed_file(&repository.path, &target_path)?;
+    let target_bytes = committed_file(&repository.path, &target_path, mode)?;
     let target_blob_spec = format!("HEAD:{}", target_path.to_string_lossy());
     let target_git_blob_oid = git_optional(
         &repository.path,
@@ -484,7 +508,7 @@ fn load_manifest_operation(
     }
     let assertions = derive_manifest_schema_assertions(&target_bytes)?;
     let template_relative = safe_relative(&operation.config_template)?;
-    let template = committed_file(&repository.path, &template_relative)?;
+    let template = committed_file(&repository.path, &template_relative, mode)?;
     let production_config = template_relative.with_file_name("wrangler.production.toml");
     let baseline_names = baseline
         .iter()
@@ -970,17 +994,24 @@ fn selector(name: &str, location: &str) -> SelectorV1 {
     }
 }
 
-pub(super) fn committed_file(repository: &Path, relative: &Path) -> Result<Vec<u8>> {
+pub(super) fn committed_file(
+    repository: &Path,
+    relative: &Path,
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<u8>> {
     let relative = safe_relative(relative.to_string_lossy().as_ref())?;
-    reject_symlinks(repository, &relative)?;
-    let worktree = fs::read(repository.join(&relative))
-        .map_err(|source| super::io_error(&repository.join(&relative), source))?;
     let committed = git_blob(repository, &relative)?.ok_or_else(|| {
         invariant(format!(
             "workspace operation input `{}` is not tracked at HEAD",
             relative.display()
         ))
     })?;
+    if !mode.requires_clean_worktree() {
+        return Ok(committed);
+    }
+    reject_symlinks(repository, &relative)?;
+    let worktree = fs::read(repository.join(&relative))
+        .map_err(|source| super::io_error(&repository.join(&relative), source))?;
     if worktree != committed {
         return Err(invariant(format!(
             "workspace operation input `{}` differs from HEAD",

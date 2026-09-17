@@ -26,8 +26,8 @@ public documentation, and proof in one coherent change.
 tracked doctrine and public contract for a particular harness; they carry no
 independent product truth and cannot widen authority.
 
-`CONTRIBUTING.md`, runbooks, and website planning documents are consumers. They
-may explain a bounded workflow but cannot redefine a higher layer.
+`CONTRIBUTING.md`, runbooks, and the website launch checklist are consumers.
+They may explain a bounded workflow but cannot redefine a higher layer.
 
 `NUANCE.md` is a private evidentiary sidecar. A reproduced observation may
 falsify an assumption at any layer, but cannot create doctrine, grant

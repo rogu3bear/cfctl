@@ -20,7 +20,11 @@ mod d1_reads;
 mod d1_reply_admission;
 pub use d1_reads::revalidate_workspace_d1_read_inventory;
 mod operation_identity;
-pub use operation_identity::load_workspace_operation_capability;
+mod operation_pack;
+pub use operation_identity::{
+    WorkspaceOperationLoad, inspect_workspace_operation_capability,
+    load_workspace_operation_capability,
+};
 mod reply_subdomain_ingress;
 
 pub use d1_evidence::{

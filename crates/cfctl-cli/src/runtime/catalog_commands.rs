@@ -11,7 +11,7 @@ use super::support::catalog_index_file;
 use super::support::cli_io;
 use super::support::docs_file;
 use super::support::http_client;
-use super::support::load_workspace_capability;
+use super::support::inspect_workspace_capability;
 use crate::telemetry_product::operational_proof_coverage;
 use cfctl_catalog::{
     attach_official_product_knowledge, fetch_official, fetch_official_text_feeds, ingest_cli_help,
@@ -45,7 +45,7 @@ pub(super) async fn catalog_command(
             let capability = if let Some(capability) = catalog.get(&selector.capability_id) {
                 capability.clone()
             } else {
-                load_workspace_capability(store, &selector.capability_id)?
+                inspect_workspace_capability(store, &selector.capability_id)?
                     .ok_or_else(|| capability_missing(&selector.capability_id))?
             };
             Ok(ResultEnvelopeV2::success(
@@ -212,7 +212,7 @@ pub(super) async fn guide_command(
     let capability = if let Some(capability) = catalog.get(capability_id) {
         capability.clone()
     } else {
-        load_workspace_capability(store, capability_id)?
+        inspect_workspace_capability(store, capability_id)?
             .ok_or_else(|| capability_missing(capability_id))?
     };
     Ok(ResultEnvelopeV2::success(

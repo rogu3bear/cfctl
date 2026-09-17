@@ -11,7 +11,9 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{Result, WorkspaceError, git_blob, git_optional};
+use super::{
+    Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
+};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-evidence.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
@@ -156,15 +158,15 @@ struct OperationPack {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OperationDeclaration {
-    id: String,
-    title: String,
-    description: String,
-    config_template: String,
-    production_config: String,
-    database_binding: String,
-    wrangler_version: String,
-    projection: String,
+pub(super) struct OperationDeclaration {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) description: String,
+    pub(super) config_template: String,
+    pub(super) production_config: String,
+    pub(super) database_binding: String,
+    pub(super) wrangler_version: String,
+    pub(super) projection: String,
 }
 
 /// Load one clean-repository-owned, fixed-query D1 evidence capability.
@@ -174,18 +176,23 @@ pub fn load_workspace_d1_evidence_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+    load_selected(
+        &super::operation_identity::discover(roots)?,
+        capability_id,
+        WorkspaceOperationLoad::Execute,
+    )
 }
 
 pub(super) fn load_selected(
     candidates: &[PathBuf],
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     let repositories =
         super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
     let mut matches = Vec::new();
     for repository in &repositories {
-        if let Some(capability) = load_from_repository(repository, capability_id)? {
+        if let Some(capability) = load_from_repository(repository, capability_id, mode)? {
             matches.push(capability);
         }
     }
@@ -201,11 +208,12 @@ pub(super) fn load_selected(
 fn load_from_repository(
     repository: &super::RepositoryNode,
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     if !super::operation_identity::contains(&repository.path, PACK_RELATIVE_PATH, capability_id)? {
         return Ok(None);
     }
-    if repository.git.dirty {
+    if mode.requires_clean_worktree() && repository.git.dirty {
         return Err(invariant(format!(
             "workspace D1 evidence repository `{}` must be clean",
             repository.path.display()
@@ -220,12 +228,15 @@ fn load_from_repository(
     let origin = git_optional(&repository.path, &["config", "--get", "remote.origin.url"])?
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invariant("workspace D1 evidence repository has no origin"))?;
-    let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH))?;
+    let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH), mode)?;
     let pack: OperationPack = toml::from_str(
         std::str::from_utf8(&pack_bytes)
             .map_err(|_| invariant("workspace D1 evidence pack is not UTF-8"))?,
     )
     .map_err(|error| invariant(format!("workspace D1 evidence pack is invalid: {error}")))?;
+    if pack.schema_version == 2 {
+        return Ok(None);
+    }
     if pack.schema_version != PACK_SCHEMA_VERSION {
         return Err(invariant(
             "workspace D1 evidence pack schema version is unsupported",
@@ -250,17 +261,44 @@ fn load_from_repository(
     else {
         return Ok(None);
     };
+    bind_declared(
+        repository,
+        mode,
+        PACK_RELATIVE_PATH,
+        &pack_bytes,
+        head,
+        origin,
+        operation,
+    )
+}
+
+pub(super) fn bind_declared(
+    repository: &super::RepositoryNode,
+    mode: WorkspaceOperationLoad,
+    pack_relative: &str,
+    pack_bytes: &[u8],
+    head: &str,
+    origin: String,
+    operation: &OperationDeclaration,
+) -> Result<Option<CapabilityV1>> {
+    if mode.requires_clean_worktree() && repository.git.dirty {
+        return Err(invariant(format!(
+            "workspace D1 evidence repository `{}` must be clean",
+            repository.path.display()
+        )));
+    }
     validate_operation(operation)?;
     let template = committed_file(
         &repository.path,
         &safe_relative(&operation.config_template)?,
+        mode,
     )?;
     let contract = WorkspaceD1EvidenceContractV1 {
         repository_root: repository.path.display().to_string(),
         repository_head: head.to_owned(),
         repository_origin: origin,
-        operation_pack_path: PACK_RELATIVE_PATH.to_owned(),
-        operation_pack_sha256: sha256(&pack_bytes),
+        operation_pack_path: pack_relative.to_owned(),
+        operation_pack_sha256: sha256(pack_bytes),
         config_template_path: operation.config_template.clone(),
         config_template_sha256: sha256(&template),
         production_config_path: safe_relative(&operation.production_config)?
@@ -379,17 +417,24 @@ fn selector(name: &str, location: &str) -> SelectorV1 {
     }
 }
 
-fn committed_file(repository: &Path, relative: &Path) -> Result<Vec<u8>> {
+fn committed_file(
+    repository: &Path,
+    relative: &Path,
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<u8>> {
     let relative = safe_relative(relative.to_string_lossy().as_ref())?;
-    reject_symlinks(repository, &relative)?;
-    let worktree = std::fs::read(repository.join(&relative))
-        .map_err(|source| super::io_error(&repository.join(&relative), source))?;
     let committed = git_blob(repository, &relative)?.ok_or_else(|| {
         invariant(format!(
             "workspace D1 evidence input `{}` is not tracked at HEAD",
             relative.display()
         ))
     })?;
+    if !mode.requires_clean_worktree() {
+        return Ok(committed);
+    }
+    reject_symlinks(repository, &relative)?;
+    let worktree = std::fs::read(repository.join(&relative))
+        .map_err(|source| super::io_error(&repository.join(&relative), source))?;
     if worktree != committed {
         return Err(invariant(format!(
             "workspace D1 evidence input `{}` differs from HEAD",
@@ -693,6 +738,24 @@ mod tests {
         )
         .expect_err("dirty authority fails closed");
         assert!(error.to_string().contains("must be clean"));
+
+        let root = fixture();
+        fs::write(root.path().join("unrelated"), "dirty").expect("unrelated dirt");
+        let id = "star-maildesk-cf.d1-evidence-read";
+        load_workspace_d1_evidence_capability(&[root.path().to_path_buf()], id)
+            .expect_err("execute still requires a clean worktree");
+        let inspected =
+            crate::inspect_workspace_operation_capability(&[root.path().to_path_buf()], id)
+                .expect("inspect")
+                .expect("committed capability");
+        assert_eq!(inspected.id, id);
+        fs::write(root.path().join(PACK_RELATIVE_PATH), "schema_version = 1\n")
+            .expect("pack drift");
+        let still_committed =
+            crate::inspect_workspace_operation_capability(&[root.path().to_path_buf()], id)
+                .expect("inspect uses HEAD")
+                .expect("committed capability");
+        assert_eq!(still_committed.id, id);
 
         let root = fixture();
         let pack = root.path().join(PACK_RELATIVE_PATH);
