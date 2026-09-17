@@ -728,6 +728,8 @@ pub struct PlanSelector {
 #[derive(Debug, Args)]
 pub struct PlanApproveArgs {
     pub operation_id: String,
+    /// Typed confirmation for this operation id. Defaults off; chat, spearhead,
+    /// or a prior auto-approve cannot set it.
     #[arg(long)]
     pub yes: bool,
     #[arg(long)]
