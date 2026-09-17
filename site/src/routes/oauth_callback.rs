@@ -101,15 +101,18 @@ fn OAuthCallbackBridge() -> impl IntoView {
             timeout.forget();
 
             let page_clear = clear_sensitive;
-            let page_event = Closure::<dyn FnMut(web_sys::Event)>::new(move |event| {
-                let persisted = event
-                    .dyn_ref::<web_sys::PageTransitionEvent>()
-                    .is_some_and(web_sys::PageTransitionEvent::persisted);
-                if crate::oauth::clears_sensitive_callback_on_page_event(&event.type_(), persisted)
-                {
-                    page_clear();
-                }
-            });
+            let page_event =
+                Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+                    let persisted = event
+                        .dyn_ref::<web_sys::PageTransitionEvent>()
+                        .is_some_and(web_sys::PageTransitionEvent::persisted);
+                    if crate::oauth::clears_sensitive_callback_on_page_event(
+                        &event.type_(),
+                        persisted,
+                    ) {
+                        page_clear();
+                    }
+                });
             let _ = window
                 .add_event_listener_with_callback("pagehide", page_event.as_ref().unchecked_ref());
             let _ = window
