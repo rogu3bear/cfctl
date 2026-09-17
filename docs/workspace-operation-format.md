@@ -19,10 +19,10 @@ but its *logic* is five Rust modules compiled into the CLI:
 | `workspace_d1_evidence` | 1,167 |
 | `workspace_d1_projection` | 826 |
 
-`load_workspace_capability` (`crates/cfctl-cli/src/runtime/support.rs:189`)
+`load_workspace_capability` (`crates/cfctl-cli/src/runtime/support.rs:202`)
 calls them in a fixed sequence. Each is named for an application, so cfctl
 cannot gain an operation without a cfctl release, and `CapabilityV1` carries
-ten fields named for applications — two named for individual migrations.
+eleven fields named for applications — two named for individual migrations.
 
 ## What the modules actually share
 
