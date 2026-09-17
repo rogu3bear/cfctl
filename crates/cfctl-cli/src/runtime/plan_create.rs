@@ -1044,24 +1044,15 @@ pub(super) async fn read_live_worker_deployment_state(
             .ok_or_else(|| {
                 CliError::Input("Worker rollback target version is missing".to_owned())
             })?;
-        let version_source = exact_worker_deployment_read_capability(
+        let version = read_worker_version_detail(
             catalog,
-            worker_deployment::VERSION_CAPABILITY_ID,
-            worker_deployment::VERSION_PATH,
-        )?;
-        let version_input = CallInput {
-            selectors: json!({
-                "account_id": account_id,
-                "script_name": service_name,
-                "version_id": target_version_id,
-            }),
-            query: json!({}),
-            body: None,
-            ..CallInput::default()
-        };
-        let version = executor
-            .execute_read(version_source, &version_input, credential)
-            .await?;
+            &executor,
+            credential,
+            account_id,
+            service_name,
+            target_version_id,
+        )
+        .await?;
         worker_deployment::apply_rollback_state_responses(
             account_id,
             service_name,
@@ -1073,16 +1064,88 @@ pub(super) async fn read_live_worker_deployment_state(
             &version,
         )?
     } else {
+        let require_singular_active =
+            capability.id == cfctl_core::WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID;
+        let version = if require_singular_active {
+            read_current_active_version_detail(
+                catalog,
+                &executor,
+                credential,
+                account_id,
+                service_name,
+                deployments.as_ref(),
+            )
+            .await?
+        } else {
+            None
+        };
         worker_deployment::apply_state_responses(
             account_id,
             service_name,
             &settings,
             deployments.as_ref(),
-            capability.id == cfctl_core::WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+            version.as_ref(),
+            require_singular_active,
         )?
     };
     let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
+}
+
+async fn read_worker_version_detail(
+    catalog: &CatalogSnapshot,
+    executor: &Executor,
+    credential: &AuthCredential,
+    account_id: &str,
+    service_name: &str,
+    version_id: &str,
+) -> Result<CloudflareResponseV1> {
+    let version_source = exact_worker_deployment_read_capability(
+        catalog,
+        worker_deployment::VERSION_CAPABILITY_ID,
+        worker_deployment::VERSION_PATH,
+    )?;
+    let version_input = CallInput {
+        selectors: json!({
+            "account_id": account_id,
+            "script_name": service_name,
+            "version_id": version_id,
+        }),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    };
+    Ok(executor
+        .execute_read(version_source, &version_input, credential)
+        .await?)
+}
+
+async fn read_current_active_version_detail(
+    catalog: &CatalogSnapshot,
+    executor: &Executor,
+    credential: &AuthCredential,
+    account_id: &str,
+    service_name: &str,
+    deployments: Option<&CloudflareResponseV1>,
+) -> Result<Option<CloudflareResponseV1>> {
+    let Some(deployments) =
+        deployments.filter(|response| response.success && (200..300).contains(&response.status))
+    else {
+        return Ok(None);
+    };
+    let (_, version_id) =
+        worker_deployment::current_active_deployment_identity(&deployments.result)?;
+    Ok(Some(
+        read_worker_version_detail(
+            catalog,
+            executor,
+            credential,
+            account_id,
+            service_name,
+            version_id,
+        )
+        .await?,
+    ))
 }
 
 pub(super) fn exact_worker_deployment_read_capability<'a>(

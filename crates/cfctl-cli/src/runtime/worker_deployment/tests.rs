@@ -1,10 +1,37 @@
 #![allow(clippy::wildcard_imports, reason = "white-box domain tests")]
 
 use super::*;
-use cfctl_cloudflare::CloudflareApiErrorV1;
-use cfctl_core::{AdapterStatus, EffectClass, PlanStatus, RiskClass};
+use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1};
+use cfctl_core::{AdapterStatus, EffectClass, PlanStatus, PlanV1, RiskClass};
 use cfctl_workspace::RegisteredRoot;
 use std::process::Command;
+
+fn provider_ok(result: Value) -> CloudflareResponseV1 {
+    CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result,
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    }
+}
+
+fn provider_err(status: u16, code: i64, message: &str) -> CloudflareResponseV1 {
+    CloudflareResponseV1 {
+        status,
+        success: false,
+        result: Value::Null,
+        errors: vec![CloudflareApiErrorV1 {
+            code: Some(code),
+            message: message.to_owned(),
+        }],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    }
+}
 
 #[test]
 fn every_local_worker_traffic_mutation_resolves_to_one_shared_lock_target() {
@@ -1236,69 +1263,44 @@ fn target_rejects_nested_repository_inside_ignored_artifact_directory() {
 
 #[test]
 fn live_state_receipts_distinguish_absence_from_redacted_existing_state() {
-    let absent = CloudflareResponseV1 {
-        status: 404,
-        success: false,
-        result: Value::Null,
-        errors: vec![CloudflareApiErrorV1 {
-            code: Some(NOT_FOUND_ERROR_CODE),
-            message: "This Worker does not exist on your account.".to_owned(),
-        }],
-        result_info: None,
-        etag: None,
-        cf_ray: None,
-    };
-    let error = apply_state_responses("account-a", "cfctl-site", &absent, None, true)
+    let absent = provider_err(
+        404,
+        NOT_FOUND_ERROR_CODE,
+        "This Worker does not exist on your account.",
+    );
+    let error = apply_state_responses("account-a", "cfctl-site", &absent, None, None, true)
         .expect_err("planning capability requires a prior active rollback identity")
         .to_string();
     assert!(error.contains("requires one prior active version for rollback"));
-    let absent = apply_state_responses("account-a", "cfctl-site", &absent, None, false)
+    let absent = apply_state_responses("account-a", "cfctl-site", &absent, None, None, false)
         .expect("legacy lane may represent absence");
     assert_eq!(absent["exists"], false);
     assert!(absent.get("redacted_settings_hash").is_none());
     assert!(absent.get("redacted_deployments_hash").is_none());
 
-    let ambiguous = CloudflareResponseV1 {
-        status: 404,
-        success: false,
-        result: Value::Null,
-        errors: vec![CloudflareApiErrorV1 {
-            code: Some(9_999),
-            message: "ambiguous not found".to_owned(),
-        }],
-        result_info: None,
-        etag: None,
-        cf_ray: None,
-    };
-    assert!(apply_state_responses("account-a", "cfctl-site", &ambiguous, None, true).is_err());
+    let ambiguous = provider_err(404, 9_999, "ambiguous not found");
+    assert!(
+        apply_state_responses("account-a", "cfctl-site", &ambiguous, None, None, true).is_err()
+    );
 
-    let existing = CloudflareResponseV1 {
-        status: 200,
-        success: true,
-        result: json!({"compatibility_date": "2026-08-05", "secret_text": "hidden"}),
-        errors: Vec::new(),
-        result_info: None,
-        etag: None,
-        cf_ray: None,
-    };
-    let deployment_a = CloudflareResponseV1 {
-        status: 200,
-        success: true,
-        result: json!([{"id": "deployment-a", "versions": [{"version_id": "version-a", "percentage": 100}]}]),
-        errors: Vec::new(),
-        result_info: None,
-        etag: None,
-        cf_ray: None,
-    };
-    let deployment_b = CloudflareResponseV1 {
-        result: json!([{"id": "deployment-b", "versions": [{"version_id": "version-b", "percentage": 100}]}]),
-        ..deployment_a.clone()
-    };
+    let existing =
+        provider_ok(json!({"compatibility_date": "2026-08-05", "secret_text": "hidden"}));
+    let deployment_a = provider_ok(
+        json!([{"id": "deployment-a", "versions": [{"version_id": "version-a", "percentage": 100}]}]),
+    );
+    let deployment_b = provider_ok(
+        json!([{"id": "deployment-b", "versions": [{"version_id": "version-b", "percentage": 100}]}]),
+    );
+    let version_a = provider_ok(
+        json!({"id": "version-a", "number": 1, "metadata": {"source": "hidden-source"}}),
+    );
+    let version_b = provider_ok(json!({"id": "version-b", "number": 2}));
     let existing_a = apply_state_responses(
         "account-a",
         "cfctl-site",
         &existing,
         Some(&deployment_a),
+        Some(&version_a),
         true,
     )
     .expect("existing");
@@ -1307,48 +1309,119 @@ fn live_state_receipts_distinguish_absence_from_redacted_existing_state() {
         "cfctl-site",
         &existing,
         Some(&deployment_b),
+        Some(&version_b),
         true,
     )
     .expect("drifted deployment");
-    let existing = existing_a;
-    assert_eq!(existing["exists"], true);
-    assert_eq!(existing["current_active"]["deployment_id"], "deployment-a");
-    assert_eq!(existing["current_active"]["version_id"], "version-a");
-    assert_eq!(existing["current_active"]["traffic_percentage"], 100);
-    assert!(existing["redacted_settings_hash"].as_str().is_some());
-    assert!(existing["redacted_deployments_hash"].as_str().is_some());
-    assert_ne!(existing, existing_b);
-    assert!(!existing.to_string().contains("hidden"));
+    assert_eq!(existing_a["exists"], true);
+    assert_eq!(
+        existing_a["current_active"]["deployment_id"],
+        "deployment-a"
+    );
+    assert_eq!(existing_a["current_active"]["version_id"], "version-a");
+    assert_eq!(existing_a["current_active"]["traffic_percentage"], 100);
+    assert_eq!(
+        existing_a["version_source_capability_id"],
+        "worker-versions-get-version-detail"
+    );
+    assert_eq!(
+        existing_a["current_active"]["version_detail_hash"],
+        existing_a["redacted_version_detail_hash"]
+    );
+    assert_eq!(retrievable_rollback_anchor(&existing_a), Some("version-a"));
+    assert!(existing_a["redacted_settings_hash"].as_str().is_some());
+    assert!(existing_a["redacted_deployments_hash"].as_str().is_some());
+    assert_ne!(existing_a, existing_b);
+    assert!(!existing_a.to_string().contains("hidden"));
+    assert!(!existing_a.to_string().contains("hidden-source"));
+}
+
+#[test]
+fn uuid_present_in_list_versions_but_missing_on_worker_versions_get_version_detail_is_not_a_rollback_anchor()
+ {
+    let settings = provider_ok(json!({"compatibility_date": "2026-08-05"}));
+    let deployments = provider_ok(
+        json!([{"id": "deployment-a", "versions": [{"version_id": "version-a", "percentage": 100}]}]),
+    );
+    let list_only = json!({
+        "schema_version": 1,
+        "source_capability_id": SETTINGS_CAPABILITY_ID,
+        "source_path": SETTINGS_PATH,
+        "deployment_source_capability_id": DEPLOYMENTS_CAPABILITY_ID,
+        "deployment_source_path": DEPLOYMENTS_PATH,
+        "account_id": "account-a",
+        "service_name": "cfctl-site",
+        "http_status": 200,
+        "deployment_http_status": 200,
+        "exists": true,
+        "redacted_settings_hash": "sha256:settings",
+        "redacted_deployments_hash": "sha256:deployments",
+        "current_active": {
+            "deployment_id": "deployment-a",
+            "version_id": "version-a",
+            "traffic_percentage": 100,
+        },
+    });
+    assert!(
+        retrievable_rollback_anchor(&list_only).is_none(),
+        "a deployments-list 100 percent UUID is not a rollback anchor"
+    );
+
+    let omitted = apply_state_responses(
+        "account-a",
+        "cfctl-site",
+        &settings,
+        Some(&deployments),
+        None,
+        true,
+    )
+    .expect_err("planning must not treat list identity as retrievable")
+    .to_string();
+    assert!(omitted.contains("worker-versions-get-version-detail"));
+    assert!(omitted.contains("not retrievable"));
+
+    let missing = provider_err(404, NOT_FOUND_ERROR_CODE, "Worker version was not found");
+    let error = apply_state_responses(
+        "account-a",
+        "cfctl-site",
+        &settings,
+        Some(&deployments),
+        Some(&missing),
+        true,
+    )
+    .expect_err("list UUID missing on get-version-detail is not a rollback anchor")
+    .to_string();
+    assert!(error.contains("worker-versions-get-version-detail"));
+    assert!(error.contains("version-a"));
+    assert!(error.contains("not a rollback anchor"));
+
+    let mismatched = provider_ok(json!({"id": "version-other"}));
+    let mismatch = apply_state_responses(
+        "account-a",
+        "cfctl-site",
+        &settings,
+        Some(&deployments),
+        Some(&mismatched),
+        true,
+    )
+    .expect_err("get-version-detail of a different UUID is not a rollback anchor")
+    .to_string();
+    assert!(mismatch.contains("worker-versions-get-version-detail"));
 }
 
 #[test]
 fn split_traffic_cannot_supply_a_truthful_prior_active_rollback_identity() {
-    let settings = CloudflareResponseV1 {
-        status: 200,
-        success: true,
-        result: json!({"compatibility_date": "2026-08-05"}),
-        errors: Vec::new(),
-        result_info: None,
-        etag: None,
-        cf_ray: None,
-    };
-    let deployments = CloudflareResponseV1 {
-        status: 200,
-        success: true,
-        result: json!({"deployments":[{"id":"deployment-a","versions":[
-            {"version_id":"version-a","percentage":50},
-            {"version_id":"version-b","percentage":50}
-        ]}]}),
-        errors: Vec::new(),
-        result_info: None,
-        etag: None,
-        cf_ray: None,
-    };
+    let settings = provider_ok(json!({"compatibility_date": "2026-08-05"}));
+    let deployments = provider_ok(json!({"deployments":[{"id":"deployment-a","versions":[
+        {"version_id":"version-a","percentage":50},
+        {"version_id":"version-b","percentage":50}
+    ]}]}));
     let legacy = apply_state_responses(
         "account-a",
         "relay-router",
         &settings,
         Some(&deployments),
+        None,
         false,
     )
     .expect("legacy deploy/upload lanes retain split-traffic planning");
@@ -1358,6 +1431,7 @@ fn split_traffic_cannot_supply_a_truthful_prior_active_rollback_identity() {
         "relay-router",
         &settings,
         Some(&deployments),
+        None,
         true,
     )
     .expect_err("split traffic has no sole rollback identity")
