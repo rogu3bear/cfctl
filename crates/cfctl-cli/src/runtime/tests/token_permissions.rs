@@ -932,3 +932,78 @@ pub(super) fn token_creation_guide_routes_through_the_inventory_bound_keys_workf
         ])
     );
 }
+
+#[test]
+pub(super) fn mint_planned_with_profile_minter_does_not_report_minter_as_wrangler_versions_upload_profile()
+ {
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create Token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let mut plan = PlanV1::draft("minter", "account-a", "catalog-sha", capability, json!({}))
+        .expect("draft mint plan");
+    plan.input = json!({
+        "selectors": {"account_id": "account-a"},
+        "query": {},
+        "body": {"name": "cfctl-site-release-test"}
+    });
+    let apply = EvidenceV1::new(
+        EvidenceClass::Apply,
+        "sha256:apply",
+        "/managed/evidence/apply.json",
+    );
+    let envelope = api_plan_result_envelope(
+        &plan,
+        json!({"success": true, "result": {"id": "token-id", "status": "active"}}),
+        apply,
+        None,
+        ApiVerificationOutcome {
+            state: VerificationState::Passed,
+            basis: "created token id and active status matched".to_owned(),
+            evidence: None,
+            error: None,
+            correlated_resource_id: None,
+        },
+        true,
+        None,
+    );
+
+    assert_eq!(envelope.profile_id.as_deref(), Some("minter"));
+    assert_eq!(envelope.result["mint_parent_profile"], "minter");
+    assert_eq!(
+        envelope.result["launch_profile_id"],
+        "cfctl-site-release-test"
+    );
+    assert_eq!(
+        envelope.result["install_child_argv"],
+        json!([
+            "cfctl",
+            "auth",
+            "import-api-token",
+            "--profile",
+            "cfctl-site-release-test",
+            "--account",
+            "account-a",
+            "--stdin"
+        ])
+    );
+    assert!(
+        envelope.result.get("current_profile").is_none(),
+        "plans run of a mint must not auto-select minter as current_profile"
+    );
+
+    let upload_profile = wrangler_versions_upload_profile_from_mint_envelope(&envelope)
+        .expect("plans-run mint result names the child launch profile");
+    assert_eq!(upload_profile, "cfctl-site-release-test");
+    assert_ne!(
+        upload_profile, "minter",
+        "wrangler.versions-upload must not use the mint parent"
+    );
+    assert_ne!(
+        Some(upload_profile),
+        envelope.profile_id.as_deref(),
+        "envelope.profile_id remains the mint parent and is not the upload profile"
+    );
+}

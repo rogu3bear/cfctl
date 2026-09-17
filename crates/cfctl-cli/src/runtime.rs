@@ -39,6 +39,7 @@ mod import_rectification;
 mod import_resume;
 mod keys_commands;
 mod live_state_contracts;
+mod mint_launch_lane;
 mod mutation_input;
 mod oauth_state;
 mod pages_deployment;
