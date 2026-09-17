@@ -660,6 +660,25 @@ pub(super) fn missing_credential_points_at_import() {
             .contains("import-api-token")
     );
 }
+
+#[test]
+pub(super) fn account_selection_errors_list_profiles_not_auth_status() {
+    for error in [
+        super::CliError::Auth(cfctl_auth::AuthError::NoAccounts),
+        super::CliError::Auth(cfctl_auth::AuthError::AmbiguousAccount { count: 2 }),
+        super::CliError::Auth(cfctl_auth::AuthError::AccountNotFound("acct".to_owned())),
+    ] {
+        let step = error.next_step().expect("account errors carry a step");
+        assert!(
+            step.contains("auth profiles"),
+            "{error}: expected auth profiles, got {step}"
+        );
+        assert!(
+            !step.contains("auth status --json"),
+            "{error}: auth status is one profile, not the list surface: {step}"
+        );
+    }
+}
 #[test]
 pub(super) fn evidence_key_transition_guidance_distinguishes_unchanged_and_indeterminate() {
     let unchanged = super::CliError::Auth(cfctl_auth::AuthError::EvidenceKeyLifecycle(

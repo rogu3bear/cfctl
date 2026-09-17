@@ -353,7 +353,7 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
                 .to_owned()
         }
         E::NoAccounts | E::AmbiguousAccount { .. } | E::AccountNotFound(_) => {
-            "Pass `--account <account-id>` explicitly (list available accounts with `cfctl auth status --json`)."
+            "Pass `--account <account-id>` explicitly (list profiles with `cfctl auth profiles --json`)."
                 .to_owned()
         }
         E::UnsupportedLegacyWranglerSession(id) => format!(

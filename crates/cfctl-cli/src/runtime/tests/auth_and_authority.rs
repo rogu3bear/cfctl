@@ -1,4 +1,5 @@
 use super::*;
+use clap::Parser;
 
 pub(super) fn emergency_global_key_as_current() -> ProfilesConfig {
     let mut profiles = BTreeMap::new();
@@ -36,6 +37,83 @@ pub(super) fn emergency_global_key_is_never_selected_without_an_explicit_profile
     profiles
         .selected(None)
         .expect("non-emergency profiles remain selectable as current");
+}
+
+fn parsed_auth_status(arguments: &[&str]) -> AuthStatusArgs {
+    let parsed = Cli::try_parse_from(arguments).expect("auth status parses");
+    let Some(Command::Auth(auth)) = parsed.command else {
+        panic!("expected auth command, got {:?}", parsed.command);
+    };
+    let AuthCommand::Status(status) = auth.command else {
+        panic!("expected auth status, got {:?}", auth.command);
+    };
+    status
+}
+
+fn site_release_and_default_profiles(current: Option<&str>) -> ProfilesConfig {
+    let mut profiles = BTreeMap::new();
+    profiles.insert(
+        "default".to_owned(),
+        ProfileMetadata::new("default", ProfileKind::ApiToken, Some("account-a")),
+    );
+    profiles.insert(
+        "cfctl-site-release-x".to_owned(),
+        ProfileMetadata::new(
+            "cfctl-site-release-x",
+            ProfileKind::ApiToken,
+            Some("account-a"),
+        ),
+    );
+    ProfilesConfig {
+        current_profile: current.map(str::to_owned),
+        profiles,
+        ..ProfilesConfig::default()
+    }
+}
+
+#[test]
+pub(super) fn bare_auth_status_reports_selected_cfctl_site_release_profile() {
+    let arguments = parsed_auth_status(&["cfctl", "auth", "status", "--json"]);
+    assert!(
+        arguments.profile.is_none(),
+        "bare `cfctl auth status --json` must not default the operand to `default`"
+    );
+
+    let secrets = MemorySecretStore::default();
+    let profiles = site_release_and_default_profiles(Some("cfctl-site-release-x"));
+    let envelope = auth_status(&profiles, &secrets, &arguments).expect("bare status");
+
+    assert_eq!(envelope.result["profile"]["id"], "cfctl-site-release-x");
+    assert_eq!(envelope.result["selected"], true);
+}
+
+#[test]
+pub(super) fn bare_auth_status_errors_when_no_profile_is_selected() {
+    let arguments = parsed_auth_status(&["cfctl", "auth", "status", "--json"]);
+    let secrets = MemorySecretStore::default();
+    let profiles = site_release_and_default_profiles(None);
+    let error = auth_status(&profiles, &secrets, &arguments)
+        .expect_err("bare status without a selection must fail closed");
+    assert_eq!(error.code(), "CFCTL_NO_PROFILE");
+    let step = error.next_step().expect("no-profile status carries a step");
+    assert!(step.contains("auth profiles"), "{step}");
+    assert!(
+        !step.contains("auth status --json"),
+        "the list surface is auth profiles, not auth status: {step}"
+    );
+}
+
+#[test]
+pub(super) fn auth_status_explicit_operand_reports_that_named_profile() {
+    let arguments = parsed_auth_status(&["cfctl", "auth", "status", "default", "--json"]);
+    assert_eq!(arguments.profile.as_deref(), Some("default"));
+
+    let secrets = MemorySecretStore::default();
+    let profiles = site_release_and_default_profiles(Some("cfctl-site-release-x"));
+    let envelope = auth_status(&profiles, &secrets, &arguments).expect("named status");
+
+    assert_eq!(envelope.result["profile"]["id"], "default");
+    assert_eq!(envelope.result["selected"], false);
 }
 
 #[tokio::test]

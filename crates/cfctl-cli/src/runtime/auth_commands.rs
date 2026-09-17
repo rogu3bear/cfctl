@@ -6,9 +6,9 @@ use super::credential_resolution::platform_secrets;
 use super::credential_resolution::resolve_login_scopes;
 use super::evidence_key_commands::evidence_key_command;
 use super::prelude::{
-    AuthCommand, AuthLoginArgs, CliError, ImportGlobalKeyArgs, OAuthClientConfig, PendingLogin,
-    PkceSession, ProfileKind, ProfileMetadata, ProfileSelector, ProfilesConfig, Result,
-    ResultEnvelopeV2, SecretStore, StateStore, Write, json,
+    AuthCommand, AuthLoginArgs, AuthStatusArgs, CliError, ImportGlobalKeyArgs, OAuthClientConfig,
+    PendingLogin, PkceSession, ProfileKind, ProfileMetadata, ProfileSelector, ProfilesConfig,
+    Result, ResultEnvelopeV2, SecretStore, StateStore, Write, json,
 };
 use super::support::http_client;
 use super::support::read_import_secret;
@@ -35,7 +35,7 @@ pub(super) async fn auth_command(
         AuthCommand::Login(arguments) => {
             complete_oauth_login(store, &mut profiles, &secrets, arguments).await
         }
-        AuthCommand::Status(selector) => auth_status(&profiles, &secrets, &selector),
+        AuthCommand::Status(arguments) => auth_status(&profiles, &secrets, &arguments),
         AuthCommand::Profiles => Ok(ResultEnvelopeV2::success(
             "auth profiles",
             json!({"current": profiles.current_profile, "profiles": profiles.profiles.values().collect::<Vec<_>>() }),
@@ -164,17 +164,32 @@ pub(super) async fn complete_oauth_login(
 pub(super) fn auth_status(
     profiles: &ProfilesConfig,
     secrets: &dyn SecretStore,
-    selector: &ProfileSelector,
+    arguments: &AuthStatusArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let requested = arguments
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let id = match requested {
+        Some(id) => id,
+        None => profiles.current_profile.as_deref().ok_or_else(|| {
+            CliError::guided(
+                "CFCTL_NO_PROFILE",
+                "no active profile is selected",
+                "Run `cfctl auth profiles --json`, then `cfctl auth use <profile> --json`.",
+            )
+        })?,
+    };
     let profile = profiles
         .profiles
-        .get(&selector.profile)
-        .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
+        .get(id)
+        .ok_or_else(|| CliError::Input(format!("profile `{id}` does not exist")))?;
     ensure_supported_profile(profile)?;
     let credential_available = secrets.load_profile_credential(profile).is_ok();
     Ok(ResultEnvelopeV2::success(
         "auth status",
-        json!({"profile": profile, "credential_available": credential_available, "selected": profiles.current_profile.as_deref() == Some(&profile.id)}),
+        json!({"profile": profile, "credential_available": credential_available, "selected": profiles.current_profile.as_deref() == Some(profile.id.as_str())}),
     ))
 }
 

@@ -55,8 +55,8 @@ pub(super) use walkdir::WalkDir;
 pub(super) use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub(super) use crate::{
-    AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand,
-    Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
+    AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, AuthStatusArgs, CallArgs,
+    CatalogCommand, Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
     EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, EvidenceKeyCommand,
     EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanCommand, EvidenceKeyRecoverPlanSelector,
     EvidenceKeyRetireArgs, GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs,
