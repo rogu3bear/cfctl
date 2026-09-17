@@ -18,6 +18,9 @@ documentation, and evidence model agree.
   account, database, migration, or deployment policy into either class. New
   `legacy_embedded` entries are prohibited; workspace-owned behavior must wait
   for the typed operation-pack loader and remain in its owning repository.
+  `CapabilityV1` application-extension fields are inventoried in
+  `crates/cfctl-core/tests/capability_contract.rs` (`CAPABILITY_V1_APPLICATION_FIELDS`);
+  that list may shrink and must not grow.
 - Reads are not plans, plans are not applies, and apply artifacts are not
   post-change verification. Keep those evidence classes distinct.
 - All new mutations use the one-use canonical `PlanV2` lifecycle. The stored

@@ -79,7 +79,9 @@ const CAPABILITY_V1_FIELDS: [&str; 57] = [
 ///
 /// **This list may shrink. It must never grow.** Every entry removed is one
 /// application contract that moved to the repository that owns it.
-const CAPABILITY_V1_APPLICATION_FIELDS: [&str; 10] = [
+/// Recording `workspace_d1_read_inventory` here does not add a field; it
+/// classifies a field that was already on the struct.
+const CAPABILITY_V1_APPLICATION_FIELDS: [&str; 11] = [
     "mln_0142_post_import_schema",
     "mln_0143_data_invariants",
     "d1_approved_mln_import",
@@ -89,8 +91,17 @@ const CAPABILITY_V1_APPLICATION_FIELDS: [&str; 10] = [
     "workspace_d1_reply_admission",
     "workspace_reply_subdomain_ingress",
     "workspace_d1_evidence",
+    "workspace_d1_read_inventory",
     "email_routing_subdomain_dns",
 ];
+
+fn application_shaped(field: &str) -> bool {
+    field.starts_with("mln_")
+        || field.starts_with("workspace_d1_")
+        || field.starts_with("d1_approved_mln")
+        || field.starts_with("workspace_reply_")
+        || field == "email_routing_subdomain_dns"
+}
 fn declared_fields(content: &str) -> Result<Vec<String>, String> {
     let source = syn::parse_file(content).map_err(|error| error.to_string())?;
     let mut declarations = source.items.into_iter().filter_map(|item| match item {
@@ -117,9 +128,18 @@ fn declared_fields(content: &str) -> Result<Vec<String>, String> {
 }
 
 fn check(content: &str) -> Result<(), String> {
+    check_with(content, &[])
+}
+
+fn check_with(content: &str, extra_universal: &[&str]) -> Result<(), String> {
     let declared = declared_fields(content)?;
+    let universal: Vec<&str> = CAPABILITY_V1_FIELDS
+        .iter()
+        .copied()
+        .chain(extra_universal.iter().copied())
+        .collect();
     for field in &declared {
-        if !CAPABILITY_V1_FIELDS.contains(&field.as_str()) {
+        if !universal.iter().any(|name| *name == field) {
             return Err(format!(
                 "CapabilityV1 declares `{field}`, which is not in CAPABILITY_V1_FIELDS; review the universal contract and update its inventory in the same change"
             ));
@@ -136,6 +156,14 @@ fn check(content: &str) -> Result<(), String> {
         if !declared.iter().any(|declared| declared == field) {
             return Err(format!(
                 "CAPABILITY_V1_APPLICATION_FIELDS lists `{field}`, which CapabilityV1 no longer declares; remove the extracted application field from the inventory"
+            ));
+        }
+    }
+    for field in &declared {
+        if application_shaped(field) && !CAPABILITY_V1_APPLICATION_FIELDS.contains(&field.as_str())
+        {
+            return Err(format!(
+                "CapabilityV1 declares application-shaped `{field}` that is not on CAPABILITY_V1_APPLICATION_FIELDS; that list may shrink and must not grow by omission"
             ));
         }
     }
@@ -161,6 +189,21 @@ fn added_field_requires_an_inventory_change_at_every_visibility() {
         let error = check(&changed).expect_err("unlisted field");
         assert!(error.contains("new_application_field"), "{error}");
     }
+}
+
+#[test]
+fn application_shaped_field_cannot_hide_on_the_universal_inventory() {
+    let changed = CORE_SOURCE.replace(
+        "pub struct CapabilityV1 {",
+        "pub struct CapabilityV1 {\n    pub workspace_d1_new_ticket: Option<String>,",
+    );
+    let error =
+        check_with(&changed, &["workspace_d1_new_ticket"]).expect_err("application-shaped field");
+    assert!(error.contains("workspace_d1_new_ticket"), "{error}");
+    assert!(
+        error.contains("CAPABILITY_V1_APPLICATION_FIELDS"),
+        "{error}"
+    );
 }
 
 #[test]
