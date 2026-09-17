@@ -62,12 +62,15 @@ without cfctl changing. A kind enum admits exactly five.
 
 ## The format
 
-One schema, `schema_version = 2`, in `.cfctl/operations/*.toml`. The four
-existing files keep their names; the schema is shared, so a pack's filename
-stops carrying meaning.
+One schema, `schema_version = 2` plus `contract = "workspace_operation_v1"`, in
+`.cfctl/operations/*.toml`. Typed D1 migration packs already use
+`schema_version = 2` without that contract key; cfctl must not treat the
+integer as a format name. The four existing files keep their names; the schema
+is shared, so a pack's filename stops carrying meaning.
 
 ```toml
 schema_version = 2
+contract = "workspace_operation_v1"
 
 [[operation]]
 id = "star-maildesk-cf.d1-policy-project"
@@ -135,14 +138,18 @@ A compiled input adds one block; nothing else changes:
 ## Naming and versioning
 
 - The type is `WorkspaceOperationContractV1` in `cfctl-catalog` — v1 of the
-  *contract type*, carried in v2 of the *pack file*. The pack schema version
-  and the contract type version are separate because a pack may gain fields
-  without the contract changing.
+  *contract type*, carried in a pack that declares
+  `contract = "workspace_operation_v1"` at `schema_version = 2`. The pack
+  integer is shared with typed D1 migration packs; the contract key is the
+  format name. The pack schema version and the contract type version are
+  separate because a pack may gain fields without the contract changing.
 - It is not `CapabilityV1`. A workspace operation resolves *into* a
-  `CapabilityV1` through `CapabilityAuthorityScopeV1::WorkspaceOwned`; the ten
-  application fields are what R28 removes once nothing reads them.
-- `schema_version = 1` packs stay loadable until R26 completes, so a
-  registered root is never broken by a cfctl upgrade it did not ask for.
+  `CapabilityV1` through `CapabilityAuthorityScopeV1::WorkspaceOwned`; the
+  eleven application fields are what later unread-then-delete removes once
+  nothing reads them.
+- `schema_version = 1` packs stay loadable until their owning repositories cut
+  over, so a registered root is never broken by a cfctl upgrade it did not ask
+  for. A `schema_version = 2` pack without this contract is not this format.
 
 ## Verification strategies
 
