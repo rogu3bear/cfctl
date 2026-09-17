@@ -63,7 +63,7 @@ pub const OFFICIAL_OPENAPI_URL: &str =
 pub const OFFICIAL_DOCS_INDEX_URL: &str = "https://developers.cloudflare.com/llms.txt";
 pub const OFFICIAL_CHANGELOG_URL: &str = "https://developers.cloudflare.com/changelog/";
 
-/// v1 of the workspace-owned contract type (pack `schema_version = 2`).
+/// v1 of the workspace-owned contract type (`contract = "workspace_operation_v1"`).
 pub use cfctl_core::WorkspaceOperationContractV1;
 
 /// Frozen migration debt from before workspace-owned operation packs existed.
