@@ -54,7 +54,7 @@ impl ProfilesConfig {
                 CliError::guided(
                     "CFCTL_NO_PROFILE",
                     "no active profile is selected",
-                    "Import a scoped token: `printf '%s' \"$TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin`, or run `cfctl auth login --client-id <id>`. Check state with `cfctl auth status --json`.",
+                    "Import a scoped token: `printf '%s' \"$TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin`, or run `cfctl auth login --client-id <id>`. List profiles with `cfctl auth profiles --json`.",
                 )
             })?;
         let profile = self

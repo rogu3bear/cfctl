@@ -81,7 +81,7 @@ pub enum AuthCommand {
     /// Start or complete OAuth login for one named profile.
     Login(AuthLoginArgs),
     /// Inspect the selected profile and its authentication state.
-    Status(ProfileSelector),
+    Status(AuthStatusArgs),
     /// List configured profiles and the active selection.
     Profiles,
     /// Select the profile used when a command does not name one.
@@ -261,6 +261,13 @@ pub struct AuthLoginArgs {
     pub account: Option<String>,
     #[arg(long)]
     pub complete: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthStatusArgs {
+    /// Named profile. When omitted, reports the selected profile.
+    #[arg(value_name = "PROFILE")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
