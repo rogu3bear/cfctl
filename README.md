@@ -148,8 +148,20 @@ cfctl keys mint --profile <parent> --name <child-profile> \
   --value-out "$SINK" --json
 ```
 
-Review the plan, approve the exact operation ID, and run it once. Then install
-and select the child:
+`keys mint` is IdentityOrOwnership. The mint gate is
+`cfctl plans approve <operation-id> --yes` typed for that exact operation id.
+Prior chat auto-approve or spearhead is not that id. Do not concatenate plan
+creation, approval, and run.
+
+```bash
+cfctl plans approve <operation-id> --yes --json
+```
+
+```bash
+cfctl plans run <operation-id> --json
+```
+
+Then install and select the child:
 
 ```bash
 cfctl auth import-api-token --profile <child-profile> \
