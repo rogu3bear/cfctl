@@ -153,13 +153,13 @@ Cloudflare Dashboard is an emergency human path; it is not P2-complete.
 SINK=<new-mode-0600-path>
 cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> \
   --permission "Workers Scripts Read" --permission "Workers Scripts Write" \
-  --account ca30e922fda7f5578e49873542e4aaca \
+  --account <account-id> \
   --value-out "$SINK" --json
 # review, then: cfctl plans approve <operation-id> --yes --json
 #              cfctl plans run <operation-id> --json
 
 cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> \
-  --account ca30e922fda7f5578e49873542e4aaca --stdin --json \
+  --account <account-id> --stdin --json \
   < "$SINK"
 cfctl auth use cfctl-site-release-<UTC-date> --json
 ```
