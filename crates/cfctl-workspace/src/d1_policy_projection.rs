@@ -12,7 +12,9 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{Result, WorkspaceError, git_blob, git_optional};
+use super::{
+    Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
+};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-policy-projections.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
@@ -52,18 +54,23 @@ pub fn load_workspace_d1_policy_projection_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+    load_selected(
+        &super::operation_identity::discover(roots)?,
+        capability_id,
+        WorkspaceOperationLoad::Execute,
+    )
 }
 
 pub(super) fn load_selected(
     candidates: &[PathBuf],
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     let repositories =
         super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
     let mut matches = Vec::new();
     for repository in &repositories {
-        if let Some(capability) = load_from_repository(repository, capability_id)? {
+        if let Some(capability) = load_from_repository(repository, capability_id, mode)? {
             matches.push(capability);
         }
     }
@@ -79,11 +86,12 @@ pub(super) fn load_selected(
 fn load_from_repository(
     repository: &super::RepositoryNode,
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     if !super::operation_identity::contains(&repository.path, PACK_RELATIVE_PATH, capability_id)? {
         return Ok(None);
     }
-    if repository.git.dirty {
+    if mode.requires_clean_worktree() && repository.git.dirty {
         return Err(invariant(format!(
             "workspace operation repository `{}` must be clean",
             repository.path.display()
@@ -98,7 +106,7 @@ fn load_from_repository(
     let origin = git_optional(&repository.path, &["config", "--get", "remote.origin.url"])?
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invariant("workspace operation repository has no origin"))?;
-    let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH))?;
+    let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH), mode)?;
     let pack: OperationPack = toml::from_str(
         std::str::from_utf8(&pack_bytes)
             .map_err(|_| invariant("workspace operation pack is not UTF-8"))?,
@@ -128,7 +136,7 @@ fn load_from_repository(
     };
     validate_operation(operation)?;
     let template_relative = safe_relative(&operation.config_template)?;
-    let template = committed_file(&repository.path, &template_relative)?;
+    let template = committed_file(&repository.path, &template_relative, mode)?;
     let production_config = safe_relative(&operation.production_config)?;
     let contract = WorkspaceD1PolicyProjectionContractV1 {
         repository_root: repository.path.display().to_string(),
@@ -268,17 +276,24 @@ fn selector(name: &str, location: &str) -> SelectorV1 {
     }
 }
 
-fn committed_file(repository: &Path, relative: &Path) -> Result<Vec<u8>> {
+fn committed_file(
+    repository: &Path,
+    relative: &Path,
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<u8>> {
     let relative = safe_relative(relative.to_string_lossy().as_ref())?;
-    reject_symlinks(repository, &relative)?;
-    let worktree = fs::read(repository.join(&relative))
-        .map_err(|source| super::io_error(&repository.join(&relative), source))?;
     let committed = git_blob(repository, &relative)?.ok_or_else(|| {
         invariant(format!(
             "workspace operation input `{}` is not tracked at HEAD",
             relative.display()
         ))
     })?;
+    if !mode.requires_clean_worktree() {
+        return Ok(committed);
+    }
+    reject_symlinks(repository, &relative)?;
+    let worktree = fs::read(repository.join(&relative))
+        .map_err(|source| super::io_error(&repository.join(&relative), source))?;
     if worktree != committed {
         return Err(invariant(format!(
             "workspace operation input `{}` differs from HEAD",

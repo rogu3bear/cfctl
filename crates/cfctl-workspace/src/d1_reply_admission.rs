@@ -12,7 +12,9 @@ use cfctl_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{Result, WorkspaceError, git_blob, git_optional};
+use super::{
+    Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
+};
 
 const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-reply-admission.toml";
 
@@ -57,7 +59,11 @@ pub fn load_workspace_d1_reply_admission_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    load_selected(&super::operation_identity::discover(roots)?, capability_id)
+    load_selected(
+        &super::operation_identity::discover(roots)?,
+        capability_id,
+        WorkspaceOperationLoad::Execute,
+    )
 }
 
 #[expect(
@@ -67,6 +73,7 @@ pub fn load_workspace_d1_reply_admission_capability(
 pub(super) fn load_selected(
     candidates: &[PathBuf],
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     let repositories =
         super::operation_identity::select(candidates, PACK_RELATIVE_PATH, capability_id)?;
@@ -79,7 +86,7 @@ pub(super) fn load_selected(
         )? {
             continue;
         }
-        if repository.git.dirty {
+        if mode.requires_clean_worktree() && repository.git.dirty {
             return Err(invariant(format!(
                 "reply-admission operation repository `{}` must be clean",
                 repository.path.display()
@@ -96,7 +103,7 @@ pub(super) fn load_selected(
         let origin = git_optional(&repository.path, &["config", "--get", "remote.origin.url"])?
             .filter(|v| !v.is_empty())
             .ok_or_else(|| invariant("reply-admission operation repository has no origin"))?;
-        let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH))?;
+        let pack_bytes = committed_file(&repository.path, Path::new(PACK_RELATIVE_PATH), mode)?;
         let pack: Pack = toml::from_str(
             std::str::from_utf8(&pack_bytes)
                 .map_err(|_| invariant("reply-admission operation pack is not UTF-8"))?,
@@ -124,9 +131,9 @@ pub(super) fn load_selected(
         };
         validate(operation)?;
         let template_path = safe_relative(&operation.config_template)?;
-        let template = committed_file(&repository.path, &template_path)?;
+        let template = committed_file(&repository.path, &template_path, mode)?;
         let compiler_path = safe_relative(&operation.compiler_path)?;
-        let compiler = committed_file(&repository.path, &compiler_path)?;
+        let compiler = committed_file(&repository.path, &compiler_path, mode)?;
         if operation.compiler_sha256 != sha256(&compiler) {
             return Err(invariant(
                 "reply-admission compiler bytes do not match the declared SHA-256",
@@ -350,13 +357,16 @@ fn read_capability(o: &Operation, contract: WorkspaceD1ReplyAdmissionContractV1)
     c
 }
 
-fn committed_file(root: &Path, relative: &Path) -> Result<Vec<u8>> {
+fn committed_file(root: &Path, relative: &Path, mode: WorkspaceOperationLoad) -> Result<Vec<u8>> {
     let relative = safe_relative(relative.to_string_lossy().as_ref())?;
+    let committed = git_blob(root, &relative)?
+        .ok_or_else(|| invariant("reply-admission operation input is not tracked at HEAD"))?;
+    if !mode.requires_clean_worktree() {
+        return Ok(committed);
+    }
     reject_symlinks(root, &relative)?;
     let bytes =
         fs::read(root.join(&relative)).map_err(|e| super::io_error(&root.join(&relative), e))?;
-    let committed = git_blob(root, &relative)?
-        .ok_or_else(|| invariant("reply-admission operation input is not tracked at HEAD"))?;
     if bytes != committed {
         return Err(invariant(
             "reply-admission operation input differs from HEAD",

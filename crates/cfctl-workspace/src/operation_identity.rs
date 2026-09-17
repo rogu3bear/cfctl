@@ -9,11 +9,41 @@ use std::{
 };
 use walkdir::WalkDir;
 
+/// Inspect reads the committed pack without requiring a clean worktree.
+/// Execute (call/plan/run) keeps the clean-HEAD rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceOperationLoad {
+    Inspect,
+    Execute,
+}
+
+impl WorkspaceOperationLoad {
+    #[must_use]
+    pub const fn requires_clean_worktree(self) -> bool {
+        matches!(self, Self::Execute)
+    }
+}
+
 // One lookup owns one ephemeral repository list. Selected execution inputs are
 // inspected below; no status, pack content or root list survives this call.
 pub fn load_workspace_operation_capability(
     roots: &[PathBuf],
     capability_id: &str,
+) -> Result<Option<cfctl_core::CapabilityV1>> {
+    load_with(roots, capability_id, WorkspaceOperationLoad::Execute)
+}
+
+pub fn inspect_workspace_operation_capability(
+    roots: &[PathBuf],
+    capability_id: &str,
+) -> Result<Option<cfctl_core::CapabilityV1>> {
+    load_with(roots, capability_id, WorkspaceOperationLoad::Inspect)
+}
+
+fn load_with(
+    roots: &[PathBuf],
+    capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<cfctl_core::CapabilityV1>> {
     let candidates = discover(roots)?;
     for loader in [
@@ -22,19 +52,16 @@ pub fn load_workspace_operation_capability(
         super::d1_reply_admission::load_selected,
         super::d1_reads::load_selected,
     ] {
-        if let Some(capability) = loader(&candidates, capability_id)? {
+        if let Some(capability) = loader(&candidates, capability_id, mode)? {
             return Ok(Some(capability));
         }
     }
     if let Some(capability) =
-        super::reply_subdomain_ingress::load_workspace_reply_subdomain_ingress_capability(
-            roots,
-            capability_id,
-        )?
+        super::reply_subdomain_ingress::load_selected(roots, capability_id, mode)?
     {
         return Ok(Some(capability));
     }
-    super::d1_evidence::load_selected(&candidates, capability_id)
+    super::d1_evidence::load_selected(&candidates, capability_id, mode)
 }
 
 #[cfg(test)]
@@ -63,8 +90,10 @@ pub(super) fn select(
 pub(super) fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
     for root in roots {
+        // A missing registered root must not fail lookup of an unrelated
+        // unknown id. WorkspaceGraph::discover still fails closed.
         if !root.is_dir() {
-            return Err(WorkspaceError::MissingRoot(root.display().to_string()));
+            continue;
         }
         for entry in WalkDir::new(root)
             .follow_links(false)
@@ -202,6 +231,30 @@ mod tests {
                 .expect("uncommitted ID")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn missing_registered_root_does_not_poison_unknown_capability_lookup() {
+        let roots = [PathBuf::from("/this/registered/root/does-not-exist")];
+        assert!(
+            load_workspace_operation_capability(&roots, "definitely.not-a-capability")
+                .expect("missing root is not an unknown-id failure")
+                .is_none()
+        );
+        assert!(
+            inspect_workspace_operation_capability(&roots, "definitely.not-a-capability")
+                .expect("missing root is not an inspect failure")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_root_is_skipped_during_operation_discovery() {
+        let root = tempfile::tempdir().expect("root");
+        repository(root.path(), ID);
+        let missing = root.path().join("missing");
+        let found = discover(&[missing, root.path().to_path_buf()]).expect("skip missing");
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
