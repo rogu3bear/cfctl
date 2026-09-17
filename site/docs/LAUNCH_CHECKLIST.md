@@ -28,7 +28,7 @@ context but never authorize or prove the current candidate.
 | First live target | The account-bound `workers.dev` hostname |
 | Branded production target | `cfctl.com`, attached only after `workers.dev` verification |
 | Analytics | None; content-free operational health only |
-| Public OAuth | Disabled and outside this launch |
+| Public OAuth | Unproved; outside this launch; do not enable |
 | Event-ingress bridge | Outside this launch |
 | CLI binary release | Separate release train; not implied by website deployment |
 
@@ -108,6 +108,12 @@ Dashboard is an emergency human path; it is not P2-complete.
       intended account.
 - [ ] Read current Worker settings, versions, production deployments, routes,
       custom domains, and required secret names through governed capabilities.
+- [ ] Record `oauth: unproved`. Doctor `public_oauth`, empty
+      `worker-list-script-secrets`, and ASSETS-only
+      `worker-script-get-settings` do not authorize `oauth: unconfigured`.
+      Catalog `oauth-clients-get` requires `oauth_client_id` and cannot prove
+      absence; collection `/accounts/{account_id}/oauth_clients` is POST-only
+      (`oauth-clients-create`). Do not enable OAuth.
 - [ ] Record the previous production version UUID and prove it remains
       retrievable.
 - [ ] Resolve the compensation path: a separate reviewed
