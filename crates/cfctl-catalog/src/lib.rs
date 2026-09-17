@@ -63,6 +63,9 @@ pub const OFFICIAL_OPENAPI_URL: &str =
 pub const OFFICIAL_DOCS_INDEX_URL: &str = "https://developers.cloudflare.com/llms.txt";
 pub const OFFICIAL_CHANGELOG_URL: &str = "https://developers.cloudflare.com/changelog/";
 
+/// v1 of the workspace-owned contract type (pack `schema_version = 2`).
+pub use cfctl_core::WorkspaceOperationContractV1;
+
 /// Frozen migration debt from before workspace-owned operation packs existed.
 /// Adding an id here is a public architecture decision, not the normal path for
 /// extending cfctl. Keep this sorted for the fail-closed binary search below.

@@ -46,6 +46,11 @@ fn load_with(
     mode: WorkspaceOperationLoad,
 ) -> Result<Option<cfctl_core::CapabilityV1>> {
     let candidates = discover(roots)?;
+    if let Some(capability) =
+        super::operation_pack::load_selected(&candidates, capability_id, mode)?
+    {
+        return Ok(Some(capability));
+    }
     for loader in [
         super::d1_operation::load_selected,
         super::d1_policy_projection::load_selected,

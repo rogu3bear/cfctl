@@ -158,15 +158,15 @@ struct OperationPack {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OperationDeclaration {
-    id: String,
-    title: String,
-    description: String,
-    config_template: String,
-    production_config: String,
-    database_binding: String,
-    wrangler_version: String,
-    projection: String,
+pub(super) struct OperationDeclaration {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) description: String,
+    pub(super) config_template: String,
+    pub(super) production_config: String,
+    pub(super) database_binding: String,
+    pub(super) wrangler_version: String,
+    pub(super) projection: String,
 }
 
 /// Load one clean-repository-owned, fixed-query D1 evidence capability.
@@ -234,6 +234,9 @@ fn load_from_repository(
             .map_err(|_| invariant("workspace D1 evidence pack is not UTF-8"))?,
     )
     .map_err(|error| invariant(format!("workspace D1 evidence pack is invalid: {error}")))?;
+    if pack.schema_version == 2 {
+        return Ok(None);
+    }
     if pack.schema_version != PACK_SCHEMA_VERSION {
         return Err(invariant(
             "workspace D1 evidence pack schema version is unsupported",
@@ -258,6 +261,32 @@ fn load_from_repository(
     else {
         return Ok(None);
     };
+    bind_declared(
+        repository,
+        mode,
+        PACK_RELATIVE_PATH,
+        &pack_bytes,
+        head,
+        origin,
+        operation,
+    )
+}
+
+pub(super) fn bind_declared(
+    repository: &super::RepositoryNode,
+    mode: WorkspaceOperationLoad,
+    pack_relative: &str,
+    pack_bytes: &[u8],
+    head: &str,
+    origin: String,
+    operation: &OperationDeclaration,
+) -> Result<Option<CapabilityV1>> {
+    if mode.requires_clean_worktree() && repository.git.dirty {
+        return Err(invariant(format!(
+            "workspace D1 evidence repository `{}` must be clean",
+            repository.path.display()
+        )));
+    }
     validate_operation(operation)?;
     let template = committed_file(
         &repository.path,
@@ -268,8 +297,8 @@ fn load_from_repository(
         repository_root: repository.path.display().to_string(),
         repository_head: head.to_owned(),
         repository_origin: origin,
-        operation_pack_path: PACK_RELATIVE_PATH.to_owned(),
-        operation_pack_sha256: sha256(&pack_bytes),
+        operation_pack_path: pack_relative.to_owned(),
+        operation_pack_sha256: sha256(pack_bytes),
         config_template_path: operation.config_template.clone(),
         config_template_sha256: sha256(&template),
         production_config_path: safe_relative(&operation.production_config)?

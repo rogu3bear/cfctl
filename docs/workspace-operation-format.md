@@ -1,7 +1,6 @@
 # Workspace operation contract v2 (proposed)
 
-Status: **proposed**. This specifies the declarative format that replaces the
-five application-named modules in `cfctl-cli`. Nothing implements it yet.
+Status: **in progress**. Generic loader exists in `cfctl-workspace` (`operation_pack.rs`). First cutover is `workspace_d1_evidence`; existing typed validators remain authoritative until the mapping table below has an owner and each predicate has passing semantic-equivalence tests.
 
 ## Why
 
@@ -170,6 +169,9 @@ declares *which* proof applies, never *how* to prove it.
   what may be read; cfctl builds the query.
 - It does not make packs executable without registration, a clean HEAD, a
   committed pack, and pinned tool versions.
+- It does not relocate HMAC evidence-key, Keychain ACLs, cdhash binding, or
+  adopt/reset. Those remain the ANCHOR qualification layer regardless of
+  workspace extraction.
 
 ## Open questions for review
 
