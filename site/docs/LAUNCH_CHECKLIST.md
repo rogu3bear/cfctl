@@ -112,8 +112,12 @@ Dashboard is an emergency human path; it is not P2-complete.
       intended account.
 - [ ] Read current Worker settings, versions, production deployments, routes,
       custom domains, and required secret names through governed capabilities.
-- [ ] Record the previous production version UUID and prove it remains
-      retrievable.
+- [ ] Record the previous production version UUID from the current 100
+      percent deployment, then prove that UUID remains retrievable with
+      `cfctl call worker-versions-get-version-detail --selector account_id=<account> --selector script_name=cfctl-site --selector version_id=<uuid-from-this-read-100%> --json`.
+      Persist the version-detail receipt hash on the governed preflight.
+      A UUID present in versions list or serving 100 percent is not a
+      rollback anchor until that get-version-detail returns the same identity.
 - [ ] Resolve the compensation path: a separate reviewed
       `wrangler.versions-deploy` plan targeting `<previous-uuid>@100`.
 
