@@ -155,9 +155,22 @@ cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> \
   --permission "Workers Scripts Read" --permission "Workers Scripts Write" \
   --account <account-id> \
   --value-out "$SINK" --json
-# review, then: cfctl plans approve <operation-id> --yes --json
-#              cfctl plans run <operation-id> --json
+```
 
+`keys mint`, token create, roll, and revoke are IdentityOrOwnership. The only
+mint gate is `cfctl plans approve <operation-id> --yes` typed for that exact
+operation id. Prior chat auto-approve or spearhead is not that id. Do not
+concatenate plan creation, approval, and run.
+
+```bash
+cfctl plans approve <operation-id> --yes --json
+```
+
+```bash
+cfctl plans run <operation-id> --json
+```
+
+```bash
 cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> \
   --account <account-id> --stdin --json \
   < "$SINK"

@@ -90,5 +90,9 @@ Cloudflare.
   registrar/billing actions, irreversible data changes, cross-repository
   changes, unknown-risk work, and paid actions always require explicit
   approval.
+- IdentityOrOwnership (`keys mint`, token create, roll, revoke) requires
+  `cfctl plans approve <operation-id> --yes` typed for that exact operation
+  id. Prior chat auto-approve or spearhead is not that id. Do not concatenate
+  mint plan creation, approval, and run.
 - A plan, handoff, screenshot, or evidence file is not post-change
   verification merely because it exists.
