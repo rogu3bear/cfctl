@@ -821,6 +821,60 @@ fn approval_requires_the_exact_plan_id_and_explicit_yes_flag() {
 }
 
 #[test]
+fn keys_mint_rotate_and_revoke_do_not_accept_silent_yes() {
+    let mint = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "mint",
+        "--name",
+        "deployment",
+        "--permission",
+        "group-id",
+        "--account",
+        "account-id",
+        "--value-out",
+        "/tmp/new-token",
+        "--yes",
+    ]);
+    assert!(
+        mint.is_err(),
+        "keys mint must not take --yes; IdentityOrOwnership approval is plans approve <operation-id> --yes"
+    );
+
+    let rotate = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "rotate",
+        "--id",
+        "token-id",
+        "--account",
+        "account-id",
+        "--value-out",
+        "/tmp/rotated-token",
+        "--yes",
+    ]);
+    assert!(
+        rotate.is_err(),
+        "keys rotate must not take --yes; IdentityOrOwnership approval is plans approve <operation-id> --yes"
+    );
+
+    let revoke = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "revoke",
+        "--id",
+        "token-id",
+        "--account",
+        "account-id",
+        "--yes",
+    ]);
+    assert!(
+        revoke.is_err(),
+        "keys revoke must not take --yes; IdentityOrOwnership approval is plans approve <operation-id> --yes"
+    );
+}
+
+#[test]
 fn user_owned_key_lifecycle_requires_an_explicit_owner_flag_and_account_context() {
     let parsed = Cli::try_parse_from([
         "cfctl",
