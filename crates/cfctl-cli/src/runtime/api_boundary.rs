@@ -1,3 +1,4 @@
+use super::mint_launch_lane::attach_mint_child_launch_lane;
 use super::oauth_state::is_oauth_client_create_capability;
 use super::oauth_state::is_oauth_client_create_operation_identity;
 use super::plan_commands::persist_transaction_stage;
@@ -168,6 +169,7 @@ pub(super) fn api_plan_result_envelope(
             resource_id.clone(),
         );
     }
+    attach_mint_child_launch_lane(&mut result, plan);
     if let Some(error) = finalization_error {
         let mut envelope = post_boundary_failure_envelope(
             plan,
