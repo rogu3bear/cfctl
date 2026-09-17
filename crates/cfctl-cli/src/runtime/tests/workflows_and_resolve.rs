@@ -726,9 +726,8 @@ pub(super) fn worker_deployment_identity_drift_stops_before_delegated_boundary()
     assert_eq!(plan.status, PlanStatus::Draft);
 }
 
-#[test]
-pub(super) fn worker_planning_receipt_requires_exact_prior_active_identity() {
-    let planned = json!({
+fn worker_planning_live_state_receipt() -> Value {
+    json!({
         "schema_version": 1,
         "source_capability_id": "worker-script-get-settings",
         "source_path": "/accounts/{account_id}/workers/scripts/{script_name}/settings",
@@ -741,12 +740,43 @@ pub(super) fn worker_planning_receipt_requires_exact_prior_active_identity() {
         "exists": true,
         "redacted_settings_hash": "sha256:settings",
         "redacted_deployments_hash": "sha256:deployments",
+        "version_source_capability_id": "worker-versions-get-version-detail",
+        "version_source_path": "/accounts/{account_id}/workers/scripts/{script_name}/versions/{version_id}",
+        "version_http_status": 200,
+        "redacted_version_detail_hash": "sha256:version-detail",
         "current_active": {
             "deployment_id": "deployment-a",
             "version_id": "version-a",
             "traffic_percentage": 100,
+            "version_detail_hash": "sha256:version-detail",
         },
-    });
+    })
+}
+
+fn deployments_list_only_worker_state(mut receipt: Value) -> Value {
+    let object = receipt.as_object_mut().expect("receipt object");
+    for field in [
+        "version_source_capability_id",
+        "version_source_path",
+        "version_http_status",
+        "redacted_version_detail_hash",
+    ] {
+        object.remove(field);
+    }
+    object.insert(
+        "current_active".to_owned(),
+        json!({
+            "deployment_id": "deployment-a",
+            "version_id": "version-a",
+            "traffic_percentage": 100,
+        }),
+    );
+    receipt
+}
+
+#[test]
+pub(super) fn worker_planning_receipt_requires_exact_prior_active_identity() {
+    let planned = worker_planning_live_state_receipt();
     let planned_hash = hash_value(&planned).expect("strict state hash");
     let mut capability = CapabilityV1::new(
         WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
@@ -783,6 +813,24 @@ pub(super) fn worker_planning_receipt_requires_exact_prior_active_identity() {
         super::required_worker_deployment_state_precondition(&plan)
             .expect("strict planning state authority"),
         Some(planned_hash.as_str())
+    );
+
+    let mut list_only = plan.clone();
+    let list_only_receipt = deployments_list_only_worker_state(
+        list_only
+            .targets
+            .pointer("/live_preconditions/worker_deployment_state")
+            .expect("list-only state receipt")
+            .clone(),
+    );
+    list_only.targets["live_preconditions"]["worker_deployment_state"] = list_only_receipt.clone();
+    list_only.precondition_hashes.insert(
+        super::worker_deployment::STATE_PRECONDITION.to_owned(),
+        hash_value(&list_only_receipt).expect("list-only state hash"),
+    );
+    assert!(
+        super::required_worker_deployment_state_precondition(&list_only).is_err(),
+        "a UUID present in deployments-list is not a rollback anchor without worker-versions-get-version-detail"
     );
 
     let malformed_receipt = plan
