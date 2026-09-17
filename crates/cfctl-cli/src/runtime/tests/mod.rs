@@ -7,6 +7,7 @@ use super::access_application::*;
 use super::access_ownership::*;
 use super::access_policy::*;
 use super::api_boundary::*;
+use super::api_execution::execute_api_plan;
 use super::auth_commands::*;
 use super::call_command::*;
 use super::call_input::*;
