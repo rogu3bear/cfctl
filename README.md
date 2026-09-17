@@ -14,17 +14,10 @@ Cloudflare state rather than assumed from a 200 response.
 It has no MCP dependency, accepts natural-language intent through a local
 agent, and every command emits stable JSON for automation.
 
-- [Quickstart](QUICKSTART.md) — install, first commands, first governed write
-- [Operator runbook](docs/runbooks/cfctl.md) — triage, health, exit codes, recovery
-- [Capability procedures](docs/runbooks/capability-procedures.md) — per-capability reads and writes
-- [Pages direct-upload setup](docs/pages-direct-setup.md) — empty projects, protected production variables, and first-upload proof
-- [Runtime policy](docs/runtime-policy.md) — what needs approval, and why
-- [Security contract](docs/v2-security.md) — secrets, hashing, redaction, evidence
-- [Capability safety contracts](docs/capability-safety-contracts.md) — what each governed capability depends on
-- [Architecture](docs/v2-architecture.md) — crates, boundaries, trust sequence
-- [Telemetry control plane](docs/telemetry-control-plane.md) — GraphQL, bounded queries, observability, Logpush, and security response
-- [Agent landing](docs/agent-landing.md) — first-load doctrine for agents
-- [Contributing](CONTRIBUTING.md) — dev setup, proof lane, release lanes
+- [Quickstart](QUICKSTART.md) — install, authenticate, first governed write
+- [Operator runbook](docs/runbooks/cfctl.md) — triage, health, recovery
+- [Docs](docs/README.md) — contracts, procedures, architecture
+- [Contributing](CONTRIBUTING.md) — proof lane and release
 
 ## Install
 
@@ -142,161 +135,47 @@ the public contracts `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,
 
 ## Authenticate
 
-Day-to-day auth is a scoped API token, imported through protected input and
-pinned to one account:
+Create a purpose-scoped token with `cfctl keys mint` from a qualified parent
+profile. The one-time value lands only in `--value-out`. The apply envelope
+names that path and does not carry `value`, `secret`, or `key`.
+`auth import-api-token` installs the child sink; it does not create the token.
+A Dashboard-minted token is an emergency human path.
 
 ```bash
-printf '%s' "$CLOUDFLARE_API_TOKEN" | \
-  cfctl auth import-api-token --account <account-id> --stdin
+SINK=<new-mode-0600-path>
+cfctl keys mint --profile <parent> --name <child-profile> \
+  --permission "<reviewed-permission>" --account <account-id> \
+  --value-out "$SINK" --json
 ```
 
-The token lives in the platform keyring (Keychain on macOS, Secret Service on
-Linux) and falls back to a mode-0600 file store when the keyring is
-unavailable; `cfctl doctor` reports which backend is active.
-
-For interactive intake, use `--prompt` to enter a token without terminal echo.
-Noninteractive callers can use `--stdin` or `--value-in <mode-0600-path>`;
-token values never belong in command arguments. Ordinary import selects the
-profile and can replace it. Add `--create-only` to refuse an existing profile
-or pending login, and `--no-select` to preserve the current selection, including
-when no profile is selected.
-
-Import holds the existing runtime lock exclusively through input, verification
-and storage. Concurrent cfctl invocations fail with a retryable busy message,
-so another writer cannot invalidate the collision check or overwrite selection.
-
-When a capability requires a user-owned token, `--verify-user` checks the
-supplied token against the catalog's read-only user verification endpoint
-before storing it. Add `--expires-before <RFC3339-timestamp>` to require a
-provider-reported expiry no later than that future cutoff. For example:
+Review the plan, approve the exact operation ID, and run it once. Then install
+and select the child:
 
 ```bash
-cfctl auth import-api-token --profile publication-read --account <account-id> \
-  --prompt --create-only --no-select --verify-user \
-  --expires-before <future-RFC3339-timestamp>
+cfctl auth import-api-token --profile <child-profile> \
+  --account <account-id> --stdin --json \
+  < "$SINK"
+cfctl auth use <child-profile> --json
+cfctl auth status --json
 ```
 
-Verification uses only the supplied token and requires an explicitly refreshed
-catalog. A rejection leaves credentials and profile selection untouched. The
-receipt binds the observed user identity, active status and expiry to the
-stored credential generation; it does not prove account membership or the
-permission policy. Inspect those separately for the intended operation.
-This command imports an existing token. Create it under Cloudflare's **My
-Profile > API Tokens**, or use `cfctl keys mint --user` with a qualified parent
-credential and the normal plan approval lifecycle.
+Bare `auth status --json` reports the selected profile. Name a profile to
+inspect that one. List configured profiles with `cfctl auth profiles --json`.
 
-Qualifying local evidence uses a separate, explicitly selected integrity key.
-The platform mode never automatically falls back to a file: inspect the exact initialization transition with
-`cfctl auth evidence-key init-preview --json`, initialize it explicitly with
-`init`, inspect it with `status`, rotate to a new signing generation with
-`rotate`, and retire an inactive generation only when cfctl reports that no
-authenticated local artifact still depends on it. The preview discloses
-backend, custody, state-root transition, verification-generation behavior, and
-recovery semantics without creating a key or exposing key bytes.
+The credential lives in the platform keyring (Keychain on macOS, Secret
+Service on Linux) and falls back to a mode-0600 file store when the keyring is
+unavailable; `cfctl doctor` reports which backend is active. If a wrapper
+routes stdin through `cargo`, import with `--value-in` against the same sink.
+`CFCTL_FORCE_IPV4=1` pins outbound calls to IPv4 when an IP-allowlisted token
+needs it.
 
-For routine use without platform credential dialogs, prepare an explicit fresh
-local runtime with `cfctl auth evidence-key private-preview --json`, inspect
-its carried/missing profile IDs and local trust boundary, then run the returned
-`private-activate <plan-id> --yes --json` command. The same flow works on a fresh
-host before importing its first scoped token. It creates a fresh authority,
-keeps old state and history intact, and persistently selects private local
-credentials and evidence storage. `status` and `doctor` report `private_file`.
-No continuity with old signing keys or approval authority is claimed. Software
-running as your OS user can access these files; filesystem privacy does not
-isolate mutually distrustful programs running as the same user.
+Optional PKCE login requires an explicit client identifier. An emergency
+global key can be imported with `cfctl auth import-global-key` and is never
+selected silently.
 
-For a private epoch whose original registry becomes unreachable after a macOS
-device-number change, `cfctl auth evidence-key private-rebind-preview
---previous-device <original-device-number> --json` verifies the exact original
-registry, every retained authenticated descriptor and its body, and every
-retained operational proof. The original device number must be established from
-location evidence; the command does not search for a convenient key. It retains
-the canonical path and all five inode/birth identities. Missing, ambiguous,
-malformed or mismatched authority and incomplete or invalid retained history
-remain blocked. The preview exposes no key bytes and writes nothing.
-
-After reviewing that result, `cfctl auth evidence-key private-rebind
---previous-device <original-device-number> --expected-review <review-digest>
---yes --json` creates one signed, non-secret binding for the exact current
-location. It preserves the original key file, root marker, epoch and history.
-Normal authority attachment verifies that binding with the original key;
-filesystem identity drift remains blocked. There is no automatic ignore-device
-fallback. A changed history or location requires a fresh preview. A failed or
-uncertain publication is inspected with `auth evidence-key status --json` and
-the same preview; never overwrite an existing binding or recreate keys.
-Binding signatures also prevent retirement of a generation they still need.
-
-Initialization crosses two independent custody domains: the platform registry
-and the filesystem state-root marker. No transaction spans both, so `init`
-publishes a private initialization intent naming the exact state root before
-creating the authority, and retires that intent only after the marker reads
-back. If the process dies between the two writes, the next `init` recognizes
-the registry as this installation's own interrupted crossing and resumes it
-forward by creating only the missing marker, preserving the exact authority and
-its generation. Resumption requires the published intent to name the registry
-that is actually present and requires zero authenticated local artifacts; an
-intent that disagrees with the registry fails closed rather than being
-reconciled by inference. A valid registry with no such intent is not
-resumable — it is an authority of unknown provenance, and remains an adoption
-question rather than an initialization one.
-
-If the exact sole canonical platform registry is already valid while its local
-marker and all authenticated storage-v2 artifacts are absent, use
-`adopt-preview` for a strictly read-only classification. `adopt-plan current`
-and `adopt-plan status` remain read-only so historical records can be inspected,
-and `adopt-plan revoke` remains limited to a plan that has not crossed.
-
-`adopt-plan create` and `adopt <plan-id> --yes` are intentionally unavailable
-in this release. Both fail with
-`CFCTL_AUTH_INSTALLED_IDENTITY_RECEIPT_REQUIRED` before plan persistence,
-filesystem-marker creation, private crossing-seal publication, or terminal
-completion. Signed publication and installation may proceed independently, but
-adoption must wait for a separately reviewed producer and consumer for an
-authenticated installed-identity receipt. The CLI accepts no raw source,
-artifact, architecture, CDHash, algorithm, or provenance flags as authority.
-
-Receipt-less historical plan records remain readable but non-executable. The
-preserved state machine also rejects a record-backed `allocating` pointer as
-crossing authority: it cannot publish a seal, project `marker_crossed`, complete,
-or enable ordinary evidence authentication. This release claims no adoption
-outcome.
-
-A valid registry that cannot be resumed and cannot be adopted is not a dead end.
-`auth evidence-key reset --yes` discards it and initializes a fresh authority.
-Adoption *inherits* an existing authority, which is why it must authenticate the
-identity of the code asking; reset inherits nothing, claims no lineage, and
-produces exactly what a clean host produces, so it requires no installed-identity
-receipt. It is admissible only when the state-root marker is absent, the registry
-is a fresh single-generation authority in direct platform custody, and zero
-authenticated descriptors and proofs exist. That last condition is the point: an
-authority nothing depends on can be discarded without losing anything, and reset
-refuses rather than orphaning a single authenticated artifact. The discarded
-registry is removed through the managed platform-keyring teardown, never by hand.
-
-If the sole canonical platform registry is malformed while the filesystem
-marker and authenticated storage-v2 artifacts are absent, use
-`recover-preview` for a strictly read-only classification and byte count. It
-does not disclose raw registry material, a digest, a secret-derived identity,
-or a deterministic execution handle. A separate `recover-plan create` writes
-a short-lived private intent to the platform keyring and returns only a random
-opaque plan ID; inspect or revoke that plan with `recover-plan status|revoke`,
-without another confirmation prompt. Only the transition that quarantines and
-replaces the protected registry requires `recover <plan-id> --yes`. Recovery preserves the original
-bytes in private quarantine before publishing a fresh chunked authority and
-resumes the same plan forward after an interrupted transition. Quarantine
-retirement is a separate lifecycle and legacy evidence remains historical and
-nonqualifying.
-
-Two things that commonly bite:
-
-- If a wrapper routes stdin through `cargo`, pass a new mode-0600 file with
-  `--value-in` instead, so the secret never touches stdin.
-- `CFCTL_FORCE_IPV4=1` pins outbound calls to an IPv4 source, which an
-  IP-allowlisted token needs when the host default-routes over IPv6.
-
-OAuth with PKCE is available when you have a Cloudflare OAuth client
-(`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). An emergency global key can be
-imported with `cfctl auth import-global-key`, and is never selected silently.
+Evidence integrity is a separate key. Recovery, adoption, reset, and private
+local storage are in the [operator runbook](docs/runbooks/cfctl.md) and the
+[quickstart](QUICKSTART.md).
 
 ## Read, then change
 

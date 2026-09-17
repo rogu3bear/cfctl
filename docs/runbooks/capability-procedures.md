@@ -112,8 +112,8 @@ and post-restore must reproduce the pre-import full-table digest and count.
 ```sh
 printf '%s' '{"migration_id":"0143","phase":"pre_import"}' |
   cfctl call mln-0143-data-invariants \
-    --selector account_id=ca30e922fda7f5578e49873542e4aaca \
-    --selector database_id=7c282983-2e48-4ea4-9f0d-09b0d718fe65 \
+    --selector account_id=<account-id> \
+    --selector database_id=<database-id> \
     --body-stdin --json
 ```
 
@@ -546,10 +546,8 @@ Protocol references: [D1 import](https://developers.cloudflare.com/d1/tutorials/
 and [Wrangler import response types](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/d1/types.ts).
 
 OSINT Research Center migrations 0028 through 0034 use the narrower
-`d1-import-approved-osint-research-migration` adapter. It pins account
-`ca30e922fda7f5578e49873542e4aaca`, database
-`1c1ce476-73ab-4dd6-a2e2-de0c155ade61`, repository
-`github.com/rogu3bear/osint-research-center`, release HEAD, and every migration
+`d1-import-approved-osint-research-migration` adapter. The catalog pins the
+account, database, repository, release HEAD, and every migration
 path/blob/SHA-256/MD5/size. The caller selects only one migration ID, supplies
 the corresponding reviewed absolute `--source-file`, and binds a current
 governed `d1-time-travel-get-bookmark` evidence hash plus the SHA-256 of its
@@ -562,9 +560,9 @@ printf '%s' \
   '{"migration_id":"0028","pre_recovery_anchor_evidence_hash":"sha256:<live-read-evidence>","pre_recovery_anchor_bookmark_hash":"sha256:<bookmark-string-hash>"}' |
   cfctl call d1-import-approved-osint-research-migration \
     --profile osint-research-d1 \
-    --account ca30e922fda7f5578e49873542e4aaca \
-    --selector account_id=ca30e922fda7f5578e49873542e4aaca \
-    --selector database_id=1c1ce476-73ab-4dd6-a2e2-de0c155ade61 \
+    --account <account-id> \
+    --selector account_id=<account-id> \
+    --selector database_id=<database-id> \
     --source-file /absolute/reviewed/repository/migrations/d1/0028_founder_people_handoff.sql \
     --body-stdin --json
 ```
