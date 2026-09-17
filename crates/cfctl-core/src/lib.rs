@@ -3937,6 +3937,7 @@ pub const SECRET_FIELD_NAMES: &[&str] = &[
     "value",
     "token",
     "secret",
+    "key",
     "access_token",
     "client_secret",
     "text",
@@ -3963,8 +3964,14 @@ pub const SECRET_FIELD_NAMES: &[&str] = &[
 ///
 /// `secret_sink_value_keys_are_a_subset_of_secret_field_names` binds this to the
 /// redaction set: everything extractable is redactable, but not the reverse.
-pub const SECRET_SINK_VALUE_KEYS: &[&str] =
-    &["value", "token", "secret", "access_token", "client_secret"];
+pub const SECRET_SINK_VALUE_KEYS: &[&str] = &[
+    "value",
+    "token",
+    "secret",
+    "key",
+    "access_token",
+    "client_secret",
+];
 
 /// Returns whether an RFC 6901 JSON pointer's leaf segment names a known secret
 /// field. Used as a fail-closed guard so a drifted catalog identity pointer can
