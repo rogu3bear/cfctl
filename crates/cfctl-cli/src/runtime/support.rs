@@ -203,10 +203,23 @@ pub(super) fn load_workspace_capability(
     store: &StateStore,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    let capability = cfctl_workspace::load_workspace_operation_capability(
+    finish_workspace_capability(cfctl_workspace::load_workspace_operation_capability(
         &store.workspace_roots()?,
         capability_id,
-    )?;
+    )?)
+}
+
+pub(super) fn inspect_workspace_capability(
+    store: &StateStore,
+    capability_id: &str,
+) -> Result<Option<CapabilityV1>> {
+    finish_workspace_capability(cfctl_workspace::inspect_workspace_operation_capability(
+        &store.workspace_roots()?,
+        capability_id,
+    )?)
+}
+
+fn finish_workspace_capability(capability: Option<CapabilityV1>) -> Result<Option<CapabilityV1>> {
     if let Some(contract) = capability
         .as_ref()
         .and_then(|c| c.workspace_d1_read_inventory.as_ref())

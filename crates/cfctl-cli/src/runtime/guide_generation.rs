@@ -27,7 +27,7 @@ use super::r2_credentials::is_r2_temporary_credentials_operation_identity;
 use super::secret_io::is_access_service_token_create_capability;
 use super::secret_io::is_secret_output_capability;
 use super::secret_io::is_worker_tail_create_capability;
-use super::support::load_workspace_capability;
+use super::support::inspect_workspace_capability;
 use super::worker_custom_domain;
 use cfctl_core::guide_stages;
 
@@ -119,12 +119,12 @@ pub(super) async fn resolve_command(
     }
     let catalog = ensure_catalog(store).await?;
     // Workspace loaders resolve exact operation IDs, not natural-language
-    // provider searches. An unrelated dirty registered application must not
-    // prevent discovering a provider capability.
+    // provider searches. A dirty or missing registered application must not
+    // prevent discovering a provider capability or inspecting a workspace id.
     let workspace = if catalog.get(intent).is_some() || intent.chars().any(char::is_whitespace) {
         None
     } else {
-        load_workspace_capability(store, intent)?
+        inspect_workspace_capability(store, intent)?
     };
     let ranked = workspace.as_ref().map_or_else(
         || catalog.search_scored(intent),

@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used)]
 use cfctl_core::{AdapterStatus, CapabilityAuthorityScopeV1};
 use cfctl_workspace::{
-    load_workspace_operation_capability, revalidate_workspace_d1_read_inventory,
+    inspect_workspace_operation_capability, load_workspace_operation_capability,
+    revalidate_workspace_d1_read_inventory,
 };
 use std::{fs, path::Path, process::Command};
 
@@ -106,6 +107,23 @@ fn clean_committed_population_derives_its_own_identity_and_public_contract() {
     assert!(!capability.cost.known);
     assert!(capability.cost.maximum.is_none());
     revalidate_workspace_d1_read_inventory(contract).expect("current immutable inputs");
+}
+
+#[test]
+fn inspect_reads_a_committed_population_from_a_dirty_worktree() {
+    let root = tempfile::tempdir().expect("root");
+    repository(root.path());
+    fs::write(root.path().join("unrelated"), "dirty").expect("unrelated dirt");
+    let roots = [root.path().to_path_buf()];
+    assert!(
+        load_workspace_operation_capability(&roots, ID).is_err(),
+        "execute still requires a clean worktree"
+    );
+    assert!(
+        inspect_workspace_operation_capability(&roots, ID)
+            .expect("inspect")
+            .is_some()
+    );
 }
 
 #[test]

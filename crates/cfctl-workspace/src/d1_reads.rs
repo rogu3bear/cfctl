@@ -14,6 +14,7 @@ use super::{
     Result, WorkspaceError,
     d1_operation::{committed_file, reject_symlinks, safe_relative},
     git_optional,
+    operation_identity::WorkspaceOperationLoad,
 };
 
 /// Recheck the exact immutable owner before each provider boundary. With HEAD
@@ -68,6 +69,7 @@ pub fn revalidate_workspace_d1_read_inventory(
 pub(super) fn load_selected(
     candidates: &[std::path::PathBuf],
     capability_id: &str,
+    mode: WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
     let selected = super::operation_identity::select(candidates, D1_READ_PACK_PATH, capability_id)?;
     if selected.len() > 1 {
@@ -78,7 +80,7 @@ pub(super) fn load_selected(
     let Some(repository) = selected.first() else {
         return Ok(None);
     };
-    if repository.git.dirty {
+    if mode.requires_clean_worktree() && repository.git.dirty {
         return Err(invalid("read operation repository must be clean"));
     }
     let head = repository
@@ -94,7 +96,7 @@ pub(super) fn load_selected(
     let origin = git_optional(root, &["config", "--get", "remote.origin.url"])?
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid("read operation requires its repository origin"))?;
-    let (pack, bytes) = load_pack(root)?;
+    let (pack, bytes) = load_pack(root, mode)?;
     let operation = pack
         .operation
         .into_iter()
@@ -117,7 +119,7 @@ pub(super) fn load_selected(
         ));
     }
     for source in &operation.source {
-        let source_bytes = bounded_committed(root, &source.path, 16 * 1024 * 1024)?;
+        let source_bytes = bounded_committed(root, &source.path, 16 * 1024 * 1024, mode)?;
         if sha256(&source_bytes) != source.sha256
             || !git_optional(
                 root,
@@ -135,7 +137,8 @@ pub(super) fn load_selected(
             return Err(invalid("reviewed read source input is missing or changed"));
         }
     }
-    let inventory_bytes = bounded_committed(root, &operation.inventory_path, 16 * 1024 * 1024)?;
+    let inventory_bytes =
+        bounded_committed(root, &operation.inventory_path, 16 * 1024 * 1024, mode)?;
     if sha256(&inventory_bytes) != operation.inventory_sha256 {
         return Err(invalid(
             "committed read inventory digest differs from its declaration",
@@ -155,8 +158,8 @@ pub(super) fn load_selected(
     Ok(Some(capability(contract)))
 }
 
-fn load_pack(root: &Path) -> Result<(D1ReadPackV1, Vec<u8>)> {
-    let bytes = bounded_committed(root, D1_READ_PACK_PATH, 256 * 1024)?;
+fn load_pack(root: &Path, mode: WorkspaceOperationLoad) -> Result<(D1ReadPackV1, Vec<u8>)> {
+    let bytes = bounded_committed(root, D1_READ_PACK_PATH, 256 * 1024, mode)?;
     let pack: D1ReadPackV1 = toml::from_str(
         std::str::from_utf8(&bytes).map_err(|_| invalid("read pack must be UTF-8"))?,
     )
@@ -207,17 +210,24 @@ fn validate_operation_identity(operation: &D1ReadOperationV1) -> Result<()> {
     Ok(())
 }
 
-fn bounded_committed(root: &Path, relative: &str, max: u64) -> Result<Vec<u8>> {
+fn bounded_committed(
+    root: &Path,
+    relative: &str,
+    max: u64,
+    mode: WorkspaceOperationLoad,
+) -> Result<Vec<u8>> {
     let relative_path = safe_relative(relative)?;
-    reject_symlinks(root, &relative_path)?;
-    let metadata =
-        std::fs::metadata(root.join(relative)).map_err(|_| invalid("read input is unavailable"))?;
-    if !metadata.is_file() || metadata.len() > max {
-        return Err(invalid(
-            "read input must be a bounded committed regular file",
-        ));
+    if mode.requires_clean_worktree() {
+        reject_symlinks(root, &relative_path)?;
+        let metadata = std::fs::metadata(root.join(relative))
+            .map_err(|_| invalid("read input is unavailable"))?;
+        if !metadata.is_file() || metadata.len() > max {
+            return Err(invalid(
+                "read input must be a bounded committed regular file",
+            ));
+        }
     }
-    let bytes = committed_file(root, &relative_path)?;
+    let bytes = committed_file(root, &relative_path, mode)?;
     if bytes.len() as u64 > max {
         return Err(invalid("read input exceeded its byte bound"));
     }
