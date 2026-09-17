@@ -144,20 +144,30 @@ checks retry only plan creation through the explicit minter profile.
 
 ## Authentication
 
-Day-to-day auth is a scoped API token imported out-of-band. Pipe it through
-stdin, or hand cfctl a mode-0600 file with `--value-in` when a build wrapper
-(such as the in-repo `./cfctl` shim, which routes stdin through `cargo`) would
-otherwise swallow stdin:
+The closed create path is `cfctl keys mint` from a qualified parent profile.
+The one-time value lands only in `--value-out`. Importing that sink creates
+the **child** profile used for later work. Importing a token minted in the
+Cloudflare Dashboard is an emergency human path; it is not P2-complete.
 
 ```bash
-printf '%s' "$CLOUDFLARE_API_TOKEN" | \
-  cfctl auth import-api-token --account <account-id> --stdin --json
+SINK=<new-mode-0600-path>
+cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> \
+  --permission "Workers Scripts Read" --permission "Workers Scripts Write" \
+  --account ca30e922fda7f5578e49873542e4aaca \
+  --value-out "$SINK" --json
+# review, then: cfctl plans approve <operation-id> --yes --json
+#              cfctl plans run <operation-id> --json
 
-# or, stdin-free (survives ./cfctl):
-( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
-cfctl auth import-api-token --account <account-id> --value-in token.tok --json
-rm -f token.tok
+cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> \
+  --account ca30e922fda7f5578e49873542e4aaca --stdin --json \
+  < "$SINK"
+cfctl auth use cfctl-site-release-<UTC-date> --json
 ```
+
+When a build wrapper (such as the in-repo `./cfctl` shim, which routes stdin
+through `cargo`) would swallow stdin, import with `--value-in` against the same
+mode-0600 sink instead of a second copy. Do not start the create job at the
+Dashboard.
 
 OAuth login (optional) uses PKCE and an explicit client id until public cfctl
 OAuth is promoted:

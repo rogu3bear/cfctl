@@ -88,6 +88,19 @@ successful Worker/source contract checks.
 
 ### C. Account and rollback preflight
 
+The closed token job for this launch is `cfctl keys mint`, then stdin import
+and `auth use` of the **child** profile. Creating a token in the Cloudflare
+Dashboard is an emergency human path; it is not P2-complete.
+
+- [ ] From a parent profile that may mint (Account API Tokens Write), not a
+      Worker deploy lane, create the child token. Set
+      `SINK=<new-mode-0600-path>`, then:
+      `cfctl keys mint --profile <parent> --name cfctl-site-release-<UTC-date> --permission "Workers Scripts Read" --permission "Workers Scripts Write" --account ca30e922fda7f5578e49873542e4aaca --value-out "$SINK" --json`
+- [ ] Review that plan; approve and run the exact operation ID. The one-time
+      value goes only to the named `--value-out` file.
+- [ ] Install the child, not the parent:
+      `cfctl auth import-api-token --profile cfctl-site-release-<UTC-date> --account ca30e922fda7f5578e49873542e4aaca --stdin --json < "$SINK"`
+      then `cfctl auth use cfctl-site-release-<UTC-date> --json`.
 - [ ] Select a profile owned by `cfctl-site`; do not reuse an AOS deployment
       profile merely because it points at the same account.
 - [ ] Verify Workers Scripts Read and Workers Scripts Write without exposing
