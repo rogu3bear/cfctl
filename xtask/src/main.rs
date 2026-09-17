@@ -1637,6 +1637,10 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
         ("docs/runbooks/cfctl.md", "Do not replay `plans run`"),
         (
             "docs/runbooks/cfctl.md",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
+        (
+            "docs/runbooks/cfctl.md",
             "cfctl plans approve <operation-id> --yes",
         ),
         (
