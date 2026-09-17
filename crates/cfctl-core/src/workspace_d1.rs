@@ -412,3 +412,20 @@ impl WorkspaceD1MigrationContractV1 {
             && contract.rollback_capability_id == "d1-restore-exact-bookmark"
     }
 }
+
+/// v1 of the workspace-owned *contract type*, carried in pack `schema_version = 2`.
+/// cfctl fills these columns; application acceptance stays on typed validators
+/// until semantic equivalence tests pass (docs/workspace-operation-format.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOperationContractV1 {
+    pub repository_root: String,
+    pub repository_head: String,
+    pub repository_origin: String,
+    pub operation_pack_path: String,
+    pub operation_pack_sha256: String,
+    pub id: String,
+    pub substrate_adapter: String,
+    pub mutates: bool,
+    pub verification_strategy: String,
+}
