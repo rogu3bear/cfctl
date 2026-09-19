@@ -106,8 +106,13 @@ Dashboard is an emergency human path; it is not P2-complete.
       instruction drift.
 - [ ] Audit the registered workspace and confirm the site config maps to the
       intended account.
-- [ ] Read current Worker settings, versions, production deployments, routes,
-      custom domains, and required secret names through governed capabilities.
+- [ ] Read current Worker settings, versions, production deployments, and
+      required secret names through governed capabilities.
+- [ ] Read the `cfctl-site` route surface as three independent this-reads;
+      none stands in for another:
+      1. workers.dev host from `cfctl call getWorker --selector account_id=<account> --selector worker_id=cfctl-site --json` (`subdomain.url`).
+      2. custom domains from `cfctl call workers.domains.list --selector account_id=<account> --json` filtered to `service=cfctl-site`.
+      3. zone worker routes from `cfctl call worker-routes-list-routes --selector zone_id=<zone_id> --json` whose `script` is `cfctl-site`. That call needs `zone_id` from governed zone inventory; if that inventory is missing, fail closed. Do not report `routes:[]` unless this read ran.
 - [ ] Record the previous production version UUID and prove it remains
       retrievable.
 - [ ] Resolve the compensation path: a separate reviewed
