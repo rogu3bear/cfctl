@@ -179,6 +179,7 @@ fn path_identity_classifies_missing_and_uninspectable() {
     assert_eq!(missing.state, PathBuildStateV1::Missing);
     assert!(missing.path.is_none());
     assert!(missing.build.is_none());
+    assert!(missing.checkout_head.is_none());
 
     let uninspectable = classify_path_build(PathBuildProbeV1::Uninspectable {
         path: "/bin/cfctl".into(),
@@ -188,6 +189,7 @@ fn path_identity_classifies_missing_and_uninspectable() {
     assert_eq!(uninspectable.state, PathBuildStateV1::Uninspectable);
     assert_eq!(uninspectable.path.as_deref(), Some(Path::new("/bin/cfctl")));
     assert!(uninspectable.build.is_none());
+    assert!(uninspectable.checkout_head.is_none());
     assert_eq!(
         uninspectable.detail,
         "PATH cfctl is a different executable and was not run"
@@ -206,6 +208,7 @@ fn same_path_git_checkout_is_stale_when_head_differs() {
     let current = same_executable_path_identity(&running, path.clone(), Some(COMMIT_A));
     assert!(current.healthy);
     assert_eq!(current.state, PathBuildStateV1::Current);
+    assert_eq!(current.checkout_head.as_deref(), Some(COMMIT_A));
 
     let stale = same_executable_path_identity(
         &running,
@@ -214,6 +217,10 @@ fn same_path_git_checkout_is_stale_when_head_differs() {
     );
     assert!(!stale.healthy);
     assert_eq!(stale.state, PathBuildStateV1::Stale);
+    assert_eq!(
+        stale.checkout_head.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
     assert!(stale.detail.contains("checkout HEAD"));
 
     let release = BuildInfoV1 {
@@ -222,11 +229,17 @@ fn same_path_git_checkout_is_stale_when_head_differs() {
     };
     let release_current = same_executable_path_identity(
         &release,
-        path,
+        path.clone(),
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     );
     assert!(release_current.healthy);
     assert_eq!(release_current.state, PathBuildStateV1::Current);
+    assert!(release_current.checkout_head.is_none());
+
+    let unbound = same_executable_path_identity(&running, path, None);
+    assert!(unbound.healthy);
+    assert_eq!(unbound.state, PathBuildStateV1::Current);
+    assert!(unbound.checkout_head.is_none());
 }
 
 #[cfg(unix)]
@@ -270,6 +283,7 @@ fn doctor_never_executes_a_different_path_cfctl() {
         assert_platform_keyring_probe_skipped(&envelope);
         assert_eq!(envelope["result"]["path_build"]["state"], "uninspectable");
         assert_eq!(envelope["result"]["path_build"]["healthy"], false);
+        assert!(envelope["result"]["path_build"]["checkout_head"].is_null());
         assert!(
             envelope["result"]["path_build"]["detail"]
                 .as_str()
@@ -309,6 +323,7 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
 
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
     assert_eq!(envelope["result"]["path_build"]["healthy"], true);
+    assert!(envelope["result"]["path_build"]["checkout_head"].is_null());
     assert_eq!(
         envelope["result"]["build_identity_healthy"],
         identity_healthy

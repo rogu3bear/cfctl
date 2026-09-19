@@ -58,6 +58,10 @@ pub struct PathBuildIdentityV1 {
     pub state: PathBuildStateV1,
     pub path: Option<PathBuf>,
     pub build: Option<BuildInfoV1>,
+    /// Checkout HEAD compared against `build.git_commit` when doctor ran
+    /// inside this cfctl source tree. `null` means that comparison did not run
+    /// (PATH is missing, a different executable, or cwd is not this repo).
+    pub checkout_head: Option<String>,
     pub detail: String,
 }
 
@@ -70,6 +74,7 @@ pub fn classify_path_build(probe: PathBuildProbeV1) -> PathBuildIdentityV1 {
             state: PathBuildStateV1::Uninspectable,
             path: Some(path),
             build: None,
+            checkout_head: None,
             detail,
         },
         PathBuildProbeV1::Missing => PathBuildIdentityV1 {
@@ -78,6 +83,7 @@ pub fn classify_path_build(probe: PathBuildProbeV1) -> PathBuildIdentityV1 {
             state: PathBuildStateV1::Missing,
             path: None,
             build: None,
+            checkout_head: None,
             detail: "cfctl is missing from PATH".to_owned(),
         },
     }
@@ -108,21 +114,23 @@ pub fn same_executable_path_identity(
     path: PathBuf,
     source_head: Option<&str>,
 ) -> PathBuildIdentityV1 {
+    let checkout_head = match running.identity_source {
+        BuildIdentitySourceV1::GitCheckout => source_head.map(str::to_owned),
+        BuildIdentitySourceV1::ReleaseEnv | BuildIdentitySourceV1::Unknown => None,
+    };
     let current = PathBuildIdentityV1 {
         schema_version: 1,
         healthy: true,
         state: PathBuildStateV1::Current,
         path: Some(path.clone()),
         build: Some(running.clone()),
+        checkout_head: checkout_head.clone(),
         detail: "PATH resolves to the running cfctl executable".to_owned(),
     };
-    if running.identity_source != BuildIdentitySourceV1::GitCheckout {
-        return current;
-    }
     let Some(installed) = running.git_commit.as_deref() else {
         return current;
     };
-    let Some(head) = source_head else {
+    let Some(head) = checkout_head.as_deref() else {
         return current;
     };
     if installed == head {
@@ -134,6 +142,7 @@ pub fn same_executable_path_identity(
         state: PathBuildStateV1::Stale,
         path: Some(path),
         build: Some(running.clone()),
+        checkout_head,
         detail: "PATH git_commit differs from this cfctl checkout HEAD; rerun ./bootstrap.sh from a clean checkout".to_owned(),
     }
 }

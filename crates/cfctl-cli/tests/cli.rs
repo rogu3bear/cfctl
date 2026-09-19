@@ -1127,6 +1127,10 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     assert_eq!(doctor["result"]["build_identity_healthy"], identity_healthy);
     assert_eq!(doctor["result"]["catalog"]["present"], false);
     assert_eq!(doctor["result"]["path_build"]["state"], "current");
+    assert!(
+        doctor["result"]["path_build"]["checkout_head"].is_null(),
+        "isolated doctor cwd is not this cfctl checkout, so PATH was not compared to HEAD"
+    );
 
     let evidence = &doctor["result"]["evidence_authority"];
     assert_eq!(evidence["qualifying"], false);
@@ -1539,6 +1543,10 @@ fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
         identity_healthy
     );
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
+    assert!(
+        envelope["result"]["path_build"]["checkout_head"].is_null(),
+        "isolated agents doctor cwd is not this cfctl checkout, so PATH was not compared to HEAD"
+    );
     assert_eq!(envelope["result"]["instruction_drift"], 0);
 }
 

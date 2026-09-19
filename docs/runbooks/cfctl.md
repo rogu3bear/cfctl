@@ -49,8 +49,10 @@ needed. Unknown source identity, missing or different PATH executables, and
 managed-instruction drift are unhealthy installation states. When doctor runs
 inside this cfctl checkout and PATH git_commit differs from this cfctl checkout HEAD,
 that state is also unhealthy: PATH matching the running executable is not proof
-it matches this source. Recover with `./bootstrap.sh` from a clean checkout of
-the proven SHA.
+it matches this source. The JSON field `path_build.checkout_head` is the SHA
+that comparison used; it is `null` when doctor did not run inside this
+checkout. Recover with `./bootstrap.sh` from a clean checkout of the proven
+SHA.
 
 Source bootstrap applies that same tracked-and-untracked non-ignored
 cleanliness invariant before verification or installation. Its current `cargo
