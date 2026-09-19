@@ -51,8 +51,9 @@ inside this cfctl checkout and PATH git_commit differs from this cfctl checkout 
 that state is also unhealthy: PATH matching the running executable is not proof
 it matches this source. The JSON field `path_build.checkout_head` is the SHA
 that comparison used; it is `null` when doctor did not run inside this
-checkout. Recover with `./bootstrap.sh` from a clean checkout of the proven
-SHA.
+checkout. Unhealthy doctor and `agents doctor` errors name that PATH, source,
+or instruction failure instead of a generic combined blob. Recover with
+`./bootstrap.sh` from a clean checkout of the proven SHA.
 
 Source bootstrap applies that same tracked-and-untracked non-ignored
 cleanliness invariant before verification or installation. Its current `cargo
