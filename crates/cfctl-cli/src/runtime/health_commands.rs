@@ -5,6 +5,7 @@ use super::prelude::{
     AgentKind, CatalogSnapshot, CliError, ErrorV1, ProfileKind, ProfilesConfig, Result,
     ResultEnvelopeV2, StateStore, Utc, Value, VerificationState, env, json,
 };
+use super::public_oauth_status::doctor_public_oauth;
 use super::support::catalog_is_stale;
 use super::support::home_directory;
 use super::support::http_client;
@@ -172,7 +173,7 @@ pub(super) fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "evidence_authority": evidence_authority_health(store)?,
             "instruction_drift": instruction_drift,
             "agents": agents,
-            "public_oauth": "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
+            "public_oauth": doctor_public_oauth(),
         }),
         healthy,
         "CFCTL_RUNTIME_DRIFT",

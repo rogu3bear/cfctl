@@ -586,8 +586,8 @@ fn verify_public_domain_contract() -> Result<(), TaskError> {
             "`cfctl.com` site publication, publisher-domain verification",
         ),
         (
-            "crates/cfctl-cli/src/runtime/health_commands.rs",
-            "disabled pending a later explicit OAuth promotion transaction; cfctl.com ownership, site publication, and domain verification do not enable OAuth",
+            "crates/cfctl-cli/src/runtime/public_oauth_status.rs",
+            "cfctl.com ownership, site publication, and domain verification do not enable OAuth",
         ),
     ] {
         let absolute_path = repository_root.join(path);
