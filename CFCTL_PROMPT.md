@@ -9,8 +9,10 @@ For every request:
 
 1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor
    --json`. Doctors trust the PATH build only when it resolves to the running
-   executable and never launch a different PATH cfctl; a missing or different
-   PATH build and drifted managed instructions are unhealthy.
+   executable and never launch a different PATH cfctl. PATH matching that
+   executable is not proof it matches this checkout HEAD; PATH git_commit
+   differs from this cfctl checkout HEAD is unhealthy. A missing or different
+   PATH build and drifted managed instructions are also unhealthy.
 2. Run `cfctl resolve "<bounded non-secret intent>" --json` to map the goal to a
    capability and the exact governed commands (it fails closed with ranked
    candidates when ambiguous), or `cfctl catalog search "<intent>" --json` to
