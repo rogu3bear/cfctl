@@ -474,7 +474,8 @@ fn verify_source_contract() -> Result<(), TaskError> {
     verify_public_domain_contract()?;
     verify_managed_agent_documents()?;
     local_adapters::verify()?;
-    verify_documented_contracts()
+    verify_documented_contracts()?;
+    verify_identity_or_ownership_mint_gate()
 }
 
 const EXPECTED_XTASK_ALIAS: [&str; 5] = ["run", "--locked", "-p", "xtask", "--"];
@@ -1656,6 +1657,111 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
     )?;
     verify_quickstart_pins_the_release_version(repository_root)?;
     verify_signed_release_posture_contract(repository_root)?;
+    Ok(())
+}
+
+const IDENTITY_MINT_GATE: &str = "cfctl plans approve <operation-id> --yes";
+const IDENTITY_MINT_SPEARHEAD_STOP: &str = "Prior chat auto-approve or spearhead is not that id.";
+const IDENTITY_MINT_FORBIDDEN_AUTOMATIC: &str = "human approves automatically";
+const IDENTITY_MINT_FORBIDDEN_CONCAT: &str = "approve and run the exact operation ID";
+const IDENTITY_MINT_STOP_PATHS: [&str; 3] = [
+    "docs/runbooks/cfctl.md",
+    "site/docs/LAUNCH_CHECKLIST.md",
+    "skills/cfctl-operator/SKILL.md",
+];
+
+fn is_tracked_operator_guidance(path: &str) -> bool {
+    if path.starts_with("compat/v1/") || path.starts_with("crates/cfctl-agent/tests/fixtures/") {
+        return false;
+    }
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        && (path.starts_with("docs/")
+            || path.starts_with("skills/")
+            || matches!(
+                path,
+                "CFCTL_PROMPT.md" | "QUICKSTART.md" | "README.md" | "site/docs/LAUNCH_CHECKLIST.md"
+            ))
+}
+
+fn verify_identity_or_ownership_mint_gate() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    let tracked = tracked_files(repository_root)?;
+    let mut documents = Vec::new();
+    for path in &tracked {
+        if !is_tracked_operator_guidance(path) {
+            continue;
+        }
+        let absolute_path = repository_root.join(path);
+        let content = fs::read_to_string(&absolute_path)
+            .map_err(|source| io_error(&absolute_path, source))?;
+        documents.push((path.as_str(), content));
+    }
+    let borrowed = documents
+        .iter()
+        .map(|(path, content)| (*path, content.as_str()))
+        .collect::<Vec<_>>();
+    validate_identity_or_ownership_mint_gate(&tracked, &borrowed)
+}
+
+fn validate_identity_or_ownership_mint_gate(
+    tracked_paths: &[String],
+    documents: &[(&str, &str)],
+) -> Result<(), TaskError> {
+    if tracked_paths
+        .iter()
+        .any(|path| path == "AGENTS.md" || path.ends_with("/AGENTS.md") || path == "CLAUDE.md")
+    {
+        return Err(TaskError::InvalidSourceContract(
+            "AGENTS.md must stay gitignored; the IdentityOrOwnership mint gate lives in tracked operator docs"
+                .to_owned(),
+        ));
+    }
+    let mut seen_stops = BTreeSet::new();
+    for (path, content) in documents {
+        if !is_tracked_operator_guidance(path) {
+            continue;
+        }
+        if content
+            .to_ascii_lowercase()
+            .contains(IDENTITY_MINT_FORBIDDEN_AUTOMATIC)
+        {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} treats token create as `{IDENTITY_MINT_FORBIDDEN_AUTOMATIC}`"
+            )));
+        }
+        if content.contains(IDENTITY_MINT_FORBIDDEN_CONCAT) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} concatenates mint approval and run; IdentityOrOwnership requires `{IDENTITY_MINT_GATE}` typed for that operation id"
+            )));
+        }
+        if IDENTITY_MINT_STOP_PATHS.contains(path) {
+            seen_stops.insert(*path);
+            for required in [
+                IDENTITY_MINT_GATE,
+                IDENTITY_MINT_SPEARHEAD_STOP,
+                "IdentityOrOwnership",
+            ] {
+                if !content.contains(required) {
+                    return Err(TaskError::InvalidSourceContract(format!(
+                        "{path} omits IdentityOrOwnership mint gate `{required}`"
+                    )));
+                }
+            }
+        } else if content.contains("keys mint") && !content.contains(IDENTITY_MINT_GATE) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} mentions keys mint without `{IDENTITY_MINT_GATE}` as the mint gate"
+            )));
+        }
+    }
+    for path in IDENTITY_MINT_STOP_PATHS {
+        if !seen_stops.contains(path) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} was not scanned for the IdentityOrOwnership mint gate"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3687,16 +3793,18 @@ mod tests {
         release_tag_is_exact_version, render_linux_installer_text, repository_root,
         security_proof_commands, validate_bootstrap_contract, validate_bound_draft_release,
         validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
-        validate_local_only_ci_contract, validate_macos_certificate_fingerprints,
-        validate_macos_provenance, validate_notary_receipt_value, validate_public_domain_anchor,
+        validate_identity_or_ownership_mint_gate, validate_local_only_ci_contract,
+        validate_macos_certificate_fingerprints, validate_macos_provenance,
+        validate_notary_receipt_value, validate_public_domain_anchor,
         validate_release_identity_inputs, validate_rollback_readback,
         validate_signed_release_file_set, validate_signed_release_posture_contract,
         validate_xtask_alias_contract, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
-        verify_generated_guidance_section_text, verify_managed_agent_documents,
-        verify_public_domain_contract, verify_quickstart_pins_the_release_version,
-        verify_signed_release_posture_contract, verify_tracked_cfctl_command_references,
-        verify_v1_cutover_contract, verify_workspace_dependency_versions,
+        verify_generated_guidance_section_text, verify_identity_or_ownership_mint_gate,
+        verify_managed_agent_documents, verify_public_domain_contract,
+        verify_quickstart_pins_the_release_version, verify_signed_release_posture_contract,
+        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
+        verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -4512,6 +4620,81 @@ mod tests {
     fn checked_in_guidance_matches_the_executable_projection() {
         let result = verify_documented_contracts();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn identity_or_ownership_mint_gate_is_tracked_operator_docs() {
+        let result = verify_identity_or_ownership_mint_gate();
+        assert!(result.is_ok(), "{result:?}");
+
+        let stop = concat!(
+            "IdentityOrOwnership requires `cfctl plans approve <operation-id> --yes` typed for that exact operation id. ",
+            "Prior chat auto-approve or spearhead is not that id."
+        );
+        let tracked = [
+            "docs/runbooks/cfctl.md".to_owned(),
+            "site/docs/LAUNCH_CHECKLIST.md".to_owned(),
+            "skills/cfctl-operator/SKILL.md".to_owned(),
+        ];
+        let documents = [
+            ("docs/runbooks/cfctl.md", stop),
+            ("site/docs/LAUNCH_CHECKLIST.md", stop),
+            ("skills/cfctl-operator/SKILL.md", stop),
+        ];
+        validate_identity_or_ownership_mint_gate(&tracked, &documents)
+            .expect("named tracked stops admit the mint gate");
+
+        let automatic = validate_identity_or_ownership_mint_gate(
+            &tracked,
+            &[
+                (
+                    "docs/runbooks/cfctl.md",
+                    "human approves automatically on token create",
+                ),
+                ("site/docs/LAUNCH_CHECKLIST.md", stop),
+                ("skills/cfctl-operator/SKILL.md", stop),
+            ],
+        )
+        .expect_err("automatic approval copy fails closed");
+        assert!(
+            automatic
+                .to_string()
+                .contains("human approves automatically")
+        );
+
+        let concatenated = validate_identity_or_ownership_mint_gate(
+            &tracked,
+            &[
+                ("docs/runbooks/cfctl.md", stop),
+                (
+                    "site/docs/LAUNCH_CHECKLIST.md",
+                    "Review that plan; approve and run the exact operation ID.",
+                ),
+                ("skills/cfctl-operator/SKILL.md", stop),
+            ],
+        )
+        .expect_err("concatenated approve-and-run fails closed");
+        assert!(
+            concatenated
+                .to_string()
+                .contains("concatenates mint approval")
+        );
+
+        let agents = validate_identity_or_ownership_mint_gate(&["AGENTS.md".to_owned()], &[])
+            .expect_err("a tracked AGENTS.md is not the mint gate");
+        assert!(agents.to_string().contains("gitignored"));
+
+        let mint_without_gate = validate_identity_or_ownership_mint_gate(
+            &tracked,
+            &[
+                ("docs/runbooks/cfctl.md", stop),
+                ("site/docs/LAUNCH_CHECKLIST.md", stop),
+                ("skills/cfctl-operator/SKILL.md", stop),
+                ("docs/agent-landing.md", "routed through keys mint"),
+            ],
+        )
+        .expect_err("keys mint without the gate fails closed");
+        assert!(mint_without_gate.to_string().contains("keys mint"));
     }
 
     #[test]
