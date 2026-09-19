@@ -147,6 +147,102 @@ pub fn same_executable_path_identity(
     }
 }
 
+/// Running-binary plus PATH identity shared by `doctor` and `agents doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeIdentityV1 {
+    pub running_build: BuildInfoV1,
+    pub build_identity_healthy: bool,
+    pub path_build: PathBuildIdentityV1,
+}
+
+impl RuntimeIdentityV1 {
+    #[must_use]
+    pub fn inspect() -> Self {
+        let running_build = current_build_info();
+        let path_build = inspect_path_build(&running_build);
+        Self {
+            build_identity_healthy: build_identity_is_healthy(&running_build),
+            running_build,
+            path_build,
+        }
+    }
+
+    #[must_use]
+    pub fn healthy(&self, instruction_drift: usize) -> bool {
+        self.build_identity_healthy && self.path_build.healthy && instruction_drift == 0
+    }
+
+    #[must_use]
+    pub fn failure(&self, instruction_drift: usize) -> Option<IdentityFailureV1> {
+        identity_failure(self, instruction_drift)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityFailureV1 {
+    pub message: String,
+    pub next_step: String,
+}
+
+#[must_use]
+pub fn identity_failure(
+    identity: &RuntimeIdentityV1,
+    instruction_drift: usize,
+) -> Option<IdentityFailureV1> {
+    if identity.healthy(instruction_drift) {
+        return None;
+    }
+    let mut messages = Vec::new();
+    let mut steps = Vec::new();
+    if !identity.path_build.healthy {
+        messages.push(identity.path_build.detail.clone());
+        match identity.path_build.state {
+            PathBuildStateV1::Stale => steps.push(
+                "Rerun ./bootstrap.sh from a clean checkout of the proven SHA.".to_owned(),
+            ),
+            PathBuildStateV1::Missing => steps.push(
+                "Install cfctl onto PATH with ./bootstrap.sh from a clean checkout of the proven SHA."
+                    .to_owned(),
+            ),
+            PathBuildStateV1::Uninspectable => steps.push(
+                "Invoke that PATH executable directly with `cfctl version --json`.".to_owned(),
+            ),
+            PathBuildStateV1::Current => {}
+        }
+    }
+    if !identity.build_identity_healthy {
+        messages.push(
+            "running build identity_source is unknown or git_commit is not a full 40-character SHA"
+                .to_owned(),
+        );
+        steps.push(
+            "Rerun ./bootstrap.sh from a checkout clean of tracked and untracked non-ignored files."
+                .to_owned(),
+        );
+    }
+    if instruction_drift > 0 {
+        messages.push(format!(
+            "{instruction_drift} managed agent instruction(s) drifted"
+        ));
+        steps.push("Run `cfctl agents sync` to refresh managed instructions.".to_owned());
+    }
+    Some(IdentityFailureV1 {
+        message: messages.join("; "),
+        next_step: steps.join(" "),
+    })
+}
+
+pub const GENERIC_IDENTITY_FAILURE_MESSAGE: &str =
+    "The source identity, PATH build, or managed agent instructions are not current.";
+
+#[must_use]
+pub fn identity_error_copy(failure: Option<&IdentityFailureV1>) -> (&str, Option<&str>) {
+    match failure {
+        Some(failure) => (failure.message.as_str(), Some(failure.next_step.as_str())),
+        None => (GENERIC_IDENTITY_FAILURE_MESSAGE, None),
+    }
+}
+
 fn cfctl_source_head(cwd: Option<&Path>) -> Option<String> {
     let cwd = cwd?;
     let toplevel = git_stdout(cwd, &["rev-parse", "--show-toplevel"])?;

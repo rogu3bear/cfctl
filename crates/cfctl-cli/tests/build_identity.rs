@@ -12,8 +12,8 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use cfctl_auth::{FileSecretStore, SecretStore};
 use cfctl_cli::{
     build_identity::{
-        PathBuildProbeV1, PathBuildStateV1, build_identity_is_healthy, classify_path_build,
-        current_build_info, same_executable_path_identity,
+        PathBuildProbeV1, PathBuildStateV1, RuntimeIdentityV1, build_identity_is_healthy,
+        classify_path_build, current_build_info, identity_failure, same_executable_path_identity,
     },
     build_support::{ResolvedIdentitySource, build_identity_rerun_paths, resolve_build_identity},
 };
@@ -194,6 +194,17 @@ fn path_identity_classifies_missing_and_uninspectable() {
         uninspectable.detail,
         "PATH cfctl is a different executable and was not run"
     );
+    let failure = identity_failure(
+        &RuntimeIdentityV1 {
+            running_build: current_build_info(),
+            build_identity_healthy: true,
+            path_build: uninspectable,
+        },
+        0,
+    )
+    .expect("uninspectable PATH is unhealthy");
+    assert!(failure.message.contains("was not run"));
+    assert!(failure.next_step.contains("cfctl version --json"));
 }
 
 #[test]
@@ -236,10 +247,30 @@ fn same_path_git_checkout_is_stale_when_head_differs() {
     assert_eq!(release_current.state, PathBuildStateV1::Current);
     assert!(release_current.checkout_head.is_none());
 
-    let unbound = same_executable_path_identity(&running, path, None);
+    let unbound = same_executable_path_identity(&running, path.clone(), None);
     assert!(unbound.healthy);
     assert_eq!(unbound.state, PathBuildStateV1::Current);
     assert!(unbound.checkout_head.is_none());
+
+    let identity = RuntimeIdentityV1 {
+        running_build: running,
+        build_identity_healthy: true,
+        path_build: stale,
+    };
+    let failure = identity_failure(&identity, 0).expect("stale PATH is unhealthy");
+    assert!(failure.message.contains("checkout HEAD"));
+    assert!(failure.next_step.contains("./bootstrap.sh"));
+    assert!(
+        identity_failure(
+            &RuntimeIdentityV1 {
+                running_build: identity.running_build.clone(),
+                build_identity_healthy: true,
+                path_build: unbound,
+            },
+            0
+        )
+        .is_none()
+    );
 }
 
 #[cfg(unix)]
@@ -285,10 +316,16 @@ fn doctor_never_executes_a_different_path_cfctl() {
         assert_eq!(envelope["result"]["path_build"]["healthy"], false);
         assert!(envelope["result"]["path_build"]["checkout_head"].is_null());
         assert!(
-            envelope["result"]["path_build"]["detail"]
+            envelope["error"]["message"]
                 .as_str()
-                .is_some_and(|detail| detail.contains("was not run")),
-            "doctor must explain the fail-closed trust boundary"
+                .is_some_and(|message| message.contains("was not run")),
+            "doctor error must name the PATH identity failure, not a generic drift blob"
+        );
+        assert!(
+            envelope["error"]["next_step"]
+                .as_str()
+                .is_some_and(|step| step.contains("cfctl version --json")),
+            "uninspectable PATH must tell the operator to invoke that executable directly"
         );
     }
 }
