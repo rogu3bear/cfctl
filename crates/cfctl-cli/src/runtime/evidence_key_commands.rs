@@ -122,6 +122,7 @@ fn runtime_result(
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn classify_native_self_validation(
     requirement_parsed: bool,
     self_code_available: bool,
@@ -225,6 +226,7 @@ fn current_adoption_clock() -> Result<EvidenceKeyAdoptionClockV1> {
     })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn parse_macos_boot_time(raw: &[u8]) -> Result<String> {
     let bytes: &[u8; 16] = raw.try_into().map_err(|_| {
         CliError::Input("kern.boottime returned an unexpected structure length".to_owned())
