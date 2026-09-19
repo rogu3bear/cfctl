@@ -46,7 +46,14 @@ closed. Release builds may use the verified full-commit release override. A
 doctor never launches a different PATH executable to inspect it; invoke that
 binary directly with `cfctl version --json` if its self-reported identity is
 needed. Unknown source identity, missing or different PATH executables, and
-managed-instruction drift are unhealthy installation states.
+managed-instruction drift are unhealthy installation states. When doctor runs
+inside this cfctl checkout and PATH git_commit differs from this cfctl checkout HEAD,
+that state is also unhealthy: PATH matching the running executable is not proof
+it matches this source. The JSON field `path_build.checkout_head` is the SHA
+that comparison used; it is `null` when doctor did not run inside this
+checkout. Unhealthy doctor and `agents doctor` errors name that PATH, source,
+or instruction failure instead of a generic combined blob. Recover with
+`./bootstrap.sh` from a clean checkout of the proven SHA.
 
 Source bootstrap applies that same tracked-and-untracked non-ignored
 cleanliness invariant before verification or installation. Its current `cargo

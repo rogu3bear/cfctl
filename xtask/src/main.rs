@@ -1634,6 +1634,30 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
             "request or accept credential values",
         ),
         ("docs/runbooks/cfctl.md", "Do not replay `plans run`"),
+        (
+            "docs/runbooks/cfctl.md",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
+        (
+            "README.md",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
+        (
+            "CFCTL_PROMPT.md",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
+        (
+            "docs/v2-architecture.md",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
+        (
+            "docs/agent-landing.md",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
+        (
+            "crates/cfctl-agent/src/lib.rs",
+            "PATH git_commit differs from this cfctl checkout HEAD",
+        ),
     ] {
         let absolute_path = repository_root.join(path);
         let content = fs::read_to_string(&absolute_path)
