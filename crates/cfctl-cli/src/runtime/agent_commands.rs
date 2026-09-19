@@ -6,7 +6,7 @@ use super::prelude::{
 };
 use super::support::configured_agent;
 use super::support::home_directory;
-use crate::build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build};
+use crate::build_identity::{RuntimeIdentityV1, identity_error_copy};
 use cfctl_agent::{inspect_agent, install_agent_skill};
 
 pub(super) fn agents_command(
@@ -71,20 +71,20 @@ pub(super) fn agents_command(
                 .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
                 .collect();
             let configured = configured_agent()?;
-            let running_build = current_build_info();
-            let build_identity_healthy = build_identity_is_healthy(&running_build);
-            let path_build = inspect_path_build(&running_build);
+            let identity = RuntimeIdentityV1::inspect();
             let instruction_drift = status
                 .iter()
                 .filter(|agent| agent.skill_present && !agent.skill_current)
                 .count();
-            let healthy = build_identity_healthy && path_build.healthy && instruction_drift == 0;
+            let healthy = identity.healthy(instruction_drift);
+            let failure = identity.failure(instruction_drift);
+            let (message, next_step) = identity_error_copy(failure.as_ref());
             Ok(health_envelope(
                 "agents doctor",
                 json!({
-                    "running_build": running_build,
-                    "build_identity_healthy": build_identity_healthy,
-                    "path_build": path_build,
+                    "running_build": identity.running_build,
+                    "build_identity_healthy": identity.build_identity_healthy,
+                    "path_build": identity.path_build,
                     "configured_default_agent": configured,
                     "platform": env::consts::OS,
                     "platform_secret_store": platform_secret_store_health(store)?,
@@ -93,7 +93,8 @@ pub(super) fn agents_command(
                 }),
                 healthy,
                 "CFCTL_AGENT_OR_BUILD_DRIFT",
-                "The source identity, PATH build, or managed agent instructions are not current.",
+                message,
+                next_step,
             ))
         }
     }
