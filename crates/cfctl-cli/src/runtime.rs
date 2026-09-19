@@ -29,6 +29,7 @@ mod error;
 mod event_batch;
 mod events_commands;
 mod evidence_key_commands;
+mod farm_content_snapshot;
 mod governed_cli;
 mod guide_generation;
 mod health_commands;

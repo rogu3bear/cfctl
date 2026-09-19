@@ -3,6 +3,7 @@
 pub mod d1_read_inventory;
 pub mod d1_reconciliation;
 mod email_routing;
+pub mod farm_content_snapshot;
 pub mod pages_artifact;
 pub mod pages_projects;
 pub mod worker_frozen_upload;

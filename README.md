@@ -227,6 +227,9 @@ cfctl call cloudflare-tunnel-get-a-cloudflare-tunnel-token \
 Token creation is exposed only through the inventory-bound `keys mint`
 workflow, never a direct create call.
 
+Farm's [private content provenance snapshot](docs/farm-content-provenance-snapshot.md)
+reads its current content and complete revision history through one fixed capability.
+
 ## What cfctl refuses to do
 
 Expect to meet the wall early, and read it as the design working. cfctl

@@ -74,6 +74,7 @@ pub(super) async fn call_command(
         || arguments.capability_id == cfctl_core::pages_artifact::PRODUCER_ID
         || arguments.capability_id == cfctl_core::d1_reconciliation::RECONCILE_ID
         || arguments.capability_id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID
+        || arguments.capability_id == cfctl_core::farm_content_snapshot::CAPABILITY_ID
     {
         cached.ok_or_else(|| {
             CliError::Input(
@@ -98,6 +99,10 @@ pub(super) async fn call_command(
     }
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
     let is_d1_full_export = capability.d1_full_export.is_some();
+    let is_farm_snapshot = capability.id == cfctl_core::farm_content_snapshot::CAPABILITY_ID;
+    if is_farm_snapshot {
+        super::farm_content_snapshot::preflight(&capability, &arguments)?;
+    }
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
     let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
     let is_workspace_d1_reply_admission = capability.workspace_d1_reply_admission.is_some();
@@ -180,9 +185,10 @@ pub(super) async fn call_command(
         && !is_r2_capture
         && !private_d1
         && capability.id != cfctl_core::d1_reconciliation::DIAGNOSTIC_ID
+        && !is_farm_snapshot
     {
         return Err(CliError::Input(
-            "`--out` is restricted to bounded analytics, governed R2 log retrieval, D1 full export/diagnostics, and private R2 capture"
+            "`--out` is restricted to bounded analytics, governed R2 log retrieval, D1 full export/diagnostics, private R2 capture, and Farm provenance snapshots"
                 .to_owned(),
         ));
     }
