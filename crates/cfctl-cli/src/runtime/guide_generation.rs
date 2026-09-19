@@ -509,9 +509,9 @@ pub(super) fn is_domain_like(token: &str) -> bool {
     })
 }
 
-pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
+fn pinned_capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
     if capability.id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID {
-        return argv(&[
+        return Some(argv(&[
             "cfctl",
             "call",
             &capability.id,
@@ -523,7 +523,7 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
             "--out",
             "<new-file-in-owned-mode-0700-directory>",
             "--json",
-        ]);
+        ]));
     }
     if matches!(
         capability.id.as_str(),
@@ -544,9 +544,8 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
             "<new-mode-0600-path>",
             "--json",
         ]);
-        return argv.into_iter().map(str::to_owned).collect();
+        return Some(argv.into_iter().map(str::to_owned).collect());
     }
-
     if let Some(contract) = &capability.workspace_d1_read_inventory {
         let operation = &contract.operation;
         let mut command = argv(&[
@@ -570,7 +569,28 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
                 "<new-file-in-owned-mode-0700-directory>".into(),
             ]);
         }
-        return command;
+        return Some(command);
+    }
+    if capability.id == cfctl_core::farm_content_snapshot::CAPABILITY_ID {
+        return Some(argv(&[
+            "cfctl",
+            "call",
+            &capability.id,
+            "--profile",
+            "<farm-d1-read-profile>",
+            "--account",
+            cfctl_core::farm_content_snapshot::ACCOUNT_ID,
+            "--out",
+            "<new-file-in-owned-mode-0700-directory>",
+            "--json",
+        ]));
+    }
+    None
+}
+
+pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
+    if let Some(argv) = pinned_capability_call_argv(capability) {
+        return argv;
     }
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
     for selector in capability
@@ -604,16 +624,6 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     }
     if capability.d1_full_export.is_some() {
         argv.extend(["--out".to_owned(), "<new-mode-0600-sql-path>".to_owned()]);
-    }
-    if capability.id == cfctl_core::farm_content_snapshot::CAPABILITY_ID {
-        argv.extend([
-            "--profile".to_owned(),
-            "<farm-d1-read-profile>".to_owned(),
-            "--account".to_owned(),
-            cfctl_core::farm_content_snapshot::ACCOUNT_ID.to_owned(),
-            "--out".to_owned(),
-            "<new-file-in-owned-mode-0700-directory>".to_owned(),
-        ]);
     }
     argv.push("--json".to_owned());
     argv
