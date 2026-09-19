@@ -29,9 +29,10 @@ cfctl doctor --json
 
 `bootstrap.sh` requires a checkout clean of tracked and untracked non-ignored
 files and proves the installed binary is the exact `HEAD` commit. Both doctors
-must report the PATH entry resolving to the running executable; a different or
-missing PATH binary and drifted agent instructions are unhealthy states, not
-warnings.
+must report the PATH entry resolving to the running executable; that is not
+proof PATH `git_commit` matches this checkout HEAD. A different or missing PATH
+binary, PATH git_commit differs from this cfctl checkout HEAD, and drifted
+agent instructions are unhealthy states, not warnings.
 
 ## The governed loop
 
