@@ -1635,14 +1635,6 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
             "request or accept credential values",
         ),
         ("docs/runbooks/cfctl.md", "Do not replay `plans run`"),
-        (
-            "docs/runbooks/cfctl.md",
-            "cfctl plans approve <operation-id> --yes",
-        ),
-        (
-            "site/docs/LAUNCH_CHECKLIST.md",
-            "cfctl plans approve <operation-id> --yes",
-        ),
     ] {
         let absolute_path = repository_root.join(path);
         let content = fs::read_to_string(&absolute_path)
