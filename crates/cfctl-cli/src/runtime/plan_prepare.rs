@@ -4,7 +4,6 @@ use super::import_planning::SECURITY_ACTION_STATE_PRECONDITION;
 use super::keys_commands::validate_selected_permission_groups;
 use super::mint_launch_lane::attach_mint_child_launch_lane;
 use super::mint_launch_lane::bind_mint_child_launch_lane_targets;
-use super::oauth_state::is_oauth_client_create_operation_identity;
 use super::pages_deployment::PROJECT_ABSENCE_PRECONDITION;
 use super::pages_source::SOURCE_REMOTE_PRECONDITION;
 use super::pages_source::pages_source_remote_snapshot;
@@ -588,9 +587,7 @@ pub(super) fn persist_prepared_plan(
     .clone_into(&mut plan.permission_lane);
     plan.input = serde_json::to_value(&input)?;
     bind_mint_child_launch_lane_targets(&mut plan);
-    if is_oauth_client_create_operation_identity(&plan.capability) {
-        preflight_secret_sink(&plan)?;
-    }
+    preflight_secret_sink(&plan)?;
     plan.precondition_hashes
         .insert("catalog".to_owned(), catalog.schema_hash.clone());
     plan.precondition_hashes
