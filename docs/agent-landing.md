@@ -18,8 +18,7 @@ cfctl agents doctor --json
 doctor` trust the `cfctl` resolved on `PATH` only when it is the same
 executable as the running build; they never launch a different PATH executable
 to inspect it. PATH matching the running executable is not proof PATH
-`git_commit` matches this checkout HEAD; PATH git_commit differs from this
-cfctl checkout HEAD is unhealthy. Missing or different PATH executables and
+`git_commit` matches this checkout HEAD; PATH git_commit differs from this cfctl checkout HEAD is unhealthy. Missing or different PATH executables and
 drifted managed guidance are also unhealthy — repair installation before
 relying on the operator surface.
 
