@@ -232,7 +232,15 @@ fn same_path_git_checkout_is_stale_when_head_differs() {
         stale.checkout_head.as_deref(),
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     );
-    assert!(stale.detail.contains("checkout HEAD"));
+    assert!(stale.detail.contains(
+        "PATH git_commit differs from this cfctl checkout HEAD; path_build.build.git_commit="
+    ));
+    assert!(stale.detail.contains(COMMIT_A));
+    assert!(
+        stale
+            .detail
+            .contains("path_build.checkout_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
 
     let release = BuildInfoV1 {
         identity_source: BuildIdentitySourceV1::ReleaseEnv,
@@ -258,7 +266,9 @@ fn same_path_git_checkout_is_stale_when_head_differs() {
         path_build: stale,
     };
     let failure = identity_failure(&identity, 0).expect("stale PATH is unhealthy");
-    assert!(failure.message.contains("checkout HEAD"));
+    assert!(failure.message.contains("path_build.build.git_commit="));
+    assert!(failure.message.contains("path_build.checkout_head="));
+    assert!(failure.message.contains(COMMIT_A));
     assert!(failure.next_step.contains("./bootstrap.sh"));
     assert!(
         identity_failure(

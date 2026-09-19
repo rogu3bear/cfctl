@@ -130,7 +130,7 @@ pub fn same_executable_path_identity(
     let Some(installed) = running.git_commit.as_deref() else {
         return current;
     };
-    let Some(head) = checkout_head.as_deref() else {
+    let Some(head) = checkout_head.clone() else {
         return current;
     };
     if installed == head {
@@ -142,8 +142,10 @@ pub fn same_executable_path_identity(
         state: PathBuildStateV1::Stale,
         path: Some(path),
         build: Some(running.clone()),
-        checkout_head,
-        detail: "PATH git_commit differs from this cfctl checkout HEAD; rerun ./bootstrap.sh from a clean checkout".to_owned(),
+        checkout_head: Some(head.clone()),
+        detail: format!(
+            "PATH git_commit differs from this cfctl checkout HEAD; path_build.build.git_commit={installed} path_build.checkout_head={head}; rerun ./bootstrap.sh from a clean checkout"
+        ),
     }
 }
 
