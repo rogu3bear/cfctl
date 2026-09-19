@@ -347,7 +347,7 @@ fn managed_skill(agent: AgentKind) -> &'static str {
 // Cursor receives the same invariants in a compact always-applied rule.
 
 /// Fail-closed doctor contract: a doctor never launches a different PATH cfctl.
-pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. Drifted managed instructions are also unhealthy.";
+pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. PATH matching the running executable is not proof PATH git_commit matches this checkout HEAD; that comparison is `path_build.checkout_head` and is unhealthy when PATH git_commit differs from this cfctl checkout HEAD. Drifted managed instructions are also unhealthy.";
 
 /// Resolve is the primary intent-to-capability translation; browsing is secondary.
 pub const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`."#;
@@ -442,7 +442,7 @@ pub fn managed_documents() -> [(&'static str, &'static str); 2] {
 /// The managed-skill contract number carried in the installed front matter.
 /// Bump this when the installed document's contract changes; `agents doctor`
 /// compares whole strings, so every install goes stale on purpose when it moves.
-pub const MANAGED_SKILL_CONTRACT: u32 = 9;
+pub const MANAGED_SKILL_CONTRACT: u32 = 10;
 
 static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
 static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);

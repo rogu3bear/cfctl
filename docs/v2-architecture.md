@@ -44,6 +44,9 @@ a later edit invalidates the embedded identity. A verified release build may
 instead inject the same full commit through the release environment. Any
 missing, malformed, or unknown source identity is reported as unhealthy by
 both doctor surfaces even when PATH resolves to the running executable.
+PATH matching the running executable is not proof PATH git_commit matches this
+checkout HEAD; PATH git_commit differs from this cfctl checkout HEAD is also
+unhealthy (`path_build.checkout_head` is the SHA compared).
 
 ## Adapter boundary
 

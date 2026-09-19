@@ -61,7 +61,7 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("cfctl plans status <operation-id> --json"));
     assert!(content.contains("Artifact presence alone is never verification"));
     assert!(content.contains("planned**, **applied**, **verified**, or **blocked"));
-    assert!(content.contains("contract: 9"));
+    assert!(content.contains("contract: 10"));
     assert!(content.contains("cfctl policy admission list --json"));
     assert!(content.contains("fully pinned PlanV2"));
     assert!(content.contains("events-consume-queue-batch"));
@@ -290,7 +290,7 @@ fn managed_skill_contract_header_is_single_sourced() {
         "contract: {}",
         cfctl_agent::MANAGED_SKILL_CONTRACT
     )));
-    assert!(skill.contains("contract: 9"));
+    assert!(skill.contains("contract: 10"));
 }
 
 fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {
