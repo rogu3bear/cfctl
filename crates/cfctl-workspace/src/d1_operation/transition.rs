@@ -36,6 +36,50 @@ struct HistoricalEntry {
     applied_at: String,
 }
 
+/// Reconstruct the exact compiled bytes from the current clean, committed pack.
+/// This supplies source bytes only; it establishes no provider eligibility.
+pub fn materialize_workspace_d1_transition(
+    contract: &WorkspaceD1MigrationContractV1,
+) -> Result<Vec<u8>> {
+    let compiled = contract
+        .transition
+        .as_ref()
+        .ok_or_else(|| invariant("V3 transition contract is missing"))?;
+    let repository = Path::new(&contract.repository_root);
+    let current = super::load_workspace_d1_migration_capability(
+        &[repository.to_path_buf()],
+        &compiled.declaration.id,
+    )?
+    .ok_or_else(|| invariant("V3 source operation is no longer registered in its pack"))?;
+    if current.workspace_d1_migration.as_ref() != Some(contract) {
+        return Err(invariant(
+            "V3 source contract changed before materialization",
+        ));
+    }
+    let mut envelope = Vec::new();
+    for segment in &compiled.segments {
+        let bytes = bound_source(repository, &segment.source, WorkspaceOperationLoad::Execute)?;
+        if segment.offset != envelope.len()
+            || segment.length != bytes.len()
+            || envelope
+                .len()
+                .checked_add(bytes.len())
+                .is_none_or(|n| n > MAX_ENVELOPE_BYTES)
+        {
+            return Err(invariant("V3 envelope segment identity changed"));
+        }
+        envelope.extend_from_slice(&bytes);
+    }
+    if envelope.len() != compiled.envelope_length
+        || sha256(&envelope) != compiled.envelope_sha256
+        || git_optional(repository, &["rev-parse", "HEAD"])?.as_deref()
+            != Some(contract.repository_head.as_str())
+    {
+        return Err(invariant("V3 envelope or repository identity changed"));
+    }
+    Ok(envelope)
+}
+
 pub(super) fn load(
     repository: &super::super::RepositoryNode,
     capability_id: &str,
@@ -199,6 +243,17 @@ fn compile(repository: &Path, op: &Declaration, mode: WorkspaceOperationLoad) ->
         || !safe_identifier(&op.database_binding)
     {
         return Err(invariant("V3 operation identity or target is invalid"));
+    }
+    if let Some(observations) = &op.observations {
+        for observation in [&observations.baseline, &observations.terminal] {
+            if !valid_operation_id(&observation.capability_id) {
+                return Err(invariant("V3 observation capability identity is invalid"));
+            }
+            serde_json::from_slice::<cfctl_core::d1_read_inventory::D1ReadInventoryV1>(
+                &bound_source(repository, &observation.inventory, mode)?,
+            )
+            .map_err(|_| invariant("V3 observation inventory schema is invalid"))?;
+        }
     }
     let manifest: MigrationManifestV1 =
         serde_json::from_slice(&bound_source(repository, &op.manifest, mode)?)

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_HISTORY: usize = 256;
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
-pub const COMPILER_ID: &str = "workspace-d1-envelope-v3.1";
+pub const COMPILER_ID: &str = "workspace-d1-envelope-v3.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +50,21 @@ pub struct Assertions {
     pub cleanup: Source,
 }
 
+/// Existing workspace read operations supply the non-atomic boundary observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observation {
+    pub capability_id: String,
+    pub inventory: Source,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observations {
+    pub baseline: Observation,
+    pub terminal: Observation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Declaration {
@@ -67,6 +82,8 @@ pub struct Declaration {
     pub target: Target,
     pub transition_schedule: Vec<Step>,
     pub assertions: Assertions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<Observations>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +223,13 @@ pub struct CompletedRef {
 #[serde(deny_unknown_fields)]
 pub struct PublicationRef {
     pub effect: EffectRef,
+    /// Required for a separate version upload followed by promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<EffectRef>,
+    /// Fresh deployment allocation, version detail and settings reads.
     pub verification: ProofRef,
+    pub version: ProofRef,
+    pub settings: ProofRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -56,7 +56,16 @@ SQLite prepares the entire selected inventory under a deny-by-default read
 authorizer before credential access. Supported shapes are one SELECT,
 nonrecursive WITH/SELECT, direct `table_info`/`foreign_key_list`/`foreign_key_check` PRAGMAs, and
 SQLite-owned `sqlite_sequence(name, seq)` metadata and table-valued `pragma_table_info`, `pragma_foreign_key_list`,
-`pragma_foreign_key_check`, `pragma_index_list` and `pragma_index_info` reads. Only declared main-table columns and compiler-approved functions are
+`pragma_foreign_key_check`, `pragma_index_list` and `pragma_index_info` reads.
+Compiler version 3 also permits SELECTs over `pragma_table_list`,
+`pragma_table_xinfo`, `pragma_index_xinfo` and `pragma_integrity_check` for
+application-owned schema and integrity assertions. This does not authorize
+PRAGMA assignments or mutable metadata; query and result limits still apply.
+Local compiler acceptance does not establish D1 support for a PRAGMA. In
+particular, `pragma_integrity_check` still requires provider qualification;
+the published D1 PRAGMA list and workerd allowlist document `quick_check`
+instead. They are not interchangeable integrity proofs.
+Only declared main-table columns and compiler-approved functions are
 accepted. Undeclared or caller-supplied parameters, multiple statements, DDL/DML, EXPLAIN, transactions,
 attachment, configuration PRAGMAs, recursive CTEs, extension calls and
 unrecognized authorizer actions are rejected. There is no query subset or SQL

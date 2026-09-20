@@ -66,6 +66,53 @@ fn v3_runtime_cannot_deserialize_caller_success_in_place_of_required_receipts() 
     );
 }
 
+#[test]
+fn v3_export_matches_public_call_empty_query_object_and_rejects_null() {
+    use cfctl_core::D1FullExportGovernedExecutionBindingV1;
+    let compiled = compiled();
+    let now = Utc::now();
+    let op = &compiled.declaration;
+    let input = CallInput {
+        selectors: serde_json::json!({"account_id":op.account_id,"database_id":op.database_id}),
+        query: serde_json::json!({}),
+        ..CallInput::default()
+    };
+    let request = hash_value(&serde_json::to_value(&input).unwrap()).unwrap();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let generation = "22222222-2222-4222-8222-222222222222";
+    let mut proof = OperationalProofV1::new(
+        now,
+        "d1-full-export",
+        &digest,
+        &request,
+        OperationalProofScopeV1::new(Some(&op.profile_id), Some(&op.account_id), Some(generation)),
+        OperationalProofOutcomeV1::Succeeded,
+        EvidenceV1::new(EvidenceClass::LiveRead, &digest, "fixture"),
+    );
+    proof
+        .bind_d1_full_export_governed_execution(D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: "11111111-1111-4111-8111-111111111111".into(),
+            capability_id: "d1-full-export".into(),
+            catalog_hash: digest.clone(),
+            target_scope_hash: hash_value(&input.selectors).unwrap(),
+            output_file_sha256: digest.clone(),
+            at_bookmark_hash: digest.clone(),
+            manifest_evidence_hash: digest,
+            request_hash: request,
+            profile_id: op.profile_id.clone(),
+            credential_generation_id: generation.into(),
+            completion_status: "completed".into(),
+            completed_at: now,
+        })
+        .unwrap();
+    validate_export(&proof, &compiled, now + Duration::seconds(1), true).unwrap();
+    let mut wrong = input;
+    wrong.query = Value::Null;
+    proof.input_hash = hash_value(&serde_json::to_value(wrong).unwrap()).unwrap();
+    assert!(validate_export(&proof, &compiled, now + Duration::seconds(1), true).is_err());
+}
+
 fn compiled() -> Compiled {
     use cfctl_core::workspace_d1::transition::{Assertions, Declaration, Source, Step, Target};
     let source = Source {
@@ -80,6 +127,7 @@ fn compiled() -> Compiled {
     };
     Compiled {
         declaration: Declaration {
+            observations: None,
             id: "fixture".to_owned(),
             title: "fixture".to_owned(),
             description: "fixture".to_owned(),
@@ -121,7 +169,7 @@ fn compiled() -> Compiled {
         scheduled_targets: vec![target],
     }
 }
-fn contract() -> WorkspaceD1MigrationContractV1 {
+pub(super) fn contract() -> WorkspaceD1MigrationContractV1 {
     WorkspaceD1MigrationContractV1 {
         repository_root: "absent".to_owned(),
         repository_head: "a".repeat(40),
@@ -168,7 +216,10 @@ fn binding() -> RuntimeBinding {
         provider_qualification: effect.clone(),
         publication: Some(PublicationRef {
             effect,
-            verification: preservation,
+            upload: None,
+            verification: preservation.clone(),
+            version: preservation.clone(),
+            settings: preservation,
         }),
     }
 }

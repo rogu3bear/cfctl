@@ -1,4 +1,5 @@
 mod transition;
+pub use transition::materialize_workspace_d1_transition;
 
 use std::{
     collections::BTreeSet,

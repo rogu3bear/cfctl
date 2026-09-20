@@ -447,6 +447,34 @@ fn add_metadata_tables(tables: &mut BTreeMap<String, BTreeSet<String>>) {
     );
     for (table, columns) in [
         (
+            "pragma_table_list",
+            &["schema", "name", "type", "ncol", "wr", "strict", "arg"][..],
+        ),
+        (
+            "pragma_table_xinfo",
+            &[
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+                "arg",
+                "schema",
+            ][..],
+        ),
+        (
+            "pragma_index_xinfo",
+            &[
+                "seqno", "cid", "name", "desc", "coll", "key", "arg", "schema",
+            ][..],
+        ),
+        (
+            "pragma_integrity_check",
+            &["integrity_check", "arg", "schema"][..],
+        ),
+        (
             "pragma_table_info",
             &[
                 "cid",

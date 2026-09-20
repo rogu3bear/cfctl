@@ -26,6 +26,34 @@ fn inventory() -> D1ReadInventoryV1 {
 }
 
 #[test]
+fn transition_metadata_selects_compile_without_enabling_pragma_mutation() {
+    for sql in [
+        "SELECT COUNT(*) AS n FROM pragma_table_list WHERE schema='main' AND wr=0;",
+        "SELECT COUNT(*) AS n FROM pragma_table_xinfo('items') WHERE hidden=0 AND pk=1;",
+        "SELECT COUNT(*) AS n FROM pragma_index_list('items') i JOIN pragma_index_xinfo(i.name) x WHERE x.key=1 AND x.coll='BINARY' AND x.desc=0;",
+        "SELECT COUNT(*) AS n FROM pragma_integrity_check WHERE integrity_check <> 'ok';",
+    ] {
+        let mut fixture = inventory();
+        fixture.queries[1].sql = sql.into();
+        fixture.queries[1].sha256 = sha256(sql.as_bytes());
+        validate_inventory(&fixture).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    for sql in [
+        "PRAGMA writable_schema=ON;",
+        "PRAGMA foreign_keys=OFF;",
+        "SELECT COUNT(*) AS n FROM pragma_writable_schema;",
+        "SELECT COUNT(*) AS n FROM pragma_journal_mode;",
+        "SELECT COUNT(*) AS n FROM temp.sqlite_schema;",
+        "UPDATE sqlite_schema SET sql='changed';",
+    ] {
+        let mut fixture = inventory();
+        fixture.queries[1].sql = sql.into();
+        fixture.queries[1].sha256 = sha256(sql.as_bytes());
+        assert!(validate_inventory(&fixture).is_err(), "accepted {sql}");
+    }
+}
+
+#[test]
 fn sequence_high_water_marks_and_direct_foreign_key_metadata_are_read_only() {
     for (sql, names) in [
         (

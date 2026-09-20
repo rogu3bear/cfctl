@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const D1_READ_PACK_PATH: &str = ".cfctl/operations/d1-reads.toml";
-pub const D1_READ_COMPILER_VERSION: u8 = 2;
+pub const D1_READ_COMPILER_VERSION: u8 = 3;
 pub const D1_PRIVATE_MAX_BYTES: u64 = 8_388_608;
 pub const D1_PRIVATE_FORMAT: &str = "workspace_d1_private_read_v1";
 

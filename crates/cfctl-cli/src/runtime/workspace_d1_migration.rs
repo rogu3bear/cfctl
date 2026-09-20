@@ -192,7 +192,7 @@ pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<V
         return Ok(None);
     };
     let root = Path::new(&contract.repository_root);
-    Ok(Some(vec![
+    let mut paths = vec![
         root.join(&contract.operation_pack_path)
             .parent()
             .ok_or_else(|| {
@@ -200,7 +200,13 @@ pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<V
             })?
             .to_path_buf(),
         root.join(&contract.migrations_dir),
-    ]))
+    ];
+    paths.extend(super::workspace_d1_transition::additional_artifact_paths(
+        contract,
+    ));
+    paths.sort();
+    paths.dedup();
+    Ok(Some(paths))
 }
 
 pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<()> {

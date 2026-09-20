@@ -1,5 +1,5 @@
 //! V3 proof intake. This module performs no provider call and grants no execution token.
-//! Native receipts can establish provenance; missing application proof producers remain closed.
+//! Authenticates native boundary receipts; unqualified transport remains closed.
 use cfctl_core::{
     EvidenceClass, OperationalProofOutcomeV1, OperationalProofV1, PlanStatus, PlanV2,
     TransactionStageV1, WorkspaceD1MigrationContractV1, hash_value,
@@ -11,6 +11,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
 use super::prelude::{CallInput, CliError, Result, StateStore};
+mod observations;
+mod publication;
 
 struct Scope<'a> {
     account: &'a str,
@@ -73,6 +75,7 @@ fn validate_export(
     let op = &compiled.declaration;
     let input = CallInput {
         selectors: serde_json::json!({"account_id":op.account_id,"database_id":op.database_id}),
+        query: serde_json::json!({}),
         ..CallInput::default()
     };
     let expected = hash_value(&serde_json::to_value(input)?)?;
@@ -192,6 +195,10 @@ pub(super) fn prepare(
     {
         return Err(invalid("mixed legacy contract or runtime target mismatch"));
     }
+    // Authenticate actual bytes before accepting runtime proof references.
+    // This creates no stage or provider operation while transport is unqualified.
+    cfctl_workspace::materialize_workspace_d1_transition(contract)
+        .map_err(|error| invalid(&error.to_string()))?;
     let binding: RuntimeBinding = serde_json::from_value(
         input
             .body
@@ -218,9 +225,43 @@ pub(super) fn prepare(
     if recovery.observed_at < baseline.observed_at {
         return Err(invalid("recovery precedes observed baseline"));
     }
-    read(store, &binding.baseline_assertions, &scope, now)?;
+    let declared = compiled.declaration.observations.as_ref().ok_or_else(|| {
+        invalid("reviewed baseline and terminal observation bindings are missing")
+    })?;
+    observations::read(
+        store,
+        contract,
+        &declared.baseline,
+        &binding.baseline_assertions,
+        &scope,
+        baseline.observed_at.max(now - Duration::seconds(600)),
+        now,
+    )?;
+    validate_completed_observations(store, contract, compiled, &binding, &scope, now)?;
+    effect(store, &binding.provider_qualification, &scope)?;
+    if let Some(publication) = &binding.publication {
+        let verified_at = publication::validate(store, contract, publication, &scope, now)?;
+        if recovery.observed_at <= verified_at {
+            return Err(invalid(
+                "post-deploy recovery must follow publication verification",
+            ));
+        }
+    }
+    Err(invalid(
+        "native boundary observations and publication resolved; atomic preservation and executor qualification remain unqualified; V3 production transport is disabled",
+    ))
+}
+
+fn validate_completed_observations(
+    store: &StateStore,
+    contract: &WorkspaceD1MigrationContractV1,
+    compiled: &Compiled,
+    binding: &RuntimeBinding,
+    scope: &Scope<'_>,
+    now: DateTime<Utc>,
+) -> Result<()> {
     for completed in &binding.completed {
-        let plan = effect(store, &completed.effect, &scope)?;
+        let plan = effect(store, &completed.effect, scope)?;
         let prior = plan
             .plan
             .capability
@@ -245,21 +286,45 @@ pub(super) fn prepare(
                 "prior transition source, sequence or envelope identity differs",
             ));
         }
-        read(store, &completed.preservation, &scope, now)?;
+        let terminal = &transition
+            .declaration
+            .observations
+            .as_ref()
+            .ok_or_else(|| invalid("prior transition lacks terminal observation binding"))?
+            .terminal;
+        let effect_evidence = store.load_evidence(&completed.effect.evidence_hash)?;
+        observations::read(
+            store,
+            prior,
+            terminal,
+            &completed.preservation,
+            scope,
+            effect_evidence.generated_at,
+            now,
+        )?;
     }
-    effect(store, &binding.provider_qualification, &scope)?;
-    if let Some(publication) = &binding.publication {
-        effect(store, &publication.effect, &scope)?;
-        let verified = read(store, &publication.verification, &scope, now)?;
-        if recovery.observed_at <= verified.observed_at {
-            return Err(invalid(
-                "post-deploy recovery must follow publication verification",
-            ));
-        }
+    Ok(())
+}
+
+pub(super) fn additional_artifact_paths(
+    contract: &WorkspaceD1MigrationContractV1,
+) -> Vec<std::path::PathBuf> {
+    let Some(compiled) = &contract.transition else {
+        return Vec::new();
+    };
+    let root = std::path::Path::new(&contract.repository_root);
+    let op = &compiled.declaration;
+    let mut paths = vec![
+        root.join(&op.manifest.path),
+        root.join(&op.historical_ledger.path),
+        root.join(&op.config_template),
+    ];
+    paths.extend(compiled.segments.iter().map(|s| root.join(&s.source.path)));
+    if let Some(observations) = &op.observations {
+        paths.push(root.join(&observations.baseline.inventory.path));
+        paths.push(root.join(&observations.terminal.inventory.path));
     }
-    Err(invalid(
-        "native receipt identities resolved; application baseline/preservation and executor qualification semantics are unavailable; V3 production transport is disabled",
-    ))
+    paths
 }
 
 #[cfg(test)]

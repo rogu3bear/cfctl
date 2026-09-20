@@ -137,6 +137,7 @@ fn fixture(count: u64) -> (tempfile::TempDir, Declaration) {
             preservation: source(root.path(), "preserve.sql"),
             cleanup: source(root.path(), "cleanup.sql"),
         },
+        observations: None,
     };
     (root, declaration)
 }
@@ -212,6 +213,72 @@ fn operations(root: &Path, op: &Declaration) -> Vec<Declaration> {
             declaration
         })
         .collect()
+}
+
+#[test]
+fn v3_observation_sources_are_committed_and_hash_bound() {
+    use cfctl_core::workspace_d1::transition::{Observation, Observations};
+    let (root, mut op) = fixture(172);
+    fs::write(
+        root.path().join("boundary.json"),
+        include_bytes!("../../../tests/fixtures/d1-reads/inventory.json"),
+    )
+    .unwrap();
+    git(root.path(), &["add", "boundary.json"]);
+    git(root.path(), &["commit", "-qm", "reviewed boundary"]);
+    let observation = Observation {
+        capability_id: "fixture.boundary".into(),
+        inventory: source(root.path(), "boundary.json"),
+    };
+    op.observations = Some(Observations {
+        baseline: observation.clone(),
+        terminal: observation,
+    });
+    compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
+    fs::write(root.path().join("boundary.json"), "{}").unwrap();
+    assert!(compile(root.path(), &op, WorkspaceOperationLoad::Execute).is_err());
+}
+
+#[test]
+fn v3_materialization_preserves_bytes_and_rejects_contract_and_source_drift() {
+    let (root, op) = fixture(172);
+    let declarations = operations(root.path(), &op);
+    let text = toml::to_string(&json!({"schema_version":3,"operation":declarations})).unwrap();
+    fs::write(root.path().join(PACK_RELATIVE_PATH), text).unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "frozen pack"]);
+    let capability =
+        load_workspace_d1_migration_capability(&[root.path().to_path_buf()], &declarations[0].id)
+            .unwrap()
+            .unwrap();
+    let contract = capability.workspace_d1_migration.unwrap();
+    let compiled = contract.transition.as_ref().unwrap();
+    let expected: Vec<u8> = compiled
+        .segments
+        .iter()
+        .flat_map(|s| fs::read(root.path().join(&s.source.path)).unwrap())
+        .collect();
+    assert_eq!(
+        materialize_workspace_d1_transition(&contract).unwrap(),
+        expected
+    );
+    for kind in 0..5 {
+        let mut bad = contract.clone();
+        let compiled = bad.transition.as_mut().unwrap();
+        match kind {
+            0 => compiled.segments.swap(0, 1),
+            1 => compiled.segments[1].offset += 1,
+            2 => compiled.segments[2].length += 1,
+            3 => compiled.envelope_sha256 = format!("sha256:{}", "0".repeat(64)),
+            _ => compiled.compiler_id = "unreviewed-compiler".to_owned(),
+        }
+        assert!(materialize_workspace_d1_transition(&bad).is_err());
+    }
+    fs::write(root.path().join("capture.sql"), "SELECT 'changed';\n").unwrap();
+    assert!(materialize_workspace_d1_transition(&contract).is_err());
+    git(root.path(), &["add", "capture.sql"]);
+    git(root.path(), &["commit", "-qm", "changed assertion"]);
+    assert!(materialize_workspace_d1_transition(&contract).is_err());
 }
 
 #[test]
