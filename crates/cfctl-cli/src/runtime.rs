@@ -18,6 +18,7 @@ mod catalog_commands;
 mod cloudflare_api;
 mod compensation;
 mod credential_resolution;
+mod custom_challenge_rule;
 mod d1_failed_query;
 mod d1_reconciliation;
 mod d1_restore_proof;

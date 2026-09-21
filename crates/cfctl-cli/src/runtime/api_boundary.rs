@@ -654,7 +654,7 @@ pub(super) async fn verify_api_plan(
     {
         return Ok(outcome);
     }
-    if !response.success {
+    if !response.success && !super::custom_challenge_rule::needs_reconciliation(plan, response) {
         if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID
             && (response.status == 429 || response.status >= 500)
         {
