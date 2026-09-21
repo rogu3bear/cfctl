@@ -551,6 +551,33 @@ fn pages_setup_redacts_values_and_provider_errors_on_project_read_and_setup_path
 }
 
 #[test]
+fn pages_project_redaction_preserves_domains_and_hides_nested_credentials() {
+    let mut read = capability(true);
+    contract::READ_ID.clone_into(&mut read.id);
+    "GET".clone_into(&mut read.method);
+    contract::DETAIL.clone_into(&mut read.path);
+    read.risk = RiskClass::Read;
+    read.mutating = false;
+    let raw = json!({"status":200,"success":true,"result":{
+        "name":"aos-web", "production_branch":"main",
+        "domains":["adapteros.com","www.adapteros.com"],
+        "deployment_configs":{"production":{"env_vars":{
+            "SECRET":{"type":"secret_text","value":"environment-secret-canary"}
+        }}},
+        "deployments":[{"aliases":["main.aos-web.pages.dev"],
+            "credentials":[{"token":"deployment-token-canary"}]}]
+    }});
+    let redacted = redact_response_for_capability(&read, &raw);
+    assert_eq!(redacted["result"]["domains"], raw["result"]["domains"]);
+    assert_eq!(
+        redacted["result"]["deployments"][0]["aliases"],
+        raw["result"]["deployments"][0]["aliases"]
+    );
+    assert!(!redacted.to_string().contains("environment-secret-canary"));
+    assert!(!redacted.to_string().contains("deployment-token-canary"));
+}
+
+#[test]
 fn pages_setup_direct_create_reuses_absence_without_git_repository_preconditions() {
     let cap = capability(true);
     assert!(should_bind_pages_project_absence(&cap));
