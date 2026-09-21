@@ -705,15 +705,20 @@ fn verify_bootstrap_contract() -> Result<(), TaskError> {
 }
 
 fn validate_bootstrap_contract(source: &str) -> Result<(), TaskError> {
-    if source.contains("cargo run --locked -p xtask -- verify") {
+    if source.contains("cargo run --locked -p xtask -- verify")
+        || source.contains("cargo xtask verify")
+    {
         return Err(TaskError::InvalidSourceContract(
             "bootstrap.sh must not hold a Cargo run gate around the nested xtask verifier"
                 .to_owned(),
         ));
     }
-    if !source.contains("cargo xtask verify") {
+    if !source
+        .contains("cargo build --locked -p xtask --target \"$host\" --target-dir \"$target_dir\"")
+        || !source.contains("\"$target_dir/$host/debug/xtask\" verify")
+    {
         return Err(TaskError::InvalidSourceContract(
-            "bootstrap.sh must invoke the repository's cargo xtask verify entrypoint".to_owned(),
+            "bootstrap.sh must build and execute the exact native xtask verifier".to_owned(),
         ));
     }
     if !source.contains("status --porcelain=v1 --untracked-files=normal") {
@@ -3701,22 +3706,28 @@ mod tests {
 
     #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
-        validate_bootstrap_contract(
-            "git status --porcelain=v1 --untracked-files=normal\n(cd \"$root\" && cargo xtask verify)\n",
-        )
-            .expect("the public xtask entrypoint is safe for nested Cargo commands");
-
+        let source = include_str!("../../bootstrap.sh");
+        validate_bootstrap_contract(source).expect("native build exits before nested proof");
+        for outer in [
+            "cargo run --locked -p xtask -- verify",
+            "cargo xtask verify",
+        ] {
+            let error = validate_bootstrap_contract(outer)
+                .expect_err("an outer Cargo gate must not enclose nested proof commands");
+            assert!(error.to_string().contains("must not hold a Cargo run gate"));
+        }
+        for required in [
+            "cargo build --locked -p xtask --target \"$host\" --target-dir \"$target_dir\"",
+            "\"$target_dir/$host/debug/xtask\" verify",
+        ] {
+            let error = validate_bootstrap_contract(&source.replace(required, ":"))
+                .expect_err("native build and exact verifier are both mandatory");
+            assert!(error.to_string().contains("exact native xtask verifier"));
+        }
         let error = validate_bootstrap_contract(
-            "(cd \"$root\" && cargo run --locked -p xtask -- verify)\n",
+            &source.replace("status --porcelain=v1 --untracked-files=normal", "status"),
         )
-        .expect_err("an outer cargo run gate would deadlock nested proof commands");
-        assert!(
-            error.to_string().contains("must not hold a Cargo run gate"),
-            "unexpected error: {error}"
-        );
-
-        let error = validate_bootstrap_contract("(cd \"$root\" && cargo xtask verify)\n")
-            .expect_err("bootstrap must reject untracked compiler inputs before installation");
+        .expect_err("bootstrap must reject untracked compiler inputs before installation");
         assert!(
             error
                 .to_string()
