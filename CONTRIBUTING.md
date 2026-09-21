@@ -76,7 +76,6 @@ cfctl catalog sync
 cfctl catalog coverage
 cfctl workspace discover
 cfctl workspace audit
-cargo xtask verify
 ```
 
 Bootstrap requires a checkout clean of tracked and untracked non-ignored files,
@@ -87,6 +86,16 @@ remains visible but does not invalidate an offline installation; inspect
 `cfctl auth evidence-key status --json` before governed operations. Use
 `--check-only` for source proof or `--skip-agent-sync` for an intentional
 binary-only install.
+
+Bootstrap builds the verifier for the native Rust host, then runs that exact
+artifact after the Cargo build exits. The complete proof still runs before
+installation. The pre-push hook uses the same ordering so nested site builds
+do not inherit an outer Cargo reservation. Both bind the build output explicitly,
+using `CARGO_TARGET_DIR` when set and the checkout's `target` directory otherwise.
+For source proof before adoption on a host whose Cargo guard rejects orchestration
+aliases, run `./bootstrap.sh --check-only` from a clean checkout. This supported
+route executes the complete verifier without installation; invoking the rejected
+`cargo xtask verify` alias directly does not establish proof.
 
 Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
