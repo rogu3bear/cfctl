@@ -46,6 +46,7 @@ fn pre_push_gate_binds_canonical_source_and_cleans_git_environment() {
         "head_drift",
         "dirty",
         "drift",
+        "build_failure",
         "verify_failure",
         "bypass",
         "tag",
@@ -70,18 +71,36 @@ fn pre_push_gate_binds_canonical_source_and_cleans_git_environment() {
             &cargo,
             r#"#!/bin/bash
 set -eu
-[ "$*" = "xtask verify" ]
+[ "$#" = 8 ]
+[ "$1 $2 $3 $4 $5 $6 $7" = 'build --locked -p xtask --target fixture-native --target-dir' ]
 if env | grep -q '^GIT_'; then exit 78; fi
 printf invoked > "$FIXTURE_MARKER"
+[ "$FIXTURE_BEHAVIOR" != build_failure ] || exit 8
+mkdir -p "$8/$6/debug"
+cat > "$8/$6/debug/xtask" <<'VERIFIER'
+#!/bin/bash
+set -eu
+[ "$*" = verify ]
+if env | grep -q '^GIT_'; then exit 78; fi
+printf invoked > "$FIXTURE_VERIFY_MARKER"
 case "$FIXTURE_BEHAVIOR" in
   drift) printf changed > source ;;
   head_drift) git -c core.hooksPath=/dev/null commit --allow-empty -qm drift ;;
   verify_failure) exit 9 ;;
 esac
+VERIFIER
+chmod +x "$8/$6/debug/xtask"
 "#,
         )
         .expect("cargo fixture");
         fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).expect("executable");
+        let rustc = bin.join("rustc");
+        fs::write(
+            &rustc,
+            "#!/bin/bash\nif env | grep -q '^GIT_'; then exit 78; fi\necho 'host: fixture-native'\n",
+        )
+        .expect("rustc fixture");
+        fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).expect("executable");
         if scenario == "dirty" {
             fs::write(root.join("dirt"), "preserve").expect("dirty fixture");
         }
@@ -105,6 +124,7 @@ esac
             local_oid = "f".repeat(40);
         }
         let marker = temp.path().join("ran");
+        let verify_marker = temp.path().join("verified");
         let gate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.githooks/pre-push-gate.sh");
         let mut command = clean_command("bash");
         command
@@ -119,6 +139,9 @@ esac
             .env("GIT_TRACE_PACKET", "1")
             .env("FIXTURE_BEHAVIOR", scenario)
             .env("FIXTURE_MARKER", &marker)
+            .env("FIXTURE_VERIFY_MARKER", &verify_marker)
+            .env("CARGO_BUILD_TARGET", "fixture-cross")
+            .env("CARGO_TARGET_DIR", temp.path().join("output with spaces"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -156,5 +179,10 @@ esac
         } else {
             assert!(marker.exists());
         }
+        assert_eq!(
+            verify_marker.exists(),
+            marker.exists() && scenario != "build_failure",
+            "the verifier must run only after a successful native build"
+        );
     }
 }
