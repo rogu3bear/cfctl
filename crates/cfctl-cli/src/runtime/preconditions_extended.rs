@@ -771,6 +771,9 @@ pub(super) fn validate_same_path_prior_state_receipt(
     plan: &PlanV1,
     receipt: &Value,
 ) -> Result<Value> {
+    if plan.capability.id == cfctl_core::custom_challenge_rule::ID {
+        return super::custom_challenge_rule::validate_receipt(plan, receipt);
+    }
     if plan.capability.id == cfctl_core::response_header_rule::ID {
         return super::response_header_rule::restore_definition(plan, receipt);
     }
@@ -959,7 +962,8 @@ pub(super) fn validate_same_path_prior_state_receipt(
 }
 
 pub(super) fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
-    let declares_same_path_state = plan.capability.id == cfctl_core::response_header_rule::ID
+    let declares_same_path_state = plan.capability.id == cfctl_core::custom_challenge_rule::ID
+        || plan.capability.id == cfctl_core::response_header_rule::ID
         || plan.capability.rollback.strategy.as_deref()
             == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
         || (access_application_login_methods_contract_supported(&plan.capability)

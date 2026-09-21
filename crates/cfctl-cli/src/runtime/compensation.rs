@@ -381,6 +381,9 @@ pub(super) fn string_compensation_resource_id<'a>(
 pub(super) fn operation_specific_compensation_request(
     plan: &PlanV1,
 ) -> Result<Option<CompensationRequest>> {
+    if plan.capability.id == cfctl_core::custom_challenge_rule::ID {
+        return Err(CliError::Input("custom challenge recovery requires authenticated apply and readback evidence; use plans rectify".into()));
+    }
     let request = if plan.capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID {
         global_warp_override_compensation_request(plan)?
     } else if is_d1_read_replication_mutation(&plan.capability) {

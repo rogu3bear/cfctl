@@ -3,6 +3,7 @@
 mod d1_reconciliation;
 mod request_schema;
 use request_schema::{normalize_request_schema_contract, request_schema_contract};
+mod custom_challenge_rule;
 mod email_preferences;
 mod persisted_rulesets;
 mod response_header_rule;
@@ -4983,6 +4984,7 @@ fn finalize_telemetry_mutations(snapshot: &mut CatalogSnapshot) {
     finalize_security_response_lifecycle(snapshot);
     finalize_custom_waf_ruleset_lifecycle(snapshot);
     response_header_rule::finalize(snapshot);
+    custom_challenge_rule::finalize(snapshot);
     finalize_waf_security_response_lifecycle(snapshot);
     finalize_rate_limit_lifecycle(snapshot);
     finalize_notification_policy_lifecycle(snapshot);

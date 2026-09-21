@@ -18,9 +18,11 @@ pub use email_routing::{
 mod read_query;
 pub use read_query::{AnalyticsQueryKindV1, D1SchemaIntrospectionContractV1, OutputFormatV1};
 mod artifact_digest;
+pub mod custom_challenge_rule;
 pub mod r2_recovery;
 pub mod r2_restore;
 pub mod response_header_rule;
+mod rollback_contracts;
 pub use artifact_digest::{
     R2PrivateFileUploadContractV1, R2PrivateObjectDigestContractV1, R2PrivateObjectDigestV1,
     WORKER_VERSION_ARTIFACT_DIGEST_ID, WORKER_VERSION_ARTIFACT_PATH,
@@ -2293,6 +2295,7 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            custom_challenge_rule::VERIFY => custom_challenge_rule::supported(self),
             response_header_rule::VERIFY => response_header_rule::supported(self),
             pages_projects::CREATE_STRATEGY | pages_projects::VARIABLES_STRATEGY => {
                 pages_projects::contract_supported(self)
@@ -3014,6 +3017,7 @@ impl CapabilityV1 {
             return true;
         }
         match self.rollback.strategy.as_deref() {
+            Some(custom_challenge_rule::ROLLBACK) => custom_challenge_rule::supported(self),
             Some(response_header_rule::ROLLBACK) => response_header_rule::supported(self),
             Some("revoke_created_api_token_by_returned_id_if_downstream_installation_fails") => {
                 self.method == "POST"
@@ -3069,35 +3073,7 @@ impl CapabilityV1 {
                 web_analytics_rum_rollback_contract_supported(self)
             }
             Some("restore_dns_record_prior_snapshot_with_put") => {
-                matches!(
-                    (self.id.as_str(), self.method.as_str()),
-                    ("dns-records-for-a-zone-update-dns-record", "PUT")
-                        | ("dns-records-for-a-zone-patch-dns-record", "PATCH")
-                ) && self.product == "DNS Records for a Zone"
-                    && self.path == DNS_RECORD_DETAIL_PATH
-                    && self.account_scope == "zone"
-                    && self.verification.strategy
-                        == "dns_record_details_match_planned_id_and_fields"
-                    && self.verification_contract_supported()
-                    && dns_record_update_request_contract_supported(self)
-                    && self.same_path_read.as_ref().is_some_and(|read| {
-                        read.path == DNS_RECORD_DETAIL_PATH
-                            && read.read_capability_id == DNS_RECORD_DETAIL_READ_CAPABILITY_ID
-                            && read.verified_response_fields
-                                == [
-                                    "comment",
-                                    "content",
-                                    "data",
-                                    "name",
-                                    "priority",
-                                    "private_routing",
-                                    "proxied",
-                                    "settings",
-                                    "tags",
-                                    "ttl",
-                                    "type",
-                                ]
-                    })
+                rollback_contracts::dns_record_update(self)
             }
             Some("restore_same_path_prior_snapshot") => {
                 self.same_path_prior_snapshot_rollback_supported()
