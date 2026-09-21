@@ -458,7 +458,9 @@ pub(super) fn redact_secret_payload(value: &Value, root: bool) -> Value {
         Value::Array(values) => Value::Array(
             values
                 .iter()
-                .map(|item| redact_secret_payload(item, true))
+                // Arrays inherit their context: a bare secret result stays
+                // secret, while named metadata such as domains stays readable.
+                .map(|item| redact_secret_payload(item, root))
                 .collect(),
         ),
         Value::String(_) if root => Value::String("[SUNK]".to_owned()),
