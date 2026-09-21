@@ -6856,6 +6856,17 @@ impl Executor {
             return Ok(combined);
         }
         if let Some(pagination) = page_pagination(combined.result_info.as_ref())? {
+            if request_is_worker_collection(request, "deployments") {
+                return self
+                    .complete_worker_collection_page_pagination(
+                        request,
+                        credential,
+                        combined,
+                        pagination,
+                        "deployments",
+                    )
+                    .await;
+            }
             return self
                 .complete_page_pagination(request, credential, combined, pagination)
                 .await;
@@ -6989,16 +7000,19 @@ impl Executor {
         }
         let pagination = page_pagination(combined.result_info.as_ref())?
             .ok_or(CloudflareError::PaginationMetadataInvalid)?;
-        self.complete_worker_versions_page_pagination(request, credential, combined, pagination)
-            .await
+        self.complete_worker_collection_page_pagination(
+            request, credential, combined, pagination, "items",
+        )
+        .await
     }
 
-    async fn complete_worker_versions_page_pagination(
+    async fn complete_worker_collection_page_pagination(
         &self,
         request: &PreparedRequest,
         credential: &AuthCredential,
         mut combined: CloudflareResponseV1,
         pagination: PagePagination,
+        collection: &str,
     ) -> Result<CloudflareResponseV1> {
         let PagePagination {
             current_page,
@@ -7009,12 +7023,12 @@ impl Executor {
         if total_pages > 1_000 {
             return Err(CloudflareError::PaginationLimit(total_pages));
         }
-        validate_worker_versions_item_count(&combined, pagination)?;
+        validate_worker_collection_item_count(&combined, pagination, collection)?;
         let status = combined.status;
         let Some(items) = combined
             .result
             .as_object_mut()
-            .and_then(|result| result.get_mut("items"))
+            .and_then(|result| result.get_mut(collection))
             .and_then(Value::as_array_mut)
         else {
             return Err(CloudflareError::InvalidResponseEnvelope { status });
@@ -7034,11 +7048,11 @@ impl Executor {
             {
                 return Err(CloudflareError::PaginationMetadataInvalid);
             }
-            validate_worker_versions_item_count(&response, response_pagination)?;
+            validate_worker_collection_item_count(&response, response_pagination, collection)?;
             let Some(page_items) = response
                 .result
                 .as_object()
-                .and_then(|result| result.get("items"))
+                .and_then(|result| result.get(collection))
                 .and_then(Value::as_array)
             else {
                 return Err(CloudflareError::InvalidResponseEnvelope {
@@ -8734,6 +8748,10 @@ fn request_expects_page_pagination(request: &PreparedRequest) -> bool {
 }
 
 fn request_is_worker_versions_list(request: &PreparedRequest) -> bool {
+    request_is_worker_collection(request, "versions")
+}
+
+fn request_is_worker_collection(request: &PreparedRequest, collection: &str) -> bool {
     if !request.method.eq_ignore_ascii_case("GET") {
         return false;
     }
@@ -8754,7 +8772,7 @@ fn request_is_worker_versions_list(request: &PreparedRequest) -> bool {
         && tail[2] == "workers"
         && tail[3] == "scripts"
         && !tail[4].is_empty()
-        && tail[5] == "versions"
+        && tail[5] == collection
 }
 
 fn request_is_worker_versions_deployable(request: &PreparedRequest) -> bool {
@@ -8765,14 +8783,15 @@ fn request_is_worker_versions_deployable(request: &PreparedRequest) -> bool {
             .any(|(name, value)| name == "deployable" && value == "true")
 }
 
-fn validate_worker_versions_item_count(
+fn validate_worker_collection_item_count(
     response: &CloudflareResponseV1,
     pagination: PagePagination,
+    collection: &str,
 ) -> Result<()> {
     let Some(items) = response
         .result
         .as_object()
-        .and_then(|result| result.get("items"))
+        .and_then(|result| result.get(collection))
         .and_then(Value::as_array)
     else {
         return Err(CloudflareError::InvalidResponseEnvelope {
