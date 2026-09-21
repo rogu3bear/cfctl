@@ -87,7 +87,7 @@ if [ -n "$initial_status" ]; then
   exit 1
 fi
 
-echo "pre-push: running cargo xtask verify for ${head_oid:0:7}..."
+echo "pre-push: building and running the complete xtask verifier for ${head_oid:0:7}..."
 
 # Capture unpiped. Piping the gate through tail/head masks its exit status and
 # has produced a false green in this repo before.
@@ -101,15 +101,33 @@ while IFS= read -r variable; do
   case "$variable" in GIT_*) proof_env+=(-u "$variable") ;; esac
 done < <(compgen -e)
 set +e
-"${proof_env[@]}" cargo xtask verify >"$log" 2>&1
+# Finish the guarded build before starting the verifier, whose Cargo children
+# also build the separate site workspace. No outer Cargo reservation spans them.
+host="$("${proof_env[@]}" rustc -vV 2>"$log" | sed -n 's/^host: //p')"
 verify_exit=$?
+if [ "$verify_exit" -eq 0 ]; then
+  if [[ ! "$host" =~ ^[[:alnum:]_][[:alnum:]_-]*$ ]]; then
+    echo "could not bind the native Rust host target" >>"$log"
+    verify_exit=1
+  fi
+fi
+build_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+if [ "$verify_exit" -eq 0 ]; then
+  "${proof_env[@]}" cargo build --locked -p xtask \
+    --target "$host" --target-dir "$build_target_dir" >>"$log" 2>&1
+  verify_exit=$?
+fi
+if [ "$verify_exit" -eq 0 ]; then
+  "${proof_env[@]}" "$build_target_dir/$host/debug/xtask" verify >>"$log" 2>&1
+  verify_exit=$?
+fi
 set -e
 
 if [ "$verify_exit" -ne 0 ]; then
   echo >&2
   tail -40 "$log" >&2
   echo >&2
-  echo "pre-push REFUSED: cargo xtask verify exited ${verify_exit}" >&2
+  echo "pre-push REFUSED: xtask build or verification exited ${verify_exit}" >&2
   echo "full log: $log" >&2
   echo "Fix the failure and retry with the same reviewed source." >&2
   exit 1
