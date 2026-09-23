@@ -87,6 +87,7 @@ mod worker_frozen_config;
 mod worker_frozen_files;
 mod worker_frozen_modules;
 mod worker_frozen_upload;
+mod worker_route_surface;
 mod workspace_commands;
 mod workspace_d1_evidence;
 mod workspace_d1_migration;
