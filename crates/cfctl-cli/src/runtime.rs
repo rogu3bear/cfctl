@@ -64,6 +64,7 @@ mod prelude;
 mod private_authority;
 mod private_runtime;
 mod provider_state;
+mod public_oauth_status;
 mod r2_credentials;
 mod r2_private_upload;
 mod r2_recovery;
