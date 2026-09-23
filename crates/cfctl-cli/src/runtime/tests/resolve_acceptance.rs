@@ -20,12 +20,12 @@ const ACCEPTANCE_FIXTURES: &[ResolveFixture] = &[
     // Zone listing
     ResolveFixture {
         intent: "list zones",
-        expected_capability_id: "zones-list",
+        expected_capability_id: "zones-get",
         allowed_ambiguous: &[],
     },
     ResolveFixture {
         intent: "get all zones",
-        expected_capability_id: "zones-list",
+        expected_capability_id: "zones-get",
         allowed_ambiguous: &[],
     },
     // DNS record reading for a zone
@@ -48,12 +48,12 @@ const ACCEPTANCE_FIXTURES: &[ResolveFixture] = &[
     ResolveFixture {
         intent: "create Pages deployment",
         expected_capability_id: "pages-deployment-create-deployment",
-        allowed_ambiguous: &["wrangler.pages-deploy"],
+        allowed_ambiguous: &[],
     },
     ResolveFixture {
         intent: "deploy to Pages",
         expected_capability_id: "pages-deployment-create-deployment",
-        allowed_ambiguous: &["wrangler.pages-deploy"],
+        allowed_ambiguous: &[],
     },
     // Token minting and rotation
     ResolveFixture {
@@ -86,9 +86,9 @@ fn minimal_capability(id: &str, title: &str, method: &str, path: &str, product: 
 #[test]
 fn resolve_acceptance_fixtures_pin_expected_capabilities() {
     // Build a minimal catalog with the capabilities referenced by fixtures.
-    let zones_list = minimal_capability(
-        "zones-list",
-        "List zones",
+    let zones_get = minimal_capability(
+        "zones-get",
+        "List Zones",
         "GET",
         "/zones",
         "Zones",
@@ -105,13 +105,6 @@ fn resolve_acceptance_fixtures_pin_expected_capabilities() {
         "Create deployment",
         "POST",
         "/accounts/{account_id}/pages/projects/{project_name}/deployments",
-        "Pages Deployment",
-    );
-    let wrangler_pages_deploy = minimal_capability(
-        "wrangler.pages-deploy",
-        "Deploy Pages project",
-        "POST",
-        "wrangler pages deploy",
         "Pages Deployment",
     );
     let account_token_create = minimal_capability(
@@ -161,10 +154,9 @@ fn resolve_acceptance_fixtures_pin_expected_capabilities() {
     );
 
     let catalog: BTreeMap<&str, &CapabilityV1> = [
-        (zones_list.id.as_str(), &zones_list),
+        (zones_get.id.as_str(), &zones_get),
         (dns_list.id.as_str(), &dns_list),
         (pages_create.id.as_str(), &pages_create),
-        (wrangler_pages_deploy.id.as_str(), &wrangler_pages_deploy),
         (account_token_create.id.as_str(), &account_token_create),
         (user_token_create.id.as_str(), &user_token_create),
         (account_token_roll.id.as_str(), &account_token_roll),
@@ -280,39 +272,38 @@ fn score_fixture_intent<'a>(
 /// Test that resolve fails closed for unrelated high-scoring distractors.
 #[test]
 fn resolve_rejects_unrelated_families_for_list_zones() {
-    let zones_list = minimal_capability(
-        "zones-list",
-        "List zones",
+    let zones_get = minimal_capability(
+        "zones-get",
+        "List Zones",
         "GET",
         "/zones",
         "Zones",
     );
 
     // Simulate a scenario where unrelated capabilities score highly but
-    // should not be ranked above zones-list for "list zones" intent.
+    // should not be ranked above zones-get for "list zones" intent.
     let unrelated = minimal_capability(
-        "worker-zones-binding",
-        "Configure zones binding",
-        "PUT",
-        "/accounts/{account_id}/workers/scripts/{script_name}/bindings/zones",
-        "Workers",
+        "zones-list-logpush-jobs",
+        "List Logpush jobs",
+        "GET",
+        "/zones/{zone_id}/logpush/jobs",
+        "Logpush",
     );
 
-    // Correct ranking: zones-list should score higher for "list zones"
-    let ranked = vec![(&zones_list, 25usize), (&unrelated, 5usize)];
+    // Correct ranking: zones-get should score higher for "list zones"
+    let ranked = vec![(&zones_get, 25usize), (&unrelated, 5usize)];
 
     let (result, error) = super::resolve_result("list zones", &ranked, None, 10);
     assert!(error.is_none(), "list zones must resolve");
     assert_eq!(
-        result["resolved"]["capability_id"], "zones-list",
-        "list zones must resolve to zones-list, not an unrelated capability"
+        result["resolved"]["capability_id"], "zones-get",
+        "list zones must resolve to zones-get, not an unrelated capability like logpush"
     );
 }
 
-/// Test that resolve handles Pages deployment intent correctly even when
-/// both native and wrangler paths exist.
+/// Test that resolve handles Pages deployment intent correctly.
 #[test]
-fn resolve_pages_deployment_allows_native_or_wrangler() {
+fn resolve_pages_deployment_to_native_api() {
     let pages_create = minimal_capability(
         "pages-deployment-create-deployment",
         "Create deployment",
@@ -320,32 +311,16 @@ fn resolve_pages_deployment_allows_native_or_wrangler() {
         "/accounts/{account_id}/pages/projects/{project_name}/deployments",
         "Pages Deployment",
     );
-    let wrangler_pages = minimal_capability(
-        "wrangler.pages-deploy",
-        "Deploy Pages project",
-        "POST",
-        "wrangler pages deploy",
-        "Pages Deployment",
-    );
 
-    // Both should score well for "create Pages deployment"
-    let ranked = vec![(&pages_create, 30usize), (&wrangler_pages, 28usize)];
+    // Should resolve to the native API capability
+    let ranked = vec![(&pages_create, 30usize)];
 
     let (result, error) = super::resolve_result("create Pages deployment", &ranked, None, 10);
 
-    // Should resolve to one of them (preferably the native API)
-    if let Some(resolved_id) = result["resolved"]["capability_id"].as_str() {
-        assert!(
-            resolved_id == "pages-deployment-create-deployment"
-                || resolved_id == "wrangler.pages-deploy",
-            "Pages deployment intent must resolve to a Pages deployment capability, got {}",
-            resolved_id
-        );
-    } else {
-        // If ambiguous, that's acceptable for this case
-        assert!(
-            error.is_some() && error.unwrap().code == "CFCTL_RESOLVE_AMBIGUOUS",
-            "If Pages deployment is ambiguous, error must be CFCTL_RESOLVE_AMBIGUOUS"
-        );
-    }
+    assert!(error.is_none(), "Pages deployment must resolve");
+    assert_eq!(
+        result["resolved"]["capability_id"],
+        "pages-deployment-create-deployment",
+        "Pages deployment intent must resolve to pages-deployment-create-deployment"
+    );
 }

@@ -144,7 +144,7 @@ mod tests {
         let authority = StandingAuthorityV1::draft(
             "account-a",
             None,
-            vec!["zones-list".to_owned()],
+            vec!["zones-get".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory1234",
             24,
@@ -164,7 +164,7 @@ mod tests {
         let authority = StandingAuthorityV1::draft(
             "account-a",
             None,
-            vec!["zones-list".to_owned()],
+            vec!["zones-get".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory1234",
             24,
@@ -183,7 +183,7 @@ mod tests {
         let authority = StandingAuthorityV1::draft(
             "account-a",
             None,
-            vec!["zones-list".to_owned(), "dns-records-for-a-zone-list-dns-records".to_owned()],
+            vec!["zones-get".to_owned(), "dns-records-for-a-zone-list-dns-records".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory1234",
             24,
@@ -194,7 +194,7 @@ mod tests {
         .expect("draft authority");
 
         assert_eq!(authority.capability_ids.len(), 2);
-        assert!(authority.capability_ids.contains(&"zones-list".to_owned()));
+        assert!(authority.capability_ids.contains(&"zones-get".to_owned()));
         assert!(authority.capability_ids.contains(&"dns-records-for-a-zone-list-dns-records".to_owned()));
     }
 
