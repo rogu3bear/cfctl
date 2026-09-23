@@ -5740,7 +5740,7 @@ async fn account_token_creation_is_verified_by_id_and_active_readback() {
         let mut buffer = vec![0_u8; 8192];
         let read = stream.read(&mut buffer).await.expect("read verification");
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-        let body = r#"{"success":true,"result":{"id":"token-1","status":"active"},"errors":[]}"#;
+        let body = r#"{"success":true,"result":{"id":"token-1","status":"active","value":"should-not-survive","policies":[{"effect":"allow","permission_groups":[{"id":"e086da7e2179491d91ee5f35b3ca210a","name":"Workers Scripts Write"},{"id":"1a71c399035b4950a1bd1466bbe4f420","name":"Workers Scripts Read"}],"resources":{"com.cloudflare.api.account.account-1":"*"}}]},"errors":[]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -5751,13 +5751,7 @@ async fn account_token_creation_is_verified_by_id_and_active_readback() {
             .expect("write verification");
         request
     });
-    let plan = token_plan(
-        "account-api-tokens-create-token",
-        "POST",
-        "/accounts/{account_id}/tokens",
-        "api_token_details_match_created_id_and_active_status",
-        json!({"account_id":"account-1"}),
-    );
+    let plan = token_create_plan();
     let apply = CloudflareResponseV1 {
         status: 200,
         success: true,
@@ -5785,12 +5779,76 @@ async fn account_token_creation_is_verified_by_id_and_active_readback() {
 
     assert!(verification.passed);
     assert!(verification.basis.contains("token-1"));
+    assert!(verification.basis.contains("permission groups"));
+    assert!(verification.readback.result.get("value").is_none());
     let request = server.await.expect("server joins");
     assert!(
         request.starts_with("GET /client/v4/accounts/account-1/tokens/token-1 "),
         "{request}"
     );
     assert!(request.contains("authorization: Bearer governing-token"));
+}
+
+#[tokio::test]
+async fn account_token_creation_fails_when_readback_groups_differ() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":{"id":"token-1","status":"active","policies":[{"effect":"allow","permission_groups":[{"id":"1a71c399035b4950a1bd1466bbe4f420","name":"Workers Scripts Read"}],"resources":{"com.cloudflare.api.account.account-1":"*"}}]},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let plan = token_create_plan();
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"token-1","status":"active","value":"one-time-secret"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(
+        verification.basis.contains("permission group IDs"),
+        "{}",
+        verification.basis
+    );
+    assert!(verification.readback.result.get("value").is_none());
+    let request = server.await.expect("server joins");
+    assert!(
+        request.starts_with("GET /client/v4/accounts/account-1/tokens/token-1 "),
+        "{request}"
+    );
 }
 
 #[tokio::test]
@@ -10636,6 +10694,30 @@ fn token_plan(
         ..CallInput::default()
     })
     .expect("input");
+    plan
+}
+
+fn token_create_plan() -> PlanV1 {
+    let mut plan = token_plan(
+        "account-api-tokens-create-token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+        "api_token_details_match_created_id_and_active_status",
+        json!({"account_id":"account-1"}),
+    );
+    let mut input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    input.body = Some(json!({
+        "name": "cfctl-site-release-x",
+        "policies": [{
+            "effect": "allow",
+            "permission_groups": [
+                {"id": "1a71c399035b4950a1bd1466bbe4f420"},
+                {"id": "e086da7e2179491d91ee5f35b3ca210a"}
+            ],
+            "resources": {"com.cloudflare.api.account.account-1": "*"}
+        }]
+    }));
+    plan.input = serde_json::to_value(input).expect("input");
     plan
 }
 

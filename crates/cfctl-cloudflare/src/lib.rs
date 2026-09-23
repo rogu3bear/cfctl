@@ -3,6 +3,7 @@ mod access_create;
 pub mod d1_read_inventory;
 mod d1_sql;
 mod oauth_scopes;
+mod token_verification;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;
 pub mod pages_projects;
 mod r2_metadata;
@@ -5089,7 +5090,8 @@ impl Executor {
         credential: &AuthCredential,
     ) -> Result<OperationVerificationV1> {
         let strategy = plan.capability.verification.strategy.as_str();
-        let (token_id, expectation) = token_verification_target(strategy, input, apply_response)?;
+        let (token_id, expectation) =
+            token_verification::token_verification_target(strategy, input, apply_response)?;
         let account_scoped = plan.capability.path.starts_with("/accounts/");
         let details_path = if account_scoped {
             "/accounts/{account_id}/tokens/{token_id}"
@@ -5116,8 +5118,10 @@ impl Executor {
                 ..CallInput::default()
             },
         )?;
-        let readback = self.send(&request, credential).await?;
-        let (passed, basis) = evaluate_token_readback(expectation, &token_id, &readback);
+        let mut readback = self.send(&request, credential).await?;
+        token_verification::redact_token_secret_fields(&mut readback);
+        let (passed, basis) =
+            token_verification::evaluate_token_readback(expectation, &token_id, &readback);
         Ok(OperationVerificationV1 {
             strategy: strategy.to_owned(),
             passed,
@@ -9247,90 +9251,6 @@ fn scalar(value: &Value) -> Option<String> {
         Value::Number(value) => Some(value.to_string()),
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenVerificationExpectation {
-    Active,
-    Revoked,
-}
-
-fn token_verification_target(
-    strategy: &str,
-    input: &CallInput,
-    apply_response: &CloudflareResponseV1,
-) -> Result<(String, TokenVerificationExpectation)> {
-    match strategy {
-        "api_token_details_match_created_id_and_active_status" => apply_response
-            .result
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(|token_id| (token_id.to_owned(), TokenVerificationExpectation::Active))
-            .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget("created token id is absent".to_owned())
-            }),
-        "api_token_details_report_active_after_value_roll" => {
-            planned_token_id(input).map(|token_id| (token_id, TokenVerificationExpectation::Active))
-        }
-        "api_token_details_returns_not_found_after_revoke" => planned_token_id(input)
-            .map(|token_id| (token_id, TokenVerificationExpectation::Revoked)),
-        other => Err(CloudflareError::UnsupportedVerificationStrategy(
-            other.to_owned(),
-        )),
-    }
-}
-
-fn planned_token_id(input: &CallInput) -> Result<String> {
-    input
-        .selectors
-        .get("token_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            CloudflareError::MissingVerificationTarget(
-                "planned token_id selector is absent".to_owned(),
-            )
-        })
-}
-
-fn evaluate_token_readback(
-    expectation: TokenVerificationExpectation,
-    token_id: &str,
-    readback: &CloudflareResponseV1,
-) -> (bool, String) {
-    match expectation {
-        TokenVerificationExpectation::Active => {
-            let readback_id = readback.result.get("id").and_then(Value::as_str);
-            let readback_status = readback.result.get("status").and_then(Value::as_str);
-            let passed = readback.success
-                && readback_id == Some(token_id)
-                && readback_status == Some("active");
-            let basis = if passed {
-                format!("live token details matched `{token_id}` with active status")
-            } else {
-                format!(
-                    "live token details did not match active token `{token_id}` (status {}, id {})",
-                    readback_status.unwrap_or("missing"),
-                    readback_id.unwrap_or("missing")
-                )
-            };
-            (passed, basis)
-        }
-        TokenVerificationExpectation::Revoked => {
-            let passed = readback.status == 404 && !readback.success;
-            let basis = if passed {
-                format!("live token details returned not found for revoked token `{token_id}`")
-            } else {
-                format!(
-                    "revoked token `{token_id}` still produced HTTP {} with success={}",
-                    readback.status, readback.success
-                )
-            };
-            (passed, basis)
-        }
     }
 }
 
