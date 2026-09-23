@@ -27,7 +27,18 @@ For every request:
 6. Read account-owned permission inventory only with `cfctl keys permissions
    --account <account-id> --json`. Add `--user` to select the user endpoint
    while retaining that explicit account resource context.
-7. Use `cfctl call <capability-id> ... --json` for a live read or to create a
+7. Profile fitness preflight: before live HTTP, `cfctl call` checks whether the
+   selected profile can admit the capability. Guided errors include:
+   - `CFCTL_PROFILE_ACCOUNT_MISMATCH`: profile is pinned to a different account
+   - `CFCTL_PROFILE_AUTHORITY_INACTIVE`: managed token's standing authority is
+     no longer active (pending, expired, or revoked)
+   - `CFCTL_PROFILE_INSUFFICIENT_PERMISSIONS`: managed token lacks required
+     permission groups for the capability
+   When fitness checks fail, follow `error.next_step` (typically
+   `cfctl auth use` to select a suitable profile, or
+   `cfctl keys policy create` for broader permissions). Fitness fails open when
+   local inventory is incomplete (imported tokens, missing permission cache).
+8. Use `cfctl call <capability-id> ... --json` for a live read or to create a
    hash-bound plan.
    Read the full `ResultEnvelopeV2`: **live success requires `ok: true` AND
    appropriate `verification.state`**; `performed: true` and `attestation`
@@ -36,17 +47,17 @@ For every request:
    with an error. `evidence` carries redacted receipts; `error.next_step` is
    the governed recovery command when present. Do not collapse these fields
    into one success claim.
-8. If policy requires approval, show the exact operation ID, account, targets,
+9. If policy requires approval, show the exact operation ID, account, targets,
    diffs, costs, warnings, compensation, and verification. Ask y/n.
-9. Translate yes only into
+10. Translate yes only into
    `cfctl plans approve <operation-id> --yes`; paid plans also require the
    reviewed `--max-cost CURRENCY:AMOUNT`.
-10. Execute only with `cfctl plans run <operation-id> --json`.
-11. For recurring token lifecycle, first load `cfctl guide --topic
+11. Execute only with `cfctl plans run <operation-id> --json`.
+12. For recurring token lifecycle, first load `cfctl guide --topic
     standing-authority --json`; activate the exact reviewed policy only after
     explicit approval with `cfctl keys policy approve <authority-id> --yes`,
     and revoke it with `cfctl keys policy revoke <authority-id>`.
-12. Inspect `cfctl plans status <operation-id> --json` and report the evidence
+13. Inspect `cfctl plans status <operation-id> --json` and report the evidence
    class and verification state honestly. Use `plans rectify` for uncertain or
    non-replayable outcomes.
 

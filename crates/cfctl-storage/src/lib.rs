@@ -809,6 +809,15 @@ impl StateStore {
             .join(format!("{authority_id}.json")))
     }
 
+    fn authority_permissions_path(&self, authority_id: &str) -> Result<PathBuf> {
+        validate_authority_id(authority_id)?;
+        Ok(self
+            .paths
+            .data_dir
+            .join("authorities")
+            .join(format!("{authority_id}-permissions.json")))
+    }
+
     fn plan_v2_path(&self, operation_id: &str) -> Result<PathBuf> {
         validate_plan_id(operation_id)?;
         Ok(self
@@ -922,6 +931,36 @@ impl StateStore {
         }
         authorities.sort_by_key(|authority: &StandingAuthorityV1| authority.created_at);
         Ok(authorities)
+    }
+
+    /// Save resolved permission groups for a standing authority.
+    /// This enables fitness checks to verify permission coverage without
+    /// requiring a live inventory call.
+    ///
+    /// The permission_groups parameter should be a JSON array where each element
+    /// has at minimum an "id" (UUID) and "name" (human-readable) field.
+    pub fn save_authority_permissions(
+        &self,
+        authority_id: &str,
+        permission_groups: &serde_json::Value,
+    ) -> Result<()> {
+        let path = self.authority_permissions_path(authority_id)?;
+        let encoded = serde_json::to_vec_pretty(permission_groups)?;
+        atomic_create(&path, &encoded)
+    }
+
+    /// Load resolved permission groups for a standing authority.
+    /// Returns None if no cached permissions exist for this authority.
+    pub fn load_authority_permissions(
+        &self,
+        authority_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let path = self.authority_permissions_path(authority_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let permissions: serde_json::Value = self.read_json(&path)?;
+        Ok(Some(permissions))
     }
 
     /// Serializes the platform evidence-key lifecycle with authenticated

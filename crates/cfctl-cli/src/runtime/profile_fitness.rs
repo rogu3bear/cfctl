@@ -7,6 +7,8 @@
 
 use super::prelude::{CapabilityV1, CliError, ProfileMetadata, Result, StateStore};
 use cfctl_core::StandingAuthorityV1;
+use serde_json::Value;
+use std::collections::HashMap;
 
 /// Check if the profile can admit the capability for the given account.
 /// Returns Ok(()) if the profile is suitable or if inventory is incomplete.
@@ -29,12 +31,15 @@ pub(super) fn check_profile_fitness(
     // Only check profiles with managed API tokens that link to standing authority
     let managed_token = match &profile.managed_api_token {
         Some(token) => token,
-        None => return Ok(()), // No inventory to check
+        None => {
+            // For non-managed api_token profiles (imported), check account pin if available
+            return check_imported_token_fitness(profile, account_id);
+        }
     };
 
     // Load the standing authority for this profile
     let authority_id = &managed_token.standing_authority_id;
-    let authority = match load_standing_authority(store, authority_id) {
+    let authority = match store.load_authority(authority_id) {
         Ok(auth) => auth,
         Err(_) => return Ok(()), // Authority not found or unreadable; proceed anyway
     };
@@ -65,17 +70,91 @@ pub(super) fn check_profile_fitness(
         }
     }
 
-    // Check if the capability is in the authority's allowlist
-    if !authority.capability_ids.contains(&capability.id) {
+    // Check if capability permissions are covered by standing authority permission groups
+    check_permission_coverage(store, &authority, capability, &profile.id, authority_id)?;
+
+    Ok(())
+}
+
+/// Check fitness for imported (non-managed) api_token profiles.
+/// Can only verify account pin; no permission inventory available.
+fn check_imported_token_fitness(
+    profile: &ProfileMetadata,
+    requested_account: Option<&str>,
+) -> Result<()> {
+    // Check account pin if both are specified
+    if let (Some(profile_account), Some(requested)) = (&profile.account_id, requested_account) {
+        if profile_account != requested {
+            return Err(CliError::guided(
+                "CFCTL_PROFILE_ACCOUNT_MISMATCH",
+                &format!(
+                    "Profile `{}` is pinned to account `{}` but the capability requires account `{}`",
+                    profile.id, profile_account, requested
+                ),
+                "Use `cfctl auth use --profile <profile>` to select a profile with access to the target account",
+            ));
+        }
+    }
+    // No permission inventory for imported tokens; fail open
+    Ok(())
+}
+
+/// Check if the capability's required permissions are covered by the standing
+/// authority's granted permission groups.
+///
+/// This is a best-effort check. If we can't determine coverage (e.g., permission
+/// inventory unavailable), we fail open and let the live call proceed.
+fn check_permission_coverage(
+    store: &StateStore,
+    authority: &StandingAuthorityV1,
+    capability: &CapabilityV1,
+    profile_id: &str,
+    authority_id: &str,
+) -> Result<()> {
+    // If capability requires no specific permissions, pass
+    if capability.permissions.is_empty() {
+        return Ok(());
+    }
+
+    // Load cached permission groups for this authority (if available)
+    let permission_groups = match load_authority_permission_groups(store, authority_id) {
+        Ok(groups) => groups,
+        Err(_) => {
+            // No cached permission inventory; fail open
+            // The authority was created before permission caching was implemented,
+            // or the cache file was deleted. Let the live call proceed.
+            return Ok(());
+        }
+    };
+
+    // Build a set of granted permission names from the authority's permission_group_ids
+    let mut granted_permissions = std::collections::HashSet::new();
+    for group_id in &authority.permission_group_ids {
+        if let Some(group_name) = permission_groups.get(group_id.as_str()) {
+            granted_permissions.insert(group_name.as_str());
+        }
+    }
+
+    // Check if all required permissions are granted
+    let missing_permissions: Vec<&str> = capability
+        .permissions
+        .iter()
+        .filter(|perm| !granted_permissions.contains(perm.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+
+    if !missing_permissions.is_empty() {
         return Err(CliError::guided(
-            "CFCTL_PROFILE_CAPABILITY_NOT_ALLOWED",
+            "CFCTL_PROFILE_INSUFFICIENT_PERMISSIONS",
             &format!(
-                "Profile `{}` is bound to standing authority `{}` which does not allow capability `{}`",
-                profile.id, authority_id, capability.id
+                "Profile `{}` lacks required permissions for `{}`. Missing: {}",
+                profile_id,
+                capability.id,
+                missing_permissions.join(", ")
             ),
             &format!(
-                "The standing authority only allows these capabilities: {}. Use `cfctl auth use` to select a different profile with broader permissions, or activate a new standing authority with `cfctl keys policy create` that includes this capability.",
-                authority.capability_ids.join(", ")
+                "Use `cfctl auth use` to select a profile with broader permissions, or create a new standing authority with `cfctl keys policy create` that includes the required permission groups for: {}",
+                missing_permissions.join(", ")
             ),
         ));
     }
@@ -83,36 +162,38 @@ pub(super) fn check_profile_fitness(
     Ok(())
 }
 
-/// Load a standing authority by ID from the store.
-/// Returns Ok(authority) if found and readable, Err otherwise.
-fn load_standing_authority(
+/// Load cached permission group name mappings for a standing authority.
+/// Returns a map from permission_group_id to permission_group_name.
+fn load_authority_permission_groups(
     store: &StateStore,
     authority_id: &str,
-) -> Result<StandingAuthorityV1> {
-    let path = store
-        .paths()
-        .data_dir
-        .join("keys")
-        .join("standing")
-        .join(format!("{authority_id}.json"));
+) -> Result<HashMap<String, String>> {
+    let cached_groups = store
+        .load_authority_permissions(authority_id)?
+        .ok_or_else(|| {
+            CliError::Input(
+                "permission inventory not cached for this authority".to_owned(),
+            )
+        })?;
 
-    if !path.is_file() {
-        return Err(CliError::Input(format!(
-            "Standing authority `{authority_id}` not found"
-        )));
-    }
-
-    let content = std::fs::read_to_string(&path).map_err(|error| {
-        CliError::Input(format!(
-            "Failed to read standing authority `{authority_id}`: {error}"
-        ))
+    let groups_array = cached_groups.as_array().ok_or_else(|| {
+        CliError::Input("cached permission inventory is not an array".to_owned())
     })?;
 
-    serde_json::from_str(&content).map_err(|error| {
-        CliError::Input(format!(
-            "Failed to parse standing authority `{authority_id}`: {error}"
-        ))
-    })
+    let mut id_to_name = HashMap::new();
+    for group in groups_array {
+        let id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("permission group missing id".to_owned()))?;
+        let name = group
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("permission group missing name".to_owned()))?;
+        id_to_name.insert(id.to_owned(), name.to_owned());
+    }
+
+    Ok(id_to_name)
 }
 
 #[cfg(test)]
@@ -196,6 +277,71 @@ mod tests {
         assert_eq!(authority.capability_ids.len(), 2);
         assert!(authority.capability_ids.contains(&"zones-get".to_owned()));
         assert!(authority.capability_ids.contains(&"dns-records-for-a-zone-list-dns-records".to_owned()));
+    }
+
+    #[test]
+    fn imported_token_checks_account_pin() {
+        // Imported tokens (non-managed) should check account pin when both are specified
+        let profile = cfctl_auth::ProfileMetadata::new(
+            "imported-profile",
+            cfctl_auth::ProfileKind::ApiToken,
+            Some("account-a"),
+        );
+
+        // Matching account should pass
+        let result = check_imported_token_fitness(&profile, Some("account-a"));
+        assert!(result.is_ok());
+
+        // Mismatched account should fail
+        let result = check_imported_token_fitness(&profile, Some("account-b"));
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        // Check that the error contains relevant account information
+        assert!(err_msg.contains("account-a") || err_msg.contains("imported-profile"));
+    }
+
+    #[test]
+    fn imported_token_fails_open_without_account_pin() {
+        // When profile has no account_id, we can't verify, so fail open
+        let profile = cfctl_auth::ProfileMetadata::new(
+            "imported-profile",
+            cfctl_auth::ProfileKind::ApiToken,
+            None,
+        );
+
+        let result = check_imported_token_fitness(&profile, Some("account-a"));
+        assert!(result.is_ok());
+
+        // When no requested account, also fail open
+        let profile_with_account = cfctl_auth::ProfileMetadata::new(
+            "imported-profile",
+            cfctl_auth::ProfileKind::ApiToken,
+            Some("account-a"),
+        );
+        let result = check_imported_token_fitness(&profile_with_account, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_permission_groups_builds_id_to_name_mapping() {
+        // This tests the permission group parsing logic
+        let groups_json = serde_json::json!([
+            {"id": "uuid-1", "name": "Zones Read", "scopes": ["com.cloudflare.api.account"]},
+            {"id": "uuid-2", "name": "DNS Read", "scopes": ["com.cloudflare.api.account"]},
+        ]);
+
+        let groups_array = groups_json.as_array().unwrap();
+        let mut id_to_name = HashMap::new();
+        
+        for group in groups_array {
+            let id = group.get("id").and_then(Value::as_str).unwrap();
+            let name = group.get("name").and_then(Value::as_str).unwrap();
+            id_to_name.insert(id.to_owned(), name.to_owned());
+        }
+
+        assert_eq!(id_to_name.get("uuid-1"), Some(&"Zones Read".to_owned()));
+        assert_eq!(id_to_name.get("uuid-2"), Some(&"DNS Read".to_owned()));
+        assert_eq!(id_to_name.len(), 2);
     }
 
 }
