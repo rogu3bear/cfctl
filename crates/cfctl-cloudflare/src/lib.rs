@@ -3291,7 +3291,9 @@ impl Executor {
             ));
         }
         let worker_rollback = plan.capability.id == WORKER_VERSION_ROLLBACK_CAPABILITY_ID;
+        let worker_secret_put = plan.capability.id == "worker-put-script-secret";
         let single_attempt = worker_rollback
+            || worker_secret_put
             || plan.capability.id == cfctl_core::custom_challenge_rule::ID
             || matches!(
                 plan.capability.id.as_str(),
@@ -3338,7 +3340,8 @@ impl Executor {
             Ok(response) => {
                 plan.status = if response.success {
                     PlanStatus::Running
-                } else if plan.capability.id == cfctl_core::custom_challenge_rule::ID
+                } else if (worker_secret_put
+                    || plan.capability.id == cfctl_core::custom_challenge_rule::ID)
                     && (response.status == 429 || response.status >= 500)
                 {
                     PlanStatus::RectificationRequired
@@ -3348,7 +3351,9 @@ impl Executor {
                 Ok(response)
             }
             Err(error) => {
-                plan.status = if plan.capability.id == cfctl_core::custom_challenge_rule::ID {
+                plan.status = if worker_secret_put
+                    || plan.capability.id == cfctl_core::custom_challenge_rule::ID
+                {
                     PlanStatus::RectificationRequired
                 } else {
                     PlanStatus::Failed

@@ -227,6 +227,22 @@ fallback authority exists, fresh writes stay there and ordinary reads never
 probe the platform keyring. Reads reject any group- or world-readable secret
 file, and `cfctl doctor` names the active backend. Secret request fields enter
 through stdin and become opaque references.
+
+The existing-widget read `accounts-turnstile-widget-get` returns the current
+secret without rotating it. It requires `--value-out` in a pre-existing mode-0700
+directory outside Git. The new mode-0600 sink is acquired before the request;
+existing files and symlinks are refused. The returned sitekey must match, and
+stdout/evidence retain only the requested identity and sink outcome. Provider
+errors and unexpected fields are not copied into the receipt. A failed read may
+leave an empty sink; use a new path after diagnosing the failure.
+
+`worker-put-script-secret` updates one binding and creates a new Worker version.
+It sends one PUT only. An uncertain transport, 429 or 5xx outcome requires
+reconciliation, never replay. Name/type readback cannot prove the secret value,
+unchanged code, or application acceptance; capture the version and complete the
+owning application's direct verification separately. Restoring a prior secret
+requires its trusted value and a separately reviewed plan.
+
 Secret results require `--value-out`, which must not exist and is created mode
 0600. Arguments, stdout, plans, logs, evidence, and delegated subprocess
 receipts are redacted. When an API cannot read a newly issued credential back,

@@ -654,7 +654,12 @@ pub(super) async fn verify_api_plan(
     {
         return Ok(outcome);
     }
-    if !response.success && !super::custom_challenge_rule::needs_reconciliation(plan, response) {
+    let uncertain_secret_put = plan.capability.id == "worker-put-script-secret"
+        && (response.status == 429 || response.status >= 500);
+    if !response.success
+        && !uncertain_secret_put
+        && !super::custom_challenge_rule::needs_reconciliation(plan, response)
+    {
         if plan.capability.id == worker_deployment::ROLLBACK_CAPABILITY_ID
             && (response.status == 429 || response.status >= 500)
         {

@@ -14951,3 +14951,5 @@ fn native_worker_deployment_plan_is_preview_only_and_operation_complete() {
         );
     }
 }
+#[path = "catalog/handoff_secrets.rs"]
+mod handoff_secrets;

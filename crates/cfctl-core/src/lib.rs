@@ -5,6 +5,7 @@ pub mod d1_reconciliation;
 mod email_routing;
 pub mod pages_artifact;
 pub mod pages_projects;
+pub mod turnstile_secret;
 pub mod worker_frozen_upload;
 pub use email_routing::{
     EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH,

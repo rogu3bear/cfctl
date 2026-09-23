@@ -138,6 +138,7 @@ pub(super) async fn execute_read_rejects_implicit_global_key_before_live_credent
         None,
         None,
         None,
+        None,
     )
     .await
     .expect_err("live read must not use ambient global-key current profile");
@@ -154,6 +155,7 @@ pub(super) async fn execute_read_rejects_implicit_global_key_before_live_credent
         &capability,
         &input,
         Some("emergency"),
+        None,
         None,
         None,
         None,

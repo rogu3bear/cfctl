@@ -587,6 +587,7 @@ pub(super) async fn execute_read(
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
     output_path: Option<&Path>,
+    secret_output_path: Option<&Path>,
     r2_credentials: Option<&R2LogRetrievalCredentials>,
     reply_admission_source: Option<&Path>,
 ) -> Result<ExecutedRead> {
@@ -702,11 +703,36 @@ pub(super) async fn execute_read(
         }
         AdapterStatus::Native | AdapterStatus::DynamicApi => {}
     }
+    let widget_secret = capability.id == cfctl_core::turnstile_secret::ID;
+    let mut widget_sink = if widget_secret {
+        if output_path.is_some() || r2_credentials.is_some() || reply_admission_source.is_some() {
+            return Err(CliError::Input(
+                "widget secret read accepts only --value-out as its sink".into(),
+            ));
+        }
+        Some(super::turnstile_secret::prepare(
+            capability,
+            secret_output_path,
+        )?)
+    } else {
+        if secret_output_path.is_some() {
+            return Err(CliError::Input(
+                "this read does not support --value-out".into(),
+            ));
+        }
+        None
+    };
     let mln_0143_parents = mln_0143_parent_manifests(store, catalog, capability, input)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
+    if widget_secret
+        && (profile.account_id.as_deref() != account_id.as_deref()
+            || input.selectors.get("account_id").and_then(Value::as_str) != account_id.as_deref())
+    {
+        return Err(CliError::Input("widget secret read requires agreement between profile, selected account and exact account selector".into()));
+    }
     let capture_token_id = if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
         let capture_request = serde_json::from_value(
             input
@@ -735,14 +761,16 @@ pub(super) async fn execute_read(
     };
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(
-        if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
+        if widget_secret || capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
             super::support::private_capture_http_client()?
         } else {
             http_client()?
         },
         API_BASE_URL,
     )?;
-    let response = if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
+    let response = if let Some(sink) = widget_sink.as_mut() {
+        super::turnstile_secret::fetch(&executor, capability, input, &credential, sink).await?
+    } else if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
         super::r2_recovery::capture(
             &executor,
             capability,
@@ -811,7 +839,16 @@ pub(super) async fn execute_read(
     envelope.performed = true;
     let email_routing_contract_rejected =
         email_routing_contract_diagnostic(capability, &response).is_some();
-    if capability.mln_0143_data_invariants.is_some() {
+    if widget_secret {
+        envelope.verification.state = if response.success {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis = Some(
+            "exact requested widget identity and durable private secret sink; no rotation".into(),
+        );
+    } else if capability.mln_0143_data_invariants.is_some() {
         let verified = response.result.get("complete").and_then(Value::as_bool) == Some(true)
             && response
                 .result
