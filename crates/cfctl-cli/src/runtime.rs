@@ -80,6 +80,7 @@ mod secret_io;
 mod security_action_input;
 mod security_action_state;
 mod support;
+mod turnstile_secret;
 mod v1_migration;
 mod worker_custom_domain;
 mod worker_deployment;

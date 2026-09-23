@@ -2,6 +2,7 @@
 
 mod d1_reconciliation;
 mod request_schema;
+mod turnstile_secret;
 use request_schema::{normalize_request_schema_contract, request_schema_contract};
 mod custom_challenge_rule;
 mod email_preferences;
@@ -8783,6 +8784,7 @@ fn apply_post_normalization_contracts(
     finalize_pages_deployment_id_selector_contracts(capabilities);
     finalize_pages_production_deployment_contract(document, capabilities);
     finalize_worker_script_secret_contracts(document, capabilities);
+    turnstile_secret::finalize(document, capabilities);
     classify_exact_resource_contracts(document, capabilities);
     finalize_singleton_resource_delete_contracts(document, capabilities);
     classify_parent_collection_delete_contracts(document, capabilities);
@@ -12353,9 +12355,16 @@ fn worker_script_secret_operation_kind(
         capability.path.as_str(),
     ) {
         ("worker-put-script-secret", "PUT", WORKER_SCRIPT_SECRET_COLLECTION_PATH)
-            if capability.title == "Add script secret"
-                && capability.description.as_deref() == Some("Add a secret to a script.")
-                && worker_script_secret_put_selectors_supported(capability)
+            if matches!(
+                (capability.title.as_str(), capability.description.as_deref()),
+                ("Add script secret", Some("Add a secret to a script."))
+                    | (
+                        "Add a secret to a Worker script",
+                        Some(
+                            "Add a secret to a Worker script by creating a new version with that secret.\n\nWhen changing more than one secret at a time, prefer the \"Patch multiple\nscript secrets\" API instead of changing many secrets individually.\n"
+                        )
+                    )
+            ) && worker_script_secret_put_selectors_supported(capability)
                 && worker_script_secret_put_request_contract_supported(capability) =>
         {
             Some(WorkerScriptSecretOperationKind::Put)
@@ -12530,7 +12539,7 @@ fn classify_worker_script_secret_operation(
             "worker_script_secret_reports_planned_name_and_type_after_put"
                 .clone_into(&mut capability.verification.strategy);
             capability.rollback.warning = Some(
-                "the API is an upsert and never returns the prior value, so cfctl cannot restore a replaced secret automatically; preserve the prior value in its trusted source and use a separately reviewed plan if restoration is required"
+                "the API creates a new Worker version for this single-binding upsert; bind the resulting version and verify code and unaffected bindings against the intended prior version. Metadata verification proves only name/type, not the value, code preservation or application acceptance. No automatic retry is safe after an uncertain boundary. The API never returns the prior value, so cfctl cannot restore a replaced secret automatically; preserve the prior value in its trusted source and use a separately reviewed plan if restoration is required"
                     .to_owned(),
             );
         }
@@ -12558,9 +12567,9 @@ fn finalize_worker_script_secret_contracts(
         .get(WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID)
         .is_some_and(|capability| {
             capability.id == WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID
-                && capability.title == "Get secret binding"
-                && capability.description.as_deref()
-                    == Some("Get a given secret binding (value omitted) on a script.")
+                && matches!((capability.title.as_str(), capability.description.as_deref()),
+                    ("Get secret binding", Some("Get a given secret binding (value omitted) on a script."))
+                    | ("Get a secret binding", Some("Get a given secret binding (value omitted) on a Worker script.")))
                 && capability.method == "GET"
                 && capability.path == WORKER_SCRIPT_SECRET_DETAIL_PATH
                 && capability.product == "Worker Script"
