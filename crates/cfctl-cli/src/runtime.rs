@@ -63,6 +63,7 @@ mod preconditions_extended;
 mod prelude;
 mod private_authority;
 mod private_runtime;
+mod profile_fitness;
 mod provider_state;
 mod r2_credentials;
 mod r2_private_upload;

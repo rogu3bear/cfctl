@@ -29,11 +29,13 @@ For every request:
    while retaining that explicit account resource context.
 7. Use `cfctl call <capability-id> ... --json` for a live read or to create a
    hash-bound plan.
-   Read the full `ResultEnvelopeV2`: `ok` is command success; `performed` says
-   whether an external boundary was crossed; `verification.state` names proof
-   status; `evidence` carries redacted receipts; and `error.next_step` is the
-   governed recovery command when present. Do not collapse them into one
-   success claim.
+   Read the full `ResultEnvelopeV2`: **live success requires `ok: true` AND
+   appropriate `verification.state`**; `performed: true` and `attestation`
+   alone never imply success. A 403 Unauthorized or similar authorization
+   failure sets `performed: true` (the boundary was crossed) but `ok: false`
+   with an error. `evidence` carries redacted receipts; `error.next_step` is
+   the governed recovery command when present. Do not collapse these fields
+   into one success claim.
 8. If policy requires approval, show the exact operation ID, account, targets,
    diffs, costs, warnings, compensation, and verification. Ask y/n.
 9. Translate yes only into

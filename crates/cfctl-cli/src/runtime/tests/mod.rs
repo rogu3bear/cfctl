@@ -82,7 +82,7 @@ use cfctl_core::{
     ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
     SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
     SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-    TransactionStageV1, VerificationState, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
+    TransactionStageV1, VerificationState, VerificationStatusV1, WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID,
     WorkflowContractV1, WorkflowStepV1, WorkspaceD1MigrationContractV1,
     WorkspaceD1PolicyProjectionContractV1, hash_value,
 };
@@ -229,6 +229,8 @@ mod compensation_and_errors;
 mod secret_io;
 mod workflows_and_resolve;
 use workflows_and_resolve::*;
+mod resolve_acceptance;
+mod envelope_success;
 mod access_application;
 use access_application::*;
 mod access_policy;
