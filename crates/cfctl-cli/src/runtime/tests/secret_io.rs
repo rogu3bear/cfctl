@@ -1026,6 +1026,207 @@ pub(super) fn metadata_only_secret_response_is_rejected_without_creating_a_sink(
     assert!(sink_secret_result(&plan, &json!({"id":"token-id","status":"active"})).is_err());
     assert!(!path.exists());
 }
+
+const CREATE_TOKEN_ONE_TIME_SECRET: &str = "cfctl-create-token-must-not-leak";
+
+fn create_token_plan(targets: Value) -> PlanV1 {
+    let mut capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create account token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    capability.risk = RiskClass::SecretSensitive;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    PlanV1::draft("profile-a", "account-a", "catalog-sha", capability, targets).expect("plan")
+}
+
+fn create_token_provider_result() -> Value {
+    json!({
+        "id": "token-id",
+        "name": "cfctl-site-release",
+        "status": "active",
+        "value": CREATE_TOKEN_ONE_TIME_SECRET,
+        "secret": CREATE_TOKEN_ONE_TIME_SECRET,
+        "key": CREATE_TOKEN_ONE_TIME_SECRET
+    })
+}
+
+fn consumed_create_token_plan(targets: Value) -> PlanV1 {
+    let mut plan = create_token_plan(targets);
+    plan.input = json!({"body":{"name":"cfctl-site-release"}});
+    plan.refresh_hash().expect("bind input");
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    plan
+}
+
+fn apply_create_token_envelope(store: &StorageStateStore, plan: &mut PlanV1) -> ResultEnvelopeV2 {
+    plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+        .expect("boundary attempt");
+    store.save_plan(plan).expect("persist plan");
+    let response = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: create_token_provider_result(),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let (response_value, apply_evidence, lineage_evidence) =
+        match process_api_boundary_response(store, plan, &response, &MemorySecretStore::default())
+            .expect("create-token apply is locally durable")
+        {
+            ApiBoundaryResponseOutcome::Ready {
+                response_value,
+                apply_evidence,
+                lineage_evidence,
+            } => (response_value, apply_evidence, lineage_evidence),
+            ApiBoundaryResponseOutcome::Recovery(envelope) => {
+                panic!("create-token apply must not enter recovery: {envelope:?}")
+            }
+        };
+    api_plan_result_envelope(
+        plan,
+        response_value,
+        apply_evidence,
+        lineage_evidence,
+        ApiVerificationOutcome {
+            state: VerificationState::Passed,
+            basis: "api_token_details_match_created_id_and_active_status".to_owned(),
+            evidence: None,
+            error: None,
+            correlated_resource_id: Some(json!("token-id")),
+        },
+        true,
+        None,
+    )
+}
+
+fn assert_create_token_field_redacted(envelope: &ResultEnvelopeV2, field: &str) {
+    let redacted = envelope.result.pointer(&format!("/result/{field}"));
+    assert!(
+        matches!(
+            redacted.and_then(Value::as_str),
+            None | Some("[SUNK]" | "[REDACTED]")
+        ),
+        "{field} must be absent or redacted in the apply envelope, got {redacted:?}"
+    );
+    assert_ne!(
+        redacted,
+        Some(&json!(CREATE_TOKEN_ONE_TIME_SECRET)),
+        "{field} leaked the one-time secret into the apply envelope"
+    );
+}
+
+fn assert_unix_mode_0600(path: &Path) {
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(path)
+                .expect("sink metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[test]
+pub(super) fn create_token_apply_envelope_redacts_value_secret_and_key() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+    let sink_path = root.path().join("created-token.txt");
+    let mut plan = consumed_create_token_plan(json!({"adapter":{"value_out": sink_path}}));
+    let envelope = apply_create_token_envelope(&store, &mut plan);
+    let stdout = serde_json::to_string(&envelope).expect("--json stdout");
+    assert!(
+        !stdout.contains(CREATE_TOKEN_ONE_TIME_SECRET),
+        "create-token --json stdout leaked the one-time value: {stdout}"
+    );
+    for field in ["value", "secret", "key"] {
+        assert_create_token_field_redacted(&envelope, field);
+    }
+    assert!(
+        matches!(
+            envelope
+                .result
+                .pointer("/result/value")
+                .and_then(Value::as_str),
+            None | Some("[SUNK]")
+        ),
+        "create-token envelope value must be absent or [SUNK]"
+    );
+    assert_eq!(
+        envelope.result.pointer("/result/id"),
+        Some(&json!("token-id"))
+    );
+    assert_eq!(
+        envelope.result.pointer("/result/name"),
+        Some(&json!("cfctl-site-release"))
+    );
+    assert_eq!(
+        envelope.result.pointer("/result/status"),
+        Some(&json!("active"))
+    );
+    assert_eq!(envelope.verification.state, VerificationState::Passed);
+    assert_eq!(
+        fs::read_to_string(&sink_path).expect("value_out holds the one-time value"),
+        CREATE_TOKEN_ONE_TIME_SECRET
+    );
+    assert_unix_mode_0600(&sink_path);
+    assert_eq!(
+        plan.targets
+            .pointer("/adapter/value_out")
+            .and_then(Value::as_str),
+        sink_path.to_str()
+    );
+    assert!(
+        envelope.result.pointer("/adapter/value_out").is_none(),
+        "value_out path belongs on plan targets, not the apply envelope result"
+    );
+    let apply_receipt = fs::read_to_string(&envelope.evidence[0].path).expect("apply receipt");
+    assert!(
+        !apply_receipt.contains(CREATE_TOKEN_ONE_TIME_SECRET),
+        "apply receipt leaked the one-time value: {apply_receipt}"
+    );
+}
+
+#[tokio::test]
+pub(super) async fn create_token_missing_value_out_fails_before_the_post() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+    let mut plan = create_token_plan(json!({}));
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    store.save_plan(&plan).expect("persist plan");
+    let error = preflight_secret_sink(&plan).expect_err("create-token requires value_out");
+    assert!(
+        error.to_string().contains("value_out"),
+        "missing sink must name value_out: {error}"
+    );
+    let error = execute_api_plan(
+        &store,
+        "catalog-sha",
+        &mut plan,
+        &CallInput::default(),
+        &AuthCredential::Bearer {
+            token: "must-not-be-sent".to_owned(),
+        },
+        &MemorySecretStore::default(),
+    )
+    .await
+    .expect_err("create-token must not POST without value_out");
+    assert!(
+        error.to_string().contains("value_out"),
+        "execute_api_plan must fail on the sink, not a provider call: {error}"
+    );
+}
+
 #[test]
 pub(super) fn planning_only_plan_cannot_enter_approval_or_execution_contract() {
     let root = tempfile::tempdir().expect("state root");
