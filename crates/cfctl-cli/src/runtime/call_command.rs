@@ -325,6 +325,29 @@ pub(super) async fn call_command(
     } else {
         preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
     }
+
+    // Profile-capability fitness preflight: check if the profile has permissions
+    // for this capability when local inventory exists. This is a best-effort
+    // check that fails early when we can prove the profile lacks permissions.
+    // Only run when profiles are configured.
+    if store.paths().profiles_file().is_file() {
+        let profiles = ProfilesConfig::load(store)?;
+        if let Ok(fitness_profile) = profiles.selected(arguments.profile.as_deref()) {
+            let fitness_account = resolve_account_id(
+                store,
+                fitness_profile,
+                arguments.account.as_deref(),
+                &prepared.input,
+            )?;
+            super::profile_fitness::check_profile_fitness(
+                store,
+                fitness_profile,
+                &capability,
+                fitness_account.as_deref(),
+            )?;
+        }
+    }
+
     if !capability.mutating {
         if prepared.secret_body.is_some() {
             return Err(CliError::Input(
