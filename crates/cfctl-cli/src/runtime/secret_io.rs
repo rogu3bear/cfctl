@@ -273,17 +273,19 @@ pub(super) fn is_secret_output_plan(plan: &PlanV1) -> bool {
 }
 
 pub(super) fn is_secret_output_capability(capability: &CapabilityV1) -> bool {
-    (capability.risk == RiskClass::SecretSensitive
-        && !is_worker_script_secret_input_only_capability(capability)
-        && !(capability.id == cfctl_core::pages_projects::VARIABLES_ID
-            && cfctl_core::pages_projects::contract_supported(capability)))
+    capability.id == cfctl_core::turnstile_secret::ID
+        || (capability.risk == RiskClass::SecretSensitive
+            && !is_worker_script_secret_input_only_capability(capability)
+            && !(capability.id == cfctl_core::pages_projects::VARIABLES_ID
+                && cfctl_core::pages_projects::contract_supported(capability)))
         || is_access_service_token_create_capability(capability)
         || is_r2_temporary_credentials_operation_identity(capability)
         || is_oauth_client_create_operation_identity(capability)
 }
 
 pub(super) fn should_redact_secret_response(capability: &CapabilityV1) -> bool {
-    capability.risk == RiskClass::SecretSensitive
+    capability.id == cfctl_core::turnstile_secret::ID
+        || capability.risk == RiskClass::SecretSensitive
         || is_pages_project_response(capability)
         || is_access_service_token_create_capability(capability)
         || is_r2_temporary_credentials_operation_identity(capability)
@@ -458,7 +460,9 @@ pub(super) fn redact_secret_payload(value: &Value, root: bool) -> Value {
         Value::Array(values) => Value::Array(
             values
                 .iter()
-                .map(|item| redact_secret_payload(item, true))
+                // Arrays inherit their context: a bare secret result stays
+                // secret, while named metadata such as domains stays readable.
+                .map(|item| redact_secret_payload(item, root))
                 .collect(),
         ),
         Value::String(_) if root => Value::String("[SUNK]".to_owned()),

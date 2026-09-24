@@ -705,15 +705,20 @@ fn verify_bootstrap_contract() -> Result<(), TaskError> {
 }
 
 fn validate_bootstrap_contract(source: &str) -> Result<(), TaskError> {
-    if source.contains("cargo run --locked -p xtask -- verify") {
+    if source.contains("cargo run --locked -p xtask -- verify")
+        || source.contains("cargo xtask verify")
+    {
         return Err(TaskError::InvalidSourceContract(
             "bootstrap.sh must not hold a Cargo run gate around the nested xtask verifier"
                 .to_owned(),
         ));
     }
-    if !source.contains("cargo xtask verify") {
+    if !source
+        .contains("cargo build --locked -p xtask --target \"$host\" --target-dir \"$target_dir\"")
+        || !source.contains("\"$target_dir/$host/debug/xtask\" verify")
+    {
         return Err(TaskError::InvalidSourceContract(
-            "bootstrap.sh must invoke the repository's cargo xtask verify entrypoint".to_owned(),
+            "bootstrap.sh must build and execute the exact native xtask verifier".to_owned(),
         ));
     }
     if !source.contains("status --porcelain=v1 --untracked-files=normal") {
@@ -3701,22 +3706,28 @@ mod tests {
 
     #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
-        validate_bootstrap_contract(
-            "git status --porcelain=v1 --untracked-files=normal\n(cd \"$root\" && cargo xtask verify)\n",
-        )
-            .expect("the public xtask entrypoint is safe for nested Cargo commands");
-
+        let source = include_str!("../../bootstrap.sh");
+        validate_bootstrap_contract(source).expect("native build exits before nested proof");
+        for outer in [
+            "cargo run --locked -p xtask -- verify",
+            "cargo xtask verify",
+        ] {
+            let error = validate_bootstrap_contract(outer)
+                .expect_err("an outer Cargo gate must not enclose nested proof commands");
+            assert!(error.to_string().contains("must not hold a Cargo run gate"));
+        }
+        for required in [
+            "cargo build --locked -p xtask --target \"$host\" --target-dir \"$target_dir\"",
+            "\"$target_dir/$host/debug/xtask\" verify",
+        ] {
+            let error = validate_bootstrap_contract(&source.replace(required, ":"))
+                .expect_err("native build and exact verifier are both mandatory");
+            assert!(error.to_string().contains("exact native xtask verifier"));
+        }
         let error = validate_bootstrap_contract(
-            "(cd \"$root\" && cargo run --locked -p xtask -- verify)\n",
+            &source.replace("status --porcelain=v1 --untracked-files=normal", "status"),
         )
-        .expect_err("an outer cargo run gate would deadlock nested proof commands");
-        assert!(
-            error.to_string().contains("must not hold a Cargo run gate"),
-            "unexpected error: {error}"
-        );
-
-        let error = validate_bootstrap_contract("(cd \"$root\" && cargo xtask verify)\n")
-            .expect_err("bootstrap must reject untracked compiler inputs before installation");
+        .expect_err("bootstrap must reject untracked compiler inputs before installation");
         assert!(
             error
                 .to_string()
@@ -3894,6 +3905,8 @@ mod tests {
                 .current_dir(repo)
                 .env("PATH", search_path)
                 .env("FAKE_CARGO_LOG", cargo_log)
+                .env("CARGO_BUILD_TARGET", "fixture-cross")
+                .env("CARGO_TARGET_DIR", repo.join("target with spaces"))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -3938,14 +3951,33 @@ mod tests {
         let fake_cargo = fake_bin.join("cargo");
         fs::write(
             &fake_cargo,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CARGO_LOG\"\n\
-             if [ -n \"${FAKE_CARGO_MUTATE_PATH:-}\" ]; then\n\
-               printf 'mutated\\n' > \"$FAKE_CARGO_MUTATE_PATH\"\n\
-             fi\n",
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FAKE_CARGO_LOG"
+[ "$#" = 8 ] && [ "$1 $2 $3 $4 $5 $6 $7" = 'build --locked -p xtask --target fixture-native --target-dir' ] || exit 71
+[ ! -f "$FAKE_CARGO_LOG.build-fail" ] || exit 72
+mkdir -p "$8/$6/debug"
+cat > "$8/$6/debug/xtask" <<'VERIFIER'
+#!/bin/sh
+set -eu
+printf 'xtask %s\n' "$*" >> "$FAKE_CARGO_LOG"
+[ "$*" = verify ] || exit 74
+[ ! -f "$FAKE_CARGO_LOG.verify-fail" ] || exit 75
+if [ -n "${FAKE_CARGO_MUTATE_PATH:-}" ]; then
+  printf 'mutated\n' > "$FAKE_CARGO_MUTATE_PATH"
+fi
+VERIFIER
+chmod +x "$8/$6/debug/xtask"
+"#,
         )
         .expect("fake cargo is written");
         fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
             .expect("fake cargo is executable");
+        let fake_rustc = fake_bin.join("rustc");
+        fs::write(&fake_rustc, "#!/bin/sh\necho 'host: fixture-native'\n")
+            .expect("fake rustc is written");
+        fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755))
+            .expect("fake rustc is executable");
         let fake_git = fake_bin.join("git");
         fs::write(
             &fake_git,
@@ -3971,6 +4003,8 @@ mod tests {
             &["config", "user.email", "cfctl-test@example.invalid"],
         );
         fs::write(repo.join("tracked.txt"), "clean\n").expect("tracked fixture is written");
+        fs::write(repo.join(".gitignore"), "/target with spaces/\n")
+            .expect("build output is ignored");
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "clean fixture"]);
         let clean_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
@@ -3979,6 +4013,11 @@ mod tests {
             .to_owned();
         let zero_oid = "0".repeat(clean_oid.len());
         let clean_update = format!("refs/heads/main {clean_oid} refs/heads/main {zero_oid}\n");
+        let expected_build = format!(
+            "build --locked -p xtask --target fixture-native --target-dir {}\n",
+            repo.join("target with spaces").display()
+        );
+        let expected_proof = format!("{expected_build}xtask verify\n");
         let clean = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, false);
         assert!(
             clean.status.success(),
@@ -3987,8 +4026,29 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&cargo_log).expect("fake cargo ran"),
-            "xtask verify\n"
+            expected_proof
         );
+
+        for (stage, expected_log) in [
+            ("build", expected_build.as_str()),
+            ("verify", expected_proof.as_str()),
+        ] {
+            fs::remove_file(&cargo_log).expect("fixture log is reset");
+            let failure = cargo_log.with_extension(format!("log.{stage}-fail"));
+            fs::write(&failure, "fail\n").expect("failure is injected");
+            let failed = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, false);
+            assert!(!failed.status.success(), "{stage} failure must refuse push");
+            assert!(
+                String::from_utf8_lossy(&failed.stderr)
+                    .contains("xtask build or verification exited")
+            );
+            assert_eq!(
+                fs::read_to_string(&cargo_log).expect("fixture commands were logged"),
+                expected_log,
+                "a failed build must never execute even an existing verifier"
+            );
+            fs::remove_file(&failure).expect("injected failure is removed");
+        }
 
         fs::remove_file(&cargo_log).expect("fake cargo log is reset");
         let unobservable = run_hook(&repo, &fake_bin, &cargo_log, &clean_update, None, true);
@@ -4027,7 +4087,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&cargo_log).expect("fake cargo ran before final rebind"),
-            "xtask verify\n"
+            expected_proof
         );
         fs::write(&tracked_path, "clean\n").expect("raced fixture is restored");
 

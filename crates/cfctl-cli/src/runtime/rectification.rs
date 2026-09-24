@@ -114,7 +114,12 @@ pub(super) async fn rectify_loaded_plan(
         ));
     }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, plan)?;
-    if let Some(mut request) = compensation_request(plan)? {
+    let compensation = if plan.capability.id == cfctl_core::custom_challenge_rule::ID {
+        super::custom_challenge_rule::compensation(store, plan)?
+    } else {
+        compensation_request(plan)?
+    };
+    if let Some(mut request) = compensation {
         let catalog = ensure_catalog(store).await?;
         let capability = catalog
             .get(&request.capability_id)

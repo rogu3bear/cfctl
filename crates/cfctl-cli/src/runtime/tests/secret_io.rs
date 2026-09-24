@@ -299,6 +299,35 @@ pub(super) fn secret_response_preserves_safe_receipt_metadata() {
 }
 
 #[test]
+fn secret_response_arrays_preserve_context_without_exposing_secret_fields() {
+    let response = json!({"result": {
+        "domains": ["adapteros.com", "www.adapteros.com"],
+        "nested": [[{"name":"public", "token":"nested-token-canary",
+            "value":["nested-value-canary"]}]],
+        "secret": ["secret-array-canary", {"name":"secret-object-canary"}]
+    }});
+    let redacted = redact_secret_result(&response);
+    assert_eq!(redacted["result"]["domains"], response["result"]["domains"]);
+    assert_eq!(redacted["result"]["nested"][0][0]["name"], "public");
+    for marker in [
+        "nested-token-canary",
+        "nested-value-canary",
+        "secret-array-canary",
+        "secret-object-canary",
+    ] {
+        assert!(!redacted.to_string().contains(marker));
+    }
+    for raw in [
+        json!("root-secret-canary"),
+        json!(["root-secret-canary", ["nested-root-secret-canary"]]),
+    ] {
+        let redacted = redact_secret_result(&json!({"result":raw}));
+        assert!(!redacted.to_string().contains("secret-canary"));
+        assert!(redacted.to_string().contains("[SUNK]"));
+    }
+}
+
+#[test]
 pub(super) fn verification_evidence_redacts_secret_readback_fields_storage_redaction_misses() {
     let root = tempfile::tempdir().expect("runtime root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");

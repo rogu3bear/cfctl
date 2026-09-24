@@ -369,6 +369,7 @@ pub(super) async fn call_command(
             arguments.profile.as_deref(),
             arguments.account.as_deref(),
             arguments.out.as_deref(),
+            arguments.value_out.as_deref(),
             r2_credentials.as_ref(),
             arguments.source_file.as_deref(),
         )

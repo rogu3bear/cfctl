@@ -35,6 +35,7 @@ contracts, procedures, and migration evidence. It does not grant authority.
 | [workspace-operation-format.md](workspace-operation-format.md) | in-progress pack contract (generic loader; typed evidence validators still win) |
 | [telemetry-control-plane.md](telemetry-control-plane.md) | bounded telemetry and security-response |
 | [response-header-rule-repair.md](response-header-rule-repair.md) | targeted header-rule repair |
+| [custom-challenge-rule-repair.md](custom-challenge-rule-repair.md) | existing custom challenge expression repair |
 
 ## Migration and reference
 

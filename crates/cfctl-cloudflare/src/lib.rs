@@ -4,6 +4,7 @@ pub mod d1_read_inventory;
 mod d1_sql;
 mod oauth_scopes;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;
+mod custom_challenge_rule;
 pub mod pages_projects;
 mod r2_metadata;
 mod r2_private;
@@ -503,6 +504,18 @@ impl RequestBuilder {
                         CloudflareError::MissingRequestBody(capability.id.clone())
                     })?,
                 )?),
+                None,
+            )
+        } else if capability.id == cfctl_core::custom_challenge_rule::ID {
+            let body = input
+                .body
+                .as_ref()
+                .ok_or_else(|| CloudflareError::MissingRequestBody(capability.id.clone()))?;
+            (
+                Some(
+                    cfctl_core::custom_challenge_rule::wire_body(body)
+                        .map_err(|reason| CloudflareError::InvalidRequestBody(reason.into()))?,
+                ),
                 None,
             )
         } else if capability.d1_full_export.is_some() {
@@ -3278,7 +3291,10 @@ impl Executor {
             ));
         }
         let worker_rollback = plan.capability.id == WORKER_VERSION_ROLLBACK_CAPABILITY_ID;
+        let worker_secret_put = plan.capability.id == "worker-put-script-secret";
         let single_attempt = worker_rollback
+            || worker_secret_put
+            || plan.capability.id == cfctl_core::custom_challenge_rule::ID
             || matches!(
                 plan.capability.id.as_str(),
                 cfctl_core::pages_projects::CREATE_ID | cfctl_core::pages_projects::VARIABLES_ID
@@ -3324,13 +3340,24 @@ impl Executor {
             Ok(response) => {
                 plan.status = if response.success {
                     PlanStatus::Running
+                } else if (worker_secret_put
+                    || plan.capability.id == cfctl_core::custom_challenge_rule::ID)
+                    && (response.status == 429 || response.status >= 500)
+                {
+                    PlanStatus::RectificationRequired
                 } else {
                     PlanStatus::Failed
                 };
                 Ok(response)
             }
             Err(error) => {
-                plan.status = PlanStatus::Failed;
+                plan.status = if worker_secret_put
+                    || plan.capability.id == cfctl_core::custom_challenge_rule::ID
+                {
+                    PlanStatus::RectificationRequired
+                } else {
+                    PlanStatus::Failed
+                };
                 Err(error)
             }
         }
@@ -4211,6 +4238,11 @@ impl Executor {
             .await;
         }
 
+        if strategy == cfctl_core::custom_challenge_rule::VERIFY {
+            return self
+                .verify_custom_challenge_rule(plan, apply_response, input, credential)
+                .await;
+        }
         if strategy == cfctl_core::response_header_rule::VERIFY {
             return self
                 .verify_response_header_rule(plan, apply_response, input, credential)
@@ -12574,6 +12606,20 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    if capability.id == cfctl_core::custom_challenge_rule::ID
+        && (!cfctl_core::custom_challenge_rule::supported(capability)
+            || input.if_match.is_some()
+            || input.if_none_match.is_some()
+            || input.query != serde_json::json!({})
+            || !input
+                .body
+                .as_ref()
+                .is_some_and(cfctl_core::custom_challenge_rule::valid_body))
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "custom challenge expression contract rejected".into(),
+        ));
+    }
     if capability.id == cfctl_core::response_header_rule::ID
         && capability.verification.strategy == cfctl_core::response_header_rule::VERIFY
         && (!cfctl_core::response_header_rule::supported(capability)

@@ -38,7 +38,18 @@ if [ -n "$checkout_status" ]; then
 fi
 head=$(git -C "$root" rev-parse --verify HEAD)
 
-(cd "$root" && cargo xtask verify)
+(
+  cd "$root"
+  # Release the guarded build before the verifier enters other workspaces.
+  rustc_version=$(rustc -vV)
+  host=$(printf '%s\n' "$rustc_version" | sed -n 's/^host: //p')
+  case "$host" in
+    ''|*[!a-zA-Z0-9_-]*) echo "could not bind the native Rust host target" >&2; exit 1 ;;
+  esac
+  target_dir="${CARGO_TARGET_DIR:-$root/target}"
+  cargo build --locked -p xtask --target "$host" --target-dir "$target_dir"
+  "$target_dir/$host/debug/xtask" verify
+)
 
 if [ "$check_only" = true ]; then
   echo "cfctl v2 source proof passed"
