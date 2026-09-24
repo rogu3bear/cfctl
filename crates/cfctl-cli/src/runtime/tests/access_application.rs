@@ -1893,3 +1893,138 @@ pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
         "error message should mention empty allowed_idps"
     );
 }
+
+#[test]
+pub(super) fn call_validation_accepts_oauth_only_for_managed_oauth() {
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+
+    let input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({
+            "oauth_configuration": {
+                "enabled": true,
+                "dynamic_client_registration": {
+                    "enabled": true,
+                    "allowed_uris": ["mlnavigator-remote://oauth/callback"]
+                }
+            }
+        })),
+        ..CallInput::default()
+    };
+
+    let result = super::validate_access_application_login_methods_desired_input(
+        &capability,
+        &input,
+    );
+
+    assert!(
+        result.is_ok(),
+        "oauth-only body should be accepted for managed-oauth capability: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+pub(super) fn call_validation_rejects_oauth_only_for_non_managed_oauth() {
+    let capability = access_application_login_methods_capability();
+
+    let input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({
+            "oauth_configuration": {
+                "enabled": true
+            }
+        })),
+        ..CallInput::default()
+    };
+
+    let result = super::validate_access_application_login_methods_desired_input(
+        &capability,
+        &input,
+    );
+
+    assert!(
+        result.is_err(),
+        "oauth-only body should be rejected for non-managed-oauth capability"
+    );
+    
+    let error_msg = result.unwrap_err().to_string();
+    println!("Error message: {}", error_msg);
+    assert!(
+        error_msg.contains("allowed_idps") || error_msg.contains("required"),
+        "error should indicate missing required field allowed_idps, got: {}",
+        error_msg
+    );
+}
+
+#[test]
+pub(super) fn call_validation_accepts_idps_only_for_managed_oauth() {
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+
+    let input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({
+            "allowed_idps": [
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+                "6f88b4fc-0ed2-48fa-95ea-3f7336c90053"
+            ]
+        })),
+        ..CallInput::default()
+    };
+
+    let result = super::validate_access_application_login_methods_desired_input(
+        &capability,
+        &input,
+    );
+
+    assert!(
+        result.is_ok(),
+        "idps-only body should be accepted for managed-oauth capability: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+pub(super) fn call_validation_rejects_invalid_oauth_only_shapes() {
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+
+    let input_non_object = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({
+            "oauth_configuration": "not an object"
+        })),
+        ..CallInput::default()
+    };
+
+    let result = super::validate_access_application_login_methods_desired_input(
+        &capability,
+        &input_non_object,
+    );
+
+    assert!(
+        result.is_err(),
+        "non-object oauth_configuration should be rejected"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("must be an object"),
+        "error should mention oauth_configuration must be an object"
+    );
+}

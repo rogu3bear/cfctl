@@ -133,10 +133,62 @@ pub(super) fn validate_access_application_login_methods_desired_input(
                 .to_owned(),
         ));
     }
+    
+    if capability.id == ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID {
+        let body_obj = input.body.as_ref().and_then(Value::as_object);
+        let body_field_count = body_obj.map_or(0, serde_json::Map::len);
+        
+        if body_field_count == 1 {
+            let single_field_key = body_obj.and_then(|obj| obj.keys().next()).map(String::as_str);
+            match single_field_key {
+                Some("oauth_configuration") => {
+                    validate_access_application_oauth_only_input(capability, input)?;
+                    return Ok(());
+                }
+                Some("allowed_idps") => {
+                }
+                _ => {}
+            }
+        }
+    }
+    
     let mut desired_capability = capability.clone();
     desired_capability.request_schema = Some(access_application_login_methods_desired_schema());
     validate_request_contract(&desired_capability, input)?;
     access_application_desired_idps(input)?;
+    Ok(())
+}
+
+fn validate_access_application_oauth_only_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if capability.id != ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID {
+        return Err(CliError::Input(
+            "OAuth-only input is only supported for the Managed OAuth capability".to_owned(),
+        ));
+    }
+    
+    let body = input.body.as_ref().and_then(Value::as_object).ok_or_else(|| {
+        CliError::Input("OAuth-only input must have a body object".to_owned())
+    })?;
+    
+    if body.len() != 1 || !body.contains_key("oauth_configuration") {
+        return Err(CliError::Input(
+            "OAuth-only input must contain exactly one field: `oauth_configuration`".to_owned(),
+        ));
+    }
+    
+    let oauth_config = body.get("oauth_configuration").ok_or_else(|| {
+        CliError::Input("OAuth-only input must contain `oauth_configuration`".to_owned())
+    })?;
+    
+    if !oauth_config.is_object() {
+        return Err(CliError::Input(
+            "oauth_configuration must be an object".to_owned(),
+        ));
+    }
+    
     Ok(())
 }
 
