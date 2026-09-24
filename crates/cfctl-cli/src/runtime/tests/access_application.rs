@@ -185,9 +185,21 @@ pub(super) fn access_application_login_methods_capability() -> CapabilityV1 {
         "enable_binding_cookie":{"type":"boolean"},
         "http_only_cookie_attribute":{"type":"boolean"},
         "name":{"type":"string"},
+        "oauth_configuration":{"type":"object"},
         "options_preflight_bypass":{"type":"boolean"},
         "path_cookie_attribute":{"type":"boolean"},
-        "policies":{"type":"array","items":{"type":"object"}},
+        "policies":{
+            "type":"array",
+            "items":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","precedence"],
+                "properties":{
+                    "id":{"type":"string"},
+                    "precedence":{"type":"integer"}
+                }
+            }
+        },
         "same_site_cookie_attribute":{"type":"string"},
         "self_hosted_domains":{"type":"array","items":{"type":"string"}},
         "session_duration":{"type":"string"},
@@ -204,6 +216,7 @@ pub(super) fn access_application_login_methods_capability() -> CapabilityV1 {
             !matches!(
                 **field,
                 "eager_redirect_cookie_setting"
+                    | "oauth_configuration"
                     | "path_cookie_attribute"
                     | "same_site_cookie_attribute"
                     | "tags"
@@ -1551,4 +1564,332 @@ pub(super) fn access_application_desired_idps_rejects_empty_duplicate_and_non_uu
             "malformed identity-provider ID was accepted: {malformed}"
         );
     }
+}
+
+#[test]
+pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_config_absent() {
+    let mut live_result = access_application_live_result();
+    live_result.as_object_mut().unwrap().remove("oauth_configuration");
+    
+    let desired_oauth_config = json!({
+        "enabled": true,
+        "dynamic_client_registration": {
+            "enabled": true,
+            "allowed_uris": ["mlnavigator-remote://oauth/callback"]
+        }
+    });
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result.clone(),
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config})),
+        ..CallInput::default()
+    };
+    
+    let receipt = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    )
+    .expect("oauth plan")
+    .expect("receipt");
+    
+    let body = input.body.as_ref().expect("prepared body");
+    assert_eq!(
+        body.get("oauth_configuration"),
+        Some(&desired_oauth_config),
+        "oauth_configuration should be set to desired value"
+    );
+    assert_eq!(
+        body.get("allowed_idps"),
+        live_result.get("allowed_idps"),
+        "allowed_idps should be preserved from live state"
+    );
+    assert_eq!(
+        body.get("policies"),
+        Some(&json!([{
+            "id": "45e44306-0e2a-460a-94aa-34c21eefdb4a",
+            "precedence": 1
+        }])),
+        "policies should be normalized"
+    );
+    assert_eq!(
+        body.get("domain"),
+        live_result.get("domain"),
+        "domain should be preserved"
+    );
+    assert!(body.get("id").is_none(), "id should be omitted");
+    assert!(body.get("aud").is_none(), "aud should be omitted");
+}
+
+#[test]
+pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_config_present() {
+    let mut live_result = access_application_live_result();
+    live_result.as_object_mut().unwrap().insert(
+        "oauth_configuration".to_owned(),
+        json!({
+            "enabled": false
+        }),
+    );
+    
+    let desired_oauth_config = json!({
+        "enabled": true,
+        "dynamic_client_registration": {
+            "enabled": true,
+            "allowed_uris": ["mlnavigator-remote://oauth/callback"]
+        }
+    });
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result.clone(),
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config})),
+        ..CallInput::default()
+    };
+    
+    let receipt = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    )
+    .expect("oauth plan")
+    .expect("receipt");
+    
+    let body = input.body.as_ref().expect("prepared body");
+    assert_eq!(
+        body.get("oauth_configuration"),
+        Some(&desired_oauth_config),
+        "oauth_configuration should be updated"
+    );
+    assert_eq!(
+        body.get("allowed_idps"),
+        live_result.get("allowed_idps"),
+        "allowed_idps should be preserved from live state"
+    );
+}
+
+#[test]
+pub(super) fn access_application_oauth_only_body_rejects_no_mutation() {
+    let desired_oauth_config = json!({
+        "enabled": true
+    });
+    
+    let mut live_result = access_application_live_result();
+    live_result.as_object_mut().unwrap().insert(
+        "oauth_configuration".to_owned(),
+        desired_oauth_config.clone(),
+    );
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result,
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config})),
+        ..CallInput::default()
+    };
+    
+    let result = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    );
+    
+    assert!(
+        result.is_err(),
+        "should reject when oauth_configuration is already set to desired value"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("already has the exact requested OAuth configuration"),
+        "error message should mention no mutation needed"
+    );
+}
+
+#[test]
+pub(super) fn access_application_oauth_only_body_rejects_missing_allowed_idps() {
+    let mut live_result = access_application_live_result();
+    live_result.as_object_mut().unwrap().remove("allowed_idps");
+    
+    let desired_oauth_config = json!({
+        "enabled": true
+    });
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result,
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config})),
+        ..CallInput::default()
+    };
+    
+    let result = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    );
+    
+    assert!(
+        result.is_err(),
+        "should reject when allowed_idps is missing from live state"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("omitted restorable field allowed_idps"),
+        "error message should mention missing allowed_idps"
+    );
+}
+
+#[test]
+pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
+    let mut live_result = access_application_live_result();
+    live_result
+        .as_object_mut()
+        .unwrap()
+        .insert("allowed_idps".to_owned(), json!([]));
+    
+    let desired_oauth_config = json!({
+        "enabled": true
+    });
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result,
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config})),
+        ..CallInput::default()
+    };
+    
+    let result = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    );
+    
+    assert!(
+        result.is_err(),
+        "should reject when allowed_idps is empty"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("empty identity-provider allowlist"),
+        "error message should mention empty allowed_idps"
+    );
 }
