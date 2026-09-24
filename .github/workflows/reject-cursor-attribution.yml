@@ -1,0 +1,56 @@
+# Canonical template: fail CI when a PR carries Cursor / agent authorship.
+# Copy to .github/workflows/reject-cursor-attribution.yml
+# On repos with branch protection / rulesets, make this check required.
+# Private personal repos without GitHub Pro cannot require the check in settings;
+# the job still fails loudly so humans/bots must not merge green.
+name: reject-cursor-attribution
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  reject-cursor-attribution:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Reject Cursor author, committer, and trailers
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t commits < <(git rev-list --no-merges "${BASE}..${HEAD}")
+          if [ "${#commits[@]}" -eq 0 ]; then
+            echo "No non-merge commits in range; ok"
+            exit 0
+          fi
+          bad=0
+          for c in "${commits[@]}"; do
+            author_name=$(git show -s --format='%an' "$c")
+            author_email=$(git show -s --format='%ae' "$c")
+            committer_name=$(git show -s --format='%cn' "$c")
+            committer_email=$(git show -s --format='%ce' "$c")
+            subject=$(git show -s --format='%s' "$c")
+            body=$(git show -s --format='%b' "$c")
+            blob=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+              "$author_name" "$author_email" "$committer_name" "$committer_email" \
+              "$subject" "$body" | tr '[:upper:]' '[:lower:]')
+            if printf '%s' "$blob" | grep -Eiq \
+              'cursoragent@cursor\.com|@cursor\.com|co-authored-by:[[:space:]]*cursor|signed-off-by:[[:space:]]*cursor|made[- ]with[[:space:]:=.\-\[(]*cursor|generated[[:space:]]+with.*cursor|^cursor[[:space:]]*$|^cursor agent$|cursorbot'; then
+              echo "FORBIDDEN Cursor attribution in $c" >&2
+              git show -s --format='  author: %an <%ae>%n  committer: %cn <%ce>%n  subject: %s' "$c" >&2
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "Rejecting PR: Cursor authorship must not land on GitHub." >&2
+            echo "Recreate commits locally as your human identity without Cursor trailers." >&2
+            exit 1
+          fi
+          echo "OK: no Cursor attribution in ${#commits[@]} commit(s)"
