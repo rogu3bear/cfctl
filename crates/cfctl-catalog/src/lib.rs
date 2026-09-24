@@ -17709,6 +17709,8 @@ const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-self-hosted-login-methods";
 const ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID: &str =
     "access-applications-update-owned-self-hosted-whole-host";
+const ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID: &str =
+    "access-applications-update-owned-self-hosted-managed-oauth";
 const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-app-launcher-login-methods";
 const ACCESS_APP_UPDATE_CAPABILITY_ID: &str = "access-applications-update-an-access-application";
@@ -17879,6 +17881,76 @@ pub fn access_application_owned_whole_host_schema() -> Value {
             "maxItems":1,
             "uniqueItems":true,
             "items":{"type":"string","format":"hostname","minLength":1,"maxLength":253}
+        }),
+    );
+    schema
+}
+
+/// Complete provider body for Access application Managed OAuth configuration.
+/// Preserves all non-oauth application fields via snapshot/read-modify pattern.
+#[must_use]
+pub fn access_application_managed_oauth_schema() -> Value {
+    let mut schema = access_application_login_methods_materialized_schema();
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return Value::Null;
+    };
+    properties.insert(
+        "oauth_configuration".to_owned(),
+        serde_json::json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["enabled"],
+            "properties":{
+                "enabled":{
+                    "type":"boolean",
+                    "description":"Whether Managed OAuth is enabled for this application"
+                },
+                "dynamic_client_registration":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "properties":{
+                        "enabled":{
+                            "type":"boolean",
+                            "description":"Whether dynamic client registration (RFC 7591) is enabled"
+                        },
+                        "allow_any_on_localhost":{
+                            "type":"boolean",
+                            "description":"Allow redirect URIs on localhost"
+                        },
+                        "allow_any_on_loopback":{
+                            "type":"boolean",
+                            "description":"Allow redirect URIs on 127.0.0.0/8"
+                        },
+                        "allowed_uris":{
+                            "type":"array",
+                            "uniqueItems":true,
+                            "items":{
+                                "type":"string",
+                                "minLength":1,
+                                "maxLength":2048,
+                                "description":"HTTPS URIs or custom-scheme URIs (e.g. mlnavigator-remote://oauth/callback). Paths may end in /* to match sub-paths"
+                            },
+                            "description":"Allowed redirect URIs for dynamically registered clients"
+                        }
+                    }
+                },
+                "grant":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "properties":{
+                        "access_token_lifetime":{
+                            "type":"string",
+                            "pattern":"^[0-9]+(ns|us|µs|ms|s|m|h)$",
+                            "description":"Access token lifetime in Go duration format (e.g. 5m, 24h)"
+                        },
+                        "session_duration":{
+                            "type":"string",
+                            "pattern":"^[0-9]+(ns|us|µs|ms|s|m|h)$",
+                            "description":"OAuth session duration in Go duration format (e.g. 24h)"
+                        }
+                    }
+                }
+            }
         }),
     );
     schema
@@ -19575,6 +19647,23 @@ fn finalize_access_application_login_methods_contract(
                 "configure exact self hosted Access application",
             ],
             request_schema: access_application_owned_whole_host_schema(),
+        },
+    );
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+            app_type: "self_hosted",
+            title: "Enable Access Managed OAuth on owned self-hosted application",
+            description: "Enables Managed OAuth (RFC 8414, RFC 7591 dynamic client registration) on one exact owned self-hosted Access application. cfctl reads the live application, preserves all non-oauth fields, and allows setting oauth_configuration including dynamic_client_registration.allowed_uris for custom-scheme redirects (e.g. mlnavigator-remote://oauth/callback). Verified by exact app_id readback.",
+            aliases: &[
+                "enable Managed OAuth for MLNavigator Remote",
+                "configure Access application OAuth DCR",
+                "set Access application allowed redirect URIs",
+            ],
+            request_schema: access_application_managed_oauth_schema(),
         },
     );
     insert_access_application_login_methods_contract(
