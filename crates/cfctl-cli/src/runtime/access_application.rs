@@ -8,6 +8,7 @@ use super::plan_secret::ACCESS_APP_LAUNCHER_MUTABLE_FIELDS;
 use super::plan_secret::ACCESS_APP_LAUNCHER_READ_ONLY_FIELDS;
 use super::plan_secret::ACCESS_APP_LAUNCHER_REQUIRED_FIELDS;
 use super::plan_secret::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID;
+use super::plan_secret::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID;
 use super::plan_secret::ACCESS_APP_MUTABLE_FIELDS;
 use super::plan_secret::ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID;
 use super::plan_secret::ACCESS_APP_READ_CAPABILITY_ID;
@@ -36,14 +37,14 @@ pub(super) fn access_application_login_methods_variant(
     capability_id: &str,
 ) -> Option<AccessApplicationLoginMethodsVariant> {
     match capability_id {
-        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID | ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID => {
-            Some(AccessApplicationLoginMethodsVariant {
-                app_type: "self_hosted",
-                mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
-                required_fields: &ACCESS_APP_REQUIRED_FIELDS,
-                read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
-            })
-        }
+        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID
+        | ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID
+        | ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
+            app_type: "self_hosted",
+            mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
+            required_fields: &ACCESS_APP_REQUIRED_FIELDS,
+            read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
+        }),
         ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID => {
             Some(AccessApplicationLoginMethodsVariant {
                 app_type: "app_launcher",
@@ -431,11 +432,9 @@ pub(super) async fn prepare_access_application_login_methods_plan_input(
                 .to_owned(),
         )
     })?;
-    let body_field_count = input
-        .body
-        .as_ref()
-        .and_then(Value::as_object)
-        .map_or(0, serde_json::Map::len);
+    let body_obj = input.body.as_ref().and_then(Value::as_object);
+    let body_field_count = body_obj.map_or(0, serde_json::Map::len);
+    
     if body_field_count != 1 {
         preflight_call_input(capability, input, None)?;
         return read_live_same_path_prior_state(
@@ -444,6 +443,41 @@ pub(super) async fn prepare_access_application_login_methods_plan_input(
         .await
         .map(Some);
     }
+    
+    let single_field_key = body_obj.and_then(|obj| obj.keys().next()).map(String::as_str);
+    match single_field_key {
+        Some("allowed_idps") => {
+            prepare_access_application_idps_only_input(
+                store, catalog, capability, input, account_id, credential, variant,
+            )
+            .await
+        }
+        Some("oauth_configuration") => {
+            prepare_access_application_oauth_only_input(
+                store, catalog, capability, input, account_id, credential, variant,
+            )
+            .await
+        }
+        _ => {
+            preflight_call_input(capability, input, None)?;
+            read_live_same_path_prior_state(
+                store, catalog, capability, input, account_id, credential,
+            )
+            .await
+            .map(Some)
+        }
+    }
+}
+
+async fn prepare_access_application_idps_only_input(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &mut CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+    variant: AccessApplicationLoginMethodsVariant,
+) -> Result<Option<(Value, EvidenceV1)>> {
     let desired_idps = access_application_desired_idps(input)?;
     input
         .selectors
@@ -489,6 +523,229 @@ pub(super) async fn prepare_access_application_login_methods_plan_input(
     let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok(Some((receipt, evidence)))
 }
+
+async fn prepare_access_application_oauth_only_input(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &mut CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+    variant: AccessApplicationLoginMethodsVariant,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if capability.id != ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID {
+        return Err(CliError::Input(
+            "OAuth-only body is only supported for the Managed OAuth capability".to_owned(),
+        ));
+    }
+    
+    let desired_oauth_config = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("oauth_configuration"))
+        .ok_or_else(|| {
+            CliError::Input("OAuth-only input must contain `oauth_configuration`".to_owned())
+        })?
+        .clone();
+    
+    input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access Managed OAuth plan requires an exact `app_id` selector".to_owned(),
+            )
+        })?;
+    
+    let source = catalog
+        .get(ACCESS_APP_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ACCESS_APP_READ_CAPABILITY_ID))?;
+    if !access_application_read_contract_supported(source) {
+        return Err(CliError::Input(
+            "Access application state source drifted from the governed exact-app read".to_owned(),
+        ));
+    }
+    
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    
+    let Some(receipt) = finalize_access_application_oauth_plan_input(
+        capability,
+        input,
+        &desired_oauth_config,
+        variant,
+        account_id,
+        &response,
+    )?
+    else {
+        return Ok(None);
+    };
+    let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(Some((receipt, evidence)))
+}
+
+pub(super) fn finalize_access_application_oauth_plan_input(
+    capability: &mut CapabilityV1,
+    input: &mut CallInput,
+    desired_oauth_config: &Value,
+    variant: AccessApplicationLoginMethodsVariant,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Option<Value>> {
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Access application state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access Managed OAuth plan requires an exact `app_id` selector".to_owned(),
+            )
+        })?
+        .to_owned();
+    if response.result.get("id").and_then(Value::as_str) != Some(app_id.as_str())
+        || response.result.get("type").and_then(Value::as_str) != Some(variant.app_type)
+    {
+        return Err(CliError::Input(format!(
+            "Access application state read returned a different app or a non-{} app; the mutation boundary was not crossed",
+            variant.app_type
+        )));
+    }
+    
+    let current_oauth_config = response.result.get("oauth_configuration");
+    if current_oauth_config == Some(desired_oauth_config) {
+        return Err(CliError::Input(
+            "Access application already has the exact requested OAuth configuration; no mutation plan was created"
+                .to_owned(),
+        ));
+    }
+    
+    let current_idps = response
+        .result
+        .get("allowed_idps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input(
+                "live Access application omitted restorable field allowed_idps; snapshot merge for OAuth-only body requires this field"
+                    .to_owned(),
+            )
+        })?;
+    
+    if current_idps.is_empty() {
+        return Err(CliError::Input(
+            "live Access application has an empty identity-provider allowlist; snapshot merge for OAuth-only body requires non-empty allowed_idps"
+                .to_owned(),
+        ));
+    }
+    
+    let mut mutable_body = access_application_oauth_mutable_body(
+        &response.result,
+        desired_oauth_config,
+        variant,
+    )?;
+    
+    if let Some(body_obj) = mutable_body.as_object_mut() {
+        body_obj.insert("allowed_idps".to_owned(), Value::Array(current_idps.clone()));
+    }
+    
+    input.body = Some(mutable_body);
+    
+    if variant.app_type == "self_hosted" {
+        capability.request_schema =
+            Some(cfctl_catalog::access_application_managed_oauth_schema());
+    }
+    preflight_call_input(capability, input, None)?;
+    
+    apply_same_path_prior_state_response(capability, input, account_id, response).map(Some)
+}
+
+fn access_application_oauth_mutable_body(
+    result: &Value,
+    desired_oauth_config: &Value,
+    variant: AccessApplicationLoginMethodsVariant,
+) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "live Access application read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let known_fields = variant
+        .mutable_fields
+        .iter()
+        .chain(variant.read_only_fields.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let unknown_fields = result
+        .keys()
+        .filter(|field| !known_fields.contains(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "live Access application contains unclassified field(s) {}; the preservation-safe mutation boundary was not crossed",
+            unknown_fields.join(",")
+        )));
+    }
+    if variant.app_type == "self_hosted" {
+        let (Some(destinations), Some(self_hosted_domains)) = (
+            result.get("destinations").and_then(Value::as_array),
+            result.get("self_hosted_domains").and_then(Value::as_array),
+        ) else {
+            return Err(CliError::Input(
+                "live self-hosted Access application has no populated destination representation; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        };
+        if destinations.is_empty() && self_hosted_domains.is_empty() {
+            return Err(CliError::Input(
+                "live self-hosted Access application has no populated destination representation; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+    }
+    let mut body = Map::new();
+    for &field in variant.mutable_fields {
+        if field == "oauth_configuration" {
+            body.insert(field.to_owned(), desired_oauth_config.clone());
+            continue;
+        }
+        
+        let Some(value) = result.get(field).cloned() else {
+            if variant.required_fields.contains(&field) && field != "allowed_idps" {
+                return Err(CliError::Input(format!(
+                    "live Access application omitted required mutable field `{field}`; the mutation boundary was not crossed"
+                )));
+            }
+            continue;
+        };
+        let value = match field {
+            "policies" => normalize_access_application_policies(&value)?,
+            _ => value,
+        };
+        body.insert(field.to_owned(), value);
+    }
+    Ok(Value::Object(body))
+}
+
 
 pub(super) fn finalize_access_application_login_methods_plan_input(
     capability: &mut CapabilityV1,

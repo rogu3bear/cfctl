@@ -67,6 +67,8 @@ pub(super) const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-self-hosted-login-methods";
 pub(super) const ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID: &str =
     "access-applications-update-owned-self-hosted-whole-host";
+pub(super) const ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID: &str =
+    "access-applications-update-owned-self-hosted-managed-oauth";
 pub(super) const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-app-launcher-login-methods";
 pub(super) const ACCESS_APP_LIST_CAPABILITY_ID: &str =
@@ -118,7 +120,7 @@ pub(super) const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 pub(super) const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str =
     "zone-subscription-zone-subscription-details";
 
-pub(super) const ACCESS_APP_MUTABLE_FIELDS: [&str; 17] = [
+pub(super) const ACCESS_APP_MUTABLE_FIELDS: [&str; 18] = [
     "allowed_idps",
     "app_launcher_visible",
     "auto_redirect_to_identity",
@@ -128,6 +130,7 @@ pub(super) const ACCESS_APP_MUTABLE_FIELDS: [&str; 17] = [
     "enable_binding_cookie",
     "http_only_cookie_attribute",
     "name",
+    "oauth_configuration",
     "options_preflight_bypass",
     "path_cookie_attribute",
     "policies",
