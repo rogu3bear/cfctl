@@ -34,10 +34,13 @@ For every request:
      no longer active (pending, expired, or revoked)
    - `CFCTL_PROFILE_INSUFFICIENT_PERMISSIONS`: managed token lacks required
      permission groups for the capability
-   When fitness checks fail, follow `error.next_step` (typically
-   `cfctl auth use` to select a suitable profile, or
-   `cfctl keys policy create` for broader permissions). Fitness fails open when
-   local inventory is incomplete (imported tokens, missing permission cache).
+   The qualified protected Turnstile widget read accepts any one of its four
+   documented permission groups. Other capability requirements retain the
+   conservative all-of check, including authored DynamicApi composites. When
+   fitness checks fail, follow
+   `error.next_step` and select a suitable least-privilege profile; do not grant
+   every alternative. Fitness defers to live enforcement when local inventory
+   is incomplete (imported tokens, missing cache, or unmapped permission ids).
 8. Use `cfctl call <capability-id> ... --json` for a live read or to create a
    hash-bound plan.
    Read the full `ResultEnvelopeV2`: **live success requires `ok: true` AND
