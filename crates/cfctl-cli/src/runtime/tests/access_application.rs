@@ -1606,7 +1606,7 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
         ..CallInput::default()
     };
     
-    let receipt = super::finalize_access_application_oauth_plan_input(
+    let _receipt = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
         &desired_oauth_config,
@@ -1690,7 +1690,7 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
         ..CallInput::default()
     };
     
-    let receipt = super::finalize_access_application_oauth_plan_input(
+    let _receipt = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
         &desired_oauth_config,
