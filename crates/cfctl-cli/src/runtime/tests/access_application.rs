@@ -2028,3 +2028,202 @@ pub(super) fn call_validation_rejects_invalid_oauth_only_shapes() {
         "error should mention oauth_configuration must be an object"
     );
 }
+
+#[test]
+pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_configuration() {
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let desired_oauth_config = json!({
+        "enabled": true,
+        "dynamic_client_registration": {
+            "enabled": true,
+            "allowed_uris": ["mlnavigator-remote://oauth/callback"]
+        }
+    });
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let mut live_result = access_application_live_result();
+    live_result.as_object_mut().unwrap().remove("oauth_configuration");
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result,
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config.clone()})),
+        ..CallInput::default()
+    };
+    
+    let receipt = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    )
+    .expect("oauth plan")
+    .expect("receipt");
+    
+    let prior_state = receipt.get("prior_state").expect("prior_state");
+    assert!(
+        prior_state.get("oauth_configuration").is_none(),
+        "prior_state should not have oauth_configuration since it was absent from live"
+    );
+    
+    assert!(
+        input.body.as_ref().unwrap().get("oauth_configuration").is_some(),
+        "input body should have oauth_configuration"
+    );
+    
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "catalog-a",
+        capability,
+        json!({
+            "selectors": input.selectors,
+            "live_preconditions": {"same_path_prior_state": receipt}
+        }),
+    )
+    .expect("plan draft");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    
+    let restored = super::validate_same_path_prior_state_receipt(
+        &plan,
+        plan.targets
+            .pointer("/live_preconditions/same_path_prior_state")
+            .expect("receipt"),
+    )
+    .expect("validation should pass when oauth_configuration is being introduced");
+    
+    assert!(
+        restored.get("oauth_configuration").is_none(),
+        "restored prior state should not have oauth_configuration"
+    );
+    assert!(
+        restored.get("allowed_idps").is_some(),
+        "restored prior state should have allowed_idps"
+    );
+}
+
+#[test]
+pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_both() {
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    
+    let desired_oauth_config = json!({
+        "enabled": true,
+        "dynamic_client_registration": {
+            "enabled": true,
+            "allowed_uris": ["mlnavigator-remote://oauth/callback"]
+        }
+    });
+    
+    let variant = super::access_application_login_methods_variant(
+        super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
+    )
+    .expect("managed oauth variant");
+    
+    let mut live_result = access_application_live_result();
+    live_result.as_object_mut().unwrap().insert(
+        "oauth_configuration".to_owned(),
+        json!({
+            "enabled": false
+        }),
+    );
+    
+    let response = CloudflareResponseV1 {
+        success: true,
+        status: 200,
+        result: live_result,
+        errors: vec![],
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    
+    let mut input = CallInput {
+        selectors: json!({
+            "account_id": "account-a",
+            "app_id": "82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+        }),
+        body: Some(json!({"oauth_configuration": desired_oauth_config.clone()})),
+        ..CallInput::default()
+    };
+    
+    let receipt = super::finalize_access_application_oauth_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_oauth_config,
+        variant,
+        "account-a",
+        &response,
+    )
+    .expect("oauth plan")
+    .expect("receipt");
+    
+    let prior_state = receipt.get("prior_state").expect("prior_state");
+    assert!(
+        prior_state.get("oauth_configuration").is_some(),
+        "prior_state should have oauth_configuration when it was present in live"
+    );
+    
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "catalog-a",
+        capability,
+        json!({
+            "selectors": input.selectors.clone(),
+            "live_preconditions": {"same_path_prior_state": receipt.clone()}
+        }),
+    )
+    .expect("plan draft");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    
+    let restored = super::validate_same_path_prior_state_receipt(
+        &plan,
+        plan.targets
+            .pointer("/live_preconditions/same_path_prior_state")
+            .expect("receipt"),
+    )
+    .expect("validation should pass when oauth_configuration is present in both");
+    
+    assert!(
+        restored.get("oauth_configuration").is_some(),
+        "restored prior state should have oauth_configuration"
+    );
+    
+    let mut tampered_receipt = receipt.clone();
+    if let Some(prior) = tampered_receipt.get_mut("prior_state").and_then(Value::as_object_mut) {
+        prior.remove("allowed_idps");
+    }
+    
+    let error = super::validate_same_path_prior_state_receipt(
+        &plan,
+        &tampered_receipt,
+    )
+    .expect_err("validation should fail when required field is missing");
+    
+    assert!(
+        error.to_string().contains("invalid source, target, selector, or field set"),
+        "error should indicate field set mismatch: {}",
+        error
+    );
+}
