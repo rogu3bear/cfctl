@@ -761,6 +761,56 @@ blind retry. Deleting an Access application removes protection and can expose a
 routed host, so a separately reviewed compensation plan must keep the host dark
 or independently protected.
 
+### Access Managed OAuth
+
+Enable Managed OAuth (RFC 8414 OAuth authorization server metadata, RFC 7591
+dynamic client registration) on an owned self-hosted Access application using
+the specialized `access-applications-update-owned-self-hosted-managed-oauth`
+capability. This capability preserves all non-oauth application fields via
+snapshot read-modify pattern and allows setting `oauth_configuration` including
+dynamic client registration with custom-scheme redirect URIs:
+
+```bash
+cfctl call access-applications-update-owned-self-hosted-managed-oauth \
+  --selector account_id=<account-id> \
+  --selector app_id=<app-id> \
+  --body-json '{
+    "oauth_configuration": {
+      "enabled": true,
+      "dynamic_client_registration": {
+        "enabled": true,
+        "allow_any_on_localhost": true,
+        "allow_any_on_loopback": true,
+        "allowed_uris": [
+          "mlnavigator-remote://oauth/callback",
+          "https://example.com/oauth/callback"
+        ]
+      },
+      "grant": {
+        "access_token_lifetime": "5m",
+        "session_duration": "24h"
+      }
+    }
+  }' --json
+```
+
+The capability reads the exact application, preserves `allowed_idps`, policies,
+domains, cookie settings, launcher visibility, redirect behavior, and all other
+non-oauth fields, then verifies the complete `oauth_configuration` object after
+apply. Custom-scheme URIs such as `mlnavigator-remote://oauth/callback` are
+accepted for desktop and CLI applications; HTTPS URIs may end in `/*` to match
+sub-paths. Restoration is a separate snapshot-bound update plan. When Managed
+OAuth is enabled, non-browser clients receive a `401` response with a
+`WWW-Authenticate` header pointing to Access's OAuth discovery endpoints instead
+of a `302` redirect to the login page.
+
+After enabling Managed OAuth with dynamic client registration, public clients
+(RFC 7636 PKCE) can dynamically register via the standard RFC 7591 endpoint at
+`https://<auth-server>/.well-known/oauth-authorization-server`. The `client_id`
+is returned by the registration endpoint and does not appear in the Access
+application GET response. To verify dynamic client registration is working,
+attempt registration with a client that supports RFC 7591 and RFC 7636.
+
 Generic polymorphic Access policy create/update also remain blocked. The
 specialized operator-group capabilities accept only `allow`, exactly one
 `include.group.id`, empty `exclude` and `require`, and the closed optional field

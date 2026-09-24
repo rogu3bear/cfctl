@@ -7096,6 +7096,136 @@ fn owned_whole_host_access_application_update_is_closed_and_governed() {
 }
 
 #[test]
+fn access_application_managed_oauth_update_is_closed_and_governed() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["oauth_configuration"] = json!({
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "dynamic_client_registration": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "allow_any_on_localhost": {"type": "boolean"},
+                        "allow_any_on_loopback": {"type": "boolean"},
+                        "allowed_uris": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "grant": {
+                    "type": "object",
+                    "properties": {
+                        "access_token_lifetime": {"type": "string"},
+                        "session_duration": {"type": "string"}
+                    }
+                }
+            }
+        });
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]["oauth_configuration"] =
+        fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"]["properties"]["oauth_configuration"].clone();
+
+    let snapshot = normalize_openapi(&fixture).expect("Access Managed OAuth catalog");
+    let update = snapshot
+        .get("access-applications-update-owned-self-hosted-managed-oauth")
+        .expect("derived Managed OAuth update");
+
+    assert_eq!(
+        update.adapter_status,
+        AdapterStatus::DynamicApi,
+        "gaps: {:?} blocked: {:?}",
+        update.mutation_contract_gaps(),
+        update.blocked_reason
+    );
+    assert_eq!(update.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(update.effect, EffectClass::IdentityOrOwnership);
+    assert!(update.cost.known);
+    assert_eq!(
+        update.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("additionalProperties"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "must reject unclassified fields"
+    );
+    assert!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/oauth_configuration/required"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| arr.contains(&json!("enabled"))),
+        "oauth_configuration.enabled is required"
+    );
+    assert!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("exact app readback")
+            .verified_response_fields
+            .contains(&"oauth_configuration".to_owned()),
+        "oauth_configuration must be verified after apply"
+    );
+    assert!(update.mutation_contract_gaps().is_empty());
+
+    let generic = snapshot
+        .get("access-applications-update-an-access-application")
+        .expect("generic update remains present");
+    assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+}
+
+#[test]
+fn access_application_managed_oauth_rejects_wrong_shape() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["oauth_configuration"] = json!({
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"}
+            }
+        });
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]["oauth_configuration"] =
+        fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"]["properties"]["oauth_configuration"].clone();
+
+    let snapshot = normalize_openapi(&fixture).expect("catalog with oauth_configuration");
+    let update = snapshot
+        .get("access-applications-update-owned-self-hosted-managed-oauth")
+        .expect("derived Managed OAuth update");
+
+    assert_eq!(
+        update.adapter_status,
+        AdapterStatus::DynamicApi,
+        "should be unblocked even with minimal schema"
+    );
+
+    let schema = cfctl_catalog::access_application_managed_oauth_schema();
+    assert!(
+        schema
+            .pointer("/properties/oauth_configuration/properties/dynamic_client_registration")
+            .is_some(),
+        "schema must include dynamic_client_registration"
+    );
+    assert!(
+        schema
+            .pointer("/properties/oauth_configuration/properties/grant")
+            .is_some(),
+        "schema must include grant"
+    );
+}
+
+#[test]
 fn access_app_launcher_login_methods_update_is_full_snapshot_governed() {
     let snapshot = normalize_openapi(&access_application_login_methods_fixture())
         .expect("Access login-method catalog");
