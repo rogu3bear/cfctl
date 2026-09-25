@@ -1141,6 +1141,11 @@ attach operation, then exposes the governed lifecycle as the exact all-of
 permission set `Workers Scripts Write` plus `DNS Read`. The latter authorizes
 the mandatory exact-host DNS conflict read; `DNS Write` is neither requested
 nor implied by attachment.
+Valid exact-host TXT records are preserved and hash-bound to the plan in a
+deterministic identity order; execution rereads them and rejects any drift.
+Other DNS record types and malformed records remain blocked. This follows
+Cloudflare's [custom-domain coexistence contract](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
+without displacing routing records. Older live-state receipts require replanning.
 The apply response must return a domain ID, and verification reads that exact
 ID back and matches all three planned fields. Detachment is never automatic:
 compensation is a separately reviewed and explicitly approved

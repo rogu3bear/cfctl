@@ -7,6 +7,7 @@ use cfctl_core::{
 };
 use cfctl_storage::StateStore;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 use super::{
     cloudflare_api::BASE_URL as API_BASE_URL,
@@ -219,6 +220,48 @@ fn require_success<'a>(label: &str, response: &'a CloudflareResponseV1) -> Resul
     }
 }
 
+fn preserved_dns_hash(records: &[Value], hostname: &str) -> Result<String> {
+    let mut ordered = BTreeMap::new();
+    for record in records {
+        let id = record.get("id").and_then(Value::as_str);
+        // TXT does not route HTTP traffic. All other types remain blocked until
+        // their coexistence contract is explicitly supported.
+        let valid = id.is_some_and(|value| {
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) && record.get("name").and_then(Value::as_str) == Some(hostname)
+            && record.get("type").and_then(Value::as_str) == Some("TXT")
+            && record
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && record
+                .get("ttl")
+                .and_then(Value::as_u64)
+                .is_some_and(|ttl| ttl > 0)
+            && record.get("proxied").and_then(Value::as_bool) == Some(false);
+        if !valid {
+            return Err(CliError::Input(
+                "Worker custom-domain DNS record conflicts or has an unsupported type, hostname, or shape; only valid exact-host TXT records may be preserved; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+        if ordered.insert(id, record).is_some() {
+            return Err(CliError::Input(
+                "Worker custom-domain DNS record list repeats an identity; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+    }
+    // Bind complete records without exposing TXT contents in the plan. Sorting
+    // by identity makes a harmless provider response reorder deterministic.
+    Ok(hash_value(&json!(
+        ordered.into_values().collect::<Vec<_>>()
+    ))?)
+}
+
 pub(super) fn apply_state_responses(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -282,16 +325,10 @@ pub(super) fn apply_state_responses(
                     .to_owned(),
             )
         })?;
-    if !dns_records.is_empty() {
-        return Err(CliError::Input(format!(
-            "hostname `{}` already has {} DNS record(s); the mutation boundary was not crossed",
-            target.hostname,
-            dns_records.len()
-        )));
-    }
+    let dns_records_hash = preserved_dns_hash(dns_records, &target.hostname)?;
 
     Ok(json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "target_capability_id": ATTACH_CAPABILITY_ID,
         "target_method": "PUT",
         "target_path": ATTACH_PATH,
@@ -311,7 +348,8 @@ pub(super) fn apply_state_responses(
         "existing_custom_domain_count": 0,
         "dns_source_capability_id": DNS_LIST_CAPABILITY_ID,
         "dns_source_path": DNS_LIST_PATH,
-        "existing_dns_record_count": 0,
+        "existing_dns_record_count": dns_records.len(),
+        "existing_dns_records_hash": dns_records_hash,
     }))
 }
 
@@ -442,8 +480,8 @@ fn valid_hash(value: &str) -> bool {
 fn validate_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let target = target(&plan.capability, &input, &plan.account_id)?;
-    let exact = receipt.as_object().is_some_and(|object| object.len() == 21)
-        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 22)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(2)
         && receipt.get("target_capability_id").and_then(Value::as_str)
             == Some(ATTACH_CAPABILITY_ID)
         && receipt.get("target_method").and_then(Value::as_str) == Some("PUT")
@@ -488,7 +526,11 @@ fn validate_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
         && receipt
             .get("existing_dns_record_count")
             .and_then(Value::as_u64)
-            == Some(0);
+            .is_some()
+        && receipt
+            .get("existing_dns_records_hash")
+            .and_then(Value::as_str)
+            .is_some_and(valid_hash);
     if exact {
         Ok(())
     } else {
@@ -614,6 +656,105 @@ mod tests {
         }
     }
 
+    fn txt_record() -> serde_json::Value {
+        json!({
+            "id":"a3200792885a5d9700aa39f25df7e758",
+            "name":"cfctl.com",
+            "type":"TXT",
+            "content":"v=spf1 include:_spf.mx.cloudflare.net ~all",
+            "ttl":1,
+            "proxied":false,
+        })
+    }
+
+    fn dns_receipt(records: serde_json::Value) -> super::Result<serde_json::Value> {
+        apply_state_responses(
+            &attach_capability(),
+            &CallInput {
+                selectors: json!({"account_id":"account-a"}),
+                body: Some(json!({
+                    "hostname":"cfctl.com",
+                    "service":"cfctl-site",
+                    "zone_id":"0123456789abcdef0123456789abcdef",
+                })),
+                ..CallInput::default()
+            },
+            "account-a",
+            &response(json!({
+                "id":"0123456789abcdef0123456789abcdef",
+                "status":"active",
+                "account":{"id":"account-a"},
+            })),
+            &response(json!({"bindings":[]})),
+            &response(json!([])),
+            &response(records),
+        )
+    }
+
+    #[test]
+    fn custom_domain_preserves_txt_and_pins_identity_content_and_order() {
+        let first = txt_record();
+        let mut second = first.clone();
+        second["id"] = json!("b3200792885a5d9700aa39f25df7e758");
+        second["content"] = json!("site-verification=example");
+        let receipt = dns_receipt(json!([first, second])).expect("TXT records coexist");
+        assert_eq!(receipt["existing_dns_record_count"], 2);
+        assert!(!receipt.to_string().contains("site-verification"));
+        assert_eq!(
+            receipt,
+            dns_receipt(json!([second, first])).expect("provider reorder is harmless")
+        );
+        for (field, changed) in [
+            ("id", json!("c3200792885a5d9700aa39f25df7e758")),
+            ("content", json!("v=spf1 -all")),
+            ("ttl", json!(300)),
+            ("comment", json!("changed metadata")),
+        ] {
+            let mut drifted = first.clone();
+            drifted[field] = changed;
+            let current = dns_receipt(json!([drifted, second])).expect("valid changed TXT");
+            assert_ne!(
+                hash_value(&receipt).expect("pinned"),
+                hash_value(&current).expect("current")
+            );
+        }
+        assert_ne!(
+            receipt,
+            dns_receipt(json!([first])).expect("record removal")
+        );
+    }
+
+    #[test]
+    fn custom_domain_rejects_routing_unknown_malformed_and_duplicate_dns() {
+        for kind in [
+            "A", "AAAA", "CNAME", "HTTPS", "SVCB", "NS", "MX", "CAA", "UNKNOWN", "txt",
+        ] {
+            let mut record = txt_record();
+            record["type"] = json!(kind);
+            dns_receipt(json!([record])).expect_err("only supported non-routing types pass");
+        }
+        for (field, value) in [
+            ("id", json!("bad")),
+            ("name", json!("other.example")),
+            ("content", json!(null)),
+            ("ttl", json!(0)),
+            ("ttl", json!("1")),
+            ("proxied", json!(true)),
+        ] {
+            let mut record = txt_record();
+            record[field] = value;
+            dns_receipt(json!([record])).expect_err("invalid record must fail closed");
+        }
+        for field in ["id", "name", "type", "content", "ttl", "proxied"] {
+            let mut record = txt_record();
+            record.as_object_mut().expect("record").remove(field);
+            dns_receipt(json!([record])).expect_err("missing field must fail closed");
+        }
+        dns_receipt(json!([txt_record(), txt_record()])).expect_err("duplicate identity");
+        dns_receipt(json!([null])).expect_err("malformed record");
+        dns_receipt(json!({})).expect_err("non-array read");
+    }
+
     #[test]
     fn custom_domain_state_binds_active_zone_worker_and_exact_hostname_absence() {
         let capability = attach_capability();
@@ -643,7 +784,7 @@ mod tests {
         )
         .expect("bounded live-state receipt");
 
-        assert_eq!(receipt["schema_version"], 1);
+        assert_eq!(receipt["schema_version"], 2);
         assert_eq!(receipt["hostname"], "cfctl.com");
         assert_eq!(receipt["service"], "cfctl-site");
         assert_eq!(receipt["zone_status"], "active");
@@ -739,6 +880,31 @@ mod tests {
         }
     }
 
+    fn assert_txt_receipt_contract(mut plan: PlanV1) {
+        let txt_receipt = dns_receipt(json!([txt_record()])).expect("preserved TXT receipt");
+        plan.targets["live_preconditions"][WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION] =
+            txt_receipt.clone();
+        plan.precondition_hashes.insert(
+            WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION.to_owned(),
+            hash_value(&txt_receipt).expect("TXT receipt hash"),
+        );
+        required_precondition(&plan).expect("nonzero TXT count and complete hash are admitted");
+        for (field, value) in [
+            ("schema_version", json!(1)),
+            ("existing_dns_records_hash", json!("invalid")),
+            ("existing_dns_record_count", json!(-1)),
+        ] {
+            let mut malformed = txt_receipt.clone();
+            malformed[field] = value;
+            plan.precondition_hashes.insert(
+                WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION.to_owned(),
+                hash_value(&malformed).expect("malformed receipt hash"),
+            );
+            plan.targets["live_preconditions"][WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION] = malformed;
+            required_precondition(&plan).expect_err("rehashed malformed or legacy receipt fails");
+        }
+    }
+
     #[test]
     fn custom_domain_plan_routes_and_hash_binds_live_state() {
         let capability = attach_capability();
@@ -807,6 +973,7 @@ mod tests {
         validate_plan_preconditions(&store, &plan)
             .expect("the dedicated live reread, not workspace hashing, validates this receipt");
 
+        assert_txt_receipt_contract(plan.clone());
         let mut retargeted = receipt;
         retargeted["hostname"] = json!("other.example.com");
         plan.precondition_hashes.insert(
