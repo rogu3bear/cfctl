@@ -13,7 +13,7 @@ function htmlResponse(body = "Know what changes. Before it changes.", overrides 
   return new Response(body, {
     status: overrides.status ?? 200,
     headers: {
-      "cache-control": "no-cache, max-age=0, must-revalidate",
+      "cache-control": "no-cache, max-age=0, must-revalidate, no-transform",
       "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' 'wasm-unsafe-eval' 'nonce-AAAAAAAAAAAAAAAAAAAAAA';",
       "content-type": "text/html; charset=utf-8",
       "cross-origin-opener-policy": "same-origin",
@@ -121,7 +121,7 @@ describe("HTML response contract", () => {
   test("rejects callback values rendered into SSR HTML", async () => {
     const response = htmlResponse("OAuth callback · isolated route cfctl-live-verifier-code-do-not-log", {
       headers: {
-        "cache-control": "no-store, no-cache, max-age=0",
+        "cache-control": "no-store, no-cache, max-age=0, no-transform",
         "pragma": "no-cache",
         "referrer-policy": "no-referrer",
       },
@@ -172,7 +172,7 @@ test("live asset readback validates actual served bytes", async () => {
     const url = new URL(value);
     const route = ROUTES.find((route) => new URL(route.path, url.origin).pathname === url.pathname);
     if (route) return htmlResponse(route.marker, { status: route.status, headers: route.callback ? {
-      "cache-control": "no-store, no-cache, max-age=0", "pragma": "no-cache", "referrer-policy": "no-referrer",
+      "cache-control": "no-store, no-cache, max-age=0, no-transform", "pragma": "no-cache", "referrer-policy": "no-referrer",
     } : {} });
     if (url.pathname === "/asset-manifest.json") return Response.json(manifest, { headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" } });
     const kind = ["js", "wasm", "css"].find((kind) => manifest[kind] === url.pathname);
@@ -200,4 +200,28 @@ test("inline framework scripts must carry the exact response nonce or an admitte
   expect(() => verifyInlineScripts('<script>__INCOMPLETE_CHUNKS=[];</script>', sources)).toThrow("not admitted");
   expect(() => verifyInlineScripts('<script nonce="BBBBBBBBBBBBBBBBBBBBBB">__INCOMPLETE_CHUNKS=[];</script>', sources)).toThrow("not admitted");
   expect(() => verifyInlineScripts('<script type="application/json">{"data":true}</script>', sources)).not.toThrow();
+});
+
+
+describe("browser-injected analytics rejection", () => {
+  test("rejects external scripts even when their nonce is authorized", () => {
+    const sources = ["'nonce-AAAAAAAAAAAAAAAAAAAAAA'"];
+    for (const src of ["https://static.cloudflareinsights.com/beacon.min.js", "//example.invalid/beacon.js", "/cdn-cgi/beacon.js"]) {
+      expect(() => verifyInlineScripts(`<script type="module" src="${src}" nonce="AAAAAAAAAAAAAAAAAAAAAA"></script>`, sources)).toThrow("unexpected external script");
+    }
+  });
+
+  test("live HTML probes request browser responses that expose injected analytics", async () => {
+    let observed;
+    const stub = spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+      observed = new Headers(options.headers);
+      return htmlResponse('Know what changes. Before it changes.<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js" nonce="AAAAAAAAAAAAAAAAAAAAAA"></script>');
+    });
+    try {
+      await expect(verifyLiveSite("https://cfctl.example")).rejects.toThrow("unexpected external script");
+      expect(observed.get("accept")).toContain("text/html");
+      expect(observed.get("accept-encoding")).toContain("gzip");
+      expect(observed.get("user-agent")).toContain("Mozilla/5.0");
+    } finally { stub.mockRestore(); }
+  });
 });

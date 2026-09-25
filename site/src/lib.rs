@@ -64,12 +64,14 @@ fn apply_response_headers(
 
     let callback = request_path == "/oauth/callback" || request_path == "/oauth/callback/";
     let headers = response.headers_mut();
+    // Keep intermediaries from injecting analytics into HTML, including callbacks.
+    // Cloudflare Web Analytics honors the origin no-transform directive.
     headers.insert(
         CACHE_CONTROL,
         HeaderValue::from_static(if callback {
-            "no-store, no-cache, max-age=0"
+            "no-store, no-cache, max-age=0, no-transform"
         } else {
-            "no-cache, max-age=0, must-revalidate"
+            "no-cache, max-age=0, must-revalidate, no-transform"
         }),
     );
     if callback {
@@ -181,7 +183,7 @@ mod tests {
                 headers
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
-                Some("no-store, no-cache, max-age=0"),
+                Some("no-store, no-cache, max-age=0, no-transform"),
                 "{path}"
             );
             assert_eq!(
@@ -260,7 +262,7 @@ mod tests {
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("no-cache, max-age=0, must-revalidate")
+            Some("no-cache, max-age=0, must-revalidate, no-transform")
         );
     }
 }

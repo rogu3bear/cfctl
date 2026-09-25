@@ -4,6 +4,13 @@ import { createHash } from "node:crypto";
 import { verifyAssetBytes, verifyAssetManifest } from "./asset-integrity.mjs";
 export { verifyAssetManifest } from "./asset-integrity.mjs";
 
+// Match a browser HTML request so edge injection cannot hide behind a CLI response.
+const BROWSER_HTML_HEADERS = {
+  "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+  "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "accept-encoding": "gzip, deflate, br",
+};
+
 const CALLBACK_CODE_SENTINEL = "cfctl-live-verifier-code-do-not-log";
 const CALLBACK_STATE_SENTINEL = "cfctl-live-verifier-state-do-not-log";
 const REQUIRED_CSP = new Map([
@@ -115,11 +122,11 @@ export async function verifyHtmlResponse(response, route) {
   const cacheControl = header(response, "cache-control");
   const referrerPolicy = header(response, "referrer-policy");
   if (route.callback) {
-    requireCondition(cacheControl === "no-store, no-cache, max-age=0", "callback cache policy drifted");
+    requireCondition(cacheControl === "no-store, no-cache, max-age=0, no-transform", "callback cache policy drifted");
     requireCondition(referrerPolicy === "no-referrer", "callback referrer policy drifted");
     requireCondition(header(response, "pragma") === "no-cache", "callback pragma drifted");
   } else {
-    requireCondition(cacheControl === "no-cache, max-age=0, must-revalidate", `${route.path} cache policy drifted`);
+    requireCondition(cacheControl === "no-cache, max-age=0, must-revalidate, no-transform", `${route.path} cache policy drifted`);
     requireCondition(referrerPolicy === "strict-origin-when-cross-origin", `${route.path} referrer policy drifted`);
   }
 
@@ -136,7 +143,7 @@ export function verifyInlineScripts(html, sources) {
   for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
     const attributes = match[1];
     const attribute = (name) => attributes.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"))?.slice(1).find((value) => value !== undefined);
-    if (attribute("src") !== undefined) continue;
+    requireCondition(attribute("src") === undefined, "unexpected external script in analytics-free HTML");
     const type = (attribute("type") ?? "").toLowerCase();
     if (!["", "module", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript"].includes(type)) continue;
     const hash = createHash("sha256").update(match[2]).digest("base64");
@@ -145,11 +152,11 @@ export function verifyInlineScripts(html, sources) {
   }
 }
 
-async function fetchExact(url) {
+async function fetchExact(url, html = false) {
   return fetch(url, {
     redirect: "manual",
     signal: AbortSignal.timeout(15_000),
-    headers: { "user-agent": "cfctl-live-site-verifier/1" },
+    headers: html ? BROWSER_HTML_HEADERS : { "user-agent": "cfctl-live-site-verifier/1" },
   });
 }
 
@@ -158,7 +165,7 @@ export async function verifyLiveSite(originValue) {
   const routeResults = [];
   for (const route of ROUTES) {
     const url = new URL(route.path, origin);
-    const response = await fetchExact(url);
+    const response = await fetchExact(url, true);
     await verifyHtmlResponse(response, route);
     routeResults.push({ path: url.pathname, status: route.status });
   }
