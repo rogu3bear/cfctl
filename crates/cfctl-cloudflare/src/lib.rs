@@ -3,6 +3,7 @@ mod access_create;
 pub mod d1_read_inventory;
 mod d1_sql;
 mod oauth_scopes;
+mod pagination_diagnostic;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;
 mod custom_challenge_rule;
 pub mod pages_projects;
@@ -173,6 +174,10 @@ pub enum CloudflareError {
     PaginationLimit(u64),
     #[error("Cloudflare page pagination metadata is invalid or internally inconsistent")]
     PaginationMetadataInvalid,
+    #[error(
+        "Cloudflare page pagination metadata is invalid or internally inconsistent ({summary})"
+    )]
+    PaginationMetadataDiagnostic { summary: String },
     #[error("Cloudflare queue-consumer single-page metadata failed the body-free `{reason}` check")]
     QueueConsumersSinglePageMetadataInvalid { reason: &'static str },
     #[error(
@@ -263,6 +268,7 @@ impl CloudflareError {
             Self::Http(_) => CloudflareReadErrorClass::TransportAmbiguous,
             Self::PaginationLimit(_)
             | Self::PaginationMetadataInvalid
+            | Self::PaginationMetadataDiagnostic { .. }
             | Self::QueueConsumersSinglePageMetadataInvalid { .. }
             | Self::PaginationCountMismatch { .. }
             | Self::PaginationCursorLoop
@@ -6887,7 +6893,9 @@ impl Executor {
             normalize_queue_consumers_single_page(&mut combined)?;
             return Ok(combined);
         }
-        if let Some(pagination) = page_pagination(combined.result_info.as_ref())? {
+        if let Some(pagination) = page_pagination(combined.result_info.as_ref())
+            .map_err(|error| pagination_diagnostic::with_metadata(error, request, &combined))?
+        {
             if request_is_worker_collection(request, "deployments") {
                 return self
                     .complete_worker_collection_page_pagination(
