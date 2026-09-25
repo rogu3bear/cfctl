@@ -912,20 +912,23 @@ pub(super) fn validate_same_path_prior_state_receipt(
                     access_application_rollback_idps(allowed_idps)
                 }
             });
-        let fields_match = if plan.capability.id == "access-applications-update-owned-self-hosted-managed-oauth" {
-            let oauth_config_in_expected = expected_fields.contains(&"oauth_configuration".to_owned());
-            let oauth_config_in_observed = observed_fields.contains(&"oauth_configuration".to_owned());
-            
-            if oauth_config_in_expected && !oauth_config_in_observed {
-                let mut expected_without_oauth = expected_fields.clone();
-                expected_without_oauth.retain(|field| field != "oauth_configuration");
-                observed_fields == expected_without_oauth
+        let fields_match =
+            if plan.capability.id == "access-applications-update-owned-self-hosted-managed-oauth" {
+                let oauth_config_in_expected =
+                    expected_fields.contains(&"oauth_configuration".to_owned());
+                let oauth_config_in_observed =
+                    observed_fields.contains(&"oauth_configuration".to_owned());
+
+                if oauth_config_in_expected && !oauth_config_in_observed {
+                    let mut expected_without_oauth = expected_fields.clone();
+                    expected_without_oauth.retain(|field| field != "oauth_configuration");
+                    observed_fields == expected_without_oauth
+                } else {
+                    observed_fields == expected_fields
+                }
             } else {
                 observed_fields == expected_fields
-            }
-        } else {
-            observed_fields == expected_fields
-        };
+            };
         fields_match
             && variant
                 .zip(current_idps.ok())

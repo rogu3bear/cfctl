@@ -53,8 +53,8 @@ fn live_403_unauthorized_is_not_success_despite_performed() {
     };
 
     // Critical assertion: 403 with performed=true must still be ok=false
-    assert_eq!(
-        envelope.ok, false,
+    assert!(
+        !envelope.ok,
         "A 403 Unauthorized response must set ok=false even when performed=true"
     );
 
@@ -74,8 +74,8 @@ fn live_403_unauthorized_is_not_success_despite_performed() {
         envelope.attestation.is_some(),
         "Test fixture must have attestation to verify the distinction"
     );
-    assert_eq!(
-        envelope.ok, false,
+    assert!(
+        !envelope.ok,
         "Success requires ok=true; performed and attestation alone are insufficient"
     );
 }
@@ -118,8 +118,11 @@ fn successful_live_read_has_ok_true_and_verification() {
         }),
     };
 
-    assert_eq!(envelope.ok, true, "Successful live read must have ok=true");
-    assert!(envelope.error.is_none(), "Successful operation has no error");
+    assert!(envelope.ok, "Successful live read must have ok=true");
+    assert!(
+        envelope.error.is_none(),
+        "Successful operation has no error"
+    );
     assert_eq!(
         envelope.verification.state,
         VerificationState::Passed,
@@ -150,7 +153,10 @@ fn live_401_authentication_error_is_not_success() {
         error: Some(ErrorV1 {
             code: "CFCTL_CLOUDFLARE_AUTHENTICATION_FAILED".to_owned(),
             message: "Cloudflare authentication failed: invalid API token".to_owned(),
-            next_step: Some("Re-import credentials with `cfctl auth import-api-token` or log in again".to_owned()),
+            next_step: Some(
+                "Re-import credentials with `cfctl auth import-api-token` or log in again"
+                    .to_owned(),
+            ),
         }),
         attestation: Some(AttestationStatusV1 {
             schema_version: 1,
@@ -159,10 +165,7 @@ fn live_401_authentication_error_is_not_success() {
         }),
     };
 
-    assert_eq!(
-        envelope.ok, false,
-        "401 authentication error must set ok=false"
-    );
+    assert!(!envelope.ok, "401 authentication error must set ok=false");
     assert!(
         envelope.error.is_some(),
         "Authentication error must include error details"
@@ -179,15 +182,15 @@ fn local_error_has_performed_false_and_ok_false() {
         Some("Provide --account or ensure profile has account_id pinned"),
     );
 
-    assert_eq!(
-        envelope.ok, false,
-        "Local validation error must have ok=false"
-    );
-    assert_eq!(
-        envelope.performed, false,
+    assert!(!envelope.ok, "Local validation error must have ok=false");
+    assert!(
+        !envelope.performed,
         "Local error before boundary must have performed=false"
     );
-    assert!(envelope.error.is_some(), "Local error must have error field");
+    assert!(
+        envelope.error.is_some(),
+        "Local error must have error field"
+    );
     assert_eq!(
         envelope.attestation, None,
         "Local error has no live attestation"
@@ -282,14 +285,11 @@ fn local_operation_can_succeed_without_live_verification() {
         attestation: None, // No live attestation for local operation
     };
 
-    assert_eq!(
-        envelope.ok, true,
+    assert!(
+        envelope.ok,
         "Local operation can succeed without live boundary"
     );
-    assert_eq!(
-        envelope.performed, false,
-        "Local operation has performed=false"
-    );
+    assert!(!envelope.performed, "Local operation has performed=false");
     assert_eq!(
         envelope.verification.state,
         VerificationState::NotApplicable,

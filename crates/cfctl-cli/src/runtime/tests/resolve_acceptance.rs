@@ -74,25 +74,22 @@ const ACCEPTANCE_FIXTURES: &[ResolveFixture] = &[
 ];
 
 /// Helper to create a minimal catalog capability for testing.
-fn minimal_capability(id: &str, title: &str, method: &str, path: &str, product: &str) -> CapabilityV1 {
+fn minimal_capability(
+    id: &str,
+    title: &str,
+    method: &str,
+    path: &str,
+    product: &str,
+) -> CapabilityV1 {
     let mut capability = CapabilityV1::new(id, title, method, path);
     capability.adapter_status = AdapterStatus::DynamicApi;
     capability.product = product.to_owned();
     capability
 }
 
-/// Test that resolve acceptance fixtures match expected capabilities and reject
-/// unrelated top ranks.
-#[test]
-fn resolve_acceptance_fixtures_pin_expected_capabilities() {
+fn acceptance_catalog() -> Vec<CapabilityV1> {
     // Build a minimal catalog with the capabilities referenced by fixtures.
-    let zones_get = minimal_capability(
-        "zones-get",
-        "List Zones",
-        "GET",
-        "/zones",
-        "Zones",
-    );
+    let zones_get = minimal_capability("zones-get", "List Zones", "GET", "/zones", "Zones");
     let dns_list = minimal_capability(
         "dns-records-for-a-zone-list-dns-records",
         "List DNS records",
@@ -153,19 +150,28 @@ fn resolve_acceptance_fixtures_pin_expected_capabilities() {
         "Workers KV",
     );
 
-    let catalog: BTreeMap<&str, &CapabilityV1> = [
-        (zones_get.id.as_str(), &zones_get),
-        (dns_list.id.as_str(), &dns_list),
-        (pages_create.id.as_str(), &pages_create),
-        (account_token_create.id.as_str(), &account_token_create),
-        (user_token_create.id.as_str(), &user_token_create),
-        (account_token_roll.id.as_str(), &account_token_roll),
-        (user_token_roll.id.as_str(), &user_token_roll),
-        (unrelated_worker.id.as_str(), &unrelated_worker),
-        (unrelated_kv_list.id.as_str(), &unrelated_kv_list),
+    vec![
+        zones_get,
+        dns_list,
+        pages_create,
+        account_token_create,
+        user_token_create,
+        account_token_roll,
+        user_token_roll,
+        unrelated_worker,
+        unrelated_kv_list,
     ]
-    .into_iter()
-    .collect();
+}
+
+/// Test that resolve acceptance fixtures match expected capabilities and reject
+/// unrelated top ranks.
+#[test]
+fn resolve_acceptance_fixtures_pin_expected_capabilities() {
+    let capabilities = acceptance_catalog();
+    let catalog = capabilities
+        .iter()
+        .map(|cap| (cap.id.as_str(), cap))
+        .collect();
 
     for fixture in ACCEPTANCE_FIXTURES {
         // Simulate catalog search by scoring all capabilities against the intent.
@@ -265,20 +271,14 @@ fn score_fixture_intent<'a>(
         .filter(|(_, score)| *score > 0)
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     scored
 }
 
 /// Test that resolve fails closed for unrelated high-scoring distractors.
 #[test]
 fn resolve_rejects_unrelated_families_for_list_zones() {
-    let zones_get = minimal_capability(
-        "zones-get",
-        "List Zones",
-        "GET",
-        "/zones",
-        "Zones",
-    );
+    let zones_get = minimal_capability("zones-get", "List Zones", "GET", "/zones", "Zones");
 
     // Simulate a scenario where unrelated capabilities score highly but
     // should not be ranked above zones-get for "list zones" intent.
@@ -319,8 +319,7 @@ fn resolve_pages_deployment_to_native_api() {
 
     assert!(error.is_none(), "Pages deployment must resolve");
     assert_eq!(
-        result["resolved"]["capability_id"],
-        "pages-deployment-create-deployment",
+        result["resolved"]["capability_id"], "pages-deployment-create-deployment",
         "Pages deployment intent must resolve to pages-deployment-create-deployment"
     );
 }

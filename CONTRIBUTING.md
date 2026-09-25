@@ -110,6 +110,15 @@ nondeterminism, the Bun bridge proof, dependency policy, full-history secret
 scanning, source/governance contracts, and the Linux musl cross-build. The
 repository does not require GitHub Actions or another hosted CI service.
 
+The native proof also runs `.githooks/check-attribution.sh origin/main HEAD`.
+It checks every non-merge commit's author, committer, subject, and body against
+the required attribution predicate and emits a receipt binding the base, head,
+script digest, and commit count. When branch protection requires the unbound
+`reject-cursor-attribution` status, publish the successful exact-candidate local
+result under that context, explicitly identifying it as a local check. Keep
+Actions disabled and the required protection intact; this status proves only
+attribution, not the rest of the release gate.
+
 `.githooks/pre-push` runs that complete local proof and refuses the push when
 it fails. A review or merge must therefore cite a fresh `cargo xtask verify`
 receipt bound to the exact candidate commit or tree; repository state alone is

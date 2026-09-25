@@ -140,25 +140,22 @@ pub(super) fn validate_access_application_login_methods_desired_input(
                 .to_owned(),
         ));
     }
-    
+
     if capability.id == ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID {
         let body_obj = input.body.as_ref().and_then(Value::as_object);
         let body_field_count = body_obj.map_or(0, serde_json::Map::len);
-        
+
         if body_field_count == 1 {
-            let single_field_key = body_obj.and_then(|obj| obj.keys().next()).map(String::as_str);
-            match single_field_key {
-                Some("oauth_configuration") => {
-                    validate_access_application_oauth_only_input(capability, input)?;
-                    return Ok(());
-                }
-                Some("allowed_idps") => {
-                }
-                _ => {}
+            let single_field_key = body_obj
+                .and_then(|obj| obj.keys().next())
+                .map(String::as_str);
+            if single_field_key == Some("oauth_configuration") {
+                validate_access_application_oauth_only_input(capability, input)?;
+                return Ok(());
             }
         }
     }
-    
+
     let mut desired_capability = capability.clone();
     desired_capability.request_schema = Some(access_application_login_methods_desired_schema());
     validate_request_contract(&desired_capability, input)?;
@@ -175,27 +172,29 @@ fn validate_access_application_oauth_only_input(
             "OAuth-only input is only supported for the Managed OAuth capability".to_owned(),
         ));
     }
-    
-    let body = input.body.as_ref().and_then(Value::as_object).ok_or_else(|| {
-        CliError::Input("OAuth-only input must have a body object".to_owned())
-    })?;
-    
+
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("OAuth-only input must have a body object".to_owned()))?;
+
     if body.len() != 1 || !body.contains_key("oauth_configuration") {
         return Err(CliError::Input(
             "OAuth-only input must contain exactly one field: `oauth_configuration`".to_owned(),
         ));
     }
-    
+
     let oauth_config = body.get("oauth_configuration").ok_or_else(|| {
         CliError::Input("OAuth-only input must contain `oauth_configuration`".to_owned())
     })?;
-    
+
     if !oauth_config.is_object() {
         return Err(CliError::Input(
             "oauth_configuration must be an object".to_owned(),
         ));
     }
-    
+
     Ok(())
 }
 
@@ -493,7 +492,7 @@ pub(super) async fn prepare_access_application_login_methods_plan_input(
     })?;
     let body_obj = input.body.as_ref().and_then(Value::as_object);
     let body_field_count = body_obj.map_or(0, serde_json::Map::len);
-    
+
     if body_field_count != 1 {
         preflight_call_input(capability, input, None)?;
         return read_live_same_path_prior_state(
@@ -502,8 +501,10 @@ pub(super) async fn prepare_access_application_login_methods_plan_input(
         .await
         .map(Some);
     }
-    
-    let single_field_key = body_obj.and_then(|obj| obj.keys().next()).map(String::as_str);
+
+    let single_field_key = body_obj
+        .and_then(|obj| obj.keys().next())
+        .map(String::as_str);
     match single_field_key {
         Some("allowed_idps") => {
             prepare_access_application_idps_only_input(
@@ -597,7 +598,7 @@ async fn prepare_access_application_oauth_only_input(
             "OAuth-only body is only supported for the Managed OAuth capability".to_owned(),
         ));
     }
-    
+
     let desired_oauth_config = input
         .body
         .as_ref()
@@ -606,7 +607,7 @@ async fn prepare_access_application_oauth_only_input(
             CliError::Input("OAuth-only input must contain `oauth_configuration`".to_owned())
         })?
         .clone();
-    
+
     input
         .selectors
         .get("app_id")
@@ -617,7 +618,7 @@ async fn prepare_access_application_oauth_only_input(
                 "Access Managed OAuth plan requires an exact `app_id` selector".to_owned(),
             )
         })?;
-    
+
     let source = catalog
         .get(ACCESS_APP_READ_CAPABILITY_ID)
         .ok_or_else(|| capability_missing(ACCESS_APP_READ_CAPABILITY_ID))?;
@@ -626,7 +627,7 @@ async fn prepare_access_application_oauth_only_input(
             "Access application state source drifted from the governed exact-app read".to_owned(),
         ));
     }
-    
+
     let response = Executor::new(http_client()?, API_BASE_URL)?
         .execute_read(
             source,
@@ -639,7 +640,7 @@ async fn prepare_access_application_oauth_only_input(
             credential,
         )
         .await?;
-    
+
     let Some(receipt) = finalize_access_application_oauth_plan_input(
         capability,
         input,
@@ -688,7 +689,7 @@ pub(super) fn finalize_access_application_oauth_plan_input(
             variant.app_type
         )));
     }
-    
+
     let current_oauth_config = response.result.get("oauth_configuration");
     if current_oauth_config == Some(desired_oauth_config) {
         return Err(CliError::Input(
@@ -696,7 +697,7 @@ pub(super) fn finalize_access_application_oauth_plan_input(
                 .to_owned(),
         ));
     }
-    
+
     let current_idps = response
         .result
         .get("allowed_idps")
@@ -707,32 +708,31 @@ pub(super) fn finalize_access_application_oauth_plan_input(
                     .to_owned(),
             )
         })?;
-    
+
     if current_idps.is_empty() {
         return Err(CliError::Input(
             "live Access application has an empty identity-provider allowlist; snapshot merge for OAuth-only body requires non-empty allowed_idps"
                 .to_owned(),
         ));
     }
-    
-    let mut mutable_body = access_application_oauth_mutable_body(
-        &response.result,
-        desired_oauth_config,
-        variant,
-    )?;
-    
+
+    let mut mutable_body =
+        access_application_oauth_mutable_body(&response.result, desired_oauth_config, variant)?;
+
     if let Some(body_obj) = mutable_body.as_object_mut() {
-        body_obj.insert("allowed_idps".to_owned(), Value::Array(current_idps.clone()));
+        body_obj.insert(
+            "allowed_idps".to_owned(),
+            Value::Array(current_idps.clone()),
+        );
     }
-    
+
     input.body = Some(mutable_body);
-    
+
     if variant.app_type == "self_hosted" {
-        capability.request_schema =
-            Some(cfctl_catalog::access_application_managed_oauth_schema());
+        capability.request_schema = Some(cfctl_catalog::access_application_managed_oauth_schema());
     }
     preflight_call_input(capability, input, None)?;
-    
+
     apply_same_path_prior_state_response(capability, input, account_id, response).map(Some)
 }
 
@@ -787,7 +787,7 @@ fn access_application_oauth_mutable_body(
             body.insert(field.to_owned(), desired_oauth_config.clone());
             continue;
         }
-        
+
         let Some(value) = result.get(field).cloned() else {
             if variant.required_fields.contains(&field) && field != "allowed_idps" {
                 return Err(CliError::Input(format!(
@@ -804,7 +804,6 @@ fn access_application_oauth_mutable_body(
     }
     Ok(Value::Object(body))
 }
-
 
 pub(super) fn finalize_access_application_login_methods_plan_input(
     capability: &mut CapabilityV1,

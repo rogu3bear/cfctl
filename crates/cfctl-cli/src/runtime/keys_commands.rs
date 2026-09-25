@@ -183,10 +183,13 @@ pub(super) async fn key_policy_create(
         expires_at,
     )?;
     store.create_authority(&authority)?;
-    
+
     // Save resolved permission groups for fitness checks
-    store.save_authority_permissions(&authority.authority_id, &serde_json::to_value(&selected_groups)?)?;
-    
+    store.save_authority_permissions(
+        &authority.authority_id,
+        &serde_json::to_value(&selected_groups)?,
+    )?;
+
     let mut envelope = ResultEnvelopeV2::success(
         "keys policy create",
         json!({

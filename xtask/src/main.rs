@@ -1,5 +1,7 @@
 //! Local verification and release orchestration for cfctl.
 
+#[cfg(test)]
+mod attribution_tests;
 mod local_adapters;
 mod local_guidance;
 
@@ -195,6 +197,10 @@ fn execute(arguments: Arguments) -> Result<(), TaskError> {
 }
 
 fn verify() -> Result<(), TaskError> {
+    run(
+        "bash",
+        &[".githooks/check-attribution.sh", "origin/main", "HEAD"],
+    )?;
     run("cargo", &["fmt", "--all", "--", "--check"])?;
     run(
         "cargo",

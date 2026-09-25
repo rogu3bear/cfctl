@@ -917,12 +917,27 @@ impl StateStore {
         for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
             let entry = entry.map_err(|source| io_error(&directory, source))?;
             if entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
-                let authority_id = managed_document_id(&entry.path(), ManagedIdKind::Authority)?;
+                let path = entry.path();
+                let permission_cache_id = path
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .and_then(|stem| stem.strip_suffix("-permissions"));
+                let authority_id = if let Some(id) = permission_cache_id {
+                    validate_authority_id(id)?;
+                    id.to_owned()
+                } else {
+                    managed_document_id(&path, ManagedIdKind::Authority)?
+                };
                 if !validate_existing_managed_file(&entry.path())? {
                     return Err(unsafe_managed_document(
                         &entry.path(),
                         "directory entry disappeared while listing",
                     ));
+                }
+                // Permission inventories are advisory cache documents, not
+                // standing authorities. Preserve managed-file safety checks.
+                if permission_cache_id.is_some() {
+                    continue;
                 }
                 let authority: StandingAuthorityV1 = self.read_json(&entry.path())?;
                 ensure_authority_identity(&authority, &authority_id)?;
@@ -937,7 +952,7 @@ impl StateStore {
     /// This enables fitness checks to verify permission coverage without
     /// requiring a live inventory call.
     ///
-    /// The permission_groups parameter should be a JSON array where each element
+    /// The `permission_groups` parameter should be a JSON array where each element
     /// has at minimum an "id" (UUID) and "name" (human-readable) field.
     pub fn save_authority_permissions(
         &self,

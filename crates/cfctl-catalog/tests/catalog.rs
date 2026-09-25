@@ -7100,27 +7100,27 @@ fn access_application_managed_oauth_update_is_closed_and_governed() {
     let mut fixture = access_application_login_methods_fixture();
     fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
         ["application/json"]["schema"]["properties"]["oauth_configuration"] = json!({
-            "type": "object",
-            "properties": {
-                "enabled": {"type": "boolean"},
-                "dynamic_client_registration": {
-                    "type": "object",
-                    "properties": {
-                        "enabled": {"type": "boolean"},
-                        "allow_any_on_localhost": {"type": "boolean"},
-                        "allow_any_on_loopback": {"type": "boolean"},
-                        "allowed_uris": {"type": "array", "items": {"type": "string"}}
-                    }
-                },
-                "grant": {
-                    "type": "object",
-                    "properties": {
-                        "access_token_lifetime": {"type": "string"},
-                        "session_duration": {"type": "string"}
-                    }
+        "type": "object",
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "dynamic_client_registration": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "allow_any_on_localhost": {"type": "boolean"},
+                    "allow_any_on_loopback": {"type": "boolean"},
+                    "allowed_uris": {"type": "array", "items": {"type": "string"}}
+                }
+            },
+            "grant": {
+                "type": "object",
+                "properties": {
+                    "access_token_lifetime": {"type": "string"},
+                    "session_duration": {"type": "string"}
                 }
             }
-        });
+        }
+    });
     fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]["oauth_configuration"] =
         fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
@@ -7189,11 +7189,11 @@ fn access_application_managed_oauth_rejects_wrong_shape() {
     let mut fixture = access_application_login_methods_fixture();
     fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
         ["application/json"]["schema"]["properties"]["oauth_configuration"] = json!({
-            "type": "object",
-            "properties": {
-                "enabled": {"type": "boolean"}
-            }
-        });
+        "type": "object",
+        "properties": {
+            "enabled": {"type": "boolean"}
+        }
+    });
     fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]["oauth_configuration"] =
         fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
