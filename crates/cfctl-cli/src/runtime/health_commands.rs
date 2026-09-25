@@ -8,7 +8,7 @@ use super::prelude::{
 use super::support::catalog_is_stale;
 use super::support::home_directory;
 use super::support::http_client;
-use crate::build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build};
+use crate::build_identity::{RuntimeIdentityV1, current_build_info, identity_error_copy};
 use cfctl_agent::inspect_agent;
 
 pub(super) fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
@@ -140,20 +140,20 @@ pub(super) fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
         .into_iter()
         .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
         .collect();
-    let running_build = current_build_info();
-    let build_identity_healthy = build_identity_is_healthy(&running_build);
-    let path_build = inspect_path_build(&running_build);
+    let identity = RuntimeIdentityV1::inspect();
     let instruction_drift = agents
         .iter()
         .filter(|agent| agent.skill_present && !agent.skill_current)
         .count();
-    let healthy = build_identity_healthy && path_build.healthy && instruction_drift == 0;
+    let healthy = identity.healthy(instruction_drift);
+    let failure = identity.failure(instruction_drift);
+    let (message, next_step) = identity_error_copy(failure.as_ref());
     Ok(health_envelope(
         "doctor",
         json!({
-            "running_build": running_build,
-            "build_identity_healthy": build_identity_healthy,
-            "path_build": path_build,
+            "running_build": identity.running_build,
+            "build_identity_healthy": identity.build_identity_healthy,
+            "path_build": identity.path_build,
             "platform": env::consts::OS,
             "config_dir": store.paths().config_dir,
             "data_dir": store.paths().data_dir,
@@ -176,7 +176,8 @@ pub(super) fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
         }),
         healthy,
         "CFCTL_RUNTIME_DRIFT",
-        "The source identity, PATH build, or managed agent instructions are not current.",
+        message,
+        next_step,
     ))
 }
 
@@ -193,6 +194,7 @@ pub(super) fn health_envelope(
     healthy: bool,
     code: &str,
     message: &str,
+    next_step: Option<&str>,
 ) -> ResultEnvelopeV2 {
     let mut envelope = ResultEnvelopeV2::success(command, result);
     if !healthy {
@@ -201,10 +203,9 @@ pub(super) fn health_envelope(
         envelope.error = Some(ErrorV1 {
             code: code.to_owned(),
             message: message.to_owned(),
-            next_step: Some(
-                "Run ./bootstrap.sh from a checkout clean of tracked and untracked non-ignored files, then synchronize managed agents."
-                    .to_owned(),
-            ),
+            next_step: Some(next_step.unwrap_or(
+                "Run ./bootstrap.sh from a checkout clean of tracked and untracked non-ignored files, then synchronize managed agents.",
+            ).to_owned()),
         });
     }
     envelope

@@ -1,6 +1,10 @@
 #![allow(clippy::expect_used)]
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -8,8 +12,8 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use cfctl_auth::{FileSecretStore, SecretStore};
 use cfctl_cli::{
     build_identity::{
-        PathBuildProbeV1, PathBuildStateV1, build_identity_is_healthy, classify_path_build,
-        current_build_info,
+        PathBuildProbeV1, PathBuildStateV1, RuntimeIdentityV1, build_identity_is_healthy,
+        classify_path_build, current_build_info, identity_failure, same_executable_path_identity,
     },
     build_support::{ResolvedIdentitySource, build_identity_rerun_paths, resolve_build_identity},
 };
@@ -175,6 +179,7 @@ fn path_identity_classifies_missing_and_uninspectable() {
     assert_eq!(missing.state, PathBuildStateV1::Missing);
     assert!(missing.path.is_none());
     assert!(missing.build.is_none());
+    assert!(missing.checkout_head.is_none());
 
     let uninspectable = classify_path_build(PathBuildProbeV1::Uninspectable {
         path: "/bin/cfctl".into(),
@@ -184,9 +189,97 @@ fn path_identity_classifies_missing_and_uninspectable() {
     assert_eq!(uninspectable.state, PathBuildStateV1::Uninspectable);
     assert_eq!(uninspectable.path.as_deref(), Some(Path::new("/bin/cfctl")));
     assert!(uninspectable.build.is_none());
+    assert!(uninspectable.checkout_head.is_none());
     assert_eq!(
         uninspectable.detail,
         "PATH cfctl is a different executable and was not run"
+    );
+    let failure = identity_failure(
+        &RuntimeIdentityV1 {
+            running_build: current_build_info(),
+            build_identity_healthy: true,
+            path_build: uninspectable,
+        },
+        0,
+    )
+    .expect("uninspectable PATH is unhealthy");
+    assert!(failure.message.contains("was not run"));
+    assert!(failure.next_step.contains("cfctl version --json"));
+}
+
+#[test]
+fn same_path_git_checkout_is_stale_when_head_differs() {
+    let running = BuildInfoV1 {
+        schema_version: 1,
+        version: "test".to_owned(),
+        git_commit: Some(COMMIT_A.to_owned()),
+        identity_source: BuildIdentitySourceV1::GitCheckout,
+    };
+    let path = PathBuf::from("/Users/star/.local/bin/cfctl");
+    let current = same_executable_path_identity(&running, path.clone(), Some(COMMIT_A));
+    assert!(current.healthy);
+    assert_eq!(current.state, PathBuildStateV1::Current);
+    assert_eq!(current.checkout_head.as_deref(), Some(COMMIT_A));
+
+    let stale = same_executable_path_identity(
+        &running,
+        path.clone(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert!(!stale.healthy);
+    assert_eq!(stale.state, PathBuildStateV1::Stale);
+    assert_eq!(
+        stale.checkout_head.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert!(stale.detail.contains(
+        "PATH git_commit differs from this cfctl checkout HEAD; path_build.build.git_commit="
+    ));
+    assert!(stale.detail.contains(COMMIT_A));
+    assert!(
+        stale
+            .detail
+            .contains("path_build.checkout_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+
+    let release = BuildInfoV1 {
+        identity_source: BuildIdentitySourceV1::ReleaseEnv,
+        ..running.clone()
+    };
+    let release_current = same_executable_path_identity(
+        &release,
+        path.clone(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert!(release_current.healthy);
+    assert_eq!(release_current.state, PathBuildStateV1::Current);
+    assert!(release_current.checkout_head.is_none());
+
+    let unbound = same_executable_path_identity(&running, path.clone(), None);
+    assert!(unbound.healthy);
+    assert_eq!(unbound.state, PathBuildStateV1::Current);
+    assert!(unbound.checkout_head.is_none());
+
+    let identity = RuntimeIdentityV1 {
+        running_build: running,
+        build_identity_healthy: true,
+        path_build: stale,
+    };
+    let failure = identity_failure(&identity, 0).expect("stale PATH is unhealthy");
+    assert!(failure.message.contains("path_build.build.git_commit="));
+    assert!(failure.message.contains("path_build.checkout_head="));
+    assert!(failure.message.contains(COMMIT_A));
+    assert!(failure.next_step.contains("./bootstrap.sh"));
+    assert!(
+        identity_failure(
+            &RuntimeIdentityV1 {
+                running_build: identity.running_build.clone(),
+                build_identity_healthy: true,
+                path_build: unbound,
+            },
+            0
+        )
+        .is_none()
     );
 }
 
@@ -213,6 +306,7 @@ fn doctor_never_executes_a_different_path_cfctl() {
         let runtime = root.path().join(command);
         seed_test_fallback_secret(&runtime);
         let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
+            .current_dir(root.path())
             .env("CFCTL_HOME", &runtime)
             .env("CFCTL_TEST_MARKER", &marker)
             .env("PATH", &fake_bin)
@@ -230,11 +324,18 @@ fn doctor_never_executes_a_different_path_cfctl() {
         assert_platform_keyring_probe_skipped(&envelope);
         assert_eq!(envelope["result"]["path_build"]["state"], "uninspectable");
         assert_eq!(envelope["result"]["path_build"]["healthy"], false);
+        assert!(envelope["result"]["path_build"]["checkout_head"].is_null());
         assert!(
-            envelope["result"]["path_build"]["detail"]
+            envelope["error"]["message"]
                 .as_str()
-                .is_some_and(|detail| detail.contains("was not run")),
-            "doctor must explain the fail-closed trust boundary"
+                .is_some_and(|message| message.contains("was not run")),
+            "doctor error must name the PATH identity failure, not a generic drift blob"
+        );
+        assert!(
+            envelope["error"]["next_step"]
+                .as_str()
+                .is_some_and(|step| step.contains("cfctl version --json")),
+            "uninspectable PATH must tell the operator to invoke that executable directly"
         );
     }
 }
@@ -250,6 +351,7 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
     seed_test_fallback_secret(&runtime);
 
     let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
+        .current_dir(root.path())
         .env("CFCTL_HOME", &runtime)
         .env("HOME", &runtime)
         .env("PATH", &linked_bin)
@@ -268,6 +370,7 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
 
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
     assert_eq!(envelope["result"]["path_build"]["healthy"], true);
+    assert!(envelope["result"]["path_build"]["checkout_head"].is_null());
     assert_eq!(
         envelope["result"]["build_identity_healthy"],
         identity_healthy

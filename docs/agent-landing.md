@@ -17,9 +17,10 @@ cfctl agents doctor --json
 `version` reports the invoked binary's build identity. `doctor` and `agents
 doctor` trust the `cfctl` resolved on `PATH` only when it is the same
 executable as the running build; they never launch a different PATH executable
-to inspect it. Missing or different PATH executables and drifted managed
-guidance are unhealthy — repair installation before relying on the operator
-surface.
+to inspect it. PATH matching the running executable is not proof PATH
+`git_commit` matches this checkout HEAD; PATH git_commit differs from this cfctl checkout HEAD is unhealthy. Missing or different PATH executables and
+drifted managed guidance are also unhealthy — repair installation before
+relying on the operator surface.
 
 Coverage includes stable `mutation_contract_gap_counts`; the counts overlap by
 design because one capability can lack several contract fields at once. Use
