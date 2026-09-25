@@ -4,6 +4,11 @@ compatibility_date = "2026-08-05"
 workers_dev = true
 upload_source_maps = false
 
+# Frozen uploads transport this prebuilt module without rebundling it.
+[[rules]]
+type = "ESModule"
+globs = ["index.js"]
+
 [build]
 command = "bash ./scripts/build-edge.sh"
 
