@@ -2269,7 +2269,10 @@ fn managed_oauth_idp_plan_preserves_existing_oauth_configuration() {
     )
     .expect("managed OAuth IdP plan")
     .expect("prior-state receipt");
-    assert_eq!(input.body.as_ref().unwrap()["oauth_configuration"], oauth);
+    assert_eq!(
+        input.body.as_ref().expect("prepared body")["oauth_configuration"],
+        oauth
+    );
     assert_eq!(prior["prior_state"]["oauth_configuration"], oauth);
     assert!(super::access_application_login_methods_contract_supported(
         &capability
