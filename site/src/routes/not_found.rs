@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use leptos_meta::Title;
 
 use crate::components::SiteShell;
 
@@ -11,11 +12,12 @@ pub fn NotFoundPage() -> impl IntoView {
 
     view! {
         <SiteShell>
+            <Title text="Page not found · cfctl"/>
             <main id="main-content" class="route-page route-miss">
                 <p class="eyebrow">"404 · route not found"</p>
-                <h1>"This path has no governed contract."</h1>
-                <p>"Return to the product overview, start with a verified read, or inspect the source."</p>
-                <p><a href="/">"Return home"</a></p>
+                <h1>"Page not found."</h1>
+                <p>"The link may be out of date. Return home or open the getting-started guide."</p>
+                <p><a href="/">"Return home"</a>" · "<a href="/start">"Get started"</a></p>
             </main>
         </SiteShell>
     }

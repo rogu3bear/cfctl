@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use leptos_meta::Title;
 
 use crate::components::SiteShell;
 
@@ -7,6 +8,7 @@ pub fn PrivacyPage() -> impl IntoView {
     view! {
         <SiteShell>
             <main id="main-content" class="route-page legal-copy">
+                <Title text="Privacy · cfctl"/>
                 <p class="eyebrow">"Privacy"</p>
                 <h1>"The website does not build a profile of you."</h1>
                 <p>"The cfctl website requires no account, form submission, database, object storage, analytics, or third-party script."</p>
@@ -24,6 +26,7 @@ pub fn TermsPage() -> impl IntoView {
     view! {
         <SiteShell>
             <main id="main-content" class="route-page legal-copy">
+                <Title text="Terms · cfctl"/>
                 <p class="eyebrow">"Terms"</p>
                 <h1>"Review before authority. Verify after execution."</h1>
                 <p>"cfctl is open-source software provided under the licenses in its repository. Cloudflare products, accounts, pricing, availability, and upstream APIs remain governed by Cloudflare's terms."</p>

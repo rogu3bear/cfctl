@@ -35,8 +35,8 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
-        <Title text="cfctl — governed Cloudflare control"/>
-        <Meta name="description" content="A local-first Cloudflare control plane that makes changes reviewable before execution and provable after."/>
+        <Title text="cfctl — Cloudflare from your terminal"/>
+        <Meta name="description" content="An open-source CLI for people and agents. Inspect Cloudflare, preview changes, approve exact operations, and verify the result."/>
         <Router>
             <Routes fallback=|| view! { <NotFoundPage/> }.into_view()>
                 <Route path=StaticSegment("") view=HomePage ssr=SsrMode::OutOfOrder/>
@@ -62,11 +62,15 @@ fn EdgeHydrationScripts(options: LeptosOptions) -> impl IntoView {
     let js_href = asset_href(&options, "js", crate::asset_hashes::JS_HASH);
     let wasm_href = asset_href(&options, "wasm", crate::asset_hashes::WASM_HASH);
     let hydration_script = edge_hydration_script(&options);
+    #[cfg(feature = "ssr")]
+    let nonce = leptos::nonce::use_nonce().map(|nonce| nonce.to_string());
+    #[cfg(not(feature = "ssr"))]
+    let nonce: Option<String> = None;
 
     view! {
         <link rel="modulepreload" href=js_href.clone() crossorigin="anonymous"/>
         <link rel="preload" href=wasm_href.clone() r#as="fetch" r#type="application/wasm" crossorigin="anonymous"/>
-        <script type="module">{hydration_script}</script>
+        <script type="module" nonce=nonce>{hydration_script}</script>
     }
 }
 

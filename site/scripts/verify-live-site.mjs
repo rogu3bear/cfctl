@@ -20,9 +20,9 @@ const REQUIRED_CSP = new Map([
 const REQUIRED_CSP_NAMES = new Set([...REQUIRED_CSP.keys(), "script-src"]);
 
 export const ROUTES = [
-  { path: "/", status: 200, marker: "See the boundary before you cross it." },
-  { path: "/start", status: 200, marker: "Reach one verified read." },
-  { path: "/security", status: 200, marker: "Your credential is not your consent." },
+  { path: "/", status: 200, marker: "Know what changes. Before it changes." },
+  { path: "/start", status: 200, marker: "Install. Connect. Read." },
+  { path: "/security", status: 200, marker: "Review the plan. Control the change." },
   { path: "/privacy", status: 200, marker: "The website does not build a profile of you." },
   { path: "/terms", status: 200, marker: "Review before authority. Verify after execution." },
   {
@@ -40,7 +40,7 @@ export const ROUTES = [
   {
     path: "/_cfctl-live-verifier-not-found",
     status: 404,
-    marker: "This path has no governed contract.",
+    marker: "Page not found.",
   },
 ];
 

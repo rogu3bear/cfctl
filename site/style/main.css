@@ -48,6 +48,21 @@ button:focus-visible {
   outline-offset: 0.22rem;
 }
 
+.skip-link {
+  position: absolute;
+  top: 0.75rem;
+  left: 1rem;
+  z-index: 10;
+  padding: 0.75rem 1rem;
+  transform: translateY(-200%);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
 button,
 code {
   font: inherit;
@@ -73,16 +88,16 @@ h3 {
 }
 
 h1 {
-  max-width: 13ch;
+  max-width: 18ch;
   margin-bottom: 1.5rem;
   font-family: ui-serif, Georgia, Cambria, serif;
-  font-size: clamp(3.2rem, 8.2vw, 8.8rem);
+  font-size: clamp(3rem, 5.2vw, 5.5rem);
   font-weight: 500;
 }
 
 h2 {
   margin-bottom: 0.8rem;
-  font-size: clamp(2rem, 4vw, 4.2rem);
+  font-size: clamp(2rem, 3.5vw, 3.3rem);
   font-weight: 560;
 }
 
@@ -156,9 +171,8 @@ h3 {
 .hero-ledger {
   display: grid;
   grid-template-columns: minmax(0, 1.65fr) minmax(18rem, 0.75fr);
-  gap: clamp(3rem, 8vw, 8rem);
-  min-height: calc(100svh - 5.5rem);
-  padding-block: clamp(5rem, 11vw, 10rem);
+  gap: clamp(2.5rem, 6vw, 6rem);
+  padding-block: clamp(3rem, 7vw, 6rem);
 }
 
 .hero-ledger__promise,
@@ -178,6 +192,36 @@ h3 {
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem;
+}
+
+.hero-caption,
+.section-note {
+  margin-block: 1.5rem 0;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.resource-links {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2rem;
+}
+
+.resource-links a {
+  display: grid;
+  gap: 0.75rem;
+  padding-block: 1.5rem;
+  border-top: 1px solid var(--line-strong);
+  text-decoration: none;
+}
+
+.resource-links strong {
+  font-size: 1.2rem;
+  text-decoration: underline;
+}
+
+.resource-links span {
+  color: var(--ink-soft);
 }
 
 .action-link,
@@ -240,6 +284,7 @@ h3 {
 .command-block code {
   min-width: 0;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .command-block button,
@@ -257,7 +302,7 @@ h3 {
 
 .ledger-section,
 .closing-action {
-  padding-block: clamp(4.5rem, 9vw, 8rem);
+  padding-block: clamp(3rem, 6vw, 5rem);
   border-top: 1px solid var(--line-strong);
 }
 
@@ -265,7 +310,7 @@ h3 {
   display: grid;
   grid-template-columns: minmax(7rem, 0.42fr) minmax(0, 1.58fr);
   gap: clamp(2rem, 7vw, 7rem);
-  margin-bottom: clamp(2.5rem, 6vw, 5rem);
+  margin-bottom: clamp(2rem, 4vw, 3rem);
 }
 
 .section-heading p {
@@ -382,11 +427,11 @@ h3 {
 
 .route-page {
   min-height: 72svh;
-  padding-block: clamp(5rem, 10vw, 9rem);
+  padding-block: clamp(3rem, 6vw, 5rem);
 }
 
 .route-page > h1 {
-  font-size: clamp(3rem, 7vw, 7.2rem);
+  font-size: clamp(2.8rem, 6vw, 5rem);
 }
 
 .route-page > p:not(.eyebrow):not(.lede),
@@ -498,7 +543,8 @@ h3 {
     min-height: auto;
   }
 
-  .trust-ledger {
+  .trust-ledger,
+  .resource-links {
     grid-template-columns: 1fr;
   }
 

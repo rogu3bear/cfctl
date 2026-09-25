@@ -12,5 +12,10 @@ pub fn ActionLink(
         "action-link"
     };
 
-    view! { <a class=class href=href>{label}<span aria-hidden="true">" ↗"</span></a> }
+    let arrow = if href.starts_with("https://") {
+        " ↗"
+    } else {
+        " →"
+    };
+    view! { <a class=class href=href>{label}<span aria-hidden="true">{arrow}</span></a> }
 }

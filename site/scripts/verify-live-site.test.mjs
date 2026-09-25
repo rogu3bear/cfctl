@@ -9,7 +9,7 @@ import {
   verifyInlineScripts,
 } from "./verify-live-site.mjs";
 
-function htmlResponse(body = "See the boundary before you cross it.", overrides = {}) {
+function htmlResponse(body = "Know what changes. Before it changes.", overrides = {}) {
   return new Response(body, {
     status: overrides.status ?? 200,
     headers: {
@@ -55,7 +55,7 @@ describe("HTML response contract", () => {
     await expect(verifyHtmlResponse(htmlResponse(), {
       path: "/",
       status: 200,
-      marker: "See the boundary before you cross it.",
+      marker: "Know what changes. Before it changes.",
     })).resolves.toBeUndefined();
   });
 
@@ -65,12 +65,12 @@ describe("HTML response contract", () => {
     await expect(verifyHtmlResponse(response, {
       path: "/",
       status: 200,
-      marker: "See the boundary before you cross it.",
+      marker: "Know what changes. Before it changes.",
     })).rejects.toThrow("content-security-policy");
   });
 
   test("rejects permissive first directives hidden by secure duplicates", async () => {
-    const response = htmlResponse("See the boundary before you cross it.", {
+    const response = htmlResponse("Know what changes. Before it changes.", {
       headers: {
         "content-security-policy": "default-src *; default-src 'self'; base-uri *; base-uri 'none'; object-src *; object-src 'none'; frame-ancestors *; frame-ancestors 'none'; form-action *; form-action 'none'; connect-src *; connect-src 'self'",
       },
@@ -78,12 +78,12 @@ describe("HTML response contract", () => {
     await expect(verifyHtmlResponse(response, {
       path: "/",
       status: 200,
-      marker: "See the boundary before you cross it.",
+      marker: "Know what changes. Before it changes.",
     })).rejects.toThrow("repeats the default-src directive");
   });
 
   test("rejects a permissive script-src that overrides default-src", async () => {
-    const response = htmlResponse("See the boundary before you cross it.", {
+    const response = htmlResponse("Know what changes. Before it changes.", {
       headers: {
         "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; font-src 'self'; connect-src 'self'; style-src 'self'; script-src * 'unsafe-inline' 'unsafe-eval';",
       },
@@ -91,7 +91,7 @@ describe("HTML response contract", () => {
     await expect(verifyHtmlResponse(response, {
       path: "/",
       status: 200,
-      marker: "See the boundary before you cross it.",
+      marker: "Know what changes. Before it changes.",
     })).rejects.toThrow("script-src does not match the production hash-bound policy");
   });
 
@@ -100,7 +100,7 @@ describe("HTML response contract", () => {
     "script-src-attr 'unsafe-inline'",
   ]) {
     test(`rejects browser-effective ${override.split(" ")[0]} authority`, async () => {
-      const response = htmlResponse("See the boundary before you cross it.", {
+      const response = htmlResponse("Know what changes. Before it changes.", {
         headers: {
           "content-security-policy": `${htmlResponse().headers.get("content-security-policy")} ${override};`,
         },
@@ -108,7 +108,7 @@ describe("HTML response contract", () => {
       await expect(verifyHtmlResponse(response, {
         path: "/",
         status: 200,
-        marker: "See the boundary before you cross it.",
+        marker: "Know what changes. Before it changes.",
       })).rejects.toThrow("directive outside the exact production policy");
     });
   }
