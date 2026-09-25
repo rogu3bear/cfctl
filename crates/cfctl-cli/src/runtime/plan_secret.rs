@@ -120,7 +120,26 @@ pub(super) const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 pub(super) const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str =
     "zone-subscription-zone-subscription-details";
 
-pub(super) const ACCESS_APP_MUTABLE_FIELDS: [&str; 18] = [
+pub(super) const ACCESS_APP_MUTABLE_FIELDS: [&str; 17] = [
+    "allowed_idps",
+    "app_launcher_visible",
+    "auto_redirect_to_identity",
+    "destinations",
+    "domain",
+    "eager_redirect_cookie_setting",
+    "enable_binding_cookie",
+    "http_only_cookie_attribute",
+    "name",
+    "options_preflight_bypass",
+    "path_cookie_attribute",
+    "policies",
+    "same_site_cookie_attribute",
+    "self_hosted_domains",
+    "session_duration",
+    "tags",
+    "type",
+];
+pub(super) const ACCESS_APP_MANAGED_OAUTH_MUTABLE_FIELDS: [&str; 18] = [
     "allowed_idps",
     "app_launcher_visible",
     "auto_redirect_to_identity",

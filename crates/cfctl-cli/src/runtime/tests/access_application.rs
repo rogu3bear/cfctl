@@ -275,6 +275,21 @@ pub(super) fn access_application_login_methods_capability() -> CapabilityV1 {
     capability
 }
 
+fn managed_oauth_capability() -> CapabilityV1 {
+    let mut capability = access_application_login_methods_capability();
+    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    capability.request_schema = Some(cfctl_catalog::access_application_managed_oauth_schema());
+    capability
+        .same_path_read
+        .as_mut()
+        .expect("readback")
+        .verified_response_fields = super::ACCESS_APP_MANAGED_OAUTH_MUTABLE_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect();
+    capability
+}
+
 pub(super) fn owned_whole_host_access_application_capability() -> CapabilityV1 {
     let mut capability = access_application_login_methods_capability();
     capability.id = super::ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID.to_owned();
@@ -1569,8 +1584,11 @@ pub(super) fn access_application_desired_idps_rejects_empty_duplicate_and_non_uu
 #[test]
 pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_config_absent() {
     let mut live_result = access_application_live_result();
-    live_result.as_object_mut().unwrap().remove("oauth_configuration");
-    
+    live_result
+        .as_object_mut()
+        .expect("fixture value")
+        .remove("oauth_configuration");
+
     let desired_oauth_config = json!({
         "enabled": true,
         "dynamic_client_registration": {
@@ -1578,12 +1596,12 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
             "allowed_uris": ["mlnavigator-remote://oauth/callback"]
         }
     });
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -1593,10 +1611,9 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
         etag: None,
         cf_ray: None,
     };
-    
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+
+    let mut capability = managed_oauth_capability();
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -1605,7 +1622,7 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
         body: Some(json!({"oauth_configuration": desired_oauth_config})),
         ..CallInput::default()
     };
-    
+
     let _receipt = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -1616,7 +1633,7 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
     )
     .expect("oauth plan")
     .expect("receipt");
-    
+
     let body = input.body.as_ref().expect("prepared body");
     assert_eq!(
         body.get("oauth_configuration"),
@@ -1648,13 +1665,13 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
 #[test]
 pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_config_present() {
     let mut live_result = access_application_live_result();
-    live_result.as_object_mut().unwrap().insert(
+    live_result.as_object_mut().expect("fixture object").insert(
         "oauth_configuration".to_owned(),
         json!({
             "enabled": false
         }),
     );
-    
+
     let desired_oauth_config = json!({
         "enabled": true,
         "dynamic_client_registration": {
@@ -1662,12 +1679,12 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
             "allowed_uris": ["mlnavigator-remote://oauth/callback"]
         }
     });
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -1677,10 +1694,9 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
         etag: None,
         cf_ray: None,
     };
-    
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+
+    let mut capability = managed_oauth_capability();
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -1689,7 +1705,7 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
         body: Some(json!({"oauth_configuration": desired_oauth_config})),
         ..CallInput::default()
     };
-    
+
     let _receipt = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -1700,7 +1716,7 @@ pub(super) fn access_application_oauth_only_body_merges_snapshot_when_oauth_conf
     )
     .expect("oauth plan")
     .expect("receipt");
-    
+
     let body = input.body.as_ref().expect("prepared body");
     assert_eq!(
         body.get("oauth_configuration"),
@@ -1719,18 +1735,18 @@ pub(super) fn access_application_oauth_only_body_rejects_no_mutation() {
     let desired_oauth_config = json!({
         "enabled": true
     });
-    
+
     let mut live_result = access_application_live_result();
-    live_result.as_object_mut().unwrap().insert(
+    live_result.as_object_mut().expect("fixture object").insert(
         "oauth_configuration".to_owned(),
         desired_oauth_config.clone(),
     );
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -1740,10 +1756,9 @@ pub(super) fn access_application_oauth_only_body_rejects_no_mutation() {
         etag: None,
         cf_ray: None,
     };
-    
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+
+    let mut capability = managed_oauth_capability();
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -1752,7 +1767,7 @@ pub(super) fn access_application_oauth_only_body_rejects_no_mutation() {
         body: Some(json!({"oauth_configuration": desired_oauth_config})),
         ..CallInput::default()
     };
-    
+
     let result = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -1761,14 +1776,14 @@ pub(super) fn access_application_oauth_only_body_rejects_no_mutation() {
         "account-a",
         &response,
     );
-    
+
     assert!(
         result.is_err(),
         "should reject when oauth_configuration is already set to desired value"
     );
     assert!(
         result
-            .unwrap_err()
+            .expect_err("expected validation failure")
             .to_string()
             .contains("already has the exact requested OAuth configuration"),
         "error message should mention no mutation needed"
@@ -1778,17 +1793,20 @@ pub(super) fn access_application_oauth_only_body_rejects_no_mutation() {
 #[test]
 pub(super) fn access_application_oauth_only_body_rejects_missing_allowed_idps() {
     let mut live_result = access_application_live_result();
-    live_result.as_object_mut().unwrap().remove("allowed_idps");
-    
+    live_result
+        .as_object_mut()
+        .expect("fixture object")
+        .remove("allowed_idps");
+
     let desired_oauth_config = json!({
         "enabled": true
     });
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -1798,10 +1816,9 @@ pub(super) fn access_application_oauth_only_body_rejects_missing_allowed_idps() 
         etag: None,
         cf_ray: None,
     };
-    
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+
+    let mut capability = managed_oauth_capability();
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -1810,7 +1827,7 @@ pub(super) fn access_application_oauth_only_body_rejects_missing_allowed_idps() 
         body: Some(json!({"oauth_configuration": desired_oauth_config})),
         ..CallInput::default()
     };
-    
+
     let result = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -1819,14 +1836,14 @@ pub(super) fn access_application_oauth_only_body_rejects_missing_allowed_idps() 
         "account-a",
         &response,
     );
-    
+
     assert!(
         result.is_err(),
         "should reject when allowed_idps is missing from live state"
     );
     assert!(
         result
-            .unwrap_err()
+            .expect_err("expected validation failure")
             .to_string()
             .contains("omitted restorable field allowed_idps"),
         "error message should mention missing allowed_idps"
@@ -1838,18 +1855,18 @@ pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
     let mut live_result = access_application_live_result();
     live_result
         .as_object_mut()
-        .unwrap()
+        .expect("fixture value")
         .insert("allowed_idps".to_owned(), json!([]));
-    
+
     let desired_oauth_config = json!({
         "enabled": true
     });
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -1859,10 +1876,9 @@ pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
         etag: None,
         cf_ray: None,
     };
-    
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+
+    let mut capability = managed_oauth_capability();
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -1871,7 +1887,7 @@ pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
         body: Some(json!({"oauth_configuration": desired_oauth_config})),
         ..CallInput::default()
     };
-    
+
     let result = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -1880,14 +1896,11 @@ pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
         "account-a",
         &response,
     );
-    
-    assert!(
-        result.is_err(),
-        "should reject when allowed_idps is empty"
-    );
+
+    assert!(result.is_err(), "should reject when allowed_idps is empty");
     assert!(
         result
-            .unwrap_err()
+            .expect_err("expected validation failure")
             .to_string()
             .contains("empty identity-provider allowlist"),
         "error message should mention empty allowed_idps"
@@ -1896,8 +1909,7 @@ pub(super) fn access_application_oauth_only_body_rejects_empty_allowed_idps() {
 
 #[test]
 pub(super) fn call_validation_accepts_oauth_only_for_managed_oauth() {
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    let capability = managed_oauth_capability();
 
     let input = CallInput {
         selectors: json!({
@@ -1916,15 +1928,13 @@ pub(super) fn call_validation_accepts_oauth_only_for_managed_oauth() {
         ..CallInput::default()
     };
 
-    let result = super::validate_access_application_login_methods_desired_input(
-        &capability,
-        &input,
-    );
+    let result =
+        super::validate_access_application_login_methods_desired_input(&capability, &input);
 
     assert!(
         result.is_ok(),
         "oauth-only body should be accepted for managed-oauth capability: {:?}",
-        result.unwrap_err()
+        result.expect_err("expected validation failure")
     );
 }
 
@@ -1945,29 +1955,24 @@ pub(super) fn call_validation_rejects_oauth_only_for_non_managed_oauth() {
         ..CallInput::default()
     };
 
-    let result = super::validate_access_application_login_methods_desired_input(
-        &capability,
-        &input,
-    );
+    let result =
+        super::validate_access_application_login_methods_desired_input(&capability, &input);
 
     assert!(
         result.is_err(),
         "oauth-only body should be rejected for non-managed-oauth capability"
     );
-    
-    let error_msg = result.unwrap_err().to_string();
-    println!("Error message: {}", error_msg);
+
+    let error_msg = result.expect_err("expected validation failure").to_string();
     assert!(
         error_msg.contains("allowed_idps") || error_msg.contains("required"),
-        "error should indicate missing required field allowed_idps, got: {}",
-        error_msg
+        "error should indicate missing required field allowed_idps, got: {error_msg}"
     );
 }
 
 #[test]
 pub(super) fn call_validation_accepts_idps_only_for_managed_oauth() {
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    let capability = managed_oauth_capability();
 
     let input = CallInput {
         selectors: json!({
@@ -1983,22 +1988,19 @@ pub(super) fn call_validation_accepts_idps_only_for_managed_oauth() {
         ..CallInput::default()
     };
 
-    let result = super::validate_access_application_login_methods_desired_input(
-        &capability,
-        &input,
-    );
+    let result =
+        super::validate_access_application_login_methods_desired_input(&capability, &input);
 
     assert!(
         result.is_ok(),
         "idps-only body should be accepted for managed-oauth capability: {:?}",
-        result.unwrap_err()
+        result.expect_err("expected validation failure")
     );
 }
 
 #[test]
 pub(super) fn call_validation_rejects_invalid_oauth_only_shapes() {
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
+    let capability = managed_oauth_capability();
 
     let input_non_object = CallInput {
         selectors: json!({
@@ -2022,7 +2024,7 @@ pub(super) fn call_validation_rejects_invalid_oauth_only_shapes() {
     );
     assert!(
         result
-            .unwrap_err()
+            .expect_err("expected validation failure")
             .to_string()
             .contains("must be an object"),
         "error should mention oauth_configuration must be an object"
@@ -2031,9 +2033,8 @@ pub(super) fn call_validation_rejects_invalid_oauth_only_shapes() {
 
 #[test]
 pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_configuration() {
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+    let mut capability = managed_oauth_capability();
+
     let desired_oauth_config = json!({
         "enabled": true,
         "dynamic_client_registration": {
@@ -2041,15 +2042,18 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
             "allowed_uris": ["mlnavigator-remote://oauth/callback"]
         }
     });
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let mut live_result = access_application_live_result();
-    live_result.as_object_mut().unwrap().remove("oauth_configuration");
-    
+    live_result
+        .as_object_mut()
+        .expect("fixture value")
+        .remove("oauth_configuration");
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -2059,7 +2063,7 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
         etag: None,
         cf_ray: None,
     };
-    
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -2068,7 +2072,7 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
         body: Some(json!({"oauth_configuration": desired_oauth_config.clone()})),
         ..CallInput::default()
     };
-    
+
     let receipt = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -2079,18 +2083,23 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
     )
     .expect("oauth plan")
     .expect("receipt");
-    
+
     let prior_state = receipt.get("prior_state").expect("prior_state");
     assert!(
         prior_state.get("oauth_configuration").is_none(),
         "prior_state should not have oauth_configuration since it was absent from live"
     );
-    
+
     assert!(
-        input.body.as_ref().unwrap().get("oauth_configuration").is_some(),
+        input
+            .body
+            .as_ref()
+            .expect("fixture value")
+            .get("oauth_configuration")
+            .is_some(),
         "input body should have oauth_configuration"
     );
-    
+
     let mut plan = PlanV1::draft(
         "profile-a",
         "account-a",
@@ -2103,7 +2112,7 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
     )
     .expect("plan draft");
     plan.input = serde_json::to_value(&input).expect("plan input");
-    
+
     let restored = super::validate_same_path_prior_state_receipt(
         &plan,
         plan.targets
@@ -2111,7 +2120,7 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
             .expect("receipt"),
     )
     .expect("validation should pass when oauth_configuration is being introduced");
-    
+
     assert!(
         restored.get("oauth_configuration").is_none(),
         "restored prior state should not have oauth_configuration"
@@ -2124,9 +2133,8 @@ pub(super) fn managed_oauth_prior_state_validation_allows_introducing_oauth_conf
 
 #[test]
 pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_both() {
-    let mut capability = access_application_login_methods_capability();
-    capability.id = super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID.to_owned();
-    
+    let mut capability = managed_oauth_capability();
+
     let desired_oauth_config = json!({
         "enabled": true,
         "dynamic_client_registration": {
@@ -2134,20 +2142,20 @@ pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_
             "allowed_uris": ["mlnavigator-remote://oauth/callback"]
         }
     });
-    
+
     let variant = super::access_application_login_methods_variant(
         super::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID,
     )
     .expect("managed oauth variant");
-    
+
     let mut live_result = access_application_live_result();
-    live_result.as_object_mut().unwrap().insert(
+    live_result.as_object_mut().expect("fixture object").insert(
         "oauth_configuration".to_owned(),
         json!({
             "enabled": false
         }),
     );
-    
+
     let response = CloudflareResponseV1 {
         success: true,
         status: 200,
@@ -2157,7 +2165,7 @@ pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_
         etag: None,
         cf_ray: None,
     };
-    
+
     let mut input = CallInput {
         selectors: json!({
             "account_id": "account-a",
@@ -2166,7 +2174,7 @@ pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_
         body: Some(json!({"oauth_configuration": desired_oauth_config.clone()})),
         ..CallInput::default()
     };
-    
+
     let receipt = super::finalize_access_application_oauth_plan_input(
         &mut capability,
         &mut input,
@@ -2177,13 +2185,13 @@ pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_
     )
     .expect("oauth plan")
     .expect("receipt");
-    
+
     let prior_state = receipt.get("prior_state").expect("prior_state");
     assert!(
         prior_state.get("oauth_configuration").is_some(),
         "prior_state should have oauth_configuration when it was present in live"
     );
-    
+
     let mut plan = PlanV1::draft(
         "profile-a",
         "account-a",
@@ -2196,7 +2204,7 @@ pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_
     )
     .expect("plan draft");
     plan.input = serde_json::to_value(&input).expect("plan input");
-    
+
     let restored = super::validate_same_path_prior_state_receipt(
         &plan,
         plan.targets
@@ -2204,26 +2212,66 @@ pub(super) fn managed_oauth_prior_state_validation_rejects_when_oauth_config_in_
             .expect("receipt"),
     )
     .expect("validation should pass when oauth_configuration is present in both");
-    
+
     assert!(
         restored.get("oauth_configuration").is_some(),
         "restored prior state should have oauth_configuration"
     );
-    
+
     let mut tampered_receipt = receipt.clone();
-    if let Some(prior) = tampered_receipt.get_mut("prior_state").and_then(Value::as_object_mut) {
+    if let Some(prior) = tampered_receipt
+        .get_mut("prior_state")
+        .and_then(Value::as_object_mut)
+    {
         prior.remove("allowed_idps");
     }
-    
-    let error = super::validate_same_path_prior_state_receipt(
-        &plan,
-        &tampered_receipt,
-    )
-    .expect_err("validation should fail when required field is missing");
-    
+
+    let error = super::validate_same_path_prior_state_receipt(&plan, &tampered_receipt)
+        .expect_err("validation should fail when required field is missing");
+
     assert!(
-        error.to_string().contains("invalid source, target, selector, or field set"),
-        "error should indicate field set mismatch: {}",
         error
+            .to_string()
+            .contains("invalid source, target, selector, or field set"),
+        "error should indicate field set mismatch: {error}"
     );
+}
+
+#[test]
+fn managed_oauth_idp_plan_preserves_existing_oauth_configuration() {
+    let mut capability = managed_oauth_capability();
+    let variant = super::access_application_login_methods_variant(&capability.id)
+        .expect("managed OAuth variant");
+    let desired_idps = vec!["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()];
+    let oauth = json!({"enabled":true});
+    let mut live = access_application_live_result();
+    live["oauth_configuration"] = oauth.clone();
+    let mut input = CallInput {
+        selectors: json!({"account_id":"account-a","app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"}),
+        body: Some(json!({"allowed_idps":desired_idps})),
+        ..CallInput::default()
+    };
+    let prior = super::finalize_access_application_login_methods_plan_input(
+        &mut capability,
+        &mut input,
+        &desired_idps,
+        variant,
+        "account-a",
+        &CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: live,
+            errors: vec![],
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        },
+    )
+    .expect("managed OAuth IdP plan")
+    .expect("prior-state receipt");
+    assert_eq!(input.body.as_ref().unwrap()["oauth_configuration"], oauth);
+    assert_eq!(prior["prior_state"]["oauth_configuration"], oauth);
+    assert!(super::access_application_login_methods_contract_supported(
+        &capability
+    ));
 }

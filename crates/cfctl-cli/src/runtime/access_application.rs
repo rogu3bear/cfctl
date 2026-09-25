@@ -9,6 +9,7 @@ use super::plan_secret::ACCESS_APP_LAUNCHER_READ_ONLY_FIELDS;
 use super::plan_secret::ACCESS_APP_LAUNCHER_REQUIRED_FIELDS;
 use super::plan_secret::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID;
 use super::plan_secret::ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID;
+use super::plan_secret::ACCESS_APP_MANAGED_OAUTH_MUTABLE_FIELDS;
 use super::plan_secret::ACCESS_APP_MUTABLE_FIELDS;
 use super::plan_secret::ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID;
 use super::plan_secret::ACCESS_APP_READ_CAPABILITY_ID;
@@ -37,11 +38,17 @@ pub(super) fn access_application_login_methods_variant(
     capability_id: &str,
 ) -> Option<AccessApplicationLoginMethodsVariant> {
     match capability_id {
-        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID
-        | ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID
-        | ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
+        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID | ACCESS_APP_OWNED_WHOLE_HOST_CAPABILITY_ID => {
+            Some(AccessApplicationLoginMethodsVariant {
+                app_type: "self_hosted",
+                mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
+                required_fields: &ACCESS_APP_REQUIRED_FIELDS,
+                read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
+            })
+        }
+        ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
             app_type: "self_hosted",
-            mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
+            mutable_fields: &ACCESS_APP_MANAGED_OAUTH_MUTABLE_FIELDS,
             required_fields: &ACCESS_APP_REQUIRED_FIELDS,
             read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
         }),
@@ -848,7 +855,11 @@ pub(super) fn finalize_access_application_login_methods_plan_input(
     )?);
     if variant.app_type == "self_hosted" {
         capability.request_schema =
-            Some(cfctl_catalog::access_application_login_methods_materialized_schema());
+            Some(if capability.id == ACCESS_APP_MANAGED_OAUTH_CAPABILITY_ID {
+                cfctl_catalog::access_application_managed_oauth_schema()
+            } else {
+                cfctl_catalog::access_application_login_methods_materialized_schema()
+            });
     }
     preflight_call_input(capability, input, None)?;
     if current_idps.is_empty() {

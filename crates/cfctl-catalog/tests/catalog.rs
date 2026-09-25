@@ -660,7 +660,7 @@ fn d1_database_create_fixture() -> Value {
                 "post":{
                     "operationId":"d1-create-database",
                     "summary":"Create D1 Database",
-                    "description":"Returns the created D1 database.",
+                    "description":"Create a new D1 database in your account.",
                     "tags":["D1"],
                     "x-api-token-group":["D1 Write"],
                     "parameters":[account.clone()],
@@ -683,7 +683,7 @@ fn d1_database_create_fixture() -> Value {
                 "get":{
                     "operationId":"d1-get-database",
                     "summary":"Get D1 Database",
-                    "description":"Returns the specified D1 database.",
+                    "description":"Get details for a specific D1 database.",
                     "tags":["D1"],
                     "x-api-token-group":["D1 Read","D1 Write"],
                     "parameters":[account.clone(),{
@@ -702,7 +702,7 @@ fn d1_database_create_fixture() -> Value {
                 "delete":{
                     "operationId":"d1-delete-database",
                     "summary":"Delete D1 Database",
-                    "description":"Deletes the specified D1 database.",
+                    "description":"Delete a D1 database.",
                     "tags":["D1"],
                     "x-api-token-group":["D1 Write"],
                     "parameters":[account,database_id],

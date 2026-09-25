@@ -14931,7 +14931,7 @@ fn d1_account_selector_supported(capability: &CapabilityV1) -> bool {
 fn d1_database_create_operation_supported(capability: &CapabilityV1) -> bool {
     capability.id == D1_DATABASE_CREATE_CAPABILITY_ID
         && capability.title == "Create D1 Database"
-        && capability.description.as_deref() == Some("Returns the created D1 database.")
+        && capability.description.as_deref() == Some("Create a new D1 database in your account.")
         && capability.method == "POST"
         && capability.path == D1_DATABASE_COLLECTION_PATH
         && capability.product == "D1"
@@ -14980,7 +14980,7 @@ fn d1_database_read_contract_supported(
             capability.id == D1_DATABASE_READ_CAPABILITY_ID
                 && capability.title == "Get D1 Database"
                 && capability.description.as_deref()
-                    == Some("Returns the specified D1 database.")
+                    == Some("Get details for a specific D1 database.")
                 && capability.method == "GET"
                 && capability.path == D1_DATABASE_DETAIL_PATH
                 && capability.product == "D1"
@@ -15056,7 +15056,7 @@ fn d1_database_delete_contract_supported(capabilities: &BTreeMap<String, Capabil
         .is_some_and(|capability| {
             capability.id == D1_DATABASE_DELETE_CAPABILITY_ID
                 && capability.title == "Delete D1 Database"
-                && capability.description.as_deref() == Some("Deletes the specified D1 database.")
+                && capability.description.as_deref() == Some("Delete a D1 database.")
                 && capability.method == "DELETE"
                 && capability.path == D1_DATABASE_DETAIL_PATH
                 && capability.product == "D1"
