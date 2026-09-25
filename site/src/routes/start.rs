@@ -39,7 +39,8 @@ pub fn StartPage() -> impl IntoView {
                     <li><div>
                         <h2>"Inspect the operation, then read"</h2>
                         <p>"The guide explains required permissions and inputs. The second command reads Workers using the same profile and account you just configured."</p>
-                        <CommandBlock label="List Workers · read only".to_owned() command="cfctl guide listWorkers --json\ncfctl call listWorkers --profile first-read --account \"$ACCOUNT_ID\" --selector account_id=\"$ACCOUNT_ID\" --json".to_owned()/>
+                        <CommandBlock label="Inspect the operation".to_owned() command="cfctl guide listWorkers --json".to_owned()/>
+                        <CommandBlock label="List Workers · read only".to_owned() command="cfctl call listWorkers --profile first-read --account \"$ACCOUNT_ID\" --selector account_id=\"$ACCOUNT_ID\" --json".to_owned()/>
                         <p>"A successful response has ok: true and performed: true, with result data and evidence references. An empty list can mean the account has no Workers. This is a live read; it does not verify a deployment or change your account."</p>
                     </div></li>
                 </ol>
