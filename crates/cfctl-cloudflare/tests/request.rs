@@ -6,6 +6,8 @@ mod email_routing;
 mod pages_projects;
 #[path = "request/worker_deployments.rs"]
 mod worker_deployments;
+#[path = "request/worker_domains.rs"]
+mod worker_domains;
 #[path = "request/worker_secrets.rs"]
 mod worker_secrets;
 

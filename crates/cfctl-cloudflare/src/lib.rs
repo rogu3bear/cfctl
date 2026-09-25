@@ -4,6 +4,7 @@ pub mod d1_read_inventory;
 mod d1_sql;
 mod oauth_scopes;
 mod pagination_diagnostic;
+mod worker_domains;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;
 mod custom_challenge_rule;
 pub mod pages_projects;
@@ -6891,6 +6892,9 @@ impl Executor {
         }
         if request_is_queue_consumers_single_page(request) {
             normalize_queue_consumers_single_page(&mut combined)?;
+            return Ok(combined);
+        }
+        if worker_domains::accept_empty_single_page(request, &mut combined) {
             return Ok(combined);
         }
         if let Some(pagination) = page_pagination(combined.result_info.as_ref())
