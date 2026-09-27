@@ -227,6 +227,7 @@ use auth_and_authority::*;
 mod boundary_rectification;
 mod compensation_and_errors;
 mod secret_io;
+mod secret_plan_impact;
 mod workflows_and_resolve;
 use workflows_and_resolve::*;
 mod access_application;
