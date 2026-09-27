@@ -465,17 +465,14 @@ pub(super) fn plan_impact(
         affected_resources: affected_resources.len(),
         dependent_configurations: local_diffs.len(),
         has_unmanaged_dependencies: workspace_impact.has_unmanaged_dependencies,
-        has_dirty_overlap: affected_repositories.iter().any(|repository_id| {
-            if archive
-                .as_ref()
-                .is_some_and(|p| &p.request.repository == repository_id)
-            {
-                return false;
-            }
-            graph
-                .repository(repository_id)
-                .is_some_and(|repository| repository.git.dirty)
-        }),
+        has_dirty_overlap: has_dirty_overlap(
+            capability,
+            &graph,
+            &affected_repositories,
+            &local_diffs,
+            &local_artifact_paths,
+            archive.as_ref().map(|p| p.request.repository.as_str()),
+        ),
         selector_ambiguous: missing_required,
     };
     Ok(PlannedImpact {
@@ -484,6 +481,32 @@ pub(super) fn plan_impact(
         affected_resources,
         local_diffs,
         local_artifact_paths,
+    })
+}
+
+fn has_dirty_overlap(
+    capability: &CapabilityV1,
+    graph: &WorkspaceGraph,
+    affected_repositories: &[String],
+    local_diffs: &[Value],
+    local_artifact_paths: &[PathBuf],
+    immutable_repository: Option<&str>,
+) -> bool {
+    if super::secret_io::is_worker_script_secret_input_only_capability(capability)
+        && capability.verification_contract_supported()
+        && local_artifact_paths.is_empty()
+    {
+        // A single-secret PUT consumes no working source. Preserve configuration
+        // overlap checks; the execution snapshot still binds repository state.
+        return local_diffs
+            .iter()
+            .any(|diff| diff["dirty"].as_bool() != Some(false));
+    }
+    affected_repositories.iter().any(|repository_id| {
+        immutable_repository != Some(repository_id.as_str())
+            && graph
+                .repository(repository_id)
+                .is_some_and(|repository| repository.git.dirty)
     })
 }
 

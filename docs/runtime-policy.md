@@ -40,6 +40,15 @@ selectors, request body hash, workspace graph, source-config hashes, local and
 Cloudflare diffs, cost, verification, compensation, and non-reversible
 warnings. It expires within 24 hours and any relevant drift invalidates it.
 
+The validated `worker-put-script-secret` contract consumes a protected request
+body, not repository source or a deployment artifact. Unrelated working-tree
+edits in its linked repositories do not count as dirty overlap when preparing
+that single-secret plan. Dirty linked configuration remains blocked, and the
+plan still pins the complete scoped workspace state and configuration hashes:
+drift in those pins after planning invalidates approval. Its identity/security effect still
+requires exact-operation approval. Source/artifact operations retain their
+clean-repository checks.
+
 An approved plan is latent authority until consumed, and expiry is only
 enforced when something tries to consume it. `cfctl plans cancel
 <operation-id>` retires that authority immediately — the plan-level
