@@ -66,7 +66,11 @@ Gitleaks, Bun 1.3.14, cargo-leptos 0.3.5, worker-build 0.7.5, and the
 the Linux ship target, it needs `zig`, `cargo-zigbuild`, and the
 `x86_64-unknown-linux-musl` Rust target. `verify` fails closed when either the
 site or cross-build toolchain is absent rather than skipping that proof.
-Install them, then orient through the public CLI:
+`verify` prefers the direct `~/.bun/bin/bun` executable and then searches PATH
+for another direct Bun. The reply-admission proof copies Bun into an isolated
+stage, where version-manager shims cannot run; if only a shim is available,
+the verifier reports its resolved path and asks for a direct executable.
+After installing these tools, orient through the public CLI:
 
 ```bash
 ./bootstrap.sh

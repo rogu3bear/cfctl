@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod attribution_tests;
+mod direct_bun;
 mod local_adapters;
 mod local_guidance;
 
@@ -94,6 +95,8 @@ enum Task {
 enum TaskError {
     #[error("command failed: {0}")]
     Command(String),
+    #[error("Bun verifier: {0}")]
+    BunVerifier(String),
     #[error("I/O failed for {path}: {source}")]
     Io {
         path: String,
@@ -197,6 +200,7 @@ fn execute(arguments: Arguments) -> Result<(), TaskError> {
 }
 
 fn verify() -> Result<(), TaskError> {
+    let bun = direct_bun::prefer_for_verification()?;
     run(
         "bash",
         &[".githooks/check-attribution.sh", "origin/main", "HEAD"],
@@ -228,8 +232,8 @@ fn verify() -> Result<(), TaskError> {
             "--locked",
         ],
     )?;
-    verify_site()?;
-    verify_event_ingress_bridge()?;
+    verify_site(&bun)?;
+    verify_event_ingress_bridge(&bun)?;
     verify_security_contract()?;
     verify_source_contract()?;
     verify_cross_target()?;
@@ -237,7 +241,7 @@ fn verify() -> Result<(), TaskError> {
     Ok(())
 }
 
-fn verify_site() -> Result<(), TaskError> {
+fn verify_site(bun: &Path) -> Result<(), TaskError> {
     let root = repository_root()?.join("site");
 
     let mut fmt = Command::new("cargo");
@@ -270,7 +274,7 @@ fn verify_site() -> Result<(), TaskError> {
         "cargo test --all-targets --features ssr --locked (site)",
     )?;
 
-    let mut live_verifier = Command::new("bun");
+    let mut live_verifier = Command::new(bun);
     live_verifier
         .args(["test", "./scripts/"])
         .current_dir(&root);
@@ -288,9 +292,9 @@ fn verify_site() -> Result<(), TaskError> {
     )
 }
 
-fn verify_event_ingress_bridge() -> Result<(), TaskError> {
+fn verify_event_ingress_bridge(bun: &Path) -> Result<(), TaskError> {
     let root = repository_root()?.join("bridge/event-ingress");
-    let mut install = Command::new("bun");
+    let mut install = Command::new(bun);
     install
         .args(["install", "--frozen-lockfile"])
         .current_dir(&root);
@@ -298,7 +302,7 @@ fn verify_event_ingress_bridge() -> Result<(), TaskError> {
         &mut install,
         "bun install --frozen-lockfile (bridge/event-ingress)",
     )?;
-    let mut check = Command::new("bun");
+    let mut check = Command::new(bun);
     check.args(["run", "check"]).current_dir(&root);
     run_command(&mut check, "bun run check (bridge/event-ingress)")
 }
@@ -3655,6 +3659,7 @@ fn run(program: &str, arguments: &[&str]) -> Result<(), TaskError> {
 }
 
 fn run_command(command: &mut Command, label: &str) -> Result<(), TaskError> {
+    direct_bun::apply_to_command(command);
     let status = command
         .status()
         .map_err(|source| io_error(Path::new(label), source))?;
