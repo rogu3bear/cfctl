@@ -8,7 +8,7 @@
 # Invoked by .githooks/pre-push, which is SHA-256 pinned in
 # ~/.config/git/guards/repo-hook-allowlist. This file is deliberately NOT pinned
 # so gate behavior can change without re-pinning. It lives beside the hook rather than
-# in scripts/, which the xtask source contract forbids as a quarantined v1
+# in scripts/, which the xtask source contract forbids as an archived v1
 # runtime path.
 #
 set -euo pipefail

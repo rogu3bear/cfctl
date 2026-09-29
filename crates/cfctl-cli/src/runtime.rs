@@ -1,4 +1,4 @@
-//! Deterministic command handlers for the cfctl v2 binary.
+//! Deterministic command handlers for the cfctl binary.
 
 #![deny(clippy::wildcard_imports)]
 
@@ -83,7 +83,6 @@ mod security_action_input;
 mod security_action_state;
 mod support;
 mod turnstile_secret;
-mod v1_migration;
 mod worker_custom_domain;
 mod worker_deployment;
 mod worker_deployment_artifact;
@@ -121,7 +120,6 @@ use prelude::{
 };
 use registry_commands::registry_command;
 use support::cli_io;
-use v1_migration::migrate_command;
 use workspace_commands::workspace_command;
 
 pub(crate) use call_input::verification_for_status;
@@ -187,7 +185,6 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Doctor => doctor_command(&store),
         Command::Version => version_command(),
         Command::Update(arguments) => update_command(arguments.check).await,
-        Command::Migrate(arguments) => migrate_command(&store, arguments.command),
     }
 }
 
@@ -202,16 +199,12 @@ fn runtime_qualifying_state_store() -> Result<StateStore> {
 }
 
 fn command_uses_nonqualifying_audit_evidence(command: &Command) -> bool {
-    match command {
-        // Cancellation de-authorizes a plan and migration imports only
-        // non-secret historical state. Neither command may be blocked by a
-        // missing evidence key, and neither output qualifies future authority.
-        Command::Plans(arguments) => {
-            matches!(&arguments.command, crate::PlansCommand::Cancel(_))
-        }
-        Command::Migrate(_) => true,
-        _ => false,
-    }
+    // Cancellation de-authorizes a plan. It may not be blocked by a missing
+    // evidence key, and its output never qualifies future authority.
+    matches!(
+        command,
+        Command::Plans(arguments) if matches!(&arguments.command, crate::PlansCommand::Cancel(_))
+    )
 }
 
 pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> {

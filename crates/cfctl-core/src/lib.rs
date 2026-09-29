@@ -1,4 +1,4 @@
-//! Versioned domain contracts for the cfctl v2 control plane.
+//! Versioned domain contracts for the cfctl control plane.
 
 pub mod d1_read_inventory;
 pub mod d1_reconciliation;
@@ -54,7 +54,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Exact sorted inventory of the executable v2 top-level command surface.
+/// Exact sorted inventory of the executable top-level command surface.
 ///
 /// The CLI tests bind this contract to the live Clap tree, while `xtask`
 /// uses it to reject stale checked-in command examples.
@@ -69,7 +69,6 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "events",
     "guide",
     "keys",
-    "migrate",
     "plans",
     "policy",
     "registry",
@@ -79,7 +78,7 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "workspace",
 ];
 
-/// One node in the exact public v2 command tree below the top level. The tree
+/// One node in the exact public command tree below the top level. The tree
 /// extends `PUBLIC_V2_SUBCOMMANDS` recursively; leaves carry no subcommands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandNodeV1 {
@@ -214,10 +213,6 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
             CommandNodeV1::leaf("revoke"),
             CommandNodeV1::leaf("rotate"),
         ],
-    },
-    CommandNodeV1 {
-        name: "migrate",
-        subcommands: &[CommandNodeV1::leaf("v1")],
     },
     CommandNodeV1 {
         name: "plans",
@@ -735,82 +730,6 @@ pub struct EventCursorV1 {
     pub overlap_seconds: u64,
     pub updated_at: DateTime<Utc>,
 }
-
-/// Frozen top-level verbs from the retired shell control plane that must
-/// always reach the deterministic parser. Without this boundary, a stale
-/// multi-token v1 command would be mistaken for natural-language intent and
-/// could launch an agent instead of failing closed.
-pub const RETIRED_V1_PUBLIC_VERBS: &[&str] = &[
-    "admin",
-    "apply",
-    "audit",
-    "bootstrap",
-    "can",
-    "classify",
-    "cloudflared",
-    "diff",
-    "env",
-    "explain",
-    "form-intake",
-    "get",
-    "hostname",
-    "lanes",
-    "list",
-    "locks",
-    "maildesk-cf",
-    "ownership",
-    "previews",
-    "skills",
-    "snapshot",
-    "standards",
-    "surfaces",
-    "token",
-    "verify",
-    "wrangler",
-];
-
-/// Frozen surface identifiers used to distinguish concrete v1 command shapes
-/// from legitimate natural-language requests that begin with words such as
-/// `list`, `explain`, or `verify`.
-pub const RETIRED_V1_SURFACES: &[&str] = &[
-    "access.app",
-    "access.group",
-    "access.idp",
-    "access.login_method",
-    "access.organization",
-    "access.policy",
-    "access.service_token",
-    "api_gateway.discovery",
-    "api_gateway.operation",
-    "api_gateway.schema",
-    "audit.log",
-    "d1.database",
-    "dns.record",
-    "edge.certificate",
-    "email.routing_rule",
-    "form.intake",
-    "logpush.job",
-    "maildesk-cf",
-    "pages.project",
-    "pages.secret",
-    "queue",
-    "r2.bucket",
-    "security.txt",
-    "sender_domain",
-    "tunnel",
-    "turnstile.widget",
-    "vulnerability_scanner.credential_set",
-    "vulnerability_scanner.scan",
-    "vulnerability_scanner.target_environment",
-    "waiting_room",
-    "worker.route",
-    "worker.script",
-    "worker.secret",
-    "workflow",
-    "zone",
-    "zone.ruleset",
-    "zone.setting",
-];
 
 /// Errors shared by the deterministic planner, policy engine, and executors.
 #[derive(Debug, Error)]
@@ -4913,7 +4832,7 @@ fn system_guide_answers() -> Vec<GuideAnswerV1> {
         ),
         guide_answer(
             GuideQuestionV1::PersistsState,
-            "Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink. The source checkout's compat/v1 tree is inert migration evidence, not runtime state or a live catalog.",
+            "Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink.",
         ),
         guide_answer(
             GuideQuestionV1::FailureRecovery,

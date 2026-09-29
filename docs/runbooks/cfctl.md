@@ -1,4 +1,4 @@
-# cfctl v2 operator runbook
+# cfctl operator runbook
 
 ## Launch support triage
 

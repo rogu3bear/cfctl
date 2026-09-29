@@ -1,4 +1,4 @@
-//! Public command contract for the cfctl v2 binary.
+//! Public command contract for the cfctl binary.
 
 use std::path::PathBuf;
 
@@ -65,8 +65,6 @@ pub enum Command {
     Version,
     /// Check for or install a newer cfctl version.
     Update(UpdateArgs),
-    /// Import explicitly supported v1 state into the v2 runtime.
-    Migrate(MigrateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1054,18 +1052,6 @@ pub enum DocsCommand {
 pub struct UpdateArgs {
     #[arg(long)]
     pub check: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct MigrateArgs {
-    #[command(subcommand)]
-    pub command: MigrateCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum MigrateCommand {
-    /// Import explicitly supported non-secret state from the v1 runtime.
-    V1,
 }
 
 fn parse_key_value(value: &str) -> Result<(String, String), String> {

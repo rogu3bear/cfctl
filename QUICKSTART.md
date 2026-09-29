@@ -1,4 +1,4 @@
-# cfctl v2 quickstart
+# cfctl quickstart
 
 ## Build and install
 

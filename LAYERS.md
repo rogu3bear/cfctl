@@ -10,7 +10,7 @@ drift at the lowest layer that owns the disputed claim.
 |---|---|---|
 | L0 — Purpose | destination, outcomes, strategic test | `NORTH_STAR.md` |
 | L1 — Invariants | product, safety, simplicity, operating, and ownership boundaries | `ANCHOR.md` |
-| L2 — Public contract | supported commands, types, and operator semantics | `README.md`, `CFCTL_PROMPT.md`, `docs/runtime-policy.md`, `docs/v2-architecture.md` |
+| L2 — Public contract | supported commands, types, and operator semantics | `README.md`, `CFCTL_PROMPT.md`, `docs/runtime-policy.md`, `docs/architecture.md` |
 | L3 — Capability | exact supported operations, schemas, adapters, and guidance | catalog metadata consumed by `cfctl catalog`, `resolve`, `guide`, and `call` |
 | L4 — Implementation | behavior that realizes the contract | `crates/*`, `site/*`, the public `cfctl` binary |
 | Gate — Proof | checks required before integration or release | `CONTRIBUTING.md`, `cargo xtask verify`, `cargo xtask release` |

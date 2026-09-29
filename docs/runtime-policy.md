@@ -1,4 +1,4 @@
-# cfctl v2 runtime policy
+# cfctl runtime policy
 
 The policy engine, never an agent, classifies a plan as `auto_execute`,
 `approval_required`, or `blocked`.
@@ -199,7 +199,7 @@ user-visible stdout, arguments, logs, profiles, plans, evidence or repository
 files. Existing credential fallback and evidence-key custody rules remain in
 force; disabling dialogs does not create a new authority or rotate an old key.
 
-The cfctl v2 macOS Keychain representation is a one-way storage migration.
+The cfctl macOS Keychain v2 representation is a one-way storage migration.
 After a v2 build writes or migrates a credential, running a binary released
 before this storage contract against that Keychain item is unsupported,
 including side-by-side use: the older binary cannot interpret the v2 root
