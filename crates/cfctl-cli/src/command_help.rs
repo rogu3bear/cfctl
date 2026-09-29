@@ -12,10 +12,6 @@ const GRAMMAR: &str = "cfctl <area> <action> [target] [flags]";
 
 const STARTING_PATHS: &[(&str, &str)] = &[
     (
-        "cfctl \"<natural-language request>\"",
-        "hand an open-ended request to the configured local agent",
-    ),
-    (
         "cfctl resolve \"<intent>\"",
         "map intent to one deterministic catalog capability",
     ),

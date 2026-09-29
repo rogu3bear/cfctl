@@ -1,8 +1,8 @@
 use std::{env, io::Write, process::ExitCode};
 
 use cfctl_cli::{
-    AuthCommand, Cli, Command, EvidenceKeyAdoptPlanCommand, EvidenceKeyCommand, InvocationMode,
-    PlansCommand, classify_invocation, runtime,
+    AuthCommand, Cli, Command, EvidenceKeyAdoptPlanCommand, EvidenceKeyCommand, PlansCommand,
+    runtime,
 };
 use cfctl_core::ResultEnvelopeV2;
 use clap::Parser;
@@ -91,41 +91,34 @@ fn failure_envelope(
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().collect();
-    let mode = classify_invocation(arguments.clone());
     let json_requested = arguments.iter().any(|argument| argument == "--json");
-    let (result, failure_context) = match mode {
-        InvocationMode::NaturalLanguage(intent) => (
-            runtime::execute_natural_language(&intent).await,
-            FailureEnvelopeContext::generic(),
-        ),
-        InvocationMode::Deterministic => match Cli::try_parse_from(arguments) {
-            Ok(cli) => {
-                let context = FailureEnvelopeContext::deterministic(&cli);
-                (runtime::execute(cli).await, context)
-            }
-            Err(error) => {
-                let exit_code = u8::try_from(error.exit_code()).unwrap_or(2);
-                if json_requested && exit_code == 2 {
-                    let envelope = ResultEnvelopeV2::failure(
-                        "cfctl",
-                        "CFCTL_USAGE",
-                        &error.to_string(),
-                        Some(
-                            "Run the nearest `cfctl <command path> --help`; use `cfctl commands` to see the complete command map.",
-                        ),
-                    );
-                    let Ok(output) = runtime::render(&envelope, true) else {
-                        return ExitCode::from(1);
-                    };
-                    if std::io::stderr().write_all(output.as_bytes()).is_err() {
-                        return ExitCode::from(1);
-                    }
-                    return ExitCode::from(exit_code);
+    let (result, failure_context) = match Cli::try_parse_from(arguments) {
+        Ok(cli) => {
+            let context = FailureEnvelopeContext::deterministic(&cli);
+            (runtime::execute(cli).await, context)
+        }
+        Err(error) => {
+            let exit_code = u8::try_from(error.exit_code()).unwrap_or(2);
+            if json_requested && exit_code == 2 {
+                let envelope = ResultEnvelopeV2::failure(
+                    "cfctl",
+                    "CFCTL_USAGE",
+                    &error.to_string(),
+                    Some(
+                        "Run the nearest `cfctl <command path> --help`; use `cfctl commands` to see the complete command map.",
+                    ),
+                );
+                let Ok(output) = runtime::render(&envelope, true) else {
+                    return ExitCode::from(1);
+                };
+                if std::io::stderr().write_all(output.as_bytes()).is_err() {
+                    return ExitCode::from(1);
                 }
-                let _ignored = error.print();
                 return ExitCode::from(exit_code);
             }
-        },
+            let _ignored = error.print();
+            return ExitCode::from(exit_code);
+        }
     };
     let (envelope, success) = match result {
         Ok(envelope) => {

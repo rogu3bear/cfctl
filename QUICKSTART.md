@@ -259,13 +259,13 @@ lineage-bound, emits redacted evidence, and exits nonzero.
 ```bash
 cfctl agents install --all-detected
 cfctl agents doctor
-cfctl "inspect the current Worker routes for example.com"
+cfctl resolve "inspect the current Worker routes for example.com" --json
 ```
 
-Agents use deterministic commands underneath; a recursion marker prevents an
-agent from launching another agent, and model output never approves or
-directly mutates Cloudflare. Quote natural language — a bare single token that
-is not a known command fails closed with a usage error, never an agent launch.
+Agents use deterministic commands underneath, and model output never approves
+or directly mutates Cloudflare. cfctl itself never launches an agent: input
+that is not a known command, including multi-word text, fails closed with a
+usage error.
 
 A source-only GitHub release may identify accepted source without uploaded
 binaries or installer assets. It is labeled source-only and is not marked

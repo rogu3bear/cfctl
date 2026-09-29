@@ -1,32 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use cfctl_agent::{
-    AgentKind, AgentLauncher, InstallMode, InvocationContext, build_intent_action,
-    install_agent_skill,
-};
-
-#[test]
-fn bare_intent_launches_the_configured_agent_once() {
-    let launcher = AgentLauncher::new(AgentKind::Codex);
-    let invocation = launcher
-        .prepare(
-            "rotate the production Worker secret",
-            &InvocationContext::default(),
-        )
-        .expect("initial invocation can launch");
-    assert_eq!(invocation.program, "codex");
-    assert!(
-        invocation
-            .env
-            .iter()
-            .any(|(k, v)| k == "CFCTL_AGENT_SESSION" && v == "1")
-    );
-
-    let nested = InvocationContext {
-        agent_session: true,
-    };
-    assert!(launcher.prepare("same intent", &nested).is_err());
-}
+use cfctl_agent::{AgentKind, InstallMode, build_ui_action, install_agent_skill};
+use cfctl_core::AgentActionKind;
 
 #[test]
 fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() {
@@ -300,13 +275,17 @@ fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {
 }
 
 #[test]
-fn agent_actions_are_hash_bound_and_do_not_grant_authority() {
-    let action =
-        build_intent_action(AgentKind::Claude, "inspect DNS", None).expect("action should build");
+fn agent_actions_are_hash_bound_and_observation_is_not_mutation() {
+    let action = build_ui_action(
+        AgentKind::Claude,
+        None,
+        None,
+        serde_json::Value::Null,
+        "inspect DNS",
+        false,
+    )
+    .expect("action should build");
     assert!(action.content_hash.starts_with("sha256:"));
-    assert!(
-        action
-            .instructions
-            .contains("does not grant mutation authority")
-    );
+    assert_eq!(action.kind, AgentActionKind::ObserveUi);
+    assert_eq!(action.agent, "claude");
 }

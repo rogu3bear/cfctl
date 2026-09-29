@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use cfctl_core::{RETIRED_V1_PUBLIC_VERBS, RETIRED_V1_SURFACES};
-use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub mod build_identity;
 #[doc(hidden)]
@@ -1069,70 +1068,6 @@ pub enum MigrateCommand {
     V1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvocationMode {
-    Deterministic,
-    NaturalLanguage(String),
-}
-
-pub fn classify_invocation<I, S>(arguments: I) -> InvocationMode
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let mut arguments = arguments.into_iter().map(Into::into);
-    let _program = arguments.next();
-    let remaining: Vec<String> = arguments.filter(|argument| argument != "--json").collect();
-    let Some(first) = remaining.first() else {
-        return InvocationMode::Deterministic;
-    };
-    if first.starts_with('-')
-        || is_known_subcommand(first)
-        || is_retired_v1_command_shape(&remaining)
-    {
-        return InvocationMode::Deterministic;
-    }
-    // A bare single token is far more likely a mistyped subcommand than a
-    // one-word natural-language request: route it to the deterministic parser
-    // so clap fails closed with an unrecognized-subcommand error (and its
-    // did-you-mean suggestion) instead of silently launching an agent.
-    if remaining.len() == 1 && !first.contains(char::is_whitespace) {
-        return InvocationMode::Deterministic;
-    }
-    InvocationMode::NaturalLanguage(remaining.join(" "))
-}
-
-fn is_retired_v1_command_shape(arguments: &[String]) -> bool {
-    let Some(first) = arguments.first().map(String::as_str) else {
-        return false;
-    };
-    if !RETIRED_V1_PUBLIC_VERBS.contains(&first) {
-        return false;
-    }
-    let second = arguments.get(1).map(String::as_str);
-    match first {
-        "apply" | "can" | "classify" | "diff" | "explain" | "get" | "list" | "snapshot"
-        | "verify" => second.is_some_and(|surface| RETIRED_V1_SURFACES.contains(&surface)),
-        "audit" => {
-            arguments.len() == 2
-                && second.is_some_and(|scope| matches!(scope, "access" | "state" | "trust"))
-        }
-        "token" => second.is_some_and(|action| {
-            matches!(action, "mint" | "permission-groups" | "revoke" | "rotate")
-        }),
-        _ => true,
-    }
-}
-
-fn is_known_subcommand(name: &str) -> bool {
-    // clap injects the `help` subcommand at parse time, so it is not visible
-    // through `get_subcommands` here.
-    name == "help"
-        || Cli::command().get_subcommands().any(|command| {
-            command.get_name() == name || command.get_all_aliases().any(|alias| alias == name)
-        })
-}
-
 fn parse_key_value(value: &str) -> Result<(String, String), String> {
     let Some((key, value)) = value.split_once('=') else {
         return Err("expected KEY=VALUE".to_owned());
@@ -1141,107 +1076,4 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
         return Err("selector key cannot be empty".to_owned());
     }
     Ok((key.to_owned(), value.to_owned()))
-}
-
-#[cfg(test)]
-mod invocation_routing_tests {
-    use super::{InvocationMode, classify_invocation};
-
-    fn classify(arguments: &[&str]) -> InvocationMode {
-        classify_invocation(arguments.iter().copied())
-    }
-
-    fn reaches_the_parser(arguments: &[&str]) -> bool {
-        classify(arguments) == InvocationMode::Deterministic
-    }
-
-    #[test]
-    fn an_empty_invocation_reaches_the_parser() {
-        assert!(reaches_the_parser(&["cfctl"]));
-        assert!(reaches_the_parser(&["cfctl", "--json"]));
-    }
-
-    #[test]
-    fn a_leading_flag_reaches_the_parser() {
-        for flag in ["--help", "-h", "--version", "-V"] {
-            assert!(reaches_the_parser(&["cfctl", flag]), "{flag}");
-        }
-    }
-
-    #[test]
-    fn a_known_subcommand_reaches_the_parser() {
-        for verb in ["doctor", "plans", "catalog", "auth", "keys", "help"] {
-            assert!(reaches_the_parser(&["cfctl", verb]), "{verb}");
-            assert!(
-                reaches_the_parser(&["cfctl", verb, "status"]),
-                "{verb} status"
-            );
-        }
-    }
-
-    #[test]
-    fn a_mistyped_subcommand_reaches_the_parser_instead_of_the_agent() {
-        // A bare unknown token is a typo, not intent: it must fail closed with
-        // clap's unrecognized-subcommand error rather than launch an agent.
-        for typo in ["not-a-real-verb", "doctr", "planz"] {
-            assert!(reaches_the_parser(&["cfctl", typo]), "{typo}");
-            assert!(
-                reaches_the_parser(&["cfctl", typo, "--json"]),
-                "{typo} --json"
-            );
-        }
-    }
-
-    #[test]
-    fn a_retired_v1_command_shape_reaches_the_parser() {
-        // RETIRED_V1_PUBLIC_VERBS exists so a stale multi-token v1 command
-        // fails closed instead of being read as natural-language intent.
-        for shape in [
-            &["verify", "dns.record"][..],
-            &["can", "dns.record", "delete"][..],
-            &["list", "d1.database"][..],
-            &["token", "mint"][..],
-            &["audit", "trust"][..],
-            &["surfaces", "list"][..],
-            &["hostname", "apply", "example.com"][..],
-        ] {
-            let arguments: Vec<&str> = std::iter::once("cfctl")
-                .chain(shape.iter().copied())
-                .collect();
-            assert!(reaches_the_parser(&arguments), "{shape:?}");
-        }
-    }
-
-    #[test]
-    fn a_retired_verb_used_as_prose_is_still_intent() {
-        // The surface list is what separates `cfctl verify dns.record` (a dead
-        // v1 command) from `verify my dns records` (a request). Without it the
-        // whole retired-verb boundary would swallow ordinary English.
-        assert_eq!(
-            classify(&["cfctl", "verify", "my", "dns", "records"]),
-            InvocationMode::NaturalLanguage("verify my dns records".to_owned())
-        );
-    }
-
-    #[test]
-    fn multi_word_input_is_routed_to_the_agent_lane() {
-        let expected = InvocationMode::NaturalLanguage("make me a dns record".to_owned());
-        assert_eq!(
-            classify(&["cfctl", "make", "me", "a", "dns", "record"]),
-            expected
-        );
-        assert_eq!(classify(&["cfctl", "make me a dns record"]), expected);
-    }
-
-    #[test]
-    fn the_json_flag_never_changes_routing() {
-        assert_eq!(
-            classify(&["cfctl", "--json", "make", "me", "a", "record"]),
-            classify(&["cfctl", "make", "me", "a", "record"])
-        );
-        assert_eq!(
-            classify(&["cfctl", "make", "me", "a", "record", "--json"]),
-            classify(&["cfctl", "make", "me", "a", "record"])
-        );
-    }
 }

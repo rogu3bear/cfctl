@@ -108,7 +108,6 @@ use agent_commands::agents_command;
 use auth_commands::auth_command;
 use call_command::call_command;
 use catalog_commands::{catalog_command, guide_command, guide_topic_envelope};
-use cfctl_agent::build_intent_action;
 use cfctl_core::render_guide_topic_document_markdown;
 use docs_commands::docs_command;
 use events_commands::events_command;
@@ -118,11 +117,10 @@ use keys_commands::keys_command;
 use plan_commands::plans_command;
 use policy_commands::policy_command;
 use prelude::{
-    AgentLauncher, Cli, Command, EvidenceClass, GuideTopicDocumentV1, InvocationContext, Path,
-    ProcessCommand, ResultEnvelopeV2, RuntimePaths, StateStore, Stdio, Value, env, json,
+    Cli, Command, GuideTopicDocumentV1, ResultEnvelopeV2, RuntimePaths, StateStore, Value,
 };
 use registry_commands::registry_command;
-use support::{cli_io, configured_agent};
+use support::cli_io;
 use v1_migration::migrate_command;
 use workspace_commands::workspace_command;
 
@@ -136,9 +134,9 @@ pub use error::CliError;
 pub type Result<T> = std::result::Result<T, CliError>;
 
 pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
-    let command = cli.command.ok_or_else(|| {
-        CliError::Input("run `cfctl --help` or pass a natural-language intent".to_owned())
-    })?;
+    let command = cli
+        .command
+        .ok_or_else(|| CliError::Input("run `cfctl --help` or `cfctl commands`".to_owned()))?;
     if let Command::Guide(arguments) = &command
         && let Some(topic) = arguments.topic
     {
@@ -191,44 +189,6 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Update(arguments) => update_command(arguments.check).await,
         Command::Migrate(arguments) => migrate_command(&store, arguments.command),
     }
-}
-
-pub async fn execute_natural_language(intent: &str) -> Result<ResultEnvelopeV2> {
-    let runtime_lock = cfctl_storage::lock_runtime_selection(&RuntimePaths::unselected()?, false)?;
-    let store = runtime_qualifying_state_store()?;
-    let agent = configured_agent()?;
-    let context = InvocationContext {
-        agent_session: env::var_os("CFCTL_AGENT_SESSION").is_some(),
-    };
-    let invocation = AgentLauncher::new(agent).prepare(intent, &context)?;
-    let action = build_intent_action(agent, intent, None)?;
-    let evidence =
-        store.write_evidence(EvidenceClass::AgentAction, &serde_json::to_value(&action)?)?;
-    drop(runtime_lock);
-    let mut process = ProcessCommand::new(&invocation.program);
-    process.args(&invocation.args);
-    for (key, value) in invocation.env {
-        process.env(key, value);
-    }
-    process
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let status = process
-        .status()
-        .await
-        .map_err(|source| cli_io(Path::new(&invocation.program), source))?;
-    let mut envelope = ResultEnvelopeV2::success(
-        "intent",
-        json!({
-            "agent": agent.label(),
-            "agent_exit_status": status.code(),
-            "message": "The agent interpreted intent; deterministic cfctl receipts remain authoritative."
-        }),
-    )
-    .with_evidence(evidence);
-    envelope.ok = status.success();
-    Ok(envelope)
 }
 
 fn runtime_unqualified_state_store() -> Result<StateStore> {

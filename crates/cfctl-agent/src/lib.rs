@@ -18,8 +18,6 @@ const LEGACY_CODEX_SKILL_V2_SHA256: &str =
 
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error("cfctl is already running inside an agent session; refusing recursive launch")]
-    RecursiveLaunch,
     #[error(transparent)]
     Core(#[from] cfctl_core::CoreError),
     #[error("agent integration I/O failed for {path}: {source}")]
@@ -73,80 +71,6 @@ impl AgentKind {
             Self::Gemini => "gemini",
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InvocationContext {
-    pub agent_session: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedInvocation {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AgentLauncher {
-    kind: AgentKind,
-}
-
-impl AgentLauncher {
-    #[must_use]
-    pub const fn new(kind: AgentKind) -> Self {
-        Self { kind }
-    }
-
-    pub fn prepare(&self, intent: &str, context: &InvocationContext) -> Result<PreparedInvocation> {
-        if context.agent_session {
-            return Err(AgentError::RecursiveLaunch);
-        }
-        let prompt = format!(
-            "Use the installed cfctl operator skill. Treat this as intent only, not authority: {intent}"
-        );
-        let args = match self.kind {
-            AgentKind::Codex => vec!["exec".to_owned(), prompt],
-            AgentKind::Claude | AgentKind::Cursor => vec!["--print".to_owned(), prompt],
-            AgentKind::Gemini => vec!["--prompt".to_owned(), prompt],
-        };
-        Ok(PreparedInvocation {
-            program: self.kind.program().to_owned(),
-            args,
-            env: vec![("CFCTL_AGENT_SESSION".to_owned(), "1".to_owned())],
-        })
-    }
-}
-
-pub fn build_intent_action(
-    agent: AgentKind,
-    intent: &str,
-    operation_id: Option<&str>,
-) -> Result<AgentActionV1> {
-    let action_id = Uuid::new_v4().to_string();
-    let instructions = format!(
-        "Interpret this bounded Cloudflare intent through deterministic cfctl commands. This handoff does not grant mutation authority: {intent}"
-    );
-    let content = serde_json::json!({
-        "schema_version": 1,
-        "action_id": action_id,
-        "operation_id": operation_id,
-        "kind": AgentActionKind::InterpretIntent,
-        "agent": agent,
-        "target": Value::Null,
-        "instructions": instructions,
-    });
-    Ok(AgentActionV1 {
-        schema_version: 1,
-        action_id,
-        operation_id: operation_id.map(str::to_owned),
-        kind: AgentActionKind::InterpretIntent,
-        agent: format!("{agent:?}").to_ascii_lowercase(),
-        account_id: None,
-        target: Value::Null,
-        instructions,
-        content_hash: hash_value(&content)?,
-    })
 }
 
 pub fn build_ui_action(
