@@ -1,8 +1,10 @@
 //! Live readback for API token create, roll, and revoke.
 //!
 //! After `plans run` of `keys mint`, `verification.passed` means GET token
-//! details reports the created id, `status=active`, the exact planned
-//! permission-group ID set, and the planned account resource. The token
+//! details reports the created id, `status=active`, and exactly the planned
+//! policies: each policy's effect, permission-group IDs, and resources, compared
+//! per policy so equal unions with different associations fail. Nested or
+//! non-string resource grants are not comparable and fail closed. The token
 //! VALUE is never kept on the verification readback.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,10 +17,41 @@ const CREATE_STRATEGY: &str = "api_token_details_match_created_id_and_active_sta
 const ROLL_STRATEGY: &str = "api_token_details_report_active_after_value_roll";
 const REVOKE_STRATEGY: &str = "api_token_details_returns_not_found_after_revoke";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PlannedTokenPolicySet {
+/// One token policy as Cloudflare associates it: an effect granting a set of
+/// permission groups on a set of resources. Policies are compared whole, so
+/// equal group or resource unions never stand in for equal policies.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TokenPolicy {
+    effect: String,
     group_ids: BTreeSet<String>,
     resources: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlannedTokenPolicySet {
+    /// Sorted, so comparison ignores provider ordering but not associations.
+    policies: Vec<TokenPolicy>,
+}
+
+impl PlannedTokenPolicySet {
+    fn group_ids(&self) -> BTreeSet<&str> {
+        self.policies
+            .iter()
+            .flat_map(|policy| policy.group_ids.iter().map(String::as_str))
+            .collect()
+    }
+
+    fn resources(&self) -> BTreeSet<(&str, &str)> {
+        self.policies
+            .iter()
+            .flat_map(|policy| {
+                policy
+                    .resources
+                    .iter()
+                    .map(|(key, access)| (key.as_str(), access.as_str()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +149,7 @@ fn evaluate_created_token_readback(
             );
         }
     };
-    if observed.group_ids != planned.group_ids {
+    if observed.group_ids() != planned.group_ids() {
         return (
             false,
             format!(
@@ -124,7 +157,7 @@ fn evaluate_created_token_readback(
             ),
         );
     }
-    if observed.resources != planned.resources {
+    if observed.resources() != planned.resources() {
         return (
             false,
             format!(
@@ -132,10 +165,18 @@ fn evaluate_created_token_readback(
             ),
         );
     }
+    if observed.policies != planned.policies {
+        return (
+            false,
+            format!(
+                "live token details for `{token_id}` were active but its policies did not match the planned effect and permission-group-to-resource associations"
+            ),
+        );
+    }
     (
         true,
         format!(
-            "live token details matched `{token_id}` with active status, planned permission groups, and planned account resource"
+            "live token details matched `{token_id}` with active status and the planned policies (effect, permission groups, and resources)"
         ),
     )
 }
@@ -195,9 +236,20 @@ fn token_policy_set_from_value(policies: &Value, source: &str) -> Result<Planned
         .ok_or_else(|| {
             CloudflareError::MissingVerificationTarget(format!("{source} are absent"))
         })?;
-    let mut group_ids = BTreeSet::new();
-    let mut resources = BTreeMap::new();
+    let mut parsed = Vec::with_capacity(policies.len());
     for policy in policies {
+        let effect = policy
+            .get("effect")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|effect| !effect.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(format!(
+                    "{source} contain a policy without an effect"
+                ))
+            })?;
+        let mut group_ids = BTreeSet::new();
+        let mut resources = BTreeMap::new();
         let groups = policy
             .get("permission_groups")
             .and_then(Value::as_array)
@@ -239,19 +291,16 @@ fn token_policy_set_from_value(policies: &Value, source: &str) -> Result<Planned
                         "{source} contain a non-string resource grant"
                     ))
                 })?;
-            if let Some(existing) = resources.insert(key.clone(), access.to_owned())
-                && existing != access
-            {
-                return Err(CloudflareError::MissingVerificationTarget(format!(
-                    "{source} grant conflicting access on `{key}`"
-                )));
-            }
+            resources.insert(key.clone(), access.to_owned());
         }
+        parsed.push(TokenPolicy {
+            effect: effect.to_owned(),
+            group_ids,
+            resources,
+        });
     }
-    Ok(PlannedTokenPolicySet {
-        group_ids,
-        resources,
-    })
+    parsed.sort();
+    Ok(PlannedTokenPolicySet { policies: parsed })
 }
 
 #[cfg(test)]
@@ -384,6 +433,96 @@ mod tests {
         assert_eq!(token_id, "token-1");
         assert!(readback.result.get("value").is_none());
         assert!(!basis.contains("should-not-survive"), "{basis}");
+    }
+
+    const ZONE_RESOURCE: &str = "com.cloudflare.api.account.zone.zone-1";
+
+    fn two_policy_input() -> CallInput {
+        CallInput {
+            selectors: json!({"account_id": "account-1"}),
+            query: json!({}),
+            body: Some(json!({
+                "name": "mixed",
+                "policies": [
+                    {"effect": "allow", "permission_groups": [{"id": GROUP_READ}],
+                     "resources": {ACCOUNT_RESOURCE: "*"}},
+                    {"effect": "allow", "permission_groups": [{"id": GROUP_WRITE}],
+                     "resources": {ZONE_RESOURCE: "*"}}
+                ]
+            })),
+            ..CallInput::default()
+        }
+    }
+
+    fn evaluate(input: &CallInput, policies: Value) -> (bool, String) {
+        let (token_id, expectation) =
+            token_verification_target(CREATE_STRATEGY, input, &apply_created())
+                .expect("create target");
+        evaluate_token_readback(expectation, &token_id, &details(policies, json!({})))
+    }
+
+    #[test]
+    fn created_token_readback_fails_when_equal_unions_swap_group_resource_associations() {
+        let (passed, basis) = evaluate(
+            &two_policy_input(),
+            json!([
+                {"effect": "allow", "permission_groups": [{"id": GROUP_WRITE}],
+                 "resources": {ACCOUNT_RESOURCE: "*"}},
+                {"effect": "allow", "permission_groups": [{"id": GROUP_READ}],
+                 "resources": {ZONE_RESOURCE: "*"}}
+            ]),
+        );
+        assert!(!passed, "{basis}");
+        assert!(basis.contains("associations"), "{basis}");
+    }
+
+    #[test]
+    fn created_token_readback_fails_when_effect_differs() {
+        let (passed, basis) = evaluate(
+            &create_input(),
+            json!([{
+                "effect": "deny",
+                "permission_groups": [{"id": GROUP_READ}, {"id": GROUP_WRITE}],
+                "resources": {ACCOUNT_RESOURCE: "*"}
+            }]),
+        );
+        assert!(!passed, "{basis}");
+        assert!(basis.contains("effect"), "{basis}");
+    }
+
+    #[test]
+    fn created_token_readback_passes_when_provider_reorders_policies_and_groups() {
+        let (passed, basis) = evaluate(
+            &two_policy_input(),
+            json!([
+                {"id": "p2", "effect": "allow", "permission_groups": [{"id": GROUP_WRITE}],
+                 "resources": {ZONE_RESOURCE: "*"}},
+                {"id": "p1", "effect": "allow", "permission_groups": [{"id": GROUP_READ}],
+                 "resources": {ACCOUNT_RESOURCE: "*"}}
+            ]),
+        );
+        assert!(passed, "{basis}");
+    }
+
+    #[test]
+    fn created_token_readback_fails_closed_without_effect_or_on_nested_resources() {
+        let (passed, basis) = evaluate(
+            &create_input(),
+            json!([{
+                "permission_groups": [{"id": GROUP_READ}, {"id": GROUP_WRITE}],
+                "resources": {ACCOUNT_RESOURCE: "*"}
+            }]),
+        );
+        assert!(!passed && basis.contains("not comparable"), "{basis}");
+        let (passed, basis) = evaluate(
+            &create_input(),
+            json!([{
+                "effect": "allow",
+                "permission_groups": [{"id": GROUP_READ}, {"id": GROUP_WRITE}],
+                "resources": {ACCOUNT_RESOURCE: {"com.cloudflare.api.account.zone.*": "*"}}
+            }]),
+        );
+        assert!(!passed && basis.contains("not comparable"), "{basis}");
     }
 
     #[test]
