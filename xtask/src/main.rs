@@ -402,6 +402,13 @@ fn classify_pre_push_registration(
     PrePushRegistration::NotRegistered
 }
 
+fn pre_push_registration_paths(home: &Path) -> (PathBuf, PathBuf) {
+    (
+        home.join(".config/git/guards/delegate-repo-hook.sh"),
+        home.join(".config/git/guards/repo-hook-allowlist"),
+    )
+}
+
 fn report_pre_push_registration() {
     let Ok(repository_root) = repository_root() else {
         return;
@@ -413,11 +420,11 @@ fn report_pre_push_registration() {
     let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
-    let delegate = home.join(".agent/hooks/delegate-repo-hook.sh");
+    let (delegate, allowlist_path) = pre_push_registration_paths(&home);
     if !delegate.exists() {
         return;
     }
-    let allowlist = fs::read_to_string(home.join(".agent/repo-hook-allowlist")).ok();
+    let allowlist = fs::read_to_string(allowlist_path).ok();
     let digest = sha256_file(&hook).ok();
     let state =
         classify_pre_push_registration(allowlist.as_deref(), repository_root, digest.as_deref());
@@ -435,7 +442,7 @@ fn report_pre_push_registration() {
     let _result = writeln!(stderr, "xtask: notice: .githooks/pre-push {advice}.");
     let _result = writeln!(
         stderr,
-        "xtask: notice: add or update this line in ~/.agent/repo-hook-allowlist, then re-run:"
+        "xtask: notice: add or update this line in ~/.config/git/guards/repo-hook-allowlist, then re-run:"
     );
     let _result = writeln!(
         stderr,
@@ -3699,12 +3706,13 @@ mod tests {
         extract_cfctl_command_refs, extract_prose_command_refs, is_canonical_github_origin,
         is_declared_quarantine_path, is_forbidden_quarantine_consumer, is_full_git_object_id,
         is_linux_musl, parse_bound_draft_release, parse_release_trust_roots,
-        parse_remote_tag_commit, release_build_driver, release_build_subcommand,
-        release_tag_is_exact_version, render_linux_installer_text, repository_root,
-        security_proof_commands, validate_bootstrap_contract, validate_bound_draft_release,
-        validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
-        validate_local_only_ci_contract, validate_macos_certificate_fingerprints,
-        validate_macos_provenance, validate_notary_receipt_value, validate_public_domain_anchor,
+        parse_remote_tag_commit, pre_push_registration_paths, release_build_driver,
+        release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
+        repository_root, security_proof_commands, validate_bootstrap_contract,
+        validate_bound_draft_release, validate_codesign_details, validate_command_refs,
+        validate_extracted_command_refs, validate_local_only_ci_contract,
+        validate_macos_certificate_fingerprints, validate_macos_provenance,
+        validate_notary_receipt_value, validate_public_domain_anchor,
         validate_release_identity_inputs, validate_rollback_readback,
         validate_signed_release_file_set, validate_signed_release_posture_contract,
         validate_xtask_alias_contract, validated_release_targets,
@@ -4529,6 +4537,19 @@ chmod +x "$8/$6/debug/xtask"
                 Some(&digest)
             ),
             PrePushRegistration::NotRegistered
+        );
+    }
+
+    #[test]
+    fn pre_push_registration_uses_the_guards_paths() {
+        let (delegate, allowlist) = pre_push_registration_paths(Path::new("/Users/star"));
+        assert_eq!(
+            delegate,
+            Path::new("/Users/star/.config/git/guards/delegate-repo-hook.sh")
+        );
+        assert_eq!(
+            allowlist,
+            Path::new("/Users/star/.config/git/guards/repo-hook-allowlist")
         );
     }
 
