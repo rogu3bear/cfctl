@@ -211,7 +211,7 @@ pub(super) use std::{
     process::{Command as StdCommand, Stdio},
     time::Duration,
 };
-pub(super) use cfctl_agent::{AgentKind, AgentLauncher, InstallMode, InvocationContext};
+pub(super) use cfctl_agent::{AgentKind, InstallMode};
 pub(super) use cfctl_auth::{
     AuthCredential, EvidenceKeyManager, EvidenceKeyStatusV1, EvidenceMacProvider,
     ManagedApiTokenV1, OAuthClientConfig, PkceSession, PlatformSecretStore, ProfileKind,

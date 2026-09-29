@@ -13,8 +13,9 @@ cfctl <area> <action> [target] [flags]
 ```
 
 The area stays first and the action says what happens. Direct operations such
-as `resolve`, `guide`, and `call` omit the area. Natural-language input remains
-the quoted `cfctl "<request>"` lane. Existing v2 paths remain compatible.
+as `resolve`, `guide`, and `call` omit the area. Plain-language goals go
+through `cfctl resolve "<intent>"`; any other input that is not a command path
+fails closed with a usage error. Existing v2 paths remain compatible.
 
 ## Canonical owners and denominator
 
@@ -87,9 +88,9 @@ Given any pre-existing v2 command path, when the candidate is parsed or run,
 then its name, nesting, arguments, dispatch, authorization boundary, output
 contract, and behavior remain unchanged. `cfctl commands` is additive.
 
-Given an unknown bare token or a retired v1 shape, when it is invoked, then it
-still fails closed through the deterministic parser instead of launching the
-agent lane.
+Given an unknown token or multi-word input, when it is invoked, then it fails
+closed through the deterministic parser with a usage error and starts no child
+process.
 
 ### AC5 — No parallel authority
 

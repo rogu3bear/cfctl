@@ -11,8 +11,8 @@ between intent and mutation: reads run freely, writes become a reviewed plan
 you approve by exact operation ID, and the result is verified against live
 Cloudflare state rather than assumed from a 200 response.
 
-It has no MCP dependency, accepts natural-language intent through a local
-agent, and every command emits stable JSON for automation.
+It has no MCP dependency, maps a plain-language goal to one catalog capability
+with `cfctl resolve`, and every command emits stable JSON for automation.
 
 - [Quickstart](QUICKSTART.md) — install, authenticate, first governed write
 - [Operator runbook](docs/runbooks/cfctl.md) — triage, health, recovery
@@ -120,7 +120,9 @@ the same map as data, or `cfctl <command path> --help` for exact arguments.
 The map is generated from the Clap command tree, so this document does not
 maintain a second command registry.
 
-Open-ended intent remains available as `cfctl "<natural-language request>"`.
+Open-ended goals go through `cfctl resolve "<intent>"`, which maps them to one
+deterministic catalog capability; cfctl does not launch an agent from its
+command line.
 Existing v2 paths remain compatible; the command map includes newer paths such
 as `auth evidence-key init-preview`, `auth evidence-key adopt-preview`,
 `auth evidence-key adopt-plan create`, `auth evidence-key recover-preview`,
@@ -341,12 +343,13 @@ cfctl agents install --all-detected
 cfctl agents doctor
 ```
 
-Natural language launches one configured agent (`CFCTL_AGENT`; default
-`codex`, also `claude`, `cursor`, `gemini`). The agent turns intent into a
-deterministic `cfctl resolve` match and governed commands — model output never
-grants authority or mutates Cloudflare directly. Quote natural language: a
-bare unknown token fails closed with a did-you-mean, so a typo is never an
-agent launch. Browser and Computer Use are available only for cataloged
+Installed agents drive the same deterministic commands: they turn intent into
+a `cfctl resolve` match and governed commands, and model output never grants
+authority or mutates Cloudflare directly. cfctl never launches an agent from
+command-line input — every invocation goes to the command parser, so unknown or
+multi-word input fails closed with a usage error. `CFCTL_AGENT` (default
+`codex`, also `claude`, `cursor`, `gemini`) names the agent recorded in
+governed UI handoffs. Browser and Computer Use are available only for cataloged
 `governed_ui` capabilities, under the same account binding, redaction,
 approval, and evidence rules.
 

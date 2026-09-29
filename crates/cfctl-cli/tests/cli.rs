@@ -10,9 +10,8 @@ use std::{fs, path::Path, process::Command as ProcessCommand};
 
 use cfctl_auth::{FileSecretStore, SecretStore};
 use cfctl_cli::{
-    Cli, Command, InvocationMode, KeysCommand,
+    Cli, Command, KeysCommand,
     build_identity::{build_identity_is_healthy, current_build_info},
-    classify_invocation,
 };
 use cfctl_core::{GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, render_guide_topic_markdown};
 use clap::{CommandFactory as _, Parser};
@@ -600,146 +599,61 @@ fn migrate_v1_accepts_quarantined_repo_state_and_external_legacy_state() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn bare_text_is_agent_intent_but_deterministic_commands_are_not() {
-    assert_eq!(
-        classify_invocation(["cfctl", "rotate the production Worker secret"]),
-        InvocationMode::NaturalLanguage("rotate the production Worker secret".to_owned())
-    );
-    assert_eq!(
-        classify_invocation(["cfctl", "catalog", "coverage"]),
-        InvocationMode::Deterministic
-    );
-    assert_eq!(
-        classify_invocation(["cfctl", "--json", "inspect the active account"]),
-        InvocationMode::NaturalLanguage("inspect the active account".to_owned())
-    );
-}
+fn multi_word_input_is_a_usage_error_and_starts_no_process() {
+    use std::os::unix::fs::PermissionsExt as _;
 
-#[test]
-fn bare_single_unknown_tokens_fail_closed_to_the_deterministic_parser() {
-    for typo in ["not-a-real-verb", "verify", "catallog", "env"] {
-        assert_eq!(
-            classify_invocation(["cfctl", typo]),
-            InvocationMode::Deterministic,
-            "single token `{typo}` must fail closed, not launch an agent"
-        );
-        assert!(
-            Cli::try_parse_from(["cfctl", typo]).is_err(),
-            "clap must reject the unknown verb `{typo}`"
-        );
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let bin = sandbox.path().join("bin");
+    fs::create_dir_all(&bin).expect("sentinel bin");
+    let marker = sandbox.path().join("launched");
+    for program in ["codex", "claude", "agent", "gemini"] {
+        let script = bin.join(program);
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho {program} >> '{}'\n", marker.display()),
+        )
+        .expect("write sentinel");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod sentinel");
     }
-    assert_eq!(
-        classify_invocation(["cfctl", "--json", "verify"]),
-        InvocationMode::Deterministic
-    );
-    // The documented quoted natural-language form keeps the agent lane, as
-    // does unquoted multi-argument intent.
-    assert_eq!(
-        classify_invocation(["cfctl", "list dns records for the active zone"]),
-        InvocationMode::NaturalLanguage("list dns records for the active zone".to_owned())
-    );
-    assert_eq!(
-        classify_invocation(["cfctl", "list", "dns", "records"]),
-        InvocationMode::NaturalLanguage("list dns records".to_owned())
-    );
-    // `help` is injected by clap at parse time and must stay deterministic.
-    assert_eq!(
-        classify_invocation(["cfctl", "help"]),
-        InvocationMode::Deterministic
-    );
-}
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("sentinel PATH");
 
-#[test]
-fn retired_v1_command_shapes_fail_closed_instead_of_launching_an_agent() {
-    for verb in [
-        "admin",
-        "bootstrap",
-        "cloudflared",
-        "env",
-        "form-intake",
-        "hostname",
-        "lanes",
-        "locks",
-        "maildesk-cf",
-        "ownership",
-        "previews",
-        "skills",
-        "standards",
-        "surfaces",
-        "wrangler",
-    ] {
-        assert_eq!(
-            classify_invocation(["cfctl", verb, "legacy-target"]),
-            InvocationMode::Deterministic,
-            "retired v1 command `{verb}` must reach clap and fail closed"
-        );
+    for json in [false, true] {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"));
+        command
+            .env("CFCTL_HOME", sandbox.path().join("home"))
+            .env("CFCTL_AGENT", "codex")
+            .env("PATH", &path)
+            .args(["some", "multi", "word", "input"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().expect("cfctl binary runs");
+        assert_eq!(output.status.code(), Some(2), "json={json}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if json {
+            let envelope: serde_json::Value =
+                serde_json::from_str(&stderr).expect("usage failure envelope");
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], "CFCTL_USAGE", "{envelope}");
+        } else {
+            assert!(
+                stderr.contains("unrecognized subcommand"),
+                "clap must reject multi-word input with a usage error, got: {stderr}"
+            );
+        }
     }
-    for verb in [
-        "apply", "can", "classify", "diff", "explain", "get", "list", "snapshot", "verify",
-    ] {
-        assert_eq!(
-            classify_invocation(["cfctl", verb, "dns.record"]),
-            InvocationMode::Deterministic,
-            "retired v1 surface command `{verb}` must fail closed"
-        );
-    }
-    for arguments in [["cfctl", "token", "mint"], ["cfctl", "token", "revoke"]] {
-        assert_eq!(
-            classify_invocation(arguments),
-            InvocationMode::Deterministic,
-            "retired token lifecycle command must fail closed"
-        );
-    }
-    for arguments in [
-        ["cfctl", "token", "permission-groups"],
-        ["cfctl", "token", "rotate"],
-        ["cfctl", "audit", "trust"],
-        ["cfctl", "audit", "access"],
-        ["cfctl", "audit", "state"],
-    ] {
-        assert_eq!(
-            classify_invocation(arguments),
-            InvocationMode::Deterministic,
-            "concrete retired v1 command must fail closed: {arguments:?}"
-        );
-    }
-}
-
-#[test]
-fn retired_words_do_not_disable_clear_natural_language_requests() {
-    for arguments in [
-        ["cfctl", "audit", "my Cloudflare account"],
-        ["cfctl", "diff", "current DNS configuration"],
-        ["cfctl", "explain", "how standing authority works"],
-        ["cfctl", "list", "dns records"],
-        ["cfctl", "verify", "the production zone"],
-    ] {
-        assert!(
-            matches!(
-                classify_invocation(arguments),
-                InvocationMode::NaturalLanguage(_)
-            ),
-            "clear natural language must keep the agent lane: {arguments:?}"
-        );
-    }
-
-    let audit_request = [
-        "cfctl",
-        "audit",
-        "access",
-        "posture",
-        "for",
-        "the",
-        "production",
-        "account",
-    ];
     assert!(
-        matches!(
-            classify_invocation(audit_request),
-            InvocationMode::NaturalLanguage(_)
-        ),
-        "only the exact retired two-token audit command may fail closed"
+        !marker.exists(),
+        "multi-word input must not start an agent or any other child process"
+    );
+    assert!(
+        Cli::try_parse_from(["cfctl", "some multi word input"]).is_err(),
+        "a quoted request is not a command either"
     );
 }
 
@@ -761,7 +675,7 @@ fn retired_multi_token_command_exits_nonzero_without_launching_an_agent() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unrecognized subcommand"),
-            "retired command {arguments:?} must reach clap instead of the agent launcher, got: {stderr}"
+            "retired command {arguments:?} must fail with a clap usage error, got: {stderr}"
         );
     }
 }
@@ -774,7 +688,7 @@ fn unknown_single_verb_exits_nonzero_without_launching_an_agent() {
         .expect("cfctl binary runs");
     assert!(
         !output.status.success(),
-        "an unknown verb must not exit 0 (the old behavior launched an agent)"
+        "an unknown verb must fail closed with a usage error"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

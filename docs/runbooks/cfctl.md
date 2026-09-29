@@ -408,13 +408,13 @@ hand-written procedure can.
 ```bash
 cfctl agents install --all-detected --json
 cfctl agents doctor --json
-cfctl "<natural-language Cloudflare request>"
+cfctl resolve "<Cloudflare goal>" --json
 ```
 
-Natural language launches one configured local agent. The agent must translate
-intent to deterministic commands; it cannot approve or directly mutate state.
-Quote natural language: a bare single token that is not a known command fails
-closed with a usage error instead of launching an agent.
+Installed agents translate intent to deterministic commands; they cannot
+approve or directly mutate state. cfctl never launches an agent from its
+command line: input that is not a known command, including multi-word text,
+fails closed with a usage error.
 
 ## Local proof
 

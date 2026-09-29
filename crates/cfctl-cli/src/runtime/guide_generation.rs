@@ -102,7 +102,7 @@ pub(super) const RESOLVE_MIN_CONFIDENT_SCORE: usize = 6;
 
 /// Deterministically map a natural-language intent to a capability and the exact
 /// governed commands to run. Read-only: it never mutates Cloudflare and never
-/// launches an agent (that is `execute_natural_language`). It fails closed —
+/// launches an agent. It fails closed —
 /// emitting only disambiguation guidance — when nothing matches confidently or
 /// the top match does not clearly beat the runner-up.
 pub(super) async fn resolve_command(

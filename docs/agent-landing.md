@@ -156,14 +156,14 @@ established, and `blocked` means discoverable but not executable, with an
 exact reason. Never improvise around a blocker. UI `AgentActionV1` output is a
 handoff, not authority or completion proof.
 
-## Natural-language entry
+## Intent entry
 
-`cfctl "rotate the production Worker secret"` launches the configured local
-agent. Agents must use deterministic cfctl commands underneath;
-`CFCTL_AGENT_SESSION` prevents recursive agent launch, and model output never
-approves or directly mutates Cloudflare. A bare single token that is not a
-known command fails closed with a usage error — mistyped verbs never become
-agent sessions.
+cfctl never launches an agent from its command line. Every invocation goes to
+the deterministic command parser, so a mistyped verb or multi-word text fails
+closed with a usage error. Map a plain-language goal with
+`cfctl resolve "rotate the production Worker secret" --json`, then follow the
+governed commands it returns; model output never approves or directly mutates
+Cloudflare.
 
 ## Completion evidence
 
