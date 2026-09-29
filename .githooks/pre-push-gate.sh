@@ -6,8 +6,8 @@
 # CONTRIBUTING.md). The repository does not require a hosted CI service.
 #
 # Invoked by .githooks/pre-push, which is SHA-256 pinned in
-# ~/.agent/repo-hook-allowlist. This file is deliberately NOT pinned so gate
-# behavior can change without re-pinning. It lives beside the hook rather than
+# ~/.config/git/guards/repo-hook-allowlist. This file is deliberately NOT pinned
+# so gate behavior can change without re-pinning. It lives beside the hook rather than
 # in scripts/, which the xtask source contract forbids as a quarantined v1
 # runtime path.
 #

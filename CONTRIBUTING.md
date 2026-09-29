@@ -130,12 +130,12 @@ not proof that the gate ran.
 
 The hook is tracked, but it does not run merely because you cloned the
 repository. It executes only where an agentOS-style delegate pins its digest in
-`~/.agent/repo-hook-allowlist`, and an unregistered repository is passed over
-silently. Register it per machine:
+`~/.config/git/guards/repo-hook-allowlist`, and an unregistered repository is
+passed over silently. Register it per machine:
 
 ```bash
 shasum -a 256 .githooks/pre-push
-# append to ~/.agent/repo-hook-allowlist:
+# append to ~/.config/git/guards/repo-hook-allowlist:
 #   <absolute-repo-root> pre-push=<digest>
 ```
 
