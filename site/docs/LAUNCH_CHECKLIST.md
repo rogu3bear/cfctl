@@ -128,8 +128,11 @@ Dashboard is an emergency human path; it is not P2-complete.
       Persist the version-detail receipt hash on the governed preflight.
       A UUID present in versions list or serving 100 percent is not a
       rollback anchor until that get-version-detail returns the same identity.
-- [ ] Resolve the compensation path: a separate reviewed
-      `wrangler.versions-deploy` plan targeting `<previous-uuid>@100`.
+- [ ] Resolve the compensation path: a separate reviewed native
+      `worker-version-rollback` plan with `target_version_id=<previous-uuid>`
+      and `expected_current_deployment_id` from this preflight (see
+      `docs/runbooks/capability-procedures.md`). `wrangler.versions-deploy`
+      is for forward promotion only.
 
 Exit evidence: profile ID and credential generation, permission inventory,
 live-read receipts, current deployment identity, and rollback anchor.
@@ -238,8 +241,10 @@ provider drift, or inability to prove the running source.
 
 1. Freeze announcements and further promotion.
 2. Preserve the failing operation IDs and evidence; do not replay.
-3. Create or refresh the governed compensation plan targeting the known-good
-   previous version at 100%.
+3. Create or refresh the governed `worker-version-rollback` plan: the
+   known-good previous version as `target_version_id`, the observed current
+   deployment as `expected_current_deployment_id`, and a reviewed message.
+   Never `wrangler rollback` or a `wrangler.versions-deploy` compensation.
 4. Review and approve that exact rollback operation.
 5. Run it once, inspect terminal status, and repeat provider and live-site
    verification.
