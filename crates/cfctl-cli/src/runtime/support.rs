@@ -3,7 +3,6 @@ use super::prelude::{
     AgentKind, BTreeSet, CapabilityV1, CliError, Duration, Path, PathBuf,
     R2LogRetrievalCredentials, Read, Result, StateStore, Value, env,
 };
-use cfctl_core::redact_json;
 
 pub(super) fn catalog_is_stale(store: &StateStore) -> bool {
     fs::metadata(store.paths().catalog_file())
@@ -227,40 +226,6 @@ fn finish_workspace_capability(capability: Option<CapabilityV1>) -> Result<Optio
         cfctl_cloudflare::d1_read_inventory::validate_inventory(&contract.inventory)?;
     }
     Ok(capability)
-}
-
-pub(super) fn is_secret_path(path: &Path) -> bool {
-    let normalized = path.display().to_string().to_ascii_lowercase();
-    [".env", "secret", "credential", "token", "private_key"]
-        .iter()
-        .any(|needle| normalized.contains(needle))
-}
-
-pub(super) fn contains_sensitive_content(content: &str) -> bool {
-    if let Ok(value) = serde_json::from_str::<Value>(content)
-        && redact_json(&value) != value
-    {
-        return true;
-    }
-    content.lines().any(|line| {
-        let normalized = line.trim().to_ascii_lowercase();
-        !normalized.contains("[redacted]")
-            && [
-                "access_token",
-                "refresh_token",
-                "api_token",
-                "api_key",
-                "global_key",
-                "client_secret",
-                "private_key",
-                "password",
-            ]
-            .iter()
-            .any(|marker| {
-                normalized.starts_with(marker)
-                    && (normalized.contains('=') || normalized.contains(':'))
-            })
-    })
 }
 
 pub(super) fn cli_io(path: &Path, source: std::io::Error) -> CliError {

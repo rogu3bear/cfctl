@@ -1,4 +1,4 @@
-# Adapter choice in cfctl v2
+# Adapter choice in cfctl
 
 There is no separate agent-selected tool-choice command. Search the catalog;
 the selected `CapabilityV1` contains the governed adapter status and blocker.

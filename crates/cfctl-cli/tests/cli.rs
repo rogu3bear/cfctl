@@ -70,7 +70,6 @@ fn every_public_command_group_is_parseable() {
             "doctor" => vec!["cfctl", "doctor"],
             "update" => vec!["cfctl", "update", "--check"],
             "version" => vec!["cfctl", "version"],
-            "migrate" => vec!["cfctl", "migrate", "v1"],
             other => panic!("PUBLIC_V2_SUBCOMMANDS verb `{other}` has no parse example"),
         };
         let parsed = Cli::try_parse_from(arguments).expect("public command parses");
@@ -551,50 +550,6 @@ fn human_system_topics_render_the_same_markdown_as_checked_in_guidance() {
                 .next()
                 .is_none(),
             "human topic rendering must remain stateless"
-        );
-    }
-}
-
-#[test]
-fn migrate_v1_accepts_quarantined_repo_state_and_external_legacy_state() {
-    for source_root in ["compat/v1/state", "state"] {
-        let workspace = tempfile::tempdir().expect("legacy workspace");
-        let runtime = tempfile::tempdir().expect("runtime root");
-        let source = workspace.path().join(source_root).join("dns.record");
-        fs::create_dir_all(&source).expect("create retained state root");
-        fs::write(
-            source.join("example.json"),
-            r#"{"match":{"name":"example"},"body":{"name":"example"}}"#,
-        )
-        .expect("write retained state");
-
-        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
-            .current_dir(workspace.path())
-            .env("CFCTL_HOME", runtime.path())
-            .args(["migrate", "v1", "--json"])
-            .output()
-            .expect("run v1 migration");
-        assert!(
-            output.status.success(),
-            "{source_root}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let envelope: serde_json::Value =
-            serde_json::from_slice(&output.stdout).expect("migration envelope");
-        let imported = envelope["result"]["imported"]
-            .as_array()
-            .expect("import list");
-        assert_eq!(imported.len(), 1, "{source_root}");
-        assert!(
-            imported[0]["source_path"].as_str().is_some_and(
-                |path| path.ends_with(&format!("{source_root}/dns.record/example.json"))
-            )
-        );
-        assert!(
-            imported[0]["destination"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("/state/dns.record/example.json")),
-            "both source layouts must preserve the v1 `state` import label"
         );
     }
 }
@@ -1518,59 +1473,6 @@ fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
         "isolated agents doctor cwd is not this cfctl checkout, so PATH was not compared to HEAD"
     );
     assert_eq!(envelope["result"]["instruction_drift"], 0);
-}
-
-#[test]
-fn v1_migration_imports_safe_state_without_copying_secret_content() {
-    let source = tempfile::tempdir().expect("source root");
-    let runtime = tempfile::tempdir().expect("runtime root");
-    fs::create_dir_all(source.path().join("state")).expect("state directory");
-    fs::write(
-        source.path().join("state/dns.yaml"),
-        "zone: example.com\nrecords: []\n",
-    )
-    .expect("safe state");
-    fs::write(
-        source.path().join("state/private.json"),
-        r#"{"access_token":"must-not-be-imported"}"#,
-    )
-    .expect("secret state");
-
-    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
-        .current_dir(source.path())
-        .env("CFCTL_HOME", runtime.path())
-        .args(["--json", "migrate", "v1"])
-        .output()
-        .expect("run migration");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("JSON result envelope");
-    assert_eq!(
-        envelope["result"]["imported"].as_array().map(Vec::len),
-        Some(1)
-    );
-    assert_eq!(
-        envelope["result"]["skipped"].as_array().map(Vec::len),
-        Some(1)
-    );
-    assert_eq!(envelope["result"]["credentials_imported"], false);
-
-    for entry in walkdir::WalkDir::new(runtime.path())
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let bytes = fs::read(entry.path()).expect("runtime artifact");
-        assert!(
-            !bytes
-                .windows(20)
-                .any(|window| window == b"must-not-be-imported")
-        );
-    }
 }
 
 #[test]

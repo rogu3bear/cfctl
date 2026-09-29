@@ -1,4 +1,4 @@
-# cfctl v2 security contract
+# cfctl security contract
 
 > Authority: this file is the security contract — it is authoritative for the
 > **cross-cutting** invariants: credential storage, secret sinks, catalog and

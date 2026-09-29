@@ -1,6 +1,6 @@
-# cfctl v2 architecture
+# cfctl architecture
 
-`cfctl` v2 is a local-first, catalog-driven Cloudflare control plane with no
+`cfctl` is a local-first, catalog-driven Cloudflare control plane with no
 MCP dependency. `cfctl-cli` orchestrates; each other crate owns one boundary,
 and every crate shares the `cfctl-core` contracts, hashing, and redaction. A
 governed write flows through the crates like this:

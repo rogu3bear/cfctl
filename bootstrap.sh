@@ -52,7 +52,7 @@ head=$(git -C "$root" rev-parse --verify HEAD)
 )
 
 if [ "$check_only" = true ]; then
-  echo "cfctl v2 source proof passed"
+  echo "cfctl source proof passed"
   exit 0
 fi
 

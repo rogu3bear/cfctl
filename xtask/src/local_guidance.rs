@@ -54,7 +54,6 @@ pub(super) fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskErro
             TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
         })?;
     // First-load agent doctrine must not re-teach archived v1 verbs or layout.
-    // Historical material below compat/v1 is governed by the quarantine manifest instead.
     // Tracked public guidance and constitutional doctrine are always required.
     // Ignored adapters and notes are present-only but must also stay v2-aligned.
     let required_guidance = [

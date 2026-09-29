@@ -253,7 +253,7 @@ pub(super) use crate::{
     EvidenceKeyRetireArgs, GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs,
     KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand,
     KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs, KeyRevokeArgs,
-    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
+    KeyRotateArgs, KeysCommand, PlanApproveArgs, PlanSelector, PlansCommand,
     PolicyCommand, ProfileSelector, RegistryCommand, RegistryDeclarationsCommand,
     RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand,
     ResolveArgs, SearchArgs, WorkspaceCommand,

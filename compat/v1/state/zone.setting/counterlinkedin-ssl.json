@@ -1,9 +1,0 @@
-{
-  "match": {
-    "zone": "counterlinkedin.com",
-    "name": "ssl"
-  },
-  "body": {
-    "value": "strict"
-  }
-}

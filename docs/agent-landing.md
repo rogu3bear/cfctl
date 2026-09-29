@@ -1,4 +1,4 @@
-# Agent landing: cfctl v2
+# Agent landing: cfctl
 
 `cfctl` is the one public Cloudflare control plane. It catalogs current
 Cloudflare APIs, official docs, Wrangler, cloudflared, and governed UI

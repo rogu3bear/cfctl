@@ -1,4 +1,4 @@
-# cfctl v2
+# cfctl
 
 `cfctl` is a governed Cloudflare control plane for macOS and Linux: an
 open-source Rust CLI that makes every change to your Cloudflare account
@@ -66,7 +66,7 @@ cfctl is a local-first, catalog-driven control plane: it separates intent, live 
 
 **What grants authority?** The deterministic policy engine grants automatic admission only to the narrow safe class. Otherwise authority is either explicit approval of one reviewed operation ID or explicit approval of one bounded standing token policy. A model never grants authority.
 
-**What is persisted?** Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink. The source checkout's compat/v1 tree is inert migration evidence, not runtime state or a live catalog.
+**What is persisted?** Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink.
 
 **What happens after a failure or crash?** Once consumption or a boundary attempt is durable, cfctl never guesses that replay is safe. Inspect `plans status`; use `plans rectify` to reconcile durable receipts and verification without replaying the original Cloudflare mutation.
 
@@ -123,7 +123,7 @@ maintain a second command registry.
 Open-ended goals go through `cfctl resolve "<intent>"`, which maps them to one
 deterministic catalog capability; cfctl does not launch an agent from its
 command line.
-Existing v2 paths remain compatible; the command map includes newer paths such
+Existing command paths remain compatible; the command map includes newer paths such
 as `auth evidence-key init-preview`, `auth evidence-key adopt-preview`,
 `auth evidence-key adopt-plan create`, `auth evidence-key recover-preview`,
 `auth evidence-key recover-plan create`,
@@ -358,13 +358,7 @@ approval, and evidence rules.
 Meaningful operations leave redacted, content-addressed local evidence, with
 the evidence class distinguishing source config, live reads, plans, applies,
 post-change verification, agent actions, and local proof. Artifact presence is
-not verification.
-
-`cfctl migrate v1` copies safe desired state and non-secret evidence into
-content-addressed imports, skipping secret-shaped paths and never importing
-credentials implicitly. Retained v1 data is quarantined under
-[`compat/v1/`](compat/v1/README.md) as inert migration evidence; the live
-catalog is managed under `CFCTL_HOME`.
+not verification. The live catalog is managed under `CFCTL_HOME`.
 
 ## Development
 

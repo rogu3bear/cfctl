@@ -15,7 +15,7 @@ cfctl <area> <action> [target] [flags]
 The area stays first and the action says what happens. Direct operations such
 as `resolve`, `guide`, and `call` omit the area. Plain-language goals go
 through `cfctl resolve "<intent>"`; any other input that is not a command path
-fails closed with a usage error. Existing v2 paths remain compatible.
+fails closed with a usage error. Existing command paths remain compatible.
 
 ## Canonical owners and denominator
 
@@ -84,7 +84,7 @@ the nearest command help and `cfctl commands` rather than a generic retry.
 
 ### AC4 — Compatibility is preserved
 
-Given any pre-existing v2 command path, when the candidate is parsed or run,
+Given any pre-existing command path, when the candidate is parsed or run,
 then its name, nesting, arguments, dispatch, authorization boundary, output
 contract, and behavior remain unchanged. `cfctl commands` is additive.
 

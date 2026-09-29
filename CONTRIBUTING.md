@@ -192,7 +192,7 @@ regardless of which file it lives in.
 
 ## Extending the runtime
 
-Crate boundaries decide where a change belongs. `docs/v2-architecture.md`
+Crate boundaries decide where a change belongs. `docs/architecture.md`
 carries the table with each crate's boundary; this file does not restate it,
 because a second copy is a second thing to keep true.
 

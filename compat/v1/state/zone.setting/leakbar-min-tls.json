@@ -1,9 +1,0 @@
-{
-  "match": {
-    "zone": "leakbar.com",
-    "name": "min_tls_version"
-  },
-  "body": {
-    "value": "1.3"
-  }
-}
