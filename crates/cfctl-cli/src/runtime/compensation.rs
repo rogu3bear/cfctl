@@ -47,7 +47,11 @@ pub(super) async fn resume_plan(
                 .to_owned(),
         )),
         PlanStatus::Verified | PlanStatus::Rectified => show_plan(store, selector),
-        _ => Err(CliError::Input(format!(
+        PlanStatus::Expired | PlanStatus::Cancelled => Err(CliError::Input(format!(
+            "operation is {:?} and its authority is retired; draft a new plan with `cfctl call <capability-id>` if the change is still wanted",
+            plan.status
+        ))),
+        PlanStatus::Failed | PlanStatus::RectificationRequired => Err(CliError::Input(format!(
             "operation is {:?}; use `cfctl plans rectify {}`",
             plan.status, plan.operation_id
         ))),

@@ -1,3 +1,4 @@
+use super::policy_commands::EVENT_BRIDGE_SIGNATURE_SOURCE;
 use super::policy_commands::EVENT_BRIDGE_WORKER_SOURCE;
 use super::policy_commands::EVENT_BRIDGE_WRANGLER_SOURCE;
 use super::policy_commands::EVENT_SCHEMA_REFERENCE;
@@ -85,6 +86,7 @@ pub(super) fn event_bridge_command(
         "worker_name": "cfctl-event-ingress",
         "worker_source_hash": hash_value(&json!(EVENT_BRIDGE_WORKER_SOURCE))?,
         "wrangler_source_hash": hash_value(&json!(EVENT_BRIDGE_WRANGLER_SOURCE))?,
+        "signature_source_hash": hash_value(&json!(EVENT_BRIDGE_SIGNATURE_SOURCE))?,
         "queue_binding": "EVENT_QUEUE",
         "realtimekit": {
             "signature_header": "rtk-signature",

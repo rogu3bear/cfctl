@@ -296,3 +296,14 @@ pub(super) fn cli_io(path: &Path, source: std::io::Error) -> CliError {
         source,
     }
 }
+
+/// The first `name` on PATH that resolves to an executable of that name. A
+/// version-manager shim resolves to its launcher, which cannot run from
+/// private staging and would never match a pinned runtime digest, so it is
+/// skipped, as the repository verify lane skips it.
+pub(super) fn direct_runtime_executable(name: &str) -> Option<PathBuf> {
+    which::which_all(name)
+        .ok()?
+        .filter_map(|candidate| fs::canonicalize(candidate).ok())
+        .find(|executable| executable.file_name() == Some(std::ffi::OsStr::new(name)))
+}

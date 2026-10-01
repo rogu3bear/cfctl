@@ -4712,6 +4712,42 @@ async fn executor_negotiates_json_csv_empty_and_byte_bounded_analytics_results()
     );
     server.await.expect("server joins");
 
+    let (address, server) =
+        single_raw_response_server("200 OK", "text/csv; charset=utf-8", "row,value\n1,a\n2,b\n")
+            .await;
+    let capped_csv = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("csv", 1)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("capped CSV analytics response");
+    assert_eq!(capped_csv.result, json!("row,value\n1,a\n"));
+    assert_eq!(
+        capped_csv
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/rows")),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        capped_csv
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/truncated")),
+        Some(&json!(true))
+    );
+    server.await.expect("server joins");
+
     let (address, server) = single_raw_response_server("200 OK", "application/x-ndjson", "").await;
     let empty = Executor::new(
         reqwest::Client::new(),

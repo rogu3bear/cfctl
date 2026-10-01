@@ -8599,9 +8599,14 @@ async fn parse_csv_response(
     cf_ray: Option<String>,
     output_path: Option<&Path>,
 ) -> Result<CloudflareResponseV1> {
-    let (bytes, byte_truncated) = read_bounded_body(response, request.max_bytes).await?;
-    let (rows, malformed) = csv_record_count(&bytes, request.max_rows);
-    let truncated = byte_truncated || rows >= request.max_rows;
+    let (mut bytes, byte_truncated) = read_bounded_body(response, request.max_bytes).await?;
+    let (rows, malformed, row_cut) = csv_record_count(&bytes, request.max_rows);
+    // Rows past the bound are dropped at a record boundary, as NDJSON drops
+    // parsed rows past it; exactly `max_rows` rows is complete, not truncated.
+    if let Some(length) = row_cut {
+        bytes.truncate(length);
+    }
+    let truncated = byte_truncated || row_cut.is_some();
     let result = if let Some(path) = output_path {
         file_receipt(path, &bytes, rows, !truncated && !malformed).await?
     } else {
@@ -8631,25 +8636,28 @@ async fn parse_csv_response(
     })
 }
 
-fn csv_record_count(bytes: &[u8], max_rows: u64) -> (u64, bool) {
+/// Counts CSV data records after the header line. Returns the record count,
+/// whether the body ended inside a quoted field, and the byte length that
+/// keeps the header plus the first `max_rows` records when more follow.
+fn csv_record_count(bytes: &[u8], max_rows: u64) -> (u64, bool, Option<usize>) {
     let mut quoted = false;
     let mut records = 0_u64;
     let mut index = 0;
-    while index < bytes.len() && records <= max_rows {
+    while index < bytes.len() {
         match bytes[index] {
             b'"' if quoted && bytes.get(index + 1) == Some(&b'"') => index += 1,
             b'"' => quoted = !quoted,
-            b'\n' if !quoted => records += 1,
+            b'\n' if !quoted => {
+                records += 1;
+                if records == max_rows.saturating_add(1) && index + 1 < bytes.len() {
+                    return (max_rows, false, Some(index + 1));
+                }
+            }
             _ => {}
         }
         index += 1;
     }
-    let records = if records > 0 {
-        records.saturating_sub(1)
-    } else {
-        0
-    };
-    (records.min(max_rows), quoted)
+    (records.saturating_sub(1).min(max_rows), quoted, None)
 }
 
 #[expect(

@@ -202,3 +202,5 @@ pub(super) const EVENT_BRIDGE_WORKER_SOURCE: &str =
     include_str!("../../../../bridge/event-ingress/src/index.ts");
 pub(super) const EVENT_BRIDGE_WRANGLER_SOURCE: &str =
     include_str!("../../../../bridge/event-ingress/wrangler.jsonc");
+pub(super) const EVENT_BRIDGE_SIGNATURE_SOURCE: &str =
+    include_str!("../../../../bridge/event-ingress/src/signature.ts");

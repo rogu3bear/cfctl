@@ -82,7 +82,9 @@ pub(super) fn workspace_command(
                 repositories.push(json!({
                     "name": repository.name,
                     "path": repository.path,
-                    "dirty": !output.stdout.is_empty(),
+                    // A failed `git status` proves nothing about cleanliness.
+                    "dirty": output.status.success().then_some(!output.stdout.is_empty()),
+                    "git_status": if output.status.success() { "read" } else { "unavailable" },
                     "cloudflare_configs": repository.cloudflare_configs,
                     "account_id": account_id,
                     "operational_proof": workspace_operational_proof_posture(

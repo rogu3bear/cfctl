@@ -486,8 +486,8 @@ writeFileSync(output, JSON.stringify({ sealed: seal(JSON.parse(readFileSync(inpu
     )
     .expect("dirty support fixture");
 
-    let bun = which::which("bun").expect("bun");
-    let bun = fs::canonicalize(bun).expect("canonical bun");
+    let bun = crate::runtime::support::direct_runtime_executable("bun")
+        .expect("a direct bun executable on PATH");
     let bun_bytes = fs::read(&bun).expect("bun bytes");
     let bun_version = Command::new(&bun)
         .arg("--version")

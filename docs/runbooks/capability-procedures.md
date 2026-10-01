@@ -151,19 +151,19 @@ is also workspace-owned and non-mutating. It accepts only `account_id`,
 `reply_domain`, and `worker_script_name`. cfctl resolves the nearest exact active
 parent zone in the selected account and reads
 `/zones/{zone_id}/email/routing/dns` with the exact reply domain in the
-`subdomain` query. It then enumerates the complete account Email Routing rule
-inventory through `GET /accounts/{account_id}/email/routing/rules`. The typed
-projection hashes each rule's domain and parent-zone identities, retains only
-validated Worker action targets, and discards raw rule values. Exactly one
-enabled rule whose domain hash matches the reply subdomain, whose parent hash
-matches the resolved zone, whose sole matcher is `all`, and whose sole action
-targets the selected Worker closes the routing plane. The closed
-`workspace_reply_subdomain_ingress_v1` projection: hashed reply-domain and
-Worker identities, typed `ok`, `drift`, or `missing` DNS and routing states,
-and explicit `provider_output_retained:false` and `body_returned:false`.
-A separate reply-domain zone, the parent-zone catch-all, incomplete account
-pagination, ambiguous exact rules, or a merely similar Worker never satisfy
-the contract.
+`subdomain` query. It then reads that parent zone's catch-all directly through
+`GET /zones/{zone_id}/email/routing/rules/catch_all`: Cloudflare enrolls
+reply-subdomain DNS under the parent zone and routes it through the zone-level
+catch-all, while the account planner rejects the enrolled subdomain as unknown.
+Exactly one enabled catch-all whose sole matcher is `all` and whose sole action
+targets the selected Worker closes the routing plane, reported with routing
+scope `parent_zone_catch_all_to_worker_covering_exact_reply_subdomain`. The
+closed `workspace_reply_subdomain_ingress_v1` projection: hashed reply-domain
+and Worker identities, typed `ok`, `drift`, or `missing` DNS and routing
+states, and explicit `provider_output_retained:false` and
+`body_returned:false`. A separate reply-domain zone, a disabled, multi-action,
+or malformed catch-all, or a merely similar Worker never satisfy the
+contract.
 
 The paired `star-maildesk-cf.reply-subdomain-ingress-activate` capability is
 the only write lane for a missing Maildesk reply-subdomain catch-all. It first
@@ -185,7 +185,7 @@ must still match the approved PlanV2. The one catch-all body preserves the same
 Worker ownership tag used by the planner and runs with automatic retries
 disabled. Apply success is insufficient: the plan closes only when both the
 direct catch-all shape/source read and the existing body-free reply-subdomain
-account-inventory read prove the intended one-all-matcher Worker rule and DNS.
+ingress read prove the intended one-all-matcher Worker rule and DNS.
 Any fresh-state drift, ambiguous apply, or failed readback requires
 reconciliation and a fresh plan; the consumed plan is never replayed.
 

@@ -716,19 +716,29 @@ pub(super) fn known_import_poll_exhausted_envelope(
                 "the exact accepted-ingest bookmark and every bounded in-progress poll receipt are durable; do not replay init/upload/ingest",
             )
         }
-        Err(error) => post_boundary_failure_envelope(
-            plan,
-            json!({
-                "success":false,
-                "outcome":"poll_exhaustion_receipt_invalid",
-                "receipt_available":false,
-            }),
-            None,
-            None,
-            &error,
-            true,
-            "poll exhaustion lineage could not be resolved exactly; do not replay any import stage",
-        ),
+        Err(error) => {
+            // The rectification-required status is durable even without a
+            // resolvable exhaustion receipt, as in the receipt-bound branch.
+            let error = match store.save_plan(plan) {
+                Ok(()) => error,
+                Err(persist) => CliError::Input(format!(
+                    "{error}; rectification-required status persistence failed: {persist}"
+                )),
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"poll_exhaustion_receipt_invalid",
+                    "receipt_available":false,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                "poll exhaustion lineage could not be resolved exactly; do not replay any import stage",
+            )
+        }
     }
 }
 

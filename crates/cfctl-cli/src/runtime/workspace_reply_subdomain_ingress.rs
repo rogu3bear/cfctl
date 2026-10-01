@@ -271,7 +271,7 @@ fn activation_preflight_failure(store: &StateStore, receipt: Value) -> Result<Va
         "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_ACTIVATION_PREFLIGHT_FAILED",
         format!("reply-subdomain activation stopped at typed provider state `{status}`"),
         format!(
-            "Preserve body-free evidence {}; repair exactly `{status}`; do not replay, take over a conflicting rule, or target the parent-zone catch-all.",
+            "Preserve body-free evidence {}; repair exactly `{status}`; do not replay, take over a conflicting rule, or change the parent-zone catch-all outside this governed activation.",
             evidence.content_hash
         ),
     ))

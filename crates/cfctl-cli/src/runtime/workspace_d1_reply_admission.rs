@@ -1328,11 +1328,10 @@ fn compiler_runtime(
             "reply-admission compiler runtime is not supported".to_owned(),
         ));
     }
-    let discovered = which::which(&contract.compiler_runtime).map_err(|_| {
-        CliError::Input("reply-admission compiler runtime is unavailable".to_owned())
-    })?;
-    let executable =
-        fs::canonicalize(&discovered).map_err(|error| super::cli_io(&discovered, error))?;
+    let executable = super::support::direct_runtime_executable(&contract.compiler_runtime)
+        .ok_or_else(|| {
+            CliError::Input("reply-admission compiler runtime is unavailable".to_owned())
+        })?;
     let metadata = fs::metadata(&executable).map_err(|error| super::cli_io(&executable, error))?;
     if !metadata.is_file() {
         return Err(CliError::Input(
