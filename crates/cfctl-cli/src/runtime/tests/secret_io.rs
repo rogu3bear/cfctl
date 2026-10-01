@@ -836,6 +836,14 @@ pub(super) fn resource_metadata_is_not_mistaken_for_a_secret_value() {
         })),
         Some("one-time-secret")
     );
+    assert_eq!(
+        find_secret_value(&json!({
+            "id": "rule-id",
+            "conditions": {"request.ip": {"in": ["203.0.113.7"]}}
+        })),
+        None,
+        "strings in unrelated arrays are never secret values"
+    );
 }
 
 #[test]

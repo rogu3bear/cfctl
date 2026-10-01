@@ -770,11 +770,27 @@ fn exact_object_from_statement(
     definition: &str,
     tokens: &[&str],
 ) -> Result<Option<WorkspaceD1ExactObjectAssertionV1>> {
-    let (object_type, name) = match tokens {
-        ["CREATE", "INDEX", name, ..] | ["CREATE", "UNIQUE", "INDEX", name, ..] => ("index", *name),
-        ["CREATE", "TRIGGER", name, ..] => ("trigger", *name),
+    // SQLite stores `sqlite_schema.sql` as a canonical keyword prefix plus the
+    // source text from the object name onward, dropping `IF NOT EXISTS` and
+    // collapsing prefix whitespace; the asserted definition must match that.
+    let (object_type, prefix, name_token) = match tokens {
+        ["CREATE", "INDEX", "IF", "NOT", "EXISTS", ..] => ("index", "CREATE INDEX", 5),
+        ["CREATE", "UNIQUE", "INDEX", "IF", "NOT", "EXISTS", ..] => {
+            ("index", "CREATE UNIQUE INDEX", 6)
+        }
+        ["CREATE", "TRIGGER", "IF", "NOT", "EXISTS", ..] => ("trigger", "CREATE TRIGGER", 5),
+        ["CREATE", "INDEX", ..] => ("index", "CREATE INDEX", 2),
+        ["CREATE", "UNIQUE", "INDEX", ..] => ("index", "CREATE UNIQUE INDEX", 3),
+        ["CREATE", "TRIGGER", ..] => ("trigger", "CREATE TRIGGER", 2),
         _ => return Ok(None),
     };
+    let name = *tokens
+        .get(name_token)
+        .ok_or_else(|| invariant("workspace D1 exact schema object omitted its name"))?;
+    let stored_definition = token_start(definition, name_token)
+        .map(|start| format!("{prefix} {}", &definition[start..]))
+        .ok_or_else(|| invariant("workspace D1 exact schema object omitted its name"))?;
+    let definition = stored_definition.as_str();
     let table = tokens
         .windows(2)
         .find_map(|pair| (pair[0] == "ON").then(|| pair[1].split('(').next().unwrap_or_default()))
@@ -791,6 +807,24 @@ fn exact_object_from_statement(
         definition: definition.to_owned(),
         definition_sha256: sha256(definition.as_bytes()),
     }))
+}
+
+/// Byte offset of the `index`-th whitespace-separated token in `text`.
+fn token_start(text: &str, index: usize) -> Option<usize> {
+    let mut seen = 0;
+    let mut in_token = false;
+    for (offset, character) in text.char_indices() {
+        if character.is_whitespace() {
+            in_token = false;
+        } else if !in_token {
+            if seen == index {
+                return Some(offset);
+            }
+            seen += 1;
+            in_token = true;
+        }
+    }
+    None
 }
 
 fn capability_manifest(
@@ -1652,6 +1686,28 @@ require_old_worker_compatibility = true
                 "CREATE TRIGGER users_guard BEFORE INSERT ON users BEGIN SELECT 1;"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_objects_assert_the_definition_sqlite_stores() {
+        let source = "CREATE UNIQUE INDEX IF NOT EXISTS idx_users ON users(id);\nCREATE  INDEX   idx_names ON users(name);\nCREATE TRIGGER IF NOT EXISTS users_guard\nBEFORE INSERT ON users\nBEGIN\n  SELECT RAISE(ABORT, 'guard');\nEND;\n";
+        let assertions = derive_manifest_schema_assertions(source.as_bytes()).expect("assertions");
+        let exact = assertions
+            .iter()
+            .filter_map(|assertion| assertion.exact_object.as_ref())
+            .map(|object| (object.name.as_str(), object.definition.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact,
+            [
+                ("idx_users", "CREATE UNIQUE INDEX idx_users ON users(id)"),
+                ("idx_names", "CREATE INDEX idx_names ON users(name)"),
+                (
+                    "users_guard",
+                    "CREATE TRIGGER users_guard\nBEFORE INSERT ON users\nBEGIN\n  SELECT RAISE(ABORT, 'guard');\nEND"
+                ),
+            ]
         );
     }
 }

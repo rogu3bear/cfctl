@@ -2551,6 +2551,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
     finalize_logpull_retrieval(snapshot);
     finalize_workers_observability_reads(snapshot);
     finalize_telemetry_mutations(snapshot);
+    persisted_rulesets::block_unreviewed_dry_run(snapshot);
     block_misleading_live_tail_heartbeat_identity(snapshot);
     for capability in graphql_analytics_capabilities()? {
         snapshot

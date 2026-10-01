@@ -333,28 +333,32 @@ pub(super) fn is_worker_script_secret_input_only_capability(capability: &Capabil
 }
 
 pub(super) fn find_secret_value(value: &Value) -> Option<&str> {
+    find_secret_in(value, true)
+}
+
+/// A bare string is a secret only as the whole result or as the value of a
+/// secret key; strings in unrelated arrays, such as IP conditions, never are.
+fn find_secret_in(value: &Value, secret_context: bool) -> Option<&str> {
     if let Some(value) = value.as_str() {
-        return Some(value);
+        return secret_context.then_some(value);
     }
     if let Some(object) = value.as_object() {
         for key in cfctl_core::SECRET_SINK_VALUE_KEYS.iter().copied() {
-            if let Some(candidate) = object.get(key) {
-                if let Some(value) = candidate.as_str() {
-                    return Some(value);
-                }
-                if (candidate.is_object() || candidate.is_array())
-                    && let Some(value) = find_secret_value(candidate)
-                {
-                    return Some(value);
-                }
+            if let Some(candidate) = object.get(key)
+                && let Some(value) = find_secret_in(candidate, true)
+            {
+                return Some(value);
             }
         }
         return object
             .values()
             .filter(|candidate| candidate.is_object() || candidate.is_array())
-            .find_map(find_secret_value);
+            .find_map(|candidate| find_secret_in(candidate, false));
     }
-    value.as_array()?.iter().find_map(find_secret_value)
+    value
+        .as_array()?
+        .iter()
+        .find_map(|candidate| find_secret_in(candidate, secret_context))
 }
 
 pub(super) fn redact_secret_result(value: &Value) -> Value {

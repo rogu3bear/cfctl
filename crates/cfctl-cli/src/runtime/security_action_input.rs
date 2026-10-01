@@ -59,6 +59,10 @@ pub(super) fn ip_is_protected(address: std::net::IpAddr) -> bool {
                 || (octets[0] == 198 && matches!(octets[1], 18 | 19))
         }
         std::net::IpAddr::V6(address) => {
+            // `::ffff:a.b.c.d` names an IPv4 target; judge it as that target.
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return ip_is_protected(std::net::IpAddr::V4(mapped));
+            }
             let segments = address.segments();
             address.is_unspecified()
                 || address.is_loopback()
@@ -1031,4 +1035,32 @@ pub(super) fn prepare_security_action_input(
         }
     };
     Ok(Some(receipt))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::ip_is_protected;
+
+    #[test]
+    fn mapped_ipv4_targets_are_judged_as_their_ipv4_address() {
+        for protected in [
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+            "10.0.0.1",
+            "fd00::1",
+        ] {
+            assert!(
+                ip_is_protected(protected.parse().expect("address")),
+                "{protected}"
+            );
+        }
+        for public in ["::ffff:1.1.1.1", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                !ip_is_protected(public.parse().expect("address")),
+                "{public}"
+            );
+        }
+    }
 }

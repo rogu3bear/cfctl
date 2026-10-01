@@ -539,10 +539,12 @@ pub(super) async fn rectify_r2_private_upload(
         "verification_only":true,
         "boundary_replayed":false,
     });
+    // Persist first: rectification needs the stage binding, so a discarded
+    // stage with an unsaved result would leave the plan unrectifiable.
+    persist_r2_private_upload_rectification_result(store, plan, receipt, passed)?;
     if passed {
         r2_private_upload::discard(store, plan, &secrets)?;
     }
-    persist_r2_private_upload_rectification_result(store, plan, receipt, passed)?;
 
     let mut envelope = ResultEnvelopeV2::success(
         "plans rectify",

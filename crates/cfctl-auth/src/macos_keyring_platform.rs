@@ -1480,6 +1480,46 @@ mod tests {
     }
 
     #[test]
+    fn one_guard_holds_mutation_authority_for_every_key_in_its_root() {
+        // Recovery relies on this: while one guard is held, a guard for any
+        // other key in the same root waits, even within this process. A second
+        // acquisition on the holding thread would therefore never return.
+        let temp = tempfile::tempdir().expect("temporary authority");
+        let root = temp.path().join("locks");
+        let first = acquire_mutation_lock_at_with_hooks(
+            &root,
+            "service",
+            "registry",
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("acquire source authority");
+        let (acquired, received) = std::sync::mpsc::channel();
+        let contender_root = root.clone();
+        let contender = thread::spawn(move || {
+            let guard = acquire_mutation_lock_at_with_hooks(
+                &contender_root,
+                "service",
+                "registry-quarantine",
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .expect("acquire quarantine authority after release");
+            acquired.send(()).expect("report acquisition");
+            drop(guard);
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a second key acquired authority while the first guard was held"
+        );
+        drop(first);
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second key acquires once the first guard is released");
+        contender.join().expect("contender thread");
+    }
+
+    #[test]
     fn security_stdout_accepts_exact_maximum_with_crlf_frame() {
         let mut output = vec![b'x'; MAX_LOGICAL_CREDENTIAL_BYTES];
         output.extend_from_slice(b"\r\n");

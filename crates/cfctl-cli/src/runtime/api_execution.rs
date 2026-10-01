@@ -229,14 +229,17 @@ pub(super) async fn execute_api_plan_with_executor(
     let finalization: Result<()> = (|| {
         #[cfg(test)]
         finalization_test_stage(FinalizationTestStage::Closure);
+        if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
+            persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+        } else {
+            store.save_plan(plan)?;
+        }
+        // The private stage is discarded only after the closed result is
+        // durable; rectification of an unsaved result still needs it.
         if plan.status == PlanStatus::Verified && plan.capability.r2_private_file_upload.is_some() {
             r2_private_upload::discard(store, plan, secrets)?;
         }
-        if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
-            persist_transaction_stage(store, plan, TransactionStageV1::Closed)
-        } else {
-            store.save_plan(plan).map_err(CliError::from)
-        }
+        Ok(())
     })();
     let finalization_error = finalization.err();
     Ok(api_plan_result_envelope(

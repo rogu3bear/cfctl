@@ -1102,8 +1102,12 @@ async fn renew_analytics_profile_locked(
             )
         })?
         .to_owned();
-    let token = read_private_secret_file(&sink_path, "internal rotation sink")?;
-    fs::remove_file(&sink_path).map_err(|source| cli_io(&sink_path, source))?;
+    // The sink is removed whether or not its read succeeds, so the child
+    // token never outlives this attempt on disk.
+    let token = read_private_secret_file(&sink_path, "internal rotation sink");
+    let removed = fs::remove_file(&sink_path).map_err(|source| cli_io(&sink_path, source));
+    let token = token?;
+    removed?;
     let expires_at = mint
         .result
         .pointer("/result/expires_on")
@@ -1156,8 +1160,11 @@ async fn renew_analytics_profile_locked(
             &new_token_id,
             &arguments.under_policy,
         ))
-        .await?;
+        .await;
+        // Local staging state is removed even when the revoke fails, so the
+        // child's secret never outlives a failed attempt in a profile slot.
         remove_staged_rotation_profile(store, &secrets, &staging_profile_id, &slot_id)?;
+        let cleanup = cleanup?;
         if cleanup.ok && cleanup.verification.state == VerificationState::Passed {
             let operation = cleanup.operation_id.as_deref().ok_or_else(|| {
                 CliError::Input(
@@ -1272,8 +1279,9 @@ async fn renew_analytics_profile_locked(
             &new_token_id,
             &arguments.under_policy,
         ))
-        .await?;
+        .await;
         secrets.delete_api_token_slot(&slot_id)?;
+        let cleanup = cleanup?;
         if cleanup.ok && cleanup.verification.state == VerificationState::Passed {
             let operation = cleanup.operation_id.as_deref().ok_or_else(|| {
                 CliError::Input(
@@ -1491,7 +1499,7 @@ async fn renew_analytics_profile_locked(
                 "active_token_id":new_token_id,
                 "old_token_id":old_token_id,
                 "revoke_operation_id":revoke_operation_id,
-                "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING",
+                "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_FAILED now, then CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING on every later hourly check until the overlap closes",
             }),
         ));
     }

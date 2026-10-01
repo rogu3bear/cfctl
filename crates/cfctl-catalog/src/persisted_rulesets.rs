@@ -1,26 +1,28 @@
 //! Select the persisted subset used by the existing ruleset lifecycles.
 
-use super::CatalogSnapshot;
+use super::{AdapterStatus, CatalogSnapshot};
+
+const PERSISTED_OPERATIONS: [(&str, &str, &str); 4] = [
+    ("createZoneRuleset", "POST", "/zones/{zone_id}/rulesets"),
+    (
+        "deleteZoneRuleset",
+        "DELETE",
+        "/zones/{zone_id}/rulesets/{ruleset_id}",
+    ),
+    (
+        "createZoneRulesetRule",
+        "POST",
+        "/zones/{zone_id}/rulesets/{ruleset_id}/rules",
+    ),
+    (
+        "deleteZoneRulesetRule",
+        "DELETE",
+        "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}",
+    ),
+];
 
 pub(super) fn restrict_dry_run(snapshot: &mut CatalogSnapshot) {
-    for (id, method, path) in [
-        ("createZoneRuleset", "POST", "/zones/{zone_id}/rulesets"),
-        (
-            "deleteZoneRuleset",
-            "DELETE",
-            "/zones/{zone_id}/rulesets/{ruleset_id}",
-        ),
-        (
-            "createZoneRulesetRule",
-            "POST",
-            "/zones/{zone_id}/rulesets/{ruleset_id}/rules",
-        ),
-        (
-            "deleteZoneRulesetRule",
-            "DELETE",
-            "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}",
-        ),
-    ] {
+    for (id, method, path) in PERSISTED_OPERATIONS {
         let Some(capability) = snapshot.capabilities.get_mut(id) else {
             continue;
         };
@@ -59,6 +61,30 @@ pub(super) fn restrict_dry_run(snapshot: &mut CatalogSnapshot) {
             capability
                 .selectors
                 .retain(|selector| selector.name != "dry_run");
+        }
+    }
+}
+
+/// Runs after every ruleset lifecycle overlay. A reviewed `dry_run` selector
+/// was removed above, so one that remains on a persisted operation, or on a
+/// capability derived from it, means its contract drifted: omission might no
+/// longer select a persisted change, so the capability stays blocked.
+pub(super) fn block_unreviewed_dry_run(snapshot: &mut CatalogSnapshot) {
+    for capability in snapshot.capabilities.values_mut() {
+        let persisted = PERSISTED_OPERATIONS
+            .iter()
+            .any(|(_, method, path)| capability.method == *method && capability.path == *path);
+        if persisted
+            && capability
+                .selectors
+                .iter()
+                .any(|selector| selector.name == "dry_run")
+        {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "schema drift: the ruleset `dry_run` selector no longer matches the reviewed persisted-operation contract; this lifecycle stays blocked until the new contract is reviewed"
+                    .to_owned(),
+            );
         }
     }
 }

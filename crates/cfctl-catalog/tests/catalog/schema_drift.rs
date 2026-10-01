@@ -188,6 +188,37 @@ fn waf_dry_run_contract_drift_cannot_promote_a_persisted_operation() {
     assert_eq!(create.adapter_status, AdapterStatus::Blocked);
 }
 
+#[test]
+fn waf_dry_run_description_drift_blocks_every_persisted_lifecycle() {
+    let mut snapshot = telemetry_tail_and_ruleset_overlay_snapshot();
+    snapshot
+        .capabilities
+        .extend(waf_security_response_overlay_snapshot().capabilities);
+    let mut selector = dry_run_selector();
+    selector.description = Some("Validates the request.".to_owned());
+    for capability in snapshot.capabilities.values_mut().filter(|c| c.mutating) {
+        capability.selectors.push(selector.clone());
+    }
+    ingest_telemetry_capabilities(&mut snapshot).unwrap();
+    for id in [
+        "security-response-create-empty-custom-ruleset",
+        "deleteZoneRuleset",
+        "deleteZoneRulesetRule",
+        "security-response-remove-expired-waf-rule",
+    ] {
+        let capability = snapshot.get(id).unwrap();
+        assert_eq!(capability.adapter_status, AdapterStatus::Blocked, "{id}");
+        assert!(
+            capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("schema drift:")),
+            "{id} {:?}",
+            capability.blocked_reason
+        );
+    }
+}
+
 fn with_optional_scopes(mut document: Value) -> Value {
     for (path, method) in [
         ("/accounts/{account_id}/oauth_clients", "post"),

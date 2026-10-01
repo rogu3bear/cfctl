@@ -387,7 +387,9 @@ impl WorkspaceD1MigrationContractV1 {
                 && contract.migrations.len() == 1
                 && !manifest.baseline_digest.is_empty()
                 && !manifest.migrations_pattern.is_empty()
-                && !manifest.ledger_table.is_empty()
+                // The runtime ledger read queries `d1_migrations` only, so
+                // any other ledger table fails closed instead of misreporting.
+                && manifest.ledger_table == "d1_migrations"
                 && !manifest.ledger_name.is_empty()
                 && !manifest.wrangler_cli_sha256.is_empty()
                 && manifest.full_export_capability_id == "d1-full-export"

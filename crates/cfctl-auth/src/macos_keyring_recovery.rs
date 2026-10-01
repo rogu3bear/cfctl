@@ -16,8 +16,11 @@ pub(super) fn recover_malformed_with(
             "malformed registry and quarantine identities must differ".to_owned(),
         ));
     }
-    let _source_guard = adapter.acquire_mutation_lock(service, key)?;
-    let _quarantine_guard = adapter.acquire_mutation_lock(service, quarantine_key)?;
+    // One guard holds the lock root's exclusive mutation authority for every
+    // key, so it also covers the quarantine identity. A second acquisition on
+    // this thread would wait on that same authority forever
+    // (`one_guard_holds_mutation_authority_for_every_key_in_its_root`).
+    let _authority_guard = adapter.acquire_mutation_lock(service, key)?;
     let quarantine = get_with(adapter, service, quarantine_key)?;
     if quarantine
         .as_deref()
