@@ -44,8 +44,8 @@ use cfctl_core::{
     EMAIL_ROUTING_RULES_MAX_PAGES, EMAIL_ROUTING_RULES_PAGE_SIZE, EmailRoutingRuleDiagnosticV1,
     GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
     PlanStatus, PlanV1, R2LogRetrievalContractV1, R2PrivateObjectDigestV1, ResponseBodyModeV1,
-    ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1, TimestampFormatV1,
-    TransactionStageV1, hash_value, is_email_routing_rules_list_capability,
+    ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
+    TimestampFormatV1, TransactionStageV1, hash_value, is_email_routing_rules_list_capability,
     normalize_email_routing_account_rule_set_with_page_size,
     normalize_email_routing_rule_set_with_page_size, request_header_is_reserved,
 };
@@ -857,6 +857,138 @@ fn evaluate_worker_version_rollback_readback(
         )
     };
     Ok((passed, basis, latest_id.map(Value::String), projected))
+}
+
+pub fn worker_script_upload_identity_matches(uploaded: &Value, settings: &Value) -> bool {
+    let uploaded_id = non_empty_string_field(uploaded, "id");
+    let settings_id = non_empty_string_field(settings, "id");
+    uploaded_id.is_some() && uploaded_id == settings_id && etag_pair_matches(uploaded, settings)
+}
+
+fn etag_pair_matches(uploaded: &Value, settings: &Value) -> bool {
+    match (
+        non_empty_string_field(uploaded, "etag"),
+        non_empty_string_field(settings, "etag"),
+    ) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn non_empty_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|item| !item.is_empty())
+}
+
+/// Percentage deployments must name unique version ids and sum to 100. Order
+/// does not matter. A missing strategy on the readback is accepted; a
+/// different strategy is not.
+pub fn worker_deployment_versions_match(planned: &Value, latest: &Value) -> bool {
+    if planned.get("strategy").and_then(Value::as_str) != Some("percentage") {
+        return false;
+    }
+    if let Some(strategy) = latest.get("strategy").and_then(Value::as_str)
+        && strategy != "percentage"
+    {
+        return false;
+    }
+    match (
+        deployment_version_pairs(planned.get("versions")),
+        deployment_version_pairs(latest.get("versions")),
+    ) {
+        (Some(planned_versions), Some(latest_versions)) => planned_versions == latest_versions,
+        _ => false,
+    }
+}
+
+fn deployment_version_pairs(versions: Option<&Value>) -> Option<Vec<(String, i64)>> {
+    let versions = versions?.as_array()?;
+    if versions.is_empty() {
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(versions.len());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut sum = 0_i64;
+    for version in versions {
+        let id = version.get("version_id").and_then(Value::as_str)?;
+        if uuid::Uuid::parse_str(id).is_err() || !seen.insert(id.to_owned()) {
+            return None;
+        }
+        let percentage = version.get("percentage").and_then(Value::as_f64)?;
+        if !(0.01..=100.0).contains(&percentage) {
+            return None;
+        }
+        let milli = (percentage * 1000.0).round() as i64;
+        sum += milli;
+        pairs.push((id.to_owned(), milli));
+    }
+    if sum != 100_000 {
+        return None;
+    }
+    pairs.sort();
+    Some(pairs)
+}
+
+/// Cron readback may reorder the list. Equality is the multiset of cron
+/// expressions, including the empty list that clears every schedule.
+pub fn worker_cron_lists_match(planned: &Value, readback: &Value) -> bool {
+    match (cron_expressions(planned), cron_expressions(readback)) {
+        (Some(mut planned_crons), Some(mut readback_crons)) => {
+            planned_crons.sort();
+            readback_crons.sort();
+            planned_crons == readback_crons
+        }
+        _ => false,
+    }
+}
+
+fn cron_expressions(value: &Value) -> Option<Vec<String>> {
+    let items = value.as_array()?;
+    let mut crons = Vec::with_capacity(items.len());
+    for item in items {
+        let cron = item.get("cron").and_then(Value::as_str)?;
+        if cron.is_empty()
+            || cron.len() > 128
+            || cron.chars().any(|character| character.is_control())
+        {
+            return None;
+        }
+        crons.push(cron.to_owned());
+    }
+    Some(crons)
+}
+
+fn worker_mutation_read_target(capability: &CapabilityV1) -> Result<&SamePathReadContractV1> {
+    capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound Worker readback contract is absent".to_owned(),
+        )
+    })
+}
+
+fn redacted_worker_verification(
+    plan: &PlanV1,
+    passed: bool,
+    basis: String,
+    mut readback: CloudflareResponseV1,
+) -> OperationVerificationV1 {
+    readback.result = serde_json::json!({
+        "schema_version": 1,
+        "passed": passed,
+        "provider_output_retained": false,
+    });
+    readback.result_info = None;
+    readback.errors.clear();
+    OperationVerificationV1 {
+        strategy: plan.capability.verification.strategy.clone(),
+        passed,
+        basis,
+        readback,
+        correlated_resource_id: None,
+    }
 }
 
 const MLN_0142_TERMINAL_TRIGGER_SQL: &str = r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
@@ -4218,6 +4350,24 @@ impl Executor {
                 .await;
         }
 
+        if strategy == "worker_script_settings_id_matches_upload_response" {
+            return self
+                .verify_worker_module_upload(plan, apply_response, input, credential)
+                .await;
+        }
+
+        if strategy == "worker_deployment_latest_matches_planned_versions" {
+            return self
+                .verify_worker_deployment_create(plan, apply_response, input, credential)
+                .await;
+        }
+
+        if strategy == "worker_cron_schedules_match_planned_crons" {
+            return self
+                .verify_worker_cron_update(plan, apply_response, input, credential)
+                .await;
+        }
+
         if strategy == "r2_private_file_upload_etag_and_conditional_read" {
             return self
                 .verify_r2_private_file_upload(plan, apply_response, input, credential)
@@ -4342,6 +4492,143 @@ impl Executor {
             readback: projected_readback,
             correlated_resource_id,
         })
+    }
+
+    async fn verify_worker_module_upload(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = worker_mutation_read_target(&plan.capability)?;
+        let readback = self
+            .read_worker_mutation_target(
+                plan,
+                input,
+                credential,
+                target,
+                "Worker script settings readback",
+            )
+            .await?;
+        let matched =
+            worker_script_upload_identity_matches(&apply_response.result, &readback.result);
+        let passed = apply_response.success && readback.success && matched;
+        let basis = if passed {
+            "the script settings id matches the upload response".to_owned()
+        } else {
+            format!(
+                "Worker module upload was not proven (apply success={}, settings success={}, identity match={matched})",
+                apply_response.success, readback.success
+            )
+        };
+        Ok(redacted_worker_verification(plan, passed, basis, readback))
+    }
+
+    async fn verify_worker_deployment_create(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let planned = input.body.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "Worker deployment plan body is absent".to_owned(),
+            )
+        })?;
+        let target = worker_mutation_read_target(&plan.capability)?;
+        let readback = self
+            .read_worker_mutation_target(
+                plan,
+                input,
+                credential,
+                target,
+                "Worker deployment list readback",
+            )
+            .await?;
+        let latest = readback
+            .result
+            .get("deployments")
+            .and_then(Value::as_array)
+            .and_then(|deployments| deployments.first());
+        let latest_id = latest
+            .and_then(|deployment| deployment.get("id"))
+            .and_then(Value::as_str);
+        let apply_id = apply_response.result.get("id").and_then(Value::as_str);
+        let identity_matches = apply_id.is_some() && apply_id == latest_id;
+        let versions_match =
+            latest.is_some_and(|deployment| worker_deployment_versions_match(planned, deployment));
+        let passed =
+            apply_response.success && readback.success && identity_matches && versions_match;
+        let basis = if passed {
+            "the latest deployment is the created deployment and serves the planned version percentages".to_owned()
+        } else {
+            format!(
+                "Worker deployment was not proven (apply success={}, list success={}, latest identity match={identity_matches}, versions match={versions_match})",
+                apply_response.success, readback.success
+            )
+        };
+        Ok(redacted_worker_verification(plan, passed, basis, readback))
+    }
+
+    async fn verify_worker_cron_update(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let planned = input.body.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget("Worker cron plan body is absent".to_owned())
+        })?;
+        let target = worker_mutation_read_target(&plan.capability)?;
+        let readback = self
+            .read_worker_mutation_target(
+                plan,
+                input,
+                credential,
+                target,
+                "Worker cron schedule readback",
+            )
+            .await?;
+        let matched = worker_cron_lists_match(planned, &readback.result);
+        let passed = apply_response.success && readback.success && matched;
+        let basis = if passed {
+            "the schedule readback matches the planned cron list".to_owned()
+        } else {
+            format!(
+                "Worker cron update was not proven (apply success={}, readback success={}, schedules match={matched})",
+                apply_response.success, readback.success
+            )
+        };
+        Ok(redacted_worker_verification(plan, passed, basis, readback))
+    }
+
+    async fn read_worker_mutation_target(
+        &self,
+        plan: &PlanV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+        target: &SamePathReadContractV1,
+        title: &str,
+    ) -> Result<CloudflareResponseV1> {
+        let details = same_path_verification_capability(
+            &plan.capability,
+            &target.read_capability_id,
+            title,
+            &target.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: serde_json::json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        self.send(&request, credential).await
     }
 
     async fn verify_r2_private_file_upload(
@@ -11330,6 +11617,15 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     if strategy == "worker_script_settings_returns_not_found_after_delete" {
         return validate_worker_script_delete_target(capability, input);
     }
+    if strategy == "worker_script_settings_id_matches_upload_response" {
+        return validate_worker_module_upload_target(capability, input);
+    }
+    if strategy == "worker_deployment_latest_matches_planned_versions" {
+        return validate_worker_deployment_create_target(capability, input);
+    }
+    if strategy == "worker_cron_schedules_match_planned_crons" {
+        return validate_worker_cron_update_target(capability, input);
+    }
     if strategy == "access_service_token_reports_refreshed_expiration" {
         return validate_access_service_token_refresh_target(capability, input);
     }
@@ -11907,6 +12203,57 @@ fn same_path_routing_header(capability: &CapabilityV1, selector: &SelectorV1) ->
         && !selector.required
         && selector.value_type == "string"
         && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
+}
+
+fn validate_worker_module_upload_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let _target = worker_mutation_read_target(capability)?;
+    if !clean_verification_query(input) || !capability.verification_contract_supported() {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "Worker module upload readback contract or query is not exact".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_worker_deployment_create_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let _target = worker_mutation_read_target(capability)?;
+    let body = input.body.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "Worker deployment plan body is absent".to_owned(),
+        )
+    })?;
+    if !clean_verification_query(input)
+        || !capability.verification_contract_supported()
+        || !worker_deployment_versions_match(body, body)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "Worker deployment body must be a percentage split of unique versions summing to 100, with no force query"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_worker_cron_update_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let _target = worker_mutation_read_target(capability)?;
+    let body = input.body.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget("Worker cron plan body is absent".to_owned())
+    })?;
+    if !clean_verification_query(input)
+        || !capability.verification_contract_supported()
+        || cron_expressions(body).is_none()
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "Worker cron body must be an array of cron expressions, with no extra query".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_worker_script_delete_target(
@@ -16517,6 +16864,66 @@ fn request_property_path(parent: &str, property: &str) -> String {
         property.to_owned()
     } else {
         format!("{parent}.{property}")
+    }
+}
+
+#[cfg(test)]
+mod worker_mutation_contract_tests {
+    use super::{
+        worker_cron_lists_match, worker_deployment_versions_match,
+        worker_script_upload_identity_matches,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn upload_identity_matches_id_and_etag_without_retaining_bytes() {
+        let uploaded = json!({"id":"script-1","etag":"abc","script":"secret-bytes"});
+        let settings = json!({"id":"script-1","etag":"abc"});
+        assert!(worker_script_upload_identity_matches(&uploaded, &settings));
+        let drifted = json!({"id":"script-1","etag":"other"});
+        assert!(!worker_script_upload_identity_matches(&uploaded, &drifted));
+        let missing = json!({"etag":"abc"});
+        assert!(!worker_script_upload_identity_matches(&uploaded, &missing));
+    }
+
+    #[test]
+    fn deployment_versions_must_be_unique_and_sum_to_100() {
+        let version = "11111111-1111-4111-8111-111111111111";
+        let other = "22222222-2222-4222-8222-222222222222";
+        let planned = json!({
+            "strategy":"percentage",
+            "versions":[
+                {"version_id":other,"percentage":25},
+                {"version_id":version,"percentage":75}
+            ]
+        });
+        let latest = json!({
+            "id":"deployment-1",
+            "strategy":"percentage",
+            "versions":[
+                {"version_id":version,"percentage":75},
+                {"version_id":other,"percentage":25}
+            ]
+        });
+        assert!(worker_deployment_versions_match(&planned, &latest));
+        let short = json!({
+            "strategy":"percentage",
+            "versions":[{"version_id":version,"percentage":75}]
+        });
+        assert!(!worker_deployment_versions_match(&short, &short));
+    }
+
+    #[test]
+    fn cron_readback_matches_the_planned_multiset() {
+        let planned = json!([{"cron":"0 * * * *"},{"cron":"15 1 * * *"}]);
+        let readback =
+            json!([{"cron":"15 1 * * *","created_on":"2026-10-05T00:00:00Z"},{"cron":"0 * * * *"}]);
+        assert!(worker_cron_lists_match(&planned, &readback));
+        assert!(worker_cron_lists_match(&json!([]), &json!([])));
+        assert!(!worker_cron_lists_match(
+            &planned,
+            &json!([{"cron":"0 * * * *"}])
+        ));
     }
 }
 

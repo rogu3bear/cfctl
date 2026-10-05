@@ -8823,6 +8823,9 @@ fn apply_post_normalization_contracts(
     finalize_email_routing_subdomain_contract(capabilities);
     finalize_email_routing_rules_read_projection(capabilities);
     finalize_worker_script_delete_contract(capabilities);
+    finalize_worker_module_upload_contract(capabilities);
+    finalize_worker_deployment_create_contract(capabilities);
+    finalize_worker_cron_trigger_update_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
     access_create::finalize_owned_create(document, capabilities);
     finalize_access_application_login_methods_contract(document, capabilities);
@@ -20310,6 +20313,226 @@ fn finalize_worker_script_delete_contract(capabilities: &mut BTreeMap<String, Ca
     capability.rollback.strategy = None;
     capability.rollback.warning = Some(
         "deletion is irreversible and destroys any Durable Object storage hosted by the script; redeployment is a separately reviewed wrangler.deploy plan, and in-use bindings (queue consumers, service bindings) must be removed through their own governed capabilities first — cfctl never passes Cloudflare's force bypass"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+const WORKER_DEPLOYMENTS_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/deployments";
+const WORKER_SCHEDULES_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/schedules";
+
+fn bind_worker_control_plane_cost(capability: &mut CapabilityV1) {
+    zero_direct_usage_cost(
+        capability,
+        "Workers platform pricing lists no charge for this control-plane call, so its hard ceiling is USD 0. Downstream Worker requests include 10 million per month and then cost $0.30 per million; CPU time includes 30 million milliseconds and then costs $0.02 per million. Cron Trigger invocations are those Worker requests. Workers Builds minutes are a different product and do not price this call.",
+        vec![official_reference(
+            "Workers pricing",
+            "https://developers.cloudflare.com/workers/platform/pricing/index.md",
+        )],
+    );
+}
+
+fn worker_json_envelope(capability: &CapabilityV1) -> bool {
+    capability
+        .response_contract
+        .as_ref()
+        .is_some_and(|response| {
+            response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                && response.success_statuses == ["200"]
+        })
+}
+
+fn required_path_selectors(capability: &CapabilityV1, names: &[&str]) -> bool {
+    names.iter().all(|name| {
+        capability.selectors.iter().any(|selector| {
+            selector.name == *name && selector.location == "path" && selector.required
+        })
+    })
+}
+
+/// Upload proves the new script id through settings readback. Previous module
+/// bytes are not retained, so traffic restoration stays on the native
+/// `worker-version-rollback` capability.
+fn finalize_worker_module_upload_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let settings_read_supported =
+        capabilities
+            .get("worker-script-get-settings")
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == WORKER_SCRIPT_SETTINGS_PATH
+                    && capability.product == "Worker Script"
+                    && !capability.mutating
+            });
+    let Some(capability) = capabilities.get_mut("worker-script-upload-worker-module") else {
+        return;
+    };
+    let identity_confirmed = settings_read_supported
+        && capability.method == "PUT"
+        && capability.path == WORKER_SCRIPT_DELETE_PATH
+        && capability.product == "Worker Script"
+        && capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions == ["Workers Scripts Write"]
+        && worker_json_envelope(capability)
+        && required_path_selectors(capability, &["account_id", "script_name"]);
+    if !identity_confirmed {
+        return;
+    }
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    bind_worker_control_plane_cost(capability);
+    capability.verification.required = true;
+    "worker_script_settings_id_matches_upload_response"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: WORKER_SCRIPT_SETTINGS_PATH.to_owned(),
+        read_capability_id: "worker-script-get-settings".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "the upload response does not retain the previous module bytes. Restoring traffic is a separately reviewed worker-version-rollback to one exact prior version; this operation does not accept a force bypass"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn worker_deployment_create_schema_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let required = schema.get("required").and_then(Value::as_array);
+    let strategy_only_percentage = schema
+        .pointer("/properties/strategy/enum")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.len() == 1 && items[0].as_str() == Some("percentage"));
+    let version_fields = schema
+        .pointer("/properties/versions/items/required")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| item.as_str() == Some("version_id"))
+                && items.iter().any(|item| item.as_str() == Some("percentage"))
+        });
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+        && required.is_some_and(|items| {
+            items.iter().any(|item| item.as_str() == Some("strategy"))
+                && items.iter().any(|item| item.as_str() == Some("versions"))
+        })
+        && strategy_only_percentage
+        && version_fields
+}
+
+/// Creating a deployment shifts traffic. `force` is stripped so this call
+/// cannot bypass Cloudflare's version guards; restoring the previous split is
+/// `worker-version-rollback` or a new reviewed deployment.
+fn finalize_worker_deployment_create_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let list_supported = capabilities
+        .get("worker-deployments-list-deployments")
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == WORKER_DEPLOYMENTS_COLLECTION_PATH
+                && capability.product == "Worker Deployments"
+                && !capability.mutating
+        });
+    let Some(capability) = capabilities.get_mut("worker-deployments-create-deployment") else {
+        return;
+    };
+    let identity_confirmed = list_supported
+        && capability.method == "POST"
+        && capability.path == WORKER_DEPLOYMENTS_COLLECTION_PATH
+        && capability.product == "Worker Deployments"
+        && capability.mutating
+        && capability.permissions == ["Workers Scripts Write"]
+        && worker_json_envelope(capability)
+        && worker_deployment_create_schema_supported(capability)
+        && required_path_selectors(capability, &["account_id", "script_name"]);
+    if !identity_confirmed {
+        return;
+    }
+    capability
+        .selectors
+        .retain(|selector| selector.location == "path");
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    bind_worker_control_plane_cost(capability);
+    capability.verification.required = true;
+    "worker_deployment_latest_matches_planned_versions"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: WORKER_DEPLOYMENTS_COLLECTION_PATH.to_owned(),
+        read_capability_id: "worker-deployments-list-deployments".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "automatic compensation is not attached. Restoring the previous traffic split is a separately reviewed worker-version-rollback, or a new reviewed deployment of the prior version percentages. cfctl strips the force query so this call cannot bypass Cloudflare's version guards"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn worker_cron_put_schema_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    schema.get("type").and_then(Value::as_str) == Some("array")
+        && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+        && schema.pointer("/items/type").and_then(Value::as_str) == Some("object")
+        && schema
+            .pointer("/items/properties/cron/type")
+            .and_then(Value::as_str)
+            == Some("string")
+        && schema
+            .pointer("/items/required")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("cron")))
+}
+
+/// A schedule PUT replaces the whole cron set. Readback compares that set, and
+/// restoration is a separately reviewed PUT of the prior list.
+fn finalize_worker_cron_trigger_update_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let read_supported = capabilities
+        .get("worker-cron-trigger-get-cron-triggers")
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == WORKER_SCHEDULES_PATH
+                && capability.product == "Worker Cron Trigger"
+                && !capability.mutating
+        });
+    let Some(capability) = capabilities.get_mut("worker-cron-trigger-update-cron-triggers") else {
+        return;
+    };
+    let identity_confirmed = read_supported
+        && capability.method == "PUT"
+        && capability.path == WORKER_SCHEDULES_PATH
+        && capability.product == "Worker Cron Trigger"
+        && capability.mutating
+        && capability.permissions == ["Workers Scripts Write"]
+        && worker_json_envelope(capability)
+        && worker_cron_put_schema_supported(capability)
+        && required_path_selectors(capability, &["account_id", "script_name"]);
+    if !identity_confirmed {
+        return;
+    }
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    bind_worker_control_plane_cost(capability);
+    capability.verification.required = true;
+    "worker_cron_schedules_match_planned_crons".clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: WORKER_SCHEDULES_PATH.to_owned(),
+        read_capability_id: "worker-cron-trigger-get-cron-triggers".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "automatic compensation is not attached. Restoring schedules is a separately reviewed PUT of the exact prior cron list captured by worker-cron-trigger-get-cron-triggers. This call replaces the whole schedule set"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);
