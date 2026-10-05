@@ -1198,6 +1198,193 @@ fn worker_script_delete_is_governed_without_the_force_bypass() {
     assert_eq!(delete.adapter_status, AdapterStatus::Blocked);
 }
 
+fn worker_mutation_account_and_script() -> (Value, Value) {
+    (
+        json!({"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}),
+        json!({"in":"path","name":"script_name","required":true,"schema":{"type":"string"}}),
+    )
+}
+
+fn worker_control_plane_fixture() -> Value {
+    let mut document = fixture();
+    let (account, script) = worker_mutation_account_and_script();
+    let force = json!({"in":"query","name":"force","required":false,"schema":{"type":"boolean"}});
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}"] = json!({
+        "put": {
+            "operationId":"worker-script-upload-worker-module",
+            "summary":"Upload Worker Module",
+            "tags":["Worker Script"],
+            "x-api-token-group":["Workers Scripts Write"],
+            "parameters":[account.clone(), script.clone()],
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/settings"] = json!({
+        "get": {
+            "operationId":"worker-script-get-settings",
+            "summary":"Get Script Settings",
+            "tags":["Worker Script"],
+            "parameters":[account.clone(), script.clone()],
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/deployments"] = json!({
+        "get": {
+            "operationId":"worker-deployments-list-deployments",
+            "summary":"List Worker deployments",
+            "tags":["Worker Deployments"],
+            "parameters":[account.clone(), script.clone()],
+            "responses": cloudflare_envelope_responses()
+        },
+        "post": {
+            "operationId":"worker-deployments-create-deployment",
+            "summary":"Create Worker Deployment",
+            "tags":["Worker Deployments"],
+            "x-api-token-group":["Workers Scripts Write"],
+            "parameters":[account.clone(), script.clone(), force],
+            "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "type":"object",
+                "required":["strategy","versions"],
+                "properties":{
+                    "strategy":{"type":"string","enum":["percentage"]},
+                    "versions":{"type":"array","items":{
+                        "type":"object",
+                        "required":["version_id","percentage"],
+                        "properties":{
+                            "version_id":{"type":"string","format":"uuid"},
+                            "percentage":{"type":"number","minimum":0.01,"maximum":100}
+                        }
+                    }},
+                    "annotations":{"type":"object","properties":{"workers/message":{"type":"string","maxLength":1000}}}
+                }
+            }}}},
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/schedules"] = json!({
+        "get": {
+            "operationId":"worker-cron-trigger-get-cron-triggers",
+            "summary":"Get Worker Script Schedules",
+            "tags":["Worker Cron Trigger"],
+            "parameters":[account.clone(), script.clone()],
+            "responses": cloudflare_envelope_responses()
+        },
+        "put": {
+            "operationId":"worker-cron-trigger-update-cron-triggers",
+            "summary":"Update Worker Script Schedules",
+            "tags":["Worker Cron Trigger"],
+            "x-api-token-group":["Workers Scripts Write"],
+            "parameters":[account, script],
+            "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "type":"array",
+                "items":{
+                    "type":"object",
+                    "required":["cron"],
+                    "properties":{"cron":{"type":"string"}}
+                }
+            }}}},
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document
+}
+
+#[test]
+fn worker_upload_deployment_and_cron_contracts_share_one_bounded_cost() {
+    let snapshot = normalize_openapi(&worker_control_plane_fixture()).expect("worker catalog");
+    for id in [
+        "worker-script-upload-worker-module",
+        "worker-deployments-create-deployment",
+        "worker-cron-trigger-update-cron-triggers",
+    ] {
+        let capability = snapshot.get(id).expect(id);
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{id} gaps: {:?} blocked: {:?}",
+            capability.mutation_contract_gaps(),
+            capability.blocked_reason
+        );
+        assert!(capability.mutation_contract_gaps().is_empty(), "{id}");
+        assert!(capability.cost.known, "{id}");
+        assert!(!capability.cost.incremental, "{id}");
+        assert_eq!(capability.cost.maximum, Some(0.0), "{id}");
+        assert_eq!(
+            capability
+                .cost
+                .references
+                .iter()
+                .map(|reference| reference.url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://developers.cloudflare.com/workers/platform/pricing/index.md"]
+        );
+        assert!(!capability.rollback.supported, "{id}");
+        assert!(
+            capability
+                .rollback
+                .warning
+                .as_deref()
+                .is_some_and(|warning| !warning.is_empty()),
+            "{id}"
+        );
+    }
+
+    let upload = snapshot
+        .get("worker-script-upload-worker-module")
+        .expect("upload");
+    assert_eq!(upload.risk, RiskClass::CrossConfig);
+    assert_eq!(upload.effect, EffectClass::ReversibleWrite);
+    assert_eq!(
+        upload.verification.strategy,
+        "worker_script_settings_id_matches_upload_response"
+    );
+
+    let deployment = snapshot
+        .get("worker-deployments-create-deployment")
+        .expect("deployment");
+    assert!(
+        deployment
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path"),
+        "force must be stripped: {:?}",
+        deployment.selectors
+    );
+    assert_eq!(
+        deployment.verification.strategy,
+        "worker_deployment_latest_matches_planned_versions"
+    );
+    assert!(
+        deployment
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("worker-version-rollback")),
+        "{:?}",
+        deployment.rollback.warning
+    );
+
+    let cron = snapshot
+        .get("worker-cron-trigger-update-cron-triggers")
+        .expect("cron");
+    assert_eq!(cron.risk, RiskClass::ScopedWrite);
+    assert_eq!(
+        cron.verification.strategy,
+        "worker_cron_schedules_match_planned_crons"
+    );
+
+    let mut without_reads = worker_control_plane_fixture();
+    without_reads["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/deployments"]
+        .as_object_mut()
+        .expect("deployments")
+        .remove("get");
+    let snapshot = normalize_openapi(&without_reads).expect("worker catalog");
+    let deployment = snapshot
+        .get("worker-deployments-create-deployment")
+        .expect("deployment remains");
+    assert_eq!(deployment.adapter_status, AdapterStatus::Blocked);
+}
+
 fn workers_script_secret_fixture() -> Value {
     let account = json!({
         "in": "path",

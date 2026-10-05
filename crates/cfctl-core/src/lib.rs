@@ -2651,6 +2651,82 @@ impl CapabilityV1 {
                             && target.verified_response_fields.is_empty()
                     })
             }
+            // Module upload returns a script id. The script GET is the raw
+            // module, so readback is the settings sub-path and must report
+            // that same id.
+            "worker_script_settings_id_matches_upload_response" => {
+                self.id == "worker-script-upload-worker-module"
+                    && self.method == "PUT"
+                    && self.path == "/accounts/{account_id}/workers/scripts/{script_name}"
+                    && self.product == "Worker Script"
+                    && self.request_schema.is_none()
+                    && self.permissions == ["Workers Scripts Write"]
+                    && ["account_id", "script_name"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                        })
+                    })
+                    && self.same_path_read.as_ref().is_some_and(|target| {
+                        target.path
+                            == "/accounts/{account_id}/workers/scripts/{script_name}/settings"
+                            && target.read_capability_id == "worker-script-get-settings"
+                            && target.verified_response_fields.is_empty()
+                    })
+            }
+            // A percentage deployment is proven when the deployment list's
+            // latest entry is the created deployment and serves the planned
+            // versions. Path-only selectors keep the `force` bypass
+            // unexpressable.
+            "worker_deployment_latest_matches_planned_versions" => {
+                self.id == "worker-deployments-create-deployment"
+                    && self.method == "POST"
+                    && self.path
+                        == "/accounts/{account_id}/workers/scripts/{script_name}/deployments"
+                    && self.product == "Worker Deployments"
+                    && self.permissions == ["Workers Scripts Write"]
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && ["account_id", "script_name"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                        })
+                    })
+                    && self.same_path_read.as_ref().is_some_and(|target| {
+                        target.path == self.path
+                            && target.read_capability_id == "worker-deployments-list-deployments"
+                            && target.verified_response_fields.is_empty()
+                    })
+            }
+            "worker_cron_schedules_match_planned_crons" => {
+                self.id == "worker-cron-trigger-update-cron-triggers"
+                    && self.method == "PUT"
+                    && self.path
+                        == "/accounts/{account_id}/workers/scripts/{script_name}/schedules"
+                    && self.product == "Worker Cron Trigger"
+                    && self.permissions == ["Workers Scripts Write"]
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && ["account_id", "script_name"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                        })
+                    })
+                    && self.same_path_read.as_ref().is_some_and(|target| {
+                        target.path == self.path
+                            && target.read_capability_id == "worker-cron-trigger-get-cron-triggers"
+                            && target.verified_response_fields.is_empty()
+                    })
+            }
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.created_resource_creation_method_supported()
                     && self.created_resource_contract_supported()
