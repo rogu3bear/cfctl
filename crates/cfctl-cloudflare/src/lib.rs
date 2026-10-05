@@ -966,10 +966,7 @@ fn cron_expressions(value: &Value) -> Option<Vec<String>> {
     let mut crons = Vec::with_capacity(items.len());
     for item in items {
         let cron = item.get("cron").and_then(Value::as_str)?;
-        if cron.is_empty()
-            || cron.len() > 128
-            || cron.chars().any(char::is_control)
-        {
+        if cron.is_empty() || cron.len() > 128 || cron.chars().any(char::is_control) {
             return None;
         }
         crons.push(cron.to_owned());
