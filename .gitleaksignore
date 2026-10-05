@@ -8,3 +8,9 @@
 a6e2d3c012c438bd95a5700a012715399b738500:crates/cfctl-cli/src/runtime/r2_recovery_tests.rs:generic-api-key:96
 a6e2d3c012c438bd95a5700a012715399b738500:crates/cfctl-cli/src/runtime/r2_restore_tests.rs:generic-api-key:110
 a6e2d3c012c438bd95a5700a012715399b738500:crates/cfctl-cloudflare/src/r2_restore_tests.rs:generic-api-key:17
+
+# Non-secret service-token UUID fixtures in historical Access policy tests.
+# These exact findings do not exclude a rule, path, or commit.
+adba7089520b367c0f90d202f08dbc791c5e6815:crates/cfctl-catalog/tests/catalog.rs:generic-api-key:6638
+adba7089520b367c0f90d202f08dbc791c5e6815:crates/cfctl-core/tests/contracts.rs:generic-api-key:3637
+e9dd64344dac7a00ffad62b1f77aed4de3d7d464:crates/cfctl-core/tests/contracts.rs:generic-api-key:3642
