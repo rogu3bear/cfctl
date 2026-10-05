@@ -859,6 +859,7 @@ fn evaluate_worker_version_rollback_readback(
     Ok((passed, basis, latest_id.map(Value::String), projected))
 }
 
+#[must_use]
 pub fn worker_script_upload_identity_matches(uploaded: &Value, settings: &Value) -> bool {
     let uploaded_id = non_empty_string_field(uploaded, "id");
     let settings_id = non_empty_string_field(settings, "id");
@@ -886,6 +887,7 @@ fn non_empty_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> 
 /// Percentage deployments must name unique version ids and sum to 100. Order
 /// does not matter. A missing strategy on the readback is accepted; a
 /// different strategy is not.
+#[must_use]
 pub fn worker_deployment_versions_match(planned: &Value, latest: &Value) -> bool {
     if planned.get("strategy").and_then(Value::as_str) != Some("percentage") {
         return false;
@@ -902,6 +904,19 @@ pub fn worker_deployment_versions_match(planned: &Value, latest: &Value) -> bool
         (Some(planned_versions), Some(latest_versions)) => planned_versions == latest_versions,
         _ => false,
     }
+}
+
+fn percentage_milli(percentage: f64) -> Option<i64> {
+    if !percentage.is_finite() {
+        return None;
+    }
+    let milli = (percentage * 1000.0).round();
+    // 0.01% is 10 thousandths and 100% is 100_000, both inside i64.
+    if !(10.0..=100_000.0).contains(&milli) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Some(milli as i64)
 }
 
 fn deployment_version_pairs(versions: Option<&Value>) -> Option<Vec<(String, i64)>> {
@@ -921,7 +936,7 @@ fn deployment_version_pairs(versions: Option<&Value>) -> Option<Vec<(String, i64
         if !(0.01..=100.0).contains(&percentage) {
             return None;
         }
-        let milli = (percentage * 1000.0).round() as i64;
+        let milli = percentage_milli(percentage)?;
         sum += milli;
         pairs.push((id.to_owned(), milli));
     }
@@ -934,6 +949,7 @@ fn deployment_version_pairs(versions: Option<&Value>) -> Option<Vec<(String, i64
 
 /// Cron readback may reorder the list. Equality is the multiset of cron
 /// expressions, including the empty list that clears every schedule.
+#[must_use]
 pub fn worker_cron_lists_match(planned: &Value, readback: &Value) -> bool {
     match (cron_expressions(planned), cron_expressions(readback)) {
         (Some(mut planned_crons), Some(mut readback_crons)) => {
@@ -952,7 +968,7 @@ fn cron_expressions(value: &Value) -> Option<Vec<String>> {
         let cron = item.get("cron").and_then(Value::as_str)?;
         if cron.is_empty()
             || cron.len() > 128
-            || cron.chars().any(|character| character.is_control())
+            || cron.chars().any(char::is_control)
         {
             return None;
         }
