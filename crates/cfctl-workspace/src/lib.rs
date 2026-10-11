@@ -235,21 +235,49 @@ pub struct WorkspaceImpactV1 {
     pub has_unmanaged_dependencies: bool,
 }
 
+/// One registered root that discovery refused to walk, with the reason.
+///
+/// Discovery never follows symbolic links. A registered root that is itself a
+/// symlink is reported here instead of being resolved and crawled, so the
+/// operator can see why its repositories are absent and re-register the real
+/// directory deliberately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedRootV1 {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceGraph {
     pub repositories: Vec<RepositoryNode>,
     pub resources: Vec<ResourceNode>,
     pub links: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_roots: Vec<SkippedRootV1>,
 }
 
 impl WorkspaceGraph {
     /// Discovers only explicitly registered roots and skips generated/vendor
     /// directories. Repository IDs in discovered links are absolute paths so
     /// two repositories with the same basename cannot collapse together.
+    ///
+    /// Symbolic links are never followed: a root that is itself a symlink is
+    /// recorded in `skipped_roots`, and symlinked entries inside a root are
+    /// neither descended nor read as configuration.
     pub fn discover(roots: &[RegisteredRoot]) -> Result<Self> {
         let mut graph = Self::default();
         let mut repositories: BTreeMap<PathBuf, RepositoryNode> = BTreeMap::new();
         for root in roots {
+            let is_symlink = fs::symlink_metadata(&root.path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if is_symlink {
+                graph.skipped_roots.push(SkippedRootV1 {
+                    path: root.path.clone(),
+                    reason: "registered root is a symbolic link; discovery does not follow symlinks. Register the resolved directory to discover it."
+                        .to_owned(),
+                });
+                continue;
+            }
             if !root.path.is_dir() {
                 return Err(WorkspaceError::MissingRoot(root.path.display().to_string()));
             }
@@ -353,6 +381,7 @@ fn discover_root(
 ) -> Result<()> {
     for entry in WalkDir::new(&root.path)
         .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_entry(included_entry)
         .filter_map(std::result::Result::ok)
@@ -445,36 +474,53 @@ fn register_repository(
 /// `build` is deliberately excluded from this list. It is a legitimate source
 /// directory name, and skipping it repository-wide could hide real Cloudflare
 /// configuration; the tool-owned subdirectory is the precise thing to skip.
+///
+/// `output` and Playwright browser bundles (`ms-playwright`, and `browsers`
+/// directly under `playwright`) are skipped by name: one registered root
+/// carried `output/playwright/browsers` with full browser builds, and walking
+/// it made discovery appear to hang.
 fn included_entry(entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() || entry.depth() == 0 {
         return true;
     }
-    !matches!(
-        entry.file_name().to_str(),
-        Some(
-            ".build"
-                | ".cache"
-                | ".git"
-                | ".swiftpm"
-                | ".terraform"
-                | ".wrangler"
-                | "Carthage"
-                | "DerivedData"
-                | "Pods"
-                | "__fixtures__"
-                | "cargo-home"
-                | "coverage"
-                | "dist"
-                | "fixtures"
-                | "node_modules"
-                | "target"
-                | "test-data"
-                | "test_data"
-                | "testdata"
-                | "var"
-                | "vendor"
-        )
-    )
+    let Some(name) = entry.file_name().to_str() else {
+        return true;
+    };
+    if matches!(
+        name,
+        ".build"
+            | ".cache"
+            | ".git"
+            | ".swiftpm"
+            | ".terraform"
+            | ".wrangler"
+            | "Carthage"
+            | "DerivedData"
+            | "Pods"
+            | "__fixtures__"
+            | "cargo-home"
+            | "coverage"
+            | "dist"
+            | "fixtures"
+            | "ms-playwright"
+            | "node_modules"
+            | "output"
+            | "target"
+            | "test-data"
+            | "test_data"
+            | "testdata"
+            | "var"
+            | "vendor"
+    ) {
+        return false;
+    }
+    !(name == "browsers" && parent_basename(entry.path()) == Some("playwright"))
+}
+
+fn parent_basename(path: &Path) -> Option<&str> {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
 }
 
 fn is_cloudflare_config(path: &Path) -> bool {

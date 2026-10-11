@@ -1326,11 +1326,15 @@ impl StateStore {
         Ok(registration)
     }
 
-    /// Stop future discovery beneath one exact registered root.
+    /// Delete one registered root from the workspace manifest so discovery
+    /// never walks it again.
     ///
-    /// Missing absolute paths remain removable so an operator can retire a
-    /// stale registration after the repository itself has already moved or
-    /// been deleted. Historical workspace graphs and evidence are preserved.
+    /// The registration is matched by its canonical path and, when that
+    /// differs, by the exact absolute spelling the operator typed: a legacy
+    /// manifest can hold a symlink spelling that canonicalization would never
+    /// reproduce. Missing absolute paths remain removable so an operator can
+    /// drop a stale registration after the repository itself has already moved
+    /// or been deleted. Historical workspace graphs and evidence are preserved.
     pub fn unregister_workspace(&self, root: &Path) -> Result<(PathBuf, bool, bool)> {
         let canonical = match root.canonicalize() {
             Ok(canonical) => canonical,
@@ -1341,11 +1345,18 @@ impl StateStore {
         };
         let _guard = self.lock_workspace_manifest()?;
         let mut manifest = self.load_workspace_manifest_unlocked()?;
-        let (removed, account_pin_removed) = manifest.unregister(&canonical);
+        let (mut path, (mut removed, mut account_pin_removed)) =
+            (canonical.clone(), manifest.unregister(&canonical));
+        if !removed && root.is_absolute() && root != canonical {
+            let by_spelling = manifest.unregister(root);
+            if by_spelling.0 {
+                (path, (removed, account_pin_removed)) = (root.to_path_buf(), by_spelling);
+            }
+        }
         if removed {
             self.write_json(&self.workspace_manifest_path(), &manifest)?;
         }
-        Ok((canonical, removed, account_pin_removed))
+        Ok((path, removed, account_pin_removed))
     }
 
     pub fn workspace_roots(&self) -> Result<Vec<PathBuf>> {
