@@ -306,3 +306,23 @@ fn audit_cursor_persists_its_overlap_window() {
         Some(cursor)
     );
 }
+
+#[test]
+fn remove_scope_deletes_the_scope_row_and_reports_repeat_removal() {
+    let root = tempfile::tempdir().expect("registry root");
+    let mut registry = Registry::open(root.path()).expect("registry opens");
+    registry.adopt_scope(&account()).expect("scope stores");
+    assert_eq!(
+        registry.list_scopes().expect("scopes list"),
+        vec![account()]
+    );
+
+    assert!(registry.remove_scope(&account()).expect("scope removes"));
+
+    assert!(registry.list_scopes().expect("scopes list").is_empty());
+    assert!(
+        !registry
+            .remove_scope(&account())
+            .expect("repeat removal is idempotent")
+    );
+}

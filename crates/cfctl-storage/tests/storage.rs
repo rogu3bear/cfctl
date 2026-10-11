@@ -1587,6 +1587,55 @@ fn registered_roots_can_be_retired_after_the_workspace_disappears() {
 }
 
 #[test]
+#[cfg(unix)]
+fn legacy_symlink_spelled_registrations_are_removed_by_their_exact_spelling() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let real_parent = tempfile::tempdir().expect("real workspace parent");
+    let real = real_parent.path().join("product-site");
+    std::fs::create_dir(&real).expect("real workspace");
+    let link_parent = tempfile::tempdir().expect("symlink parent");
+    let link = link_parent.path().join("aos-web");
+    symlink(&real, &link).expect("workspace symlink");
+    assert_ne!(
+        link.canonicalize().expect("canonical link target"),
+        link,
+        "fixture must register a spelling canonicalization never reproduces"
+    );
+    // `register_workspace` canonicalizes, so the legacy state is written as the
+    // manifest document an older release left behind.
+    store
+        .write_json(
+            &paths.config_dir.join("workspace-manifest-v1.json"),
+            &json!({
+                "schema_version": 1,
+                "registrations": [{ "path": link, "account_id": "account-a" }],
+            }),
+        )
+        .expect("legacy manifest write");
+    assert_eq!(
+        store.workspace_roots().expect("read roots"),
+        vec![link.clone()]
+    );
+
+    let (removed_path, removed, account_pin_removed) = store
+        .unregister_workspace(&link)
+        .expect("unregister symlink-spelled root");
+
+    assert_eq!(removed_path, link);
+    assert!(removed);
+    assert!(account_pin_removed);
+    assert!(store.workspace_roots().expect("read roots").is_empty());
+    let (_, removed_again, _) = store
+        .unregister_workspace(&link)
+        .expect("repeat removal is idempotent");
+    assert!(!removed_again);
+}
+
+#[test]
 fn imports_are_bounded_to_the_managed_data_directory() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");

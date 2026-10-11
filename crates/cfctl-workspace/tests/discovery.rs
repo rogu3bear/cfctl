@@ -1,8 +1,213 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::mpsc,
+    time::Duration,
+};
 
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph, load_wrangler_config};
+
+/// A hang is the failure these fixtures guard against, so discovery runs on
+/// its own thread and the test fails instead of blocking the suite.
+fn discover_within(
+    roots: Vec<PathBuf>,
+    timeout: Duration,
+) -> cfctl_workspace::Result<WorkspaceGraph> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let roots: Vec<RegisteredRoot> =
+            roots.iter().map(|path| RegisteredRoot::new(path)).collect();
+        let _ = sender.send(WorkspaceGraph::discover(&roots));
+    });
+    receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|_| panic!("discovery did not complete within {timeout:?}"))
+}
+
+fn playwright_bundle(parent: &Path) -> PathBuf {
+    let bundle = parent
+        .join("output")
+        .join("playwright")
+        .join("browsers")
+        .join("chromium-1194");
+    let mut deep = bundle.clone();
+    for level in 0..24 {
+        deep = deep.join(format!("level-{level}"));
+    }
+    init_repo(&deep, "wrangler.toml", "name = \"bundled-worker\"\n");
+    for level in 0..64 {
+        let sibling = bundle.join(format!("locale-{level}"));
+        fs::create_dir_all(&sibling).expect("bundle sibling");
+        fs::write(sibling.join("wrangler.toml"), "name = \"bundled-locale\"\n")
+            .expect("bundle sibling config");
+    }
+    bundle
+}
+
+#[test]
+#[cfg(unix)]
+fn symlinked_root_with_playwright_bundles_is_skipped_promptly_without_being_walked() {
+    use std::os::unix::fs::symlink;
+
+    let desktop = tempfile::tempdir().expect("symlink target");
+    let real = desktop.path().join("product-site");
+    init_repo(&real, "wrangler.toml", "name = \"real-worker\"\n");
+    let bundle = playwright_bundle(&real);
+    // A cycle inside the bundle makes link-following pathological rather than
+    // merely slow, so a regression cannot pass by luck.
+    symlink("../..", bundle.join("loop")).expect("bundle symlink loop");
+
+    let forest = tempfile::tempdir().expect("forest root");
+    let link = forest.path().join("aos-web");
+    symlink(&real, &link).expect("registered root symlink");
+
+    let graph = discover_within(vec![link.clone()], Duration::from_secs(20))
+        .expect("symlinked root discovery completes");
+    assert!(
+        graph.repositories.is_empty() && graph.resources.is_empty(),
+        "a symlinked root must not be resolved and walked: {graph:?}"
+    );
+    assert_eq!(graph.skipped_roots.len(), 1);
+    assert_eq!(graph.skipped_roots[0].path, link);
+    assert!(
+        graph.skipped_roots[0].reason.contains("symbolic link"),
+        "{}",
+        graph.skipped_roots[0].reason
+    );
+
+    let resolved = discover_within(vec![real.clone()], Duration::from_secs(20))
+        .expect("resolved root discovery completes");
+    assert!(resolved.skipped_roots.is_empty());
+    assert!(
+        resolved
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:real-worker"),
+        "the real directory stays discoverable when registered directly"
+    );
+    assert!(
+        resolved
+            .resources
+            .iter()
+            .all(|resource| !resource.key.starts_with("worker:bundled-")),
+        "Playwright bundle contents were walked: {:?}",
+        resolved.resources
+    );
+    let canonical_bundle = bundle.canonicalize().expect("canonical bundle");
+    assert!(
+        resolved
+            .repositories
+            .iter()
+            .all(|repository| !repository.path.starts_with(&canonical_bundle)),
+        "a checkout inside a Playwright bundle became a workspace repository"
+    );
+}
+
+#[test]
+fn playwright_browser_bundles_and_output_directories_are_not_walked() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("site");
+    init_repo(&repository, "wrangler.toml", "name = \"real-worker\"\n");
+    for (index, segments) in [
+        &["output", "report"][..],
+        &["ms-playwright", "chromium-1194"][..],
+        &["playwright", "browsers", "chromium-1194"][..],
+        &[".cache", "ms-playwright", "chromium-1194"][..],
+        &["e2e", "output", "playwright", "browsers"][..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let nested = segments
+            .iter()
+            .fold(repository.clone(), |path, segment| path.join(segment));
+        init_repo(
+            &nested,
+            "wrangler.toml",
+            &format!("name = \"skipped-{index}\"\n"),
+        );
+    }
+    // `browsers` is only a bundle name under `playwright`; elsewhere it is an
+    // ordinary source directory and stays walkable.
+    let kept = repository.join("tools").join("browsers").join("edge");
+    init_repo(&kept, "wrangler.toml", "name = \"kept-worker\"\n");
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("bundle-safe discovery");
+    for key in ["worker:real-worker", "worker:kept-worker"] {
+        assert!(
+            graph.resources.iter().any(|resource| resource.key == key),
+            "missing {key}: {:?}",
+            graph.resources
+        );
+    }
+    assert!(
+        graph
+            .resources
+            .iter()
+            .all(|resource| !resource.key.starts_with("worker:skipped-")),
+        "output or Playwright bundle contents were walked: {:?}",
+        graph.resources
+    );
+    assert_eq!(graph.repositories.len(), 2, "{:?}", graph.repositories);
+}
+
+#[test]
+#[cfg(unix)]
+fn symlinked_directories_and_files_inside_a_root_are_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("workspace root");
+    let outside = tempfile::tempdir().expect("outside root");
+    let repository = root.path().join("app");
+    init_repo(&repository, "wrangler.toml", "name = \"inside-worker\"\n");
+    let outside_repository = outside.path().join("elsewhere");
+    init_repo(
+        &outside_repository,
+        "wrangler.toml",
+        "name = \"outside-worker\"\n",
+    );
+    fs::write(
+        outside.path().join("wrangler.production.toml"),
+        "name = \"outside-config\"\n",
+    )
+    .expect("outside config");
+    symlink(&outside_repository, root.path().join("linked-directory"))
+        .expect("directory symlink inside root");
+    symlink(
+        outside.path().join("wrangler.production.toml"),
+        repository.join("wrangler.production.toml"),
+    )
+    .expect("file symlink inside repository");
+
+    let graph = discover_within(vec![root.path().to_path_buf()], Duration::from_secs(20))
+        .expect("symlink-safe discovery");
+    assert!(
+        graph
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:inside-worker")
+    );
+    for key in ["worker:outside-worker", "worker:outside-config"] {
+        assert!(
+            graph.resources.iter().all(|resource| resource.key != key),
+            "followed a symlink out of the registered root: {key}"
+        );
+    }
+    let canonical_outside = outside.path().canonicalize().expect("canonical outside");
+    assert!(
+        graph
+            .repositories
+            .iter()
+            .all(|repository| !repository.path.starts_with(&canonical_outside)),
+        "a symlinked directory was adopted as a repository: {:?}",
+        graph.repositories
+    );
+    assert!(graph.skipped_roots.is_empty());
+}
 
 #[test]
 fn exact_and_role_specific_production_wrangler_toml_are_supported() {
