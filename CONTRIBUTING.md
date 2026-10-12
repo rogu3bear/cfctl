@@ -16,8 +16,12 @@ documentation, and evidence model agree.
   Cloudflare behavior is `provider_generic`; cfctl's own public identity is
   `cfctl_product`. Do not compile a customer or application repository,
   account, database, migration, or deployment policy into either class. New
-  `legacy_embedded` entries are prohibited; workspace-owned behavior must wait
-  for the typed operation-pack loader and remain in its owning repository.
+  `legacy_embedded` entries are prohibited. Workspace-owned behavior remains
+  in its owning registered repository and uses the supported typed operation
+  pack and runtime contract. The generic `workspace_operation_v1` loader exists,
+  but consumer migration and semantic acceptance remain incomplete; see
+  [the operation-format contract](docs/workspace-operation-format.md). A pack
+  declaration does not make an unsupported adapter executable.
   `CapabilityV1` application-extension fields are inventoried in
   `crates/cfctl-core/tests/capability_contract.rs` (`CAPABILITY_V1_APPLICATION_FIELDS`);
   that list may shrink and must not grow.

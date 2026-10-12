@@ -1095,18 +1095,25 @@ rectification and never authorizes replay. Automatic rollback is not
 implemented. Restoring a prior artifact is a separate reviewed deployment and
 does not erase the failed deployment or Functions side effects or refund usage.
 
-For an existing Git-integrated Pages project, the provider-native
-`pages-deployment-create-deployment` capability starts a build from the
-production branch without accepting an artifact body:
+For an existing Git-integrated Pages project, the implementation defines a
+bodyless build-trigger contract for `pages-deployment-create-deployment`.
+Implementation support does not establish current catalog admission. Inspect
+both the selected catalog entry and its generated guide before planning:
 
 ```bash
-cfctl call pages-deployment-create-deployment \
-  --account <account-id> \
-  --selector project_name=example-web \
-  --json
+cfctl catalog show pages-deployment-create-deployment --json
+cfctl guide pages-deployment-create-deployment --json
 ```
 
-The catalog exposes this mutation only while the exact Pages Write operation,
+The catalog observed on 2026-10-09 blocks this operation and the guide returns
+`call_argv: null` because risk, effect, bounded cost, verification and
+compensation contracts are incomplete. Follow the guide's `next_action`; do
+not substitute direct Wrangler, a dashboard trigger, or a manual request.
+Only a later available guide can admit its exact profile/account/project-bound
+call and separately reviewed plan. Preserve an existing project's Git source
+delivery contract; artifact upload is not an automatic substitute.
+
+The implementation's admission contract requires the exact Pages Write operation,
 returned deployment ID, terminal-stage response shape, and exact deployment
 GET and DELETE companions remain intact. The plan records a zero direct
 API-operation ceiling and separately names downstream build, Functions, and

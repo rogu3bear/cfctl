@@ -66,7 +66,13 @@ One schema, `schema_version = 2` plus `contract = "workspace_operation_v1"`, in
 `.cfctl/operations/*.toml`. Typed D1 migration packs already use
 `schema_version = 2` without that contract key; cfctl must not treat the
 integer as a format name. The four existing files keep their names; the schema
-is shared, so a pack's filename stops carrying meaning.
+is shared, so a generic pack's filename stops carrying meaning. That applies
+only to a committed schema-2 document with the exact contract key above and a
+supported typed binder. Existing typed packs retain their declared filenames
+and validators; a separate migration TOML file does not enter the typed D1
+loader. The current generic binder supports D1 evidence reads, not arbitrary
+migration, projection, or reply-admission execution. The other examples below
+describe the proposed format and do not establish production admission.
 
 ```toml
 schema_version = 2
