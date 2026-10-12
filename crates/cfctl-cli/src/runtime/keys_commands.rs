@@ -26,6 +26,8 @@ use super::support::cli_io;
 use super::support::read_private_secret_file;
 use cfctl_core::hash_value;
 
+mod analytics_recovery;
+
 pub(super) async fn keys_command(
     store: &StateStore,
     command: KeysCommand,
@@ -253,6 +255,7 @@ pub(super) fn key_policy_list(store: &StateStore) -> Result<ResultEnvelopeV2> {
             };
             json!({
                 "authority_id": authority.authority_id,
+                "content_hash": authority.content_hash,
                 "status": effective_status,
                 "account_id": authority.account_id,
                 "zone_id": authority.zone_id,
@@ -260,6 +263,7 @@ pub(super) fn key_policy_list(store: &StateStore) -> Result<ResultEnvelopeV2> {
                 "capability_ids": authority.capability_ids,
                 "name_prefix": authority.name_prefix,
                 "permission_group_count": authority.permission_group_ids.len(),
+                "permission_group_ids": authority.permission_group_ids,
                 "max_child_ttl_hours": authority.max_child_ttl_hours,
                 "max_runs_per_day": authority.max_runs_per_day,
                 "runs_last_24h": runs_last_24h,
@@ -747,13 +751,24 @@ pub(super) fn rotation_failure(
     envelope
 }
 
+pub(super) async fn key_renew_analytics_profile(
+    store: &StateStore,
+    arguments: &KeyRenewAnalyticsProfileArgs,
+) -> Result<ResultEnvelopeV2> {
+    let mut recovery = analytics_recovery::Session::open(store, arguments)?;
+    let mut result = renew_analytics_profile_locked(store, arguments, &mut recovery).await?;
+    recovery.annotate(&mut result);
+    Ok(result)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the governed rotation keeps mint, staged reads, atomic activation, post-activation reads, rollback, and lineage-bound revocation in one fail-closed owner"
 )]
-pub(super) async fn key_renew_analytics_profile(
+async fn renew_analytics_profile_locked(
     store: &StateStore,
     arguments: &KeyRenewAnalyticsProfileArgs,
+    recovery: &mut analytics_recovery::Session,
 ) -> Result<ResultEnvelopeV2> {
     validate_zone_id(&arguments.zone)?;
     if arguments.permissions.is_empty() {
@@ -815,6 +830,7 @@ pub(super) async fn key_renew_analytics_profile(
             "minter profile must be an API token pinned to the requested account".to_owned(),
         ));
     }
+    recovery.authorize(arguments, &old_profile, minter, &authority)?;
     if let Some(pending_token_id) = old_profile.managed_api_token.as_ref().and_then(|managed| {
         (managed.pending_revoke_operation_id.is_none())
             .then(|| managed.pending_revoke_token_id.clone())
@@ -929,6 +945,7 @@ pub(super) async fn key_renew_analytics_profile(
         } else {
             secrets.delete_api_token(&arguments.profile)?;
         }
+        recovery.close_ordinary(store, pending_operation_id, &reconciled_profile, false)?;
         old_profile = reconciled_profile;
     }
     let old_token_id = match (
@@ -941,8 +958,9 @@ pub(super) async fn key_renew_analytics_profile(
                     .to_owned(),
             ));
         }
-        (Some(managed), _) => managed.token_id.clone(),
-        (None, Some(provided)) if !provided.trim().is_empty() => provided.to_owned(),
+        (Some(managed), _) => Some(managed.token_id.clone()),
+        (None, Some(provided)) if !provided.trim().is_empty() => Some(provided.to_owned()),
+        (None, None) if recovery.is_unmanaged_recovery() => None,
         (None, _) => {
             return Err(CliError::Input(
                 "the first managed renewal requires `--current-token-id`; later runs use the profile's durable managed-child identity"
@@ -980,22 +998,31 @@ pub(super) async fn key_renew_analytics_profile(
                 ));
             }
             let secrets = platform_secrets(store);
-            secrets.delete_api_token(&arguments.profile)?;
+            let legacy_cleanup = if recovery.has_unknown_predecessor() {
+                "retained_unresolved_predecessor"
+            } else {
+                secrets.delete_api_token(&arguments.profile)?;
+                "completed_idempotently"
+            };
             let mut envelope = ResultEnvelopeV2::success(
                 "keys renew-analytics-profile",
                 json!({
                     "profile":arguments.profile,
                     "state":"healthy_not_due",
+                    "renewal_performed":false,
                     "active_token_id":managed.token_id,
                     "expires_at":managed.expires_at,
                     "renew_at":renew_at,
-                    "legacy_profile_credential_cleanup":"completed_idempotently",
+                    "legacy_profile_credential_cleanup":legacy_cleanup,
                     "observable_failure_signal":"nonzero process exit with ResultEnvelopeV2 error",
                     "message":"Managed analytics child is outside its renewal window and passed account settings, zone settings, and exact-hostname RUM reads."
                 }),
             );
             envelope.profile_id = Some(arguments.profile.clone());
             envelope.account_id = Some(arguments.account.clone());
+            envelope.performed = true;
+            envelope.verification.state = VerificationState::Passed;
+            envelope.verification.basis = Some("Three current account/zone/hostname analytics reads passed; no child renewal was due".to_owned());
             envelope.evidence = active_reads
                 .into_iter()
                 .flat_map(|read| read.evidence)
@@ -1038,6 +1065,7 @@ pub(super) async fn key_renew_analytics_profile(
         },
     ))
     .await?;
+    recovery.claim_mint(store, arguments, &old_profile, &mint_plan)?;
     let mint = Box::pin(finish_standing_run(
         store,
         mint_plan,
@@ -1079,6 +1107,7 @@ pub(super) async fn key_renew_analytics_profile(
 
     let secrets = platform_secrets(store);
     let slot_id = Uuid::new_v4().to_string();
+    recovery.retain_child(&new_token_id, &slot_id)?;
     secrets.store_api_token_slot(&slot_id, token.trim())?;
     let staging_profile_id = format!("__cfctl_rotation_{rotation_id}");
     let mut staging_profile = ProfileMetadata::new(
@@ -1119,8 +1148,17 @@ pub(super) async fn key_renew_analytics_profile(
             &arguments.under_policy,
         ))
         .await?;
-        evidence.extend(cleanup.evidence);
         remove_staged_rotation_profile(store, &secrets, &staging_profile_id, &slot_id)?;
+        if cleanup.ok && cleanup.verification.state == VerificationState::Passed {
+            let operation = cleanup.operation_id.as_deref().ok_or_else(|| {
+                CliError::Input(
+                    "fresh-child cleanup omitted its operation ID; retain the mint fence"
+                        .to_owned(),
+                )
+            })?;
+            recovery.close_ordinary(store, operation, &old_profile, true)?;
+        }
+        evidence.extend(cleanup.evidence);
         return Ok(rotation_failure(
             "CFCTL_ANALYTICS_ROTATION_STAGED_READ_FAILED",
             "the fresh child failed its staged settings or hostname-bound RUM read",
@@ -1129,7 +1167,7 @@ pub(super) async fn key_renew_analytics_profile(
             json!({
                 "profile":arguments.profile,
                 "state":"staged_read_failed",
-                "new_child_revoked":cleanup.ok,
+                "new_child_revoked":cleanup.ok && cleanup.verification.state == VerificationState::Passed,
             }),
         ));
     }
@@ -1141,9 +1179,7 @@ pub(super) async fn key_renew_analytics_profile(
         .ok_or_else(|| {
             CliError::Input("publisher profile disappeared during rotation".to_owned())
         })?;
-    if current.credential_generation_id != old_profile.credential_generation_id
-        || current.api_token_slot_id != old_profile.api_token_slot_id
-    {
+    if analytics_recovery::require_unchanged(Some(current), &old_profile).is_err() {
         let _ = revoke_rotation_child(
             store,
             &arguments.minter_profile,
@@ -1157,6 +1193,17 @@ pub(super) async fn key_renew_analytics_profile(
             "publisher credential generation changed during rotation; the fresh child was not activated"
                 .to_owned(),
         ));
+    }
+    if recovery.is_unmanaged_recovery() {
+        let current_minter = activation_profiles
+            .profiles
+            .get(&arguments.minter_profile)
+            .ok_or_else(|| {
+                CliError::Input("minter profile disappeared during recovery".to_owned())
+            })?;
+        let current_authority = store.load_authority(&arguments.under_policy)?;
+        current_authority.ensure_operational()?;
+        recovery.authorize(arguments, current, current_minter, &current_authority)?;
     }
     let mut activated_profile = old_profile.clone();
     activated_profile.credential_generation_id = staging_profile.credential_generation_id.clone();
@@ -1174,6 +1221,7 @@ pub(super) async fn key_renew_analytics_profile(
     activation_profiles
         .profiles
         .insert(arguments.profile.clone(), activated_profile.clone());
+    recovery.retain_activation(&activated_profile)?;
     activation_profiles.save(store)?;
     let activation_evidence = store.write_evidence(
         EvidenceClass::PostChangeVerification,
@@ -1200,6 +1248,10 @@ pub(super) async fn key_renew_analytics_profile(
     .await?;
     if !analytics_reads_passed(&active_reads) {
         let mut rollback_profiles = ProfilesConfig::load(store)?;
+        analytics_recovery::require_unchanged(
+            rollback_profiles.profiles.get(&arguments.profile),
+            &activated_profile,
+        )?;
         rollback_profiles
             .profiles
             .insert(arguments.profile.clone(), old_profile.clone());
@@ -1213,6 +1265,15 @@ pub(super) async fn key_renew_analytics_profile(
         ))
         .await?;
         secrets.delete_api_token_slot(&slot_id)?;
+        if cleanup.ok && cleanup.verification.state == VerificationState::Passed {
+            let operation = cleanup.operation_id.as_deref().ok_or_else(|| {
+                CliError::Input(
+                    "fresh-child cleanup omitted its operation ID; retain the mint fence"
+                        .to_owned(),
+                )
+            })?;
+            recovery.close_ordinary(store, operation, &old_profile, true)?;
+        }
         let mut evidence = mint.evidence;
         evidence.push(activation_evidence);
         evidence.extend(
@@ -1229,10 +1290,49 @@ pub(super) async fn key_renew_analytics_profile(
             json!({
                 "profile":arguments.profile,
                 "state":"rolled_back",
-                "new_child_revoked":cleanup.ok,
+                "new_child_revoked":cleanup.ok && cleanup.verification.state == VerificationState::Passed,
             }),
         ));
     }
+
+    let Some(old_token_id) = old_token_id else {
+        analytics_recovery::require_unchanged(
+            ProfilesConfig::load(store)?
+                .profiles
+                .get(&arguments.profile),
+            &activated_profile,
+        )?;
+        let mut evidence = mint.evidence;
+        evidence.push(activation_evidence);
+        evidence.extend(
+            staged_reads
+                .iter()
+                .chain(&active_reads)
+                .flat_map(|read| read.evidence.clone()),
+        );
+        recovery.complete(&activated_profile, &evidence, &staged_reads, &active_reads)?;
+        let mut envelope = ResultEnvelopeV2::success(
+            "keys renew-analytics-profile",
+            json!({
+                "profile":arguments.profile,
+                "state":"recovered_old_token_unknown",
+                "renewal_performed":true,
+                "active_token_id":new_token_id,
+                "expires_at":expires_at,
+                "renew_at":expires_at - ChronoDuration::hours(i64::from(arguments.renew_before_hours)),
+                "old_token_revocation":"unresolved_unknown_identity",
+                "legacy_credential_retained":true,
+                "message":"Fresh child passed staged and active analytics reads; the unknown predecessor was not revoked. Use ordinary managed renewal for this active child."
+            }),
+        );
+        envelope.performed = true;
+        envelope.profile_id = Some(arguments.profile.clone());
+        envelope.account_id = Some(arguments.account.clone());
+        envelope.verification.state = VerificationState::Passed;
+        envelope.verification.basis = Some("Three staged and three active analytics reads passed; predecessor revocation remains explicitly unresolved".to_owned());
+        envelope.evidence = evidence;
+        return Ok(envelope);
+    };
 
     let refreshed_authority = store.load_authority(&arguments.under_policy)?;
     let old_is_lineage_bound = refreshed_authority
@@ -1391,11 +1491,18 @@ pub(super) async fn key_renew_analytics_profile(
     } else {
         secrets.delete_api_token(&arguments.profile)?;
     }
+    let revoke_operation = revoke.operation_id.as_deref().ok_or_else(|| {
+        CliError::Input(
+            "verified old-child revoke omitted its operation ID; retain the mint fence".to_owned(),
+        )
+    })?;
+    recovery.close_ordinary(store, revoke_operation, &activated_profile, false)?;
     let mut envelope = ResultEnvelopeV2::success(
         "keys renew-analytics-profile",
         json!({
             "profile":arguments.profile,
             "state":"rotated",
+            "renewal_performed":true,
             "active_token_id":new_token_id,
             "revoked_token_id":old_token_id,
             "expires_at":expires_at,

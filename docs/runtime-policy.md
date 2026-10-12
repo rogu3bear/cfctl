@@ -180,6 +180,61 @@ lineage-bound revoke persists the same old-child overlap and operation
 reference until that exact operation is reconciled to `Verified`. Successful
 later rotations use two standing run reservations: mint and old-child revoke.
 
+The source revision also supports `--unmanaged-recovery REQUEST_JSON` for a
+publisher whose predecessor token identity is unknown. It is mutually exclusive
+with `--current-token-id`. The closed version-1 request pins publisher and minter
+generations, account, zone, exact hostname, standing-authority ID and content
+hash, its exact two permission-group IDs, child TTL and the sole disposition
+`unknown_not_revoked`. This request grants no authority: the standing grant must
+be explicitly approved and operational. The mint must be a current PlanV2 pinned
+to the admitted minter generation. Target and generation drift fail closed.
+The qualified source's `keys policy list --json` exposes the non-secret
+`content_hash` and `permission_group_ids` required to prepare that request; do
+not reconstruct the hash from backend files or claim an older installed listing
+already exposes those fields.
+
+A private per-profile lock serializes renewal commands. Both ordinary rotation
+and unknown-identity recovery durably retain the native mint operation and prior
+profile before executing the mint. Ordinary rotation also records the intended
+active profile before replacement. An interrupted attempt prevents another mint;
+a process timeout is not a retry boundary. The retained ordinary attempt allows
+only the existing old-child revoke reconciliation when the full active profile,
+pending old-token identity and old slot match. It closes after exact native
+`Verified` revocation and matching profile readback: either the prior child was
+revoked after cutover, or the fresh child was revoked after rollback/staging
+failure and the prior profile remains installed. Exit status or a cleanup
+boolean alone cannot clear the attempt.
+
+Other interrupted stages remain held for reconciliation of the original plan
+and actual profile readback, including death between cutover and durable pending
+revoke metadata. This source revision provides no automatic resume or operator
+clear command for those stages. Preserve the attempt; do not delete it, rerun
+the mint, or treat a new hourly invocation as permission to mint again. An
+unknown-identity bootstrap failure retains its separate permanent replay fence.
+The existing three staged reads, atomic metadata replacement, three active
+reads and rollback remain the activation owner. Activation and rollback compare
+the complete expected profile projection; an unexpected change is preserved.
+Auth imports and other profile writers require a quiescent activation window;
+the per-profile renewal lock does not serialize those separate writers.
+
+Successful bootstrap returns `recovered_old_token_unknown`. It verifies the
+fresh publisher's reads, **not** predecessor revocation. The retained record and
+every later renewal result preserve `unknown_not_revoked`,
+`cleanup_verified:false` and `automatic_revoke_permitted:false`. The legacy
+credential is retained. Ordinary managed renewal subsequently rotates the known
+managed child through the existing lineage rules; it does not erase the unknown
+predecessor obligation. The source and tests must pass native qualification and
+explicit runtime adoption before this option is used by an installed executor.
+
+An hourly publisher must explicitly invoke renewal before publishing; managed
+identity alone executes nothing. A `healthy_not_due` result exits successfully
+only after all three current reads pass, reports `renewal_performed:false` and
+`performed:true` for those reads. Expired authority, a pending recovery attempt,
+failed reads or unverified known-child revocation remain nonzero failures. Grant
+expiry can precede child expiry: a one-day bootstrap policy does not authorize
+renewal of a seven-day child six days later. A successor grant requires its own
+review and exact approval; changing the job does not extend the grant.
+
 Profile metadata contains only opaque slot, token identity, expiry, authority,
 and pending-revocation references. Secret slots remain in the platform
 credential store or its private mode-0600 fallback. Slot activation is

@@ -541,6 +541,13 @@ pub struct KeyRenewAnalyticsProfileArgs {
     pub current_token_id: Option<String>,
     #[arg(
         long,
+        value_name = "REQUEST_JSON",
+        conflicts_with = "current_token_id",
+        help = "Generation-pinned unmanaged recovery request; retains the unknown old token as unresolved"
+    )]
+    pub unmanaged_recovery: Option<PathBuf>,
+    #[arg(
+        long,
         help = "Renew even when the managed child is outside the renewal window"
     )]
     pub force: bool,

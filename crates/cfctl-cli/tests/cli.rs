@@ -925,6 +925,44 @@ fn governed_analytics_profile_renewal_parses_explicit_authority_and_truth_scope(
 }
 
 #[test]
+fn unmanaged_analytics_recovery_parses_a_request_and_refuses_a_guessed_old_id() {
+    let base = [
+        "cfctl",
+        "keys",
+        "renew-analytics-profile",
+        "--profile",
+        "publisher",
+        "--minter-profile",
+        "minter",
+        "--account",
+        "account",
+        "--zone",
+        "zone",
+        "--hostname",
+        "example.com",
+        "--under-policy",
+        "authority",
+        "--unmanaged-recovery",
+        "/private/request.json",
+    ];
+    let parsed = Cli::try_parse_from(base).expect("typed bootstrap request parses");
+    let Some(Command::Keys(arguments)) = parsed.command else {
+        panic!("keys command");
+    };
+    let KeysCommand::RenewAnalyticsProfile(arguments) = arguments.command else {
+        panic!("renewal command");
+    };
+    assert_eq!(
+        arguments.unmanaged_recovery.as_deref(),
+        Some(std::path::Path::new("/private/request.json"))
+    );
+    assert!(arguments.current_token_id.is_none());
+    assert!(
+        Cli::try_parse_from(base.into_iter().chain(["--current-token-id", "guessed"])).is_err()
+    );
+}
+
+#[test]
 fn analytics_profile_renewal_fails_before_network_when_authority_is_missing() {
     let runtime = tempfile::tempdir().expect("runtime root");
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))

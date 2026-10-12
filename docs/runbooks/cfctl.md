@@ -138,8 +138,10 @@ as raw clap output, and an envelope appears only under `--json`, with error
 code `CFCTL_USAGE`.
 
 An hourly analytics publisher should run `keys renew-analytics-profile` before
-its read. Exit `0` means the managed child is outside its renewal window or a
-complete rotation passed staged and active reads plus old-child revocation.
+its read. Exit `0` means a `healthy_not_due` child passed all three current reads,
+a complete known-child rotation passed staged/active reads and old-child
+revocation, or the source revision's `recovered_old_token_unknown` bootstrap
+verified the fresh publisher while retaining its explicit predecessor obligation.
 Exit `1` is the observable failure signal: do not suppress it. In particular,
 `CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING` persists across later hourly
 checks until the one-time bootstrap revoke operation is approved, run, and
@@ -148,6 +150,49 @@ that did not reach verified closure; the scheduler cannot silently return to
 healthy or mint another child while two children may remain active. A
 post-activation revoke-planning failure is also durable and nonzero; later
 checks retry only plan creation through the explicit minter profile.
+
+After source qualification and explicit runtime adoption, unknown-identity
+bootstrap uses the same command with `--unmanaged-recovery REQUEST_JSON`; it
+cannot also take `--current-token-id`. Review the strict request schema and
+pending-attempt recovery limits in [runtime policy](../runtime-policy.md). Never
+delete the durable attempt to retry a mint. The unknown predecessor is not
+revoked, and its legacy credential and unresolved status remain retained.
+
+An interrupted ordinary mint also holds later renewal commands before another
+mint. Only an exact retained old-child overlap can enter the existing revoke
+reconciliation; other interrupted stages need original-plan and profile
+reconciliation and have no automatic clear command. A timeout must stop the
+refresh and must never trigger a mint retry or removal of the native attempt.
+Consumers using `--json` must also validate the version-2 success envelope,
+performed reads, passed verification, exact command/profile/account, and the
+ordinary result state (`healthy_not_due` with `renewal_performed:false`, or
+`rotated` with `renewal_performed:true`) before collecting or publishing. Reject
+malformed output or a failure envelope even if the process returns zero.
+
+The existing hourly JKCA publisher can use this ordinary renewal invocation
+before its existing refresh step, once its owner integrates the qualified public
+contract. `APPROVED_AUTHORITY_ID` must name an operational, exactly approved
+grant; this example neither creates a schedule nor approves or extends a policy:
+
+```bash
+cfctl keys renew-analytics-profile \
+  --profile jkca-public-activity-read --minter-profile minter \
+  --account ca30e922fda7f5578e49873542e4aaca \
+  --zone 08e87b3b4b8c0ef0181abfa87499437b --hostname jkca.me \
+  --permission b89a480218d04ceb98b4fe57ca29dc1f \
+  --permission 9c88f9c5bce24ce7af9a958ba9c504db \
+  --name-prefix jkca-public-activity- --ttl-hours 168 --renew-before-hours 24 \
+  --under-policy APPROVED_AUTHORITY_ID --json
+```
+
+Bootstrap adds `--unmanaged-recovery REQUEST_JSON` once. Later scheduled runs
+omit that option, `--current-token-id` and `--force`. `healthy_not_due` reports
+`renewal_performed:false`; its `performed:true` covers the three live reads.
+Nonzero renewal must remain visible and must not publish partial analytics as a
+successful refresh. Policy expiry is a distinct admission boundary: the current
+one-day bootstrap draft expires before a 168-hour child's renewal window. A
+successor authority needs a separate reviewed human approval before unattended
+renewal can continue; an hourly invocation supplies no such authority.
 
 ## Authentication
 

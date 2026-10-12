@@ -479,6 +479,11 @@ pub(super) fn authority_listings_show_the_scope_being_approved() {
 
     let listed = key_policy_list(&store).expect("list authorities");
     let entry = &listed.result["authorities"][0];
+    assert_eq!(entry["content_hash"], json!(authority.content_hash));
+    assert_eq!(
+        entry["permission_group_ids"],
+        json!(authority.permission_group_ids)
+    );
     assert_eq!(entry["zone_id"], json!(zone));
     assert_eq!(
         entry["bound_resources"],
