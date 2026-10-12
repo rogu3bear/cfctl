@@ -571,14 +571,7 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
             ]);
         }
         if let Some(source) = &contract.source_binding {
-            command.extend([
-                "--source-checkout".into(),
-                source.selection.checkout_root.clone(),
-                "--source-head".into(),
-                source.selection.head.clone(),
-                "--source-tree".into(),
-                source.selection.tree.clone(),
-            ]);
+            append_source_checkout_argv(&mut command, &source.selection);
         }
         return command;
     }
@@ -617,6 +610,20 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     }
     argv.push("--json".to_owned());
     argv
+}
+
+fn append_source_checkout_argv(
+    command: &mut Vec<String>,
+    selection: &cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1,
+) {
+    command.extend([
+        "--source-checkout".into(),
+        selection.checkout_root.clone(),
+        "--source-head".into(),
+        selection.head.clone(),
+        "--source-tree".into(),
+        selection.tree.clone(),
+    ]);
 }
 
 pub(crate) fn capability_has_meaningful_request_body(capability: &CapabilityV1) -> bool {

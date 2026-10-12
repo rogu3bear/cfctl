@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::wildcard_imports)]
 use super::*;
 use cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1;
+use serde_json::Value;
 
 #[tokio::test]
 async fn selected_source_rejects_mutations_before_catalog_or_credential_access() {
@@ -187,7 +188,7 @@ fn qualify_frozen_sign_consumer(
     // profile exercise its unchanged consumer against this real authenticated
     // native projection. Portable runs still exercise the public handler above.
     if let Some(root) = std::env::var_os("CFCTL_SIGN_CONSUMER_ROOT") {
-        let script = r#"
+        let script = r"
 import sys, json
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/lib'))
@@ -205,7 +206,7 @@ queries = p['inventory']['queries']
 expected = {queries[0]['id']: [{'name':'items'}], queries[1]['id']: [{'n':0}]}
 read_population(body, declaration, Path(p['checkout']), p['inventory'], expected)
 print('frozen Sign authenticated_body/read_population accepted native selected-source projection')
-"#;
+";
         use std::io::Write as _;
         let mut child = Command::new("python3")
             .args(["-c", script])

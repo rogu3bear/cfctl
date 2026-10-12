@@ -24,6 +24,7 @@ use super::prelude::{Datelike, PermissionsExt, fs};
 use super::support::capability_missing;
 use super::support::cli_io;
 use super::support::read_private_secret_file;
+use crate::source_checkout::SourceCheckoutArgs;
 use cfctl_core::hash_value;
 
 mod analytics_recovery;
@@ -339,7 +340,7 @@ pub(super) fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallAr
         selectors.push(("account_id".to_owned(), arguments.account.clone()));
     }
     CallArgs {
-        source_checkout: Default::default(),
+        source_checkout: SourceCheckoutArgs::default(),
         capability_id: capability_id.to_owned(),
         selectors,
         query: Vec::new(),
@@ -624,7 +625,7 @@ pub(super) async fn analytics_rotation_reads(
     let limit = i64::from(today.day());
     let calls = [
         CallArgs {
-            source_checkout: Default::default(),
+            source_checkout: SourceCheckoutArgs::default(),
             capability_id: "graphql-analytics-account-rum-dataset-settings".to_owned(),
             selectors: vec![("account_id".to_owned(), account.to_owned())],
             query: Vec::new(),
@@ -640,7 +641,7 @@ pub(super) async fn analytics_rotation_reads(
             source_file: None,
         },
         CallArgs {
-            source_checkout: Default::default(),
+            source_checkout: SourceCheckoutArgs::default(),
             capability_id: "graphql-analytics-zone-dataset-settings".to_owned(),
             selectors: vec![("zone_id".to_owned(), zone.to_owned())],
             query: Vec::new(),
@@ -656,7 +657,7 @@ pub(super) async fn analytics_rotation_reads(
             source_file: None,
         },
         CallArgs {
-            source_checkout: Default::default(),
+            source_checkout: SourceCheckoutArgs::default(),
             capability_id: "graphql-analytics-account-rum-pageload-visits".to_owned(),
             selectors: vec![("account_id".to_owned(), account.to_owned())],
             query: Vec::new(),
