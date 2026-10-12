@@ -50,7 +50,7 @@ async fn selected_source_rejects_mutations_before_catalog_or_credential_access()
 
 #[tokio::test]
 async fn ordinary_coverage_authenticates_selected_source_and_rejects_drift() {
-    let (owner, _, input) = fixture(false);
+    let (owner, input) = sign_layout_fixture();
     let worktree = tempfile::tempdir().expect("worktree parent");
     let selected = worktree.path().join("selected");
     git(
@@ -137,6 +137,28 @@ async fn ordinary_coverage_authenticates_selected_source_and_rejects_drift() {
         withdrawn.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
         false
     );
+}
+
+fn sign_layout_fixture() -> (tempfile::TempDir, CallInput) {
+    let (owner, _, input) = fixture(false);
+    let inventory_path = ".cfctl/operations/sign-readiness.json";
+    fs::rename(
+        owner.path().join("inventory.json"),
+        owner.path().join(inventory_path),
+    )
+    .expect("Sign consumer inventory layout");
+    let pack_path = owner.path().join(".cfctl/operations/d1-reads.toml");
+    let mut pack: toml::Value =
+        toml::from_str(&fs::read_to_string(&pack_path).expect("committed pack"))
+            .expect("pack TOML");
+    pack["operation"][0]["inventory_path"] = toml::Value::String(inventory_path.to_owned());
+    fs::write(
+        &pack_path,
+        toml::to_string(&pack).expect("pack serialization"),
+    )
+    .expect("Sign consumer pack path");
+    commit(owner.path());
+    (owner, input)
 }
 
 fn assert_current_projection(
