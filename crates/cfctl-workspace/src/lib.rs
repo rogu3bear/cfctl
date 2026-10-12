@@ -17,8 +17,12 @@ mod d1_evidence;
 mod d1_operation;
 mod d1_policy_projection;
 mod d1_qualification;
+mod d1_read_source;
 mod d1_reads;
 mod d1_reply_admission;
+pub use d1_read_source::{
+    load_workspace_d1_read_from_checkout, revalidate_workspace_d1_read_registration,
+};
 pub use d1_reads::revalidate_workspace_d1_read_inventory;
 mod operation_identity;
 mod operation_pack;

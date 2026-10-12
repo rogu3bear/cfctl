@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 mod diagnostic;
 mod private_output;
+mod source_checkout;
 mod synthetic;
 use super::*;
 use cfctl_core::d1_read_inventory::{D1ReadQueryResultV1, D1ReadStatusV1};

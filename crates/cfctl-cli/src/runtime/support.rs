@@ -202,20 +202,46 @@ pub(super) fn load_workspace_capability(
     store: &StateStore,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    finish_workspace_capability(cfctl_workspace::load_workspace_operation_capability(
-        &store.workspace_roots()?,
+    workspace_capability_with_source(
+        store,
         capability_id,
-    )?)
+        None,
+        cfctl_workspace::WorkspaceOperationLoad::Execute,
+    )
 }
 
 pub(super) fn inspect_workspace_capability(
     store: &StateStore,
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    finish_workspace_capability(cfctl_workspace::inspect_workspace_operation_capability(
-        &store.workspace_roots()?,
+    workspace_capability_with_source(
+        store,
         capability_id,
-    )?)
+        None,
+        cfctl_workspace::WorkspaceOperationLoad::Inspect,
+    )
+}
+
+pub(super) fn workspace_capability_with_source(
+    store: &StateStore,
+    capability_id: &str,
+    selection: Option<&cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1>,
+    mode: cfctl_workspace::WorkspaceOperationLoad,
+) -> Result<Option<CapabilityV1>> {
+    let roots = store.workspace_roots()?;
+    let capability = if let Some(selection) = selection {
+        Some(cfctl_workspace::load_workspace_d1_read_from_checkout(
+            &roots,
+            capability_id,
+            selection,
+            mode,
+        )?)
+    } else if mode == cfctl_workspace::WorkspaceOperationLoad::Inspect {
+        cfctl_workspace::inspect_workspace_operation_capability(&roots, capability_id)?
+    } else {
+        cfctl_workspace::load_workspace_operation_capability(&roots, capability_id)?
+    };
+    finish_workspace_capability(capability)
 }
 
 fn finish_workspace_capability(capability: Option<CapabilityV1>) -> Result<Option<CapabilityV1>> {

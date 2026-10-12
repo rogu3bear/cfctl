@@ -10,6 +10,7 @@ pub mod build_support;
 mod command_help;
 mod profiles;
 pub mod runtime;
+pub mod source_checkout;
 mod telemetry_product;
 
 #[derive(Debug, Parser)]
@@ -583,6 +584,8 @@ pub struct SearchArgs {
 #[derive(Debug, Args)]
 pub struct CapabilitySelector {
     pub capability_id: String,
+    #[command(flatten)]
+    pub source_checkout: source_checkout::SourceCheckoutArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -609,6 +612,8 @@ pub struct GuideArgs {
         conflicts_with = "capability_id"
     )]
     pub topic: Option<GuideTopicArg>,
+    #[command(flatten)]
+    pub source_checkout: source_checkout::SourceCheckoutArgs,
 }
 
 #[derive(Debug, Args)]
@@ -626,6 +631,8 @@ pub struct ResolveArgs {
 #[derive(Debug, Args)]
 pub struct CallArgs {
     pub capability_id: String,
+    #[command(flatten)]
+    pub source_checkout: source_checkout::SourceCheckoutArgs,
     #[arg(long = "selector", value_parser = parse_key_value)]
     pub selectors: Vec<(String, String)>,
     #[arg(long = "query", value_parser = parse_key_value)]

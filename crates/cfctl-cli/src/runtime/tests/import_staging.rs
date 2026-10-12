@@ -974,6 +974,7 @@ pub(super) async fn d1_full_export_requires_out_and_rejects_caller_body_before_c
         .write_json(&store.paths().catalog_file(), &catalog)
         .expect("seed catalog");
     let arguments = CallArgs {
+        source_checkout: Default::default(),
         capability_id: "d1-full-export".to_owned(),
         selectors: vec![
             ("account_id".to_owned(), "a".repeat(32)),
@@ -1002,6 +1003,7 @@ pub(super) async fn d1_full_export_requires_out_and_rejects_caller_body_before_c
     let error = Box::pin(call_command(
         &store,
         CallArgs {
+            source_checkout: Default::default(),
             capability_id: "d1-full-export".to_owned(),
             selectors: vec![
                 ("account_id".to_owned(), "a".repeat(32)),
@@ -1050,6 +1052,7 @@ pub(super) async fn d1_full_export_requires_out_and_rejects_caller_body_before_c
     let error = Box::pin(call_command(
         &store,
         CallArgs {
+            source_checkout: Default::default(),
             capability_id: "fixture-mutation".to_owned(),
             selectors: vec![("account_id".to_owned(), "a".repeat(32))],
             query: Vec::new(),

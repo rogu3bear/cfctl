@@ -13,7 +13,7 @@ use super::{
         StateStore, Utc, Uuid, VerificationState, json,
     },
     read_execution::{ExecutedRead, credential_generation_for_read},
-    support::{http_client, load_workspace_capability},
+    support::{http_client, workspace_capability_with_source},
 };
 
 pub(super) async fn execute(
@@ -27,8 +27,18 @@ pub(super) async fn execute(
 ) -> Result<ExecutedRead> {
     // Both current source and the complete SQL/output population are checked
     // before selecting a profile or touching its credential store.
-    let current = load_workspace_capability(store, &capability.id)?
-        .ok_or_else(|| CliError::Input("reviewed D1 read owner is no longer registered".into()))?;
+    let selection = capability
+        .workspace_d1_read_inventory
+        .as_ref()
+        .and_then(|c| c.source_binding.as_ref())
+        .map(|b| &b.selection);
+    let current = workspace_capability_with_source(
+        store,
+        &capability.id,
+        selection,
+        cfctl_workspace::WorkspaceOperationLoad::Execute,
+    )?
+    .ok_or_else(|| CliError::Input("reviewed D1 read owner is no longer registered".into()))?;
     if current.workspace_d1_read_inventory != capability.workspace_d1_read_inventory {
         return Err(CliError::Input(
             "reviewed D1 read source contract drifted".into(),
@@ -99,6 +109,10 @@ fn reacquire(
     validated: &ValidatedD1ReadInventory,
     expected: &ProfileMetadata,
 ) -> Result<()> {
+    cfctl_workspace::revalidate_workspace_d1_read_registration(
+        &store.workspace_roots()?,
+        validated.contract(),
+    )?;
     cfctl_workspace::revalidate_workspace_d1_read_inventory(validated.contract())?;
     let current = ProfilesConfig::load(store)?;
     if current.selected(Some(&expected.id))? != expected {
@@ -204,6 +218,9 @@ fn persist_bound(
         "cost_limit":"Output limits and client deadlines do not establish a hard in-flight scan or currency ceiling.",
         "ordinary_application_behavior_verified":false
     });
+    if let Some(source) = &contract.source_binding {
+        value["source_binding"] = serde_json::to_value(source)?;
+    }
     if let Some(binding) = binding {
         value["synthetic_binding"] = serde_json::to_value(binding)?;
     }

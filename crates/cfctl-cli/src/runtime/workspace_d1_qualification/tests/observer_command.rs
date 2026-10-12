@@ -108,6 +108,7 @@ async fn public_call_command_records_schema_and_ledger_operation_bound_observati
 
 fn call_args(capability_id: &str, body_json: Option<String>) -> crate::CallArgs {
     crate::CallArgs {
+        source_checkout: Default::default(),
         capability_id: capability_id.to_owned(),
         selectors: vec![
             ("account_id".to_owned(), ACCOUNT.to_owned()),

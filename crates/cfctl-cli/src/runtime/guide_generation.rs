@@ -570,6 +570,16 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
                 "<new-file-in-owned-mode-0700-directory>".into(),
             ]);
         }
+        if let Some(source) = &contract.source_binding {
+            command.extend([
+                "--source-checkout".into(),
+                source.selection.checkout_root.clone(),
+                "--source-head".into(),
+                source.selection.head.clone(),
+                "--source-tree".into(),
+                source.selection.tree.clone(),
+            ]);
+        }
         return command;
     }
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];

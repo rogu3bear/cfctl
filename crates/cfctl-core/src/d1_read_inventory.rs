@@ -209,6 +209,27 @@ pub struct D1ReadPackV1 {
     pub operation: Vec<D1ReadOperationV1>,
 }
 
+/// Expected source identity supplied explicitly and verified against Git.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1ReadSourceSelectionV1 {
+    pub checkout_root: String,
+    pub head: String,
+    pub tree: String,
+}
+
+/// A linked checkout borrows the existing registered repository's identity;
+/// it does not become a new registered owner or a separate evidence runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1ReadSourceBindingV1 {
+    pub selection: D1ReadSourceSelectionV1,
+    pub registered_repository_root: String,
+    pub registered_head: String,
+    pub registered_tree: String,
+    pub git_common_directory: String,
+}
+
 /// Identity is derived from Git by the loader, never asserted by pack contents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +241,8 @@ pub struct WorkspaceD1ReadInventoryContractV1 {
     pub operation_pack_sha256: String,
     pub operation: D1ReadOperationV1,
     pub inventory: D1ReadInventoryV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_binding: Option<D1ReadSourceBindingV1>,
 }
 
 /// The only call body: no SQL, parameters, phases, subsets or output overrides.

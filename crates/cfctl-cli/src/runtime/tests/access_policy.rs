@@ -178,6 +178,7 @@ pub(super) async fn catalog_search_exposes_same_access_caller_schema_as_show_and
     let shown = super::catalog_command(
         &store,
         CatalogCommand::Show(CapabilitySelector {
+            source_checkout: Default::default(),
             capability_id: capability_id.clone(),
         }),
     )

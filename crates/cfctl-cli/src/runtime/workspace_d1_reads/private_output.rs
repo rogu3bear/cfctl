@@ -162,7 +162,7 @@ pub(super) fn persist(
         result.classification = "provider_shape_or_output_policy_rejected";
     }
     let complete = artifact_receipt.is_some();
-    let value = json!({"kind":D1_PRIVATE_FORMAT,"schema_version":1,
+    let mut value = json!({"kind":D1_PRIVATE_FORMAT,"schema_version":1,
         "capability_id":capability.id,"catalog_schema_hash":catalog.schema_hash,
         "build":crate::build_identity::current_build_info(),"profile_id":profile.id,
         "credential_generation_id":generation,"account_id":contract.operation.account_id,
@@ -174,6 +174,9 @@ pub(super) fn persist(
         "http_status":result.http_status,"response_bytes":result.response_bytes,
         "rows_read":result.rows_read,"read_complete":complete,"application_predicates_evaluated":false,
         "artifact":artifact_receipt,"output_path":destination.path,"possibly_published":possibly_published});
+    if let Some(source) = &contract.source_binding {
+        value["source_binding"] = serde_json::to_value(source)?;
+    }
     let class = if result.attempted {
         EvidenceClass::LiveRead
     } else {

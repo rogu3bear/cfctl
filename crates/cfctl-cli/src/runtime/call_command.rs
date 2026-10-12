@@ -30,8 +30,8 @@ use super::read_execution::execute_read;
 use super::secret_io::is_secret_output_capability;
 use super::security_action_input::prepare_security_action_input;
 use super::support::capability_missing;
-use super::support::load_workspace_capability;
 use super::support::read_r2_log_retrieval_credentials;
+use super::support::workspace_capability_with_source;
 use super::workspace_state::discover_registered;
 use super::{
     pages_deployment, r2_private_upload, worker_deployment, workspace_d1_migration,
@@ -48,6 +48,10 @@ pub(super) async fn call_command(
     store: &StateStore,
     arguments: CallArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let source_selection = arguments
+        .source_checkout
+        .selection()
+        .map_err(CliError::Input)?;
     // Workspace-owned read populations must fail locally before any network
     // request, including an automatic catalog refresh. Use the existing cached
     // catalog for this route and require explicit synchronization beforehand.
@@ -58,13 +62,19 @@ pub(super) async fn call_command(
     } else {
         None
     };
-    let workspace_read = if cached
-        .as_ref()
-        .and_then(|c| c.get(&arguments.capability_id))
-        .is_none()
+    let workspace_read = if source_selection.is_some()
+        || cached
+            .as_ref()
+            .and_then(|c| c.get(&arguments.capability_id))
+            .is_none()
     {
-        load_workspace_capability(store, &arguments.capability_id)?
-            .filter(|c| c.workspace_d1_read_inventory.is_some())
+        workspace_capability_with_source(
+            store,
+            &arguments.capability_id,
+            source_selection.as_ref(),
+            cfctl_workspace::WorkspaceOperationLoad::Execute,
+        )?
+        .filter(|c| c.workspace_d1_read_inventory.is_some())
     } else {
         None
     };
@@ -84,11 +94,18 @@ pub(super) async fn call_command(
     } else {
         ensure_catalog(store).await?
     };
-    let capability = if let Some(capability) = catalog.get(&arguments.capability_id) {
+    let capability = if let Some(capability) = workspace_read {
+        capability
+    } else if let Some(capability) = catalog.get(&arguments.capability_id) {
         capability.clone()
     } else {
-        load_workspace_capability(store, &arguments.capability_id)?
-            .ok_or_else(|| capability_missing(&arguments.capability_id))?
+        workspace_capability_with_source(
+            store,
+            &arguments.capability_id,
+            None,
+            cfctl_workspace::WorkspaceOperationLoad::Execute,
+        )?
+        .ok_or_else(|| capability_missing(&arguments.capability_id))?
     };
     if is_secret_output_capability(&capability) && arguments.value_out.is_none() {
         return Err(CliError::Input(

@@ -77,6 +77,171 @@ fn repository(root: &Path) -> String {
     source_revision
 }
 
+fn linked_checkout(
+    owner: &Path,
+    checkout: &Path,
+) -> cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1 {
+    git(
+        owner,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            checkout.to_str().expect("path"),
+            "HEAD",
+        ],
+    );
+    cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1 {
+        checkout_root: checkout.to_str().expect("path").to_owned(),
+        head: git(checkout, &["rev-parse", "HEAD"]),
+        tree: git(checkout, &["rev-parse", "HEAD^{tree}"]),
+    }
+}
+
+#[test]
+fn explicit_linked_source_preserves_dirty_owner_and_pins_contract_identity() {
+    use cfctl_workspace::{
+        WorkspaceOperationLoad, load_workspace_d1_read_from_checkout,
+        revalidate_workspace_d1_read_registration,
+    };
+    let dir = tempfile::tempdir().expect("root");
+    let owner = dir.path().join("owner");
+    repository(&owner);
+    let selection = linked_checkout(&owner, &dir.path().join("checkout"));
+    fs::write(owner.join("source.txt"), "unrelated owner work").expect("dirty owner");
+    let roots = [owner.clone()];
+    assert!(load_workspace_operation_capability(&roots, ID).is_err());
+    let capability = load_workspace_d1_read_from_checkout(
+        &roots,
+        ID,
+        &selection,
+        WorkspaceOperationLoad::Execute,
+    )
+    .expect("linked source");
+    let contract = capability.workspace_d1_read_inventory.expect("contract");
+    let binding = contract.source_binding.as_ref().expect("source binding");
+    assert_eq!(contract.repository_head, selection.head);
+    assert_eq!(contract.repository_tree, selection.tree);
+    assert_eq!(contract.repository_root, binding.selection.checkout_root);
+    assert_eq!(
+        binding.registered_repository_root,
+        owner
+            .canonicalize()
+            .expect("canonical")
+            .display()
+            .to_string()
+    );
+    revalidate_workspace_d1_read_registration(&roots, &contract).expect("registered owner");
+    revalidate_workspace_d1_read_inventory(&contract).expect("clean selected source");
+    assert_eq!(
+        fs::read_to_string(owner.join("source.txt")).expect("preserved"),
+        "unrelated owner work"
+    );
+    assert!(revalidate_workspace_d1_read_registration(&[], &contract).is_err());
+    fs::write(owner.join("new.txt"), "owner advances").expect("write");
+    commit(&owner);
+    assert!(revalidate_workspace_d1_read_registration(&roots, &contract).is_err());
+}
+
+#[test]
+fn source_selection_rejects_clone_dirty_checkout_and_wrong_head_or_tree() {
+    use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
+    let dir = tempfile::tempdir().expect("root");
+    let owner = dir.path().join("owner");
+    repository(&owner);
+    let checkout = dir.path().join("checkout");
+    let selection = linked_checkout(&owner, &checkout);
+    let roots = [owner];
+    for wrong_tree in [false, true] {
+        let mut wrong = selection.clone();
+        if wrong_tree {
+            wrong.tree = "0".repeat(40);
+        } else {
+            wrong.head = "0".repeat(40);
+        }
+        assert!(
+            load_workspace_d1_read_from_checkout(
+                &roots,
+                ID,
+                &wrong,
+                WorkspaceOperationLoad::Inspect
+            )
+            .is_err()
+        );
+    }
+    let clone = dir.path().join("clone");
+    repository(&clone);
+    let mut wrong = selection.clone();
+    wrong.checkout_root = clone.to_str().expect("path").to_owned();
+    wrong.head = git(&clone, &["rev-parse", "HEAD"]);
+    wrong.tree = git(&clone, &["rev-parse", "HEAD^{tree}"]);
+    assert!(
+        load_workspace_d1_read_from_checkout(&roots, ID, &wrong, WorkspaceOperationLoad::Inspect)
+            .is_err()
+    );
+    fs::write(checkout.join("source.txt"), "dirty selected source").expect("write");
+    assert!(
+        load_workspace_d1_read_from_checkout(
+            &roots,
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Execute
+        )
+        .is_err()
+    );
+    // Inspection remains committed-blob inspection; it does not authorize call.
+    assert!(
+        load_workspace_d1_read_from_checkout(
+            &roots,
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Inspect
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn explicit_source_cannot_hide_ambiguous_owners_or_changed_committed_pack() {
+    use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
+    let dir = tempfile::tempdir().expect("root");
+    let owner = dir.path().join("owner");
+    let other = dir.path().join("other");
+    repository(&owner);
+    repository(&other);
+    let checkout = dir.path().join("checkout");
+    let mut selection = linked_checkout(&owner, &checkout);
+    let roots = [owner.clone(), other];
+    assert!(load_workspace_operation_capability(&roots, ID).is_err());
+    assert!(
+        load_workspace_d1_read_from_checkout(
+            &roots,
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Execute
+        )
+        .is_err()
+    );
+    let pack = fs::read_to_string(checkout.join(PACK)).expect("pack");
+    fs::write(
+        checkout.join(PACK),
+        format!("{pack}\n# different committed pack\n"),
+    )
+    .expect("write");
+    commit(&checkout);
+    selection.head = git(&checkout, &["rev-parse", "HEAD"]);
+    selection.tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+    assert!(
+        load_workspace_d1_read_from_checkout(
+            &[owner],
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Execute
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn clean_committed_population_derives_its_own_identity_and_public_contract() {
     let root = tempfile::tempdir().expect("root");

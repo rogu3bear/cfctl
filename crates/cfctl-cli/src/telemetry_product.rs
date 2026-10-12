@@ -20,6 +20,7 @@ use cfctl_storage::{OperationalProofPageV1, StateStore};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
+mod source_current;
 
 use crate::build_identity::current_build_info;
 use crate::profiles::ProfilesConfig;
@@ -50,8 +51,12 @@ pub(crate) fn operational_proof_coverage(
         .into_iter()
         .filter(|plan| targeted_mutations.contains(&plan.capability.id))
         .collect::<Vec<_>>();
-    let mut latest = BTreeMap::<String, &OperationalProofV1>::new();
-    for proof in proofs {
+    let source_current: Vec<_> = proofs
+        .iter()
+        .map(|proof| source_current::current(store, catalog, proof))
+        .collect();
+    let mut latest = BTreeMap::<String, (&OperationalProofV1, bool)>::new();
+    for (proof, source_current) in proofs.iter().zip(&source_current) {
         let key = format!(
             "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
             proof.capability_id,
@@ -66,15 +71,15 @@ pub(crate) fn operational_proof_coverage(
         latest
             .entry(key)
             .and_modify(|current| {
-                if proof.observed_at > current.observed_at {
-                    *current = proof;
+                if proof.observed_at > current.0.observed_at {
+                    *current = (proof, *source_current);
                 }
             })
-            .or_insert(proof);
+            .or_insert((proof, *source_current));
     }
     let latest_rows = latest
         .values()
-        .map(|proof| {
+        .map(|(proof, source_current)| {
             let mut observation = json!({
                 "capability_id": proof.capability_id,
                 "account_id": proof.account_id,
@@ -83,7 +88,8 @@ pub(crate) fn operational_proof_coverage(
                 "credential_generation_current": credential_generation_current(proof, &profiles),
                 "input_hash": proof.input_hash,
                 "catalog_hash": proof.catalog_hash,
-                "catalog_current": proof.catalog_hash == catalog.schema_hash,
+                "catalog_current": proof.catalog_hash == catalog.schema_hash && *source_current,
+                "source_current": source_current,
                 "outcome": proof.outcome,
                 "observed_at": proof.observed_at,
                 "evidence": proof.evidence,
@@ -96,16 +102,20 @@ pub(crate) fn operational_proof_coverage(
         .collect::<Vec<_>>();
     let current_catalog_successes = proofs
         .iter()
-        .filter(|proof| {
+        .zip(&source_current)
+        .filter(|(proof, source_current)| {
             proof.catalog_hash == catalog.schema_hash
+                && **source_current
                 && credential_generation_current(proof, &profiles)
                 && proof.outcome == OperationalProofOutcomeV1::Succeeded
         })
         .count();
     let current_catalog_failures = proofs
         .iter()
-        .filter(|proof| {
+        .zip(&source_current)
+        .filter(|(proof, source_current)| {
             proof.catalog_hash == catalog.schema_hash
+                && **source_current
                 && credential_generation_current(proof, &profiles)
                 && proof.outcome == OperationalProofOutcomeV1::Failed
         })
@@ -118,7 +128,7 @@ pub(crate) fn operational_proof_coverage(
         "latest_scoped_observations": latest_rows,
         "current_catalog_successes": current_catalog_successes,
         "current_catalog_failures": current_catalog_failures,
-        "catalog_drifted_observations": proofs.iter().filter(|proof| proof.catalog_hash != catalog.schema_hash).count(),
+        "catalog_drifted_observations": proofs.iter().zip(&source_current).filter(|(proof, source_current)| proof.catalog_hash != catalog.schema_hash || !**source_current).count(),
         "credential_drifted_observations": proofs.iter().filter(|proof| proof.credential_generation_id.is_some() && !credential_generation_current(proof, &profiles)).count(),
         "credential_unbound_observations": proofs.iter().filter(|proof| proof.credential_generation_id.is_none()).count(),
         "mutation_lifecycle": mutation_lifecycle,
@@ -221,7 +231,15 @@ pub(crate) fn record_operational_proof(
                 capability.id
             ))
         })?;
-    let input_hash = hash_value(&serde_json::to_value(input)?)?;
+    let input_hash = if let Some(binding) = capability
+        .workspace_d1_read_inventory
+        .as_ref()
+        .and_then(|c| c.source_binding.as_ref())
+    {
+        hash_value(&json!({"call":input,"source_binding":binding}))?
+    } else {
+        hash_value(&serde_json::to_value(input)?)?
+    };
     let mut proof = OperationalProofV1::new(
         envelope.generated_at,
         &capability.id,

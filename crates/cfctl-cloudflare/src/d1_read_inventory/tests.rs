@@ -108,6 +108,7 @@ fn prepared(inventory: D1ReadInventoryV1) -> (CapabilityV1, CallInput) {
     capability.effect = EffectClass::ReadOnly;
     capability.permissions = vec!["D1 Read".into()];
     capability.workspace_d1_read_inventory = Some(WorkspaceD1ReadInventoryContractV1 {
+        source_binding: None,
         repository_root: "/synthetic-repository".into(),
         repository_head: "a".repeat(40),
         repository_tree: "b".repeat(40),

@@ -12,6 +12,7 @@ use super::support::cli_io;
 use super::support::docs_file;
 use super::support::http_client;
 use super::support::inspect_workspace_capability;
+use super::support::workspace_capability_with_source;
 use crate::telemetry_product::operational_proof_coverage;
 use cfctl_catalog::{
     attach_official_product_knowledge, fetch_official, fetch_official_text_feeds, ingest_cli_help,
@@ -41,6 +42,23 @@ pub(super) async fn catalog_command(
             ))
         }
         CatalogCommand::Show(selector) => {
+            let selection = selector
+                .source_checkout
+                .selection()
+                .map_err(CliError::Input)?;
+            if let Some(selection) = selection.as_ref() {
+                let capability = workspace_capability_with_source(
+                    store,
+                    &selector.capability_id,
+                    Some(selection),
+                    cfctl_workspace::WorkspaceOperationLoad::Inspect,
+                )?
+                .ok_or_else(|| capability_missing(&selector.capability_id))?;
+                return Ok(ResultEnvelopeV2::success(
+                    "catalog show",
+                    serde_json::to_value(caller_facing_capability(&capability))?,
+                ));
+            }
             let catalog = ensure_catalog(store).await?;
             let capability = if let Some(capability) = catalog.get(&selector.capability_id) {
                 capability.clone()
@@ -202,12 +220,35 @@ pub(super) async fn guide_command(
     store: &StateStore,
     arguments: &GuideArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let selection = arguments
+        .source_checkout
+        .selection()
+        .map_err(CliError::Input)?;
     if let Some(topic) = arguments.topic {
+        if selection.is_some() {
+            return Err(CliError::Input(
+                "source selection requires a committed D1 read capability, not a guide topic"
+                    .into(),
+            ));
+        }
         return guide_topic_envelope(topic);
     }
     let capability_id = arguments.capability_id.as_deref().ok_or_else(|| {
         CliError::Input("guide requires one capability ID or `--topic`".to_owned())
     })?;
+    if let Some(selection) = selection.as_ref() {
+        let capability = workspace_capability_with_source(
+            store,
+            capability_id,
+            Some(selection),
+            cfctl_workspace::WorkspaceOperationLoad::Inspect,
+        )?
+        .ok_or_else(|| capability_missing(capability_id))?;
+        return Ok(ResultEnvelopeV2::success(
+            "guide",
+            serde_json::to_value(guide_document(&capability))?,
+        ));
+    }
     let catalog = ensure_catalog(store).await?;
     let capability = if let Some(capability) = catalog.get(capability_id) {
         capability.clone()

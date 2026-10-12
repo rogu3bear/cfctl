@@ -45,6 +45,7 @@ pub fn materialize_qualification_read_capability(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid("synthetic read origin missing"))?;
     let mut capability = crate::d1_reads::capability(WorkspaceD1ReadInventoryContractV1 {
+        source_binding: None,
         repository_root: bound.repository_root.clone(),
         repository_head: bound.repository_head.clone(),
         repository_tree: tree,

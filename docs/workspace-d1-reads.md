@@ -33,6 +33,35 @@ commit ID. Add or update the pack in a successor commit after the source
 revision exists. Symlinks, path traversal, ignored/untracked inputs, duplicate
 operation IDs and changed inputs fail closed.
 
+### Exact linked checkout selection
+
+For a registered repository whose working files must remain dirty, `catalog show`,
+`guide` and `call` accept all three source flags together:
+
+```bash
+cfctl catalog show <read-operation-id> \
+  --source-checkout /absolute/linked-checkout \
+  --source-head <full-commit-sha> --source-tree <full-tree-sha> --json
+```
+
+This route supports committed D1 read inventories only. The operation must still
+have one registered logical owner. The selected checkout must share that owner's
+canonical Git common directory, origin and exact committed operation pack; a
+separate clone with the same remote URL is insufficient. Its HEAD and tree must
+match the explicit flags, and `call` still requires the selected checkout to be
+clean. Inspection reads committed blobs as before. Default lookup and duplicate
+operation rejection remain unchanged. Registration and the evidence runtime do
+not change, and these flags do not select a mutation plan's source.
+
+The generated guide retains the flags. The native contract, authenticated
+evidence and scoped input hash bind the selected checkout and registered owner.
+Each query rechecks registration, owner identity and selected source. Ordinary
+`catalog coverage` needs no flags: it authenticates the stored binding and marks
+`catalog_current` false when either source or ownership drifts. This preserves
+the existing consumer join on the exact scoped observation, credential generation,
+catalog hash and content-addressed evidence; it does not establish live readiness
+or application predicates without executing the reviewed read population.
+
 ## Inventory and SQL
 
 `D1ReadInventoryV1` declares `query_count`, `witness_count`, `tables`, `functions`,

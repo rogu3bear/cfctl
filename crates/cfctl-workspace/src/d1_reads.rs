@@ -154,6 +154,7 @@ pub(super) fn load_selected(
         operation_pack_sha256: sha256(&bytes),
         operation,
         inventory,
+        source_binding: None,
     };
     Ok(Some(capability(contract)))
 }

@@ -186,6 +186,7 @@ pub(super) async fn call_command_live_read_rejects_implicit_global_key_current_p
     let error = Box::pin(call_command(
         &store,
         CallArgs {
+            source_checkout: Default::default(),
             capability_id: "accounts-list".to_owned(),
             selectors: Vec::new(),
             query: Vec::new(),
