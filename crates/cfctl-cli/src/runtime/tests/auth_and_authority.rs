@@ -1,4 +1,5 @@
 use super::*;
+use crate::source_checkout::SourceCheckoutArgs;
 use clap::Parser;
 
 pub(super) fn emergency_global_key_as_current() -> ProfilesConfig {
@@ -186,7 +187,7 @@ pub(super) async fn call_command_live_read_rejects_implicit_global_key_current_p
     let error = Box::pin(call_command(
         &store,
         CallArgs {
-            source_checkout: Default::default(),
+            source_checkout: SourceCheckoutArgs::default(),
             capability_id: "accounts-list".to_owned(),
             selectors: Vec::new(),
             query: Vec::new(),
@@ -769,7 +770,7 @@ pub(super) fn standing_admission_serializes_one_run_budget_across_two_stores() {
     store.save_plan(&plan_b).expect("persist plan B");
 
     let barrier = Arc::new(Barrier::new(2));
-    let handles = [(plan_a, input_a), (plan_b, input_b)]
+    let handles = vec![(plan_a, input_a), (plan_b, input_b)]
         .into_iter()
         .map(|(mut plan, input)| {
             let paths = paths.clone();

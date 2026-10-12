@@ -2,6 +2,7 @@
 use super::*;
 use cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1;
 use serde_json::Value;
+use std::io::Write as _;
 
 #[tokio::test]
 async fn selected_source_rejects_mutations_before_catalog_or_credential_access() {
@@ -31,9 +32,11 @@ async fn selected_source_rejects_mutations_before_catalog_or_credential_access()
     let Some(crate::Command::Call(arguments)) = parsed.command else {
         panic!("call");
     };
-    let error = super::super::super::call_command::call_command(&store, arguments)
-        .await
-        .expect_err("write source is not selectable");
+    let error = Box::pin(super::super::super::call_command::call_command(
+        &store, arguments,
+    ))
+    .await
+    .expect_err("write source is not selectable");
     assert!(
         error
             .to_string()
@@ -207,7 +210,6 @@ expected = {queries[0]['id']: [{'name':'items'}], queries[1]['id']: [{'n':0}]}
 read_population(body, declaration, Path(p['checkout']), p['inventory'], expected)
 print('frozen Sign authenticated_body/read_population accepted native selected-source projection')
 ";
-        use std::io::Write as _;
         let mut child = Command::new("python3")
             .args(["-c", script])
             .arg(root)

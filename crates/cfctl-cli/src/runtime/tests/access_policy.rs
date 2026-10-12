@@ -1,4 +1,5 @@
 use super::*;
+use crate::source_checkout::SourceCheckoutArgs;
 
 pub(super) fn access_human_policy_live_result() -> Value {
     json!({
@@ -178,7 +179,7 @@ pub(super) async fn catalog_search_exposes_same_access_caller_schema_as_show_and
     let shown = super::catalog_command(
         &store,
         CatalogCommand::Show(CapabilitySelector {
-            source_checkout: Default::default(),
+            source_checkout: SourceCheckoutArgs::default(),
             capability_id: capability_id.clone(),
         }),
     )
