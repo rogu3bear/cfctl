@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 mod diagnostic;
 mod private_output;
+mod quick_check;
 mod reconciliation;
 use super::*;
 use cfctl_auth::AuthCredential;

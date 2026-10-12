@@ -32,6 +32,12 @@ pub struct PrivatePublicationError {
 }
 
 impl PrivateDirectory {
+    /// Address pinned by this opened directory. File operations recheck custody.
+    #[must_use]
+    pub fn location(&self) -> &Path {
+        &self.path
+    }
+
     /// Read-only preflight; any existing entry, including a dangling link, fails.
     pub fn require_new_file(&self, name: &str) -> cfctl_auth::Result<()> {
         Self::name(name)?;

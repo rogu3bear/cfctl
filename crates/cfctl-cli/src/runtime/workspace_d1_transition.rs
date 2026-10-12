@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::prelude::{CallInput, CliError, Result, StateStore};
 mod observations;
 mod publication;
+mod v4;
 
 struct Scope<'a> {
     account: &'a str,
@@ -199,6 +200,28 @@ pub(super) fn prepare(
     // This creates no stage or provider operation while transport is unqualified.
     cfctl_workspace::materialize_workspace_d1_transition(contract)
         .map_err(|error| invalid(&error.to_string()))?;
+    if input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("schema_version"))
+        .and_then(Value::as_u64)
+        == Some(4)
+    {
+        return v4::prepare(
+            store,
+            contract,
+            input,
+            &Scope {
+                account,
+                profile,
+                generation,
+                catalog,
+                build: &hash_value(&serde_json::to_value(
+                    crate::build_identity::current_build_info(),
+                )?)?,
+            },
+        );
+    }
     let binding: RuntimeBinding = serde_json::from_value(
         input
             .body
@@ -323,6 +346,12 @@ pub(super) fn additional_artifact_paths(
     if let Some(observations) = &op.observations {
         paths.push(root.join(&observations.baseline.inventory.path));
         paths.push(root.join(&observations.terminal.inventory.path));
+    }
+    if let Some(assurance) = &op.assurance {
+        paths.push(root.join(&assurance.diagnostic().inventory.path));
+        if let cfctl_core::workspace_d1::transition::assurance::Declaration::ManagedD1ApplicationV1 { policy, .. } = assurance {
+            paths.push(root.join(&policy.path));
+        }
     }
     paths
 }

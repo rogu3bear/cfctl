@@ -4,9 +4,17 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+pub mod admission;
+pub mod assurance;
+pub mod execution;
+pub mod proofs;
+#[cfg(test)]
+mod tests;
+
 pub const MAX_HISTORY: usize = 256;
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
-pub const COMPILER_ID: &str = "workspace-d1-envelope-v3.2";
+pub const COMPILER_ID: &str = "workspace-d1-envelope-v3.4";
+pub const EXECUTION_COMPILER_ID: &str = "workspace-d1-execution-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +92,9 @@ pub struct Declaration {
     pub assertions: Assertions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observations: Option<Observations>,
+    /// Absent preserves historical V3 intake; V4 requires a reviewed explicit mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance: Option<assurance::Declaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +105,22 @@ pub struct Segment {
     pub length: usize,
 }
 
+/// Compiler-owned ledger placement, separate from the five immutable source segments.
+/// This is a byte identity only, never transport eligibility or a provider approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionManifest {
+    pub compiler_id: String,
+    pub source_envelope_sha256: String,
+    pub ledger_name: String,
+    /// Insert after preservation and before cleanup, at this source-envelope offset.
+    pub ledger_offset: usize,
+    pub ledger_length: usize,
+    pub ledger_sha256: String,
+    pub execution_length: usize,
+    pub execution_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compiled {
@@ -102,8 +129,11 @@ pub struct Compiled {
     pub envelope_sha256: String,
     pub envelope_length: usize,
     pub segments: Vec<Segment>,
+    pub execution: ExecutionManifest,
     pub historical_sequences: Vec<u64>,
     pub scheduled_targets: Vec<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance_policy: Option<assurance::ManagedPolicyV1>,
 }
 
 impl Compiled {

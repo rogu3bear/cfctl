@@ -121,6 +121,57 @@ fn persist(
     started_at: chrono::DateTime<Utc>,
     result: &D1ReadInventoryResultV1,
 ) -> Result<ExecutedRead> {
+    persist_bound(
+        store, catalog, capability, validated, profile, started_at, result, None,
+    )
+}
+
+pub(super) fn persist_synthetic(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    validated: &ValidatedD1ReadInventory,
+    profile: &ProfileMetadata,
+    observation: (chrono::DateTime<Utc>, &D1ReadInventoryResultV1),
+    binding: &cfctl_core::workspace_d1::transition::admission::resource::PopulationBinding,
+) -> Result<ExecutedRead> {
+    let contract = validated.contract();
+    if binding.resource.database_id != contract.operation.database_id
+        || binding.resource.identity.account_id != contract.operation.account_id
+        || binding.resource.identity.repository_head != contract.repository_head
+        || binding.resource.qualification_pack_sha256 != contract.operation_pack_sha256
+        || capability.source != "workspace-d1-synthetic-read-v1"
+    {
+        return Err(CliError::Input(
+            "synthetic read evidence substituted resource or source".into(),
+        ));
+    }
+    persist_bound(
+        store,
+        catalog,
+        capability,
+        validated,
+        profile,
+        observation.0,
+        observation.1,
+        Some(binding),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ordinary and typed synthetic evidence share the same native result/credential validation before persistence"
+)]
+fn persist_bound(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    validated: &ValidatedD1ReadInventory,
+    profile: &ProfileMetadata,
+    started_at: chrono::DateTime<Utc>,
+    result: &D1ReadInventoryResultV1,
+    binding: Option<&cfctl_core::workspace_d1::transition::admission::resource::PopulationBinding>,
+) -> Result<ExecutedRead> {
     if validated.contract().inventory.private_output.is_some() {
         return Err(CliError::Input(
             "private read cannot enter ordinary evidence".into(),
@@ -137,7 +188,7 @@ fn persist(
             "read observation credential join is inconsistent".into(),
         ));
     }
-    let value = json!({
+    let mut value = json!({
         "kind":"workspace_d1_read_inventory_v1", "run_id":Uuid::new_v4().to_string(),
         "started_at":started_at, "completed_at":Utc::now(), "non_atomic_observations":true,
         "capability_id":capability.id, "catalog_schema_hash":catalog.schema_hash,
@@ -153,6 +204,9 @@ fn persist(
         "cost_limit":"Output limits and client deadlines do not establish a hard in-flight scan or currency ceiling.",
         "ordinary_application_behavior_verified":false
     });
+    if let Some(binding) = binding {
+        value["synthetic_binding"] = serde_json::to_value(binding)?;
+    }
     let evidence_class = if result.attempted_queries > 0 {
         EvidenceClass::LiveRead
     } else {

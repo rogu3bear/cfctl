@@ -128,6 +128,7 @@ fn compiled() -> Compiled {
     Compiled {
         declaration: Declaration {
             observations: None,
+            assurance: None,
             id: "fixture".to_owned(),
             title: "fixture".to_owned(),
             description: "fixture".to_owned(),
@@ -165,8 +166,19 @@ fn compiled() -> Compiled {
         envelope_sha256: format!("sha256:{}", "d".repeat(64)),
         envelope_length: 1,
         segments: vec![],
+        execution: cfctl_core::workspace_d1::transition::ExecutionManifest {
+            compiler_id: "workspace-d1-execution-v1".to_owned(),
+            source_envelope_sha256: format!("sha256:{}", "d".repeat(64)),
+            ledger_name: "0174.sql".to_owned(),
+            ledger_offset: 0,
+            ledger_length: 1,
+            ledger_sha256: format!("sha256:{}", "e".repeat(64)),
+            execution_length: 2,
+            execution_sha256: format!("sha256:{}", "f".repeat(64)),
+        },
         historical_sequences: vec![],
         scheduled_targets: vec![target],
+        assurance_policy: None,
     }
 }
 pub(super) fn contract() -> WorkspaceD1MigrationContractV1 {
@@ -191,7 +203,7 @@ pub(super) fn contract() -> WorkspaceD1MigrationContractV1 {
         transition: Some(Box::new(compiled())),
     }
 }
-fn binding() -> RuntimeBinding {
+pub(super) fn binding() -> RuntimeBinding {
     use cfctl_core::workspace_d1::transition::{CompletedRef, PublicationRef};
     let baseline = reference();
     let mut preservation = reference();

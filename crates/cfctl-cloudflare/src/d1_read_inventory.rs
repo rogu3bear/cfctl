@@ -412,7 +412,8 @@ fn compile_schema(inventory: &D1ReadInventoryV1) -> Result<Connection> {
                     pragma_value,
                 } => {
                     let name = pragma_name.to_ascii_lowercase();
-                    (name == "foreign_key_check" && pragma_value.is_none())
+                    (["foreign_key_check", "quick_check"].contains(&name.as_str())
+                        && pragma_value.is_none())
                         || ["table_info", "foreign_key_list", "foreign_key_check"]
                             .contains(&name.as_str())
                             && pragma_value.is_some_and(|table| {

@@ -2,6 +2,7 @@
 mod access_create;
 pub mod d1_read_inventory;
 mod d1_sql;
+pub mod d1_transition;
 mod oauth_scopes;
 mod pagination_diagnostic;
 mod token_verification;

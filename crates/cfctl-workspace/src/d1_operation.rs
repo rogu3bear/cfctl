@@ -1,5 +1,7 @@
 mod transition;
-pub use transition::materialize_workspace_d1_transition;
+pub use transition::{
+    materialize_workspace_d1_transition, materialize_workspace_d1_transition_source,
+};
 
 use std::{
     collections::BTreeSet,
@@ -129,6 +131,7 @@ struct MigrationManifestV1 {
 
 #[derive(Debug, Deserialize)]
 struct MigrationManifestEntryV1 {
+    migration_class: Option<String>,
     sequence: u64,
     file: String,
     sha256: String,

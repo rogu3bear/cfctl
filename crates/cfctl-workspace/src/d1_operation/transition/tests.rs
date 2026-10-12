@@ -30,6 +30,55 @@ fn source(root: &Path, path: &str) -> Source {
             .unwrap(),
     }
 }
+
+#[test]
+fn v3_managed_policy_is_committed_exact_target_source_without_activation() {
+    use cfctl_core::workspace_d1::transition::{Observation, assurance};
+    let (root, mut op) = fixture(176);
+    let policy = json!({"schema_version":1,"mode":"managed_d1_application_v1",
+        "release_id":"fixture/intake","account_id":op.account_id,"database_id":op.database_id,
+        "target_sequence":op.target.sequence,"migration_sha256":op.target.source.sha256,
+        "accepted_unobserved_properties":["global_index_consistency","global_uniqueness_storage_consistency"],
+        "required_controls":["primary_quick_check","exact_schema","full_scan_typed_population_preservation",
+            "foreign_key_check","atomic_failure_rollback","target_once_ledger","final_scratch_cleanup"]});
+    fs::write(
+        root.path().join("policy.json"),
+        serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("diagnostic.json"),
+        include_bytes!("../../../tests/fixtures/d1-reads/inventory.json"),
+    )
+    .unwrap();
+    git(root.path(), &["add", "policy.json", "diagnostic.json"]);
+    git(root.path(), &["commit", "-qm", "bind proposed assurance"]);
+    op.assurance = Some(assurance::Declaration::ManagedD1ApplicationV1 {
+        policy: source(root.path(), "policy.json"),
+        diagnostic: Observation {
+            capability_id: "fixture.diagnostic".into(),
+            inventory: source(root.path(), "diagnostic.json"),
+        },
+    });
+    let compiled = compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
+    assert_eq!(
+        compiled.assurance_policy.unwrap().release_id,
+        "fixture/intake"
+    );
+    let mut bad = policy;
+    bad["target_sequence"] = json!(177);
+    fs::write(
+        root.path().join("policy.json"),
+        serde_json::to_vec(&bad).unwrap(),
+    )
+    .unwrap();
+    git(root.path(), &["add", "policy.json"]);
+    git(root.path(), &["commit", "-qm", "wrong target"]);
+    if let Some(assurance::Declaration::ManagedD1ApplicationV1 { policy, .. }) = &mut op.assurance {
+        *policy = source(root.path(), "policy.json");
+    }
+    assert!(compile(root.path(), &op, WorkspaceOperationLoad::Execute).is_err());
+}
 #[expect(
     clippy::too_many_lines,
     reason = "one committed synthetic repository binds the full historical ledger, schedule and reviewed SQL sources"
@@ -138,6 +187,7 @@ fn fixture(count: u64) -> (tempfile::TempDir, Declaration) {
             cleanup: source(root.path(), "cleanup.sql"),
         },
         observations: None,
+        assurance: None,
     };
     (root, declaration)
 }
@@ -147,6 +197,16 @@ fn v3_preserves_184_history_and_compiles_each_phase_without_source_rewrites() {
     let (root, mut op) = fixture(184);
     let initial = compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
     assert_eq!(initial.historical_sequences.len(), 171);
+    assert_eq!(
+        initial.execution.ledger_name,
+        initial.declaration.target.file
+    );
+    assert_eq!(initial.execution.ledger_offset, initial.segments[4].offset);
+    assert_eq!(
+        initial.execution.source_envelope_sha256,
+        initial.envelope_sha256
+    );
+    assert!(initial.execution.execution_length > initial.envelope_length);
     for (position, target) in initial.scheduled_targets.iter().enumerate() {
         op.target = target.clone();
         let compiled = compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
@@ -340,4 +400,75 @@ fn v3_frozen_pack_rejects_missing_duplicate_divergent_or_unbound_future_declarat
     let mut value = serde_json::to_value(op).unwrap();
     value["approved"] = json!(true);
     assert!(serde_json::from_value::<Declaration>(value).is_err());
+}
+
+#[test]
+fn v3_history_preserves_known_metadata_and_rejects_unknown_or_contradictory_fields() {
+    let (root, mut op) = fixture(176);
+    let path = root.path().join("history.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["migrations"][0]["sequence"] = json!(1);
+    value["migrations"][0]["migration_class"] = json!("schema");
+    value["migrations"][0]["notes"] = json!("retained canonical source note");
+    let manifest_path = root.path().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["migrations"][0]["migration_class"] = json!("schema");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    git(root.path(), &["add", "manifest.json", "history.json"]);
+    git(
+        root.path(),
+        &[
+            "commit",
+            "-qm",
+            "retain canonical optional history metadata",
+        ],
+    );
+    op.manifest = source(root.path(), "manifest.json");
+    op.historical_ledger = source(root.path(), "history.json");
+    let compiled = compile(root.path(), &op, WorkspaceOperationLoad::Execute).unwrap();
+    assert_eq!(compiled.historical_sequences.len(), 171);
+    for mutation in 0..6 {
+        let mut wrong = value.clone();
+        match mutation {
+            0 => wrong["migrations"][0]["sequence"] = json!(2),
+            1 => wrong["migrations"][0]["migration_class"] = json!("compatibility"),
+            2 => wrong["migrations"][0]["migration_class"] = json!("invented"),
+            3 => wrong["migrations"][0]["notes"] = json!("  "),
+            4 => wrong["migrations"][0]["caller_passed"] = json!(true),
+            _ => wrong["migrations"][0]["notes"] = serde_json::Value::Null,
+        }
+        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        git(root.path(), &["add", "history.json"]);
+        git(
+            root.path(),
+            &["commit", "-qm", "reject contradictory history metadata"],
+        );
+        op.historical_ledger = source(root.path(), "history.json");
+        assert!(compile(root.path(), &op, WorkspaceOperationLoad::Execute).is_err());
+    }
+}
+
+#[test]
+fn bound_transition_source_requires_exact_revision_blob_and_local_bytes() {
+    let (root, op) = fixture(176);
+    let head = git_optional(root.path(), &["rev-parse", "HEAD"])
+        .unwrap()
+        .unwrap();
+    let source = op.assertions.capture.clone();
+    let bytes =
+        materialize_workspace_d1_transition_source(root.path(), head.trim(), &source).unwrap();
+    assert_eq!(bytes, fs::read(root.path().join(&source.path)).unwrap());
+    assert!(
+        materialize_workspace_d1_transition_source(root.path(), &"f".repeat(40), &source).is_err()
+    );
+    let mut wrong = source.clone();
+    wrong.git_blob_oid = "f".repeat(40);
+    assert!(materialize_workspace_d1_transition_source(root.path(), head.trim(), &wrong).is_err());
+    wrong = source.clone();
+    wrong.path = "../escape.sql".into();
+    assert!(materialize_workspace_d1_transition_source(root.path(), head.trim(), &wrong).is_err());
+    fs::write(root.path().join(&source.path), b"SELECT 'changed';").unwrap();
+    assert!(materialize_workspace_d1_transition_source(root.path(), head.trim(), &source).is_err());
 }

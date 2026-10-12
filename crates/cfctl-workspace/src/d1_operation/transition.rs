@@ -12,6 +12,7 @@ use super::{
     valid_operation_id,
 };
 use std::{collections::BTreeSet, path::Path};
+mod execution;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +35,33 @@ struct HistoricalEntry {
     file: String,
     sha256: String,
     applied_at: String,
+    #[serde(default, deserialize_with = "present_metadata")]
+    sequence: Option<u64>,
+    #[serde(default, deserialize_with = "present_metadata")]
+    migration_class: Option<String>,
+    #[serde(default, deserialize_with = "present_metadata")]
+    notes: Option<String>,
+}
+
+fn present_metadata<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+/// Bind a transition-owned input to the registered repository's exact current Git source.
+/// This reads source only and establishes no provider or catalog eligibility.
+pub fn materialize_workspace_d1_transition_source(
+    repository: &Path,
+    expected_head: &str,
+    source: &Source,
+) -> Result<Vec<u8>> {
+    if !lower_hex(expected_head, 40)
+        || git_optional(repository, &["rev-parse", "HEAD"])?.as_deref() != Some(expected_head)
+    {
+        return Err(invariant("transition source repository revision changed"));
+    }
+    bound_source(repository, source, WorkspaceOperationLoad::Execute)
 }
 
 /// Reconstruct the exact compiled bytes from the current clean, committed pack.
@@ -72,6 +100,8 @@ pub fn materialize_workspace_d1_transition(
     }
     if envelope.len() != compiled.envelope_length
         || sha256(&envelope) != compiled.envelope_sha256
+        || execution::compile(&envelope, &compiled.segments, &compiled.declaration.target)?
+            != compiled.execution
         || git_optional(repository, &["rev-parse", "HEAD"])?.as_deref()
             != Some(contract.repository_head.as_str())
     {
@@ -157,7 +187,7 @@ pub(super) fn load(
     "workspace:d1-transition-envelope-v3".clone_into(&mut result.path);
     result.adapter_status = AdapterStatus::Blocked;
     result.risk = RiskClass::Irreversible;
-    result.blocked_reason = Some("V3 source envelope compiled; production transport remains disabled pending executor-specific qualification and typed application state proof producers".to_owned());
+    result.blocked_reason = Some("V3 source envelope compiled; production transport remains disabled pending executor-specific qualification and registration of typed application state proof producers".to_owned());
     "workspace_d1_transition_envelope_v3".clone_into(&mut result.verification.strategy);
     result.selectors = vec![
         selector("account_id", "path"),
@@ -255,6 +285,28 @@ fn compile(repository: &Path, op: &Declaration, mode: WorkspaceOperationLoad) ->
             .map_err(|_| invariant("V3 observation inventory schema is invalid"))?;
         }
     }
+    let mut assurance_policy = None;
+    if let Some(assurance) = &op.assurance {
+        let diagnostic = assurance.diagnostic();
+        if !valid_operation_id(&diagnostic.capability_id) {
+            return Err(invariant("V3 assurance diagnostic capability is invalid"));
+        }
+        serde_json::from_slice::<cfctl_core::d1_read_inventory::D1ReadInventoryV1>(&bound_source(
+            repository,
+            &diagnostic.inventory,
+            mode,
+        )?)
+        .map_err(|_| invariant("V3 assurance diagnostic inventory schema is invalid"))?;
+        if let cfctl_core::workspace_d1::transition::assurance::Declaration::ManagedD1ApplicationV1 {
+            policy, ..
+        } = assurance {
+            let policy: cfctl_core::workspace_d1::transition::assurance::ManagedPolicyV1 =
+                serde_json::from_slice(&bound_source(repository, policy, mode)?)
+                    .map_err(|_| invariant("V3 managed assurance policy schema is invalid"))?;
+            policy.validate(&op.account_id, &op.database_id, &op.target).map_err(invariant)?;
+            assurance_policy = Some(policy);
+        }
+    }
     let manifest: MigrationManifestV1 =
         serde_json::from_slice(&bound_source(repository, &op.manifest, mode)?)
             .map_err(|error| invariant(format!("V3 manifest is invalid: {error}")))?;
@@ -298,7 +350,18 @@ fn compile(repository: &Path, op: &Declaration, mode: WorkspaceOperationLoad) ->
                 invariant("historical ledger identity is absent or differs from the manifest")
             })?;
         if !historical_names.insert(entry.file.as_str())
-            || entry.applied_at.is_empty()
+            || entry.applied_at.trim().is_empty()
+            || entry
+                .sequence
+                .is_some_and(|sequence| sequence != matched.sequence)
+            || entry.migration_class.as_ref().is_some_and(|class| {
+                !matches!(class.as_str(), "schema" | "compatibility" | "data_repair")
+                    || matched.migration_class.as_ref() != Some(class)
+            })
+            || entry
+                .notes
+                .as_ref()
+                .is_some_and(|notes| notes.trim().is_empty())
             || !matched.production_applied
         {
             return Err(invariant(
@@ -398,14 +461,17 @@ fn compile(repository: &Path, op: &Declaration, mode: WorkspaceOperationLoad) ->
         });
         envelope.extend_from_slice(&bytes);
     }
+    let execution = execution::compile(&envelope, &segments, &op.target)?;
     Ok(Compiled {
         declaration: op.clone(),
         compiler_id: COMPILER_ID.to_owned(),
         envelope_sha256: sha256(&envelope),
         envelope_length: envelope.len(),
         segments,
+        execution,
         historical_sequences,
         scheduled_targets,
+        assurance_policy,
     })
 }
 

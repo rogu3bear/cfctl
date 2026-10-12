@@ -15,7 +15,7 @@ use crate::runtime::{
     support::load_workspace_capability,
 };
 
-fn assertion_outputs(inventory: &D1ReadInventoryV1) -> Result<()> {
+pub(super) fn assertion_outputs(inventory: &D1ReadInventoryV1) -> Result<()> {
     if inventory.private_output.is_some() || inventory.queries.is_empty() {
         return Err(invalid(
             "boundary assertions require ordinary nonempty reads",
@@ -73,6 +73,12 @@ pub(super) fn read(
             "boundary read source or target differs from the transition",
         ));
     }
+    cfctl_workspace::materialize_workspace_d1_transition_source(
+        std::path::Path::new(&contract.repository_root),
+        &transition.repository_head,
+        &expected.inventory,
+    )
+    .map_err(|_| invalid("boundary inventory Git source identity differs"))?;
     assertion_outputs(&contract.inventory)?;
     let input = CallInput {
         selectors: json!({"account_id":scope.account,"database_id":contract.operation.database_id}),
@@ -95,7 +101,7 @@ pub(super) fn read(
     Ok(proof)
 }
 
-fn validate_value(
+pub(super) fn validate_value(
     value: &Value,
     proof: &OperationalProofV1,
     validated: &ValidatedD1ReadInventory,

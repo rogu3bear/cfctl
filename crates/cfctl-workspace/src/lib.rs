@@ -16,6 +16,7 @@ use walkdir::{DirEntry, WalkDir};
 mod d1_evidence;
 mod d1_operation;
 mod d1_policy_projection;
+mod d1_qualification;
 mod d1_reads;
 mod d1_reply_admission;
 pub use d1_reads::revalidate_workspace_d1_read_inventory;
@@ -36,8 +37,14 @@ pub use d1_evidence::{
 };
 pub use d1_operation::{
     load_workspace_d1_migration_capability, materialize_workspace_d1_transition,
+    materialize_workspace_d1_transition_source,
 };
 pub use d1_policy_projection::load_workspace_d1_policy_projection_capability;
+pub use d1_qualification::{
+    BoundQualificationSource, MaterializedPopulation, load_workspace_d1_qualification_source,
+    materialize_qualification_population, materialize_qualification_read_capability,
+    revalidate_qualification_source,
+};
 pub use d1_reply_admission::load_workspace_d1_reply_admission_capability;
 pub use reply_subdomain_ingress::{
     ACTIVATE_CAPABILITY_ID as MAILDESK_REPLY_SUBDOMAIN_INGRESS_ACTIVATE_CAPABILITY_ID,

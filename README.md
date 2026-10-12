@@ -373,6 +373,13 @@ workflow or hosted CI service is required. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 
+On the Disk Guard host, the Cargo alias requires path qualification. Use the
+supported orchestration: run guarded `cargo build --locked -p xtask`, wait for
+that build to finish, then run `./target/debug/xtask verify`. The verifier starts
+without an outer reservation; each Cargo phase obtains its own admission.
+Preserve inherited reservation descriptors, and treat any hold as an unmet
+verification condition. This runs the same proof lane and installs no binary.
+
 Prebuilt release artifacts must not be published unless both macOS binaries carry one reviewed
 Developer ID Application identity, hardened runtime, secure timestamps, and
 accepted Apple notarization receipts. `SHA256SUMS` and the commit-bound

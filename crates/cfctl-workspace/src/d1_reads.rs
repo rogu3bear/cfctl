@@ -234,7 +234,7 @@ fn bounded_committed(
     Ok(bytes)
 }
 
-fn capability(contract: WorkspaceD1ReadInventoryContractV1) -> CapabilityV1 {
+pub(crate) fn capability(contract: WorkspaceD1ReadInventoryContractV1) -> CapabilityV1 {
     let mut cap = CapabilityV1::new(
         &contract.operation.id,
         &contract.operation.title,

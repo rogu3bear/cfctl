@@ -65,6 +65,18 @@ Local compiler acceptance does not establish D1 support for a PRAGMA. In
 particular, `pragma_integrity_check` still requires provider qualification;
 the published D1 PRAGMA list and workerd allowlist document `quick_check`
 instead. They are not interchangeable integrity proofs.
+Compiler version 4 additionally accepts direct, no-argument
+`PRAGMA quick_check;` under the same deny-by-default authorizer. Its result
+column is `quick_check`, not `integrity_check`. Arguments, assignments, other
+schemas and multiple statements remain rejected; table-valued
+`pragma_quick_check` is not added by this revision. A reviewed diagnostic can
+require exactly one nonnullable text value `ok`, but that observation does not
+clear a mandatory full-integrity gate. SQLite quick checks omit UNIQUE and
+index/table-content consistency checks. Existing migration integrity flags and
+verifiers are unchanged. Source/compiler adoption must be qualified separately;
+consumers admitting compiler versions explicitly must review version 4 before
+accepting its new receipts. Old receipts remain historical evidence, not newly
+qualified observations under the new build.
 Only declared main-table columns and compiler-approved functions are
 accepted. Undeclared or caller-supplied parameters, multiple statements, DDL/DML, EXPLAIN, transactions,
 attachment, configuration PRAGMAs, recursive CTEs, extension calls and

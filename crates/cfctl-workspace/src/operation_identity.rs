@@ -53,6 +53,7 @@ fn load_with(
     }
     for loader in [
         super::d1_operation::load_selected,
+        super::d1_qualification::load_selected,
         super::d1_policy_projection::load_selected,
         super::d1_reply_admission::load_selected,
         super::d1_reads::load_selected,
