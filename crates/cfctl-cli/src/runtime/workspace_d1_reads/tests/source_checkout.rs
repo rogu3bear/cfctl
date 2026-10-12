@@ -79,44 +79,70 @@ async fn ordinary_coverage_authenticates_selected_source_and_rejects_drift() {
         cfctl_workspace::WorkspaceOperationLoad::Execute,
     )
     .expect("selected native source");
-    let validated = d1_read_inventory::validate(&capability, &input).expect("native population");
-    let mut catalog = catalog();
-    catalog.refresh_hash().expect("valid catalog hash");
-    store
-        .write_json(&store.paths().catalog_file(), &catalog)
-        .expect("cached catalog");
-    let mut profiles = ProfilesConfig::default();
-    profiles.profiles.insert(profile().id.clone(), profile());
-    profiles.save(&store).expect("profile generation");
-    let attestation =
-        super::super::super::plan_commands::observation_attestation(&store, &capability)
-            .expect("authority");
-    let scoped = store.with_observation_attestation(&attestation);
-    let observation = persist(
-        &scoped,
-        &catalog,
-        &capability,
-        &validated,
-        &profile(),
-        Utc::now(),
-        &result(&validated),
-    )
-    .expect("actual native evidence");
-    crate::telemetry_product::record_operational_proof(
-        &scoped,
-        &catalog,
-        &capability,
-        &input,
-        Some(&profile().credential_generation_id.expect("generation")),
-        &observation.envelope,
-    )
-    .expect("authenticated index");
+    let (validated, observation) = persist_selected_observation(&store, &capability, &input);
     let public_coverage = super::super::super::catalog_commands::catalog_command(
         &store,
         crate::CatalogCommand::Coverage,
     )
     .await
     .expect("public coverage handler");
+    let evidence = assert_current_projection(
+        &store,
+        &public_coverage,
+        &observation,
+        &input,
+        &selection,
+        &capability,
+    );
+    qualify_frozen_sign_consumer(&public_coverage, &evidence, &validated, &selection);
+    // Coverage receives no source flags. It must revalidate the authenticated
+    // stored binding, rather than treating a base-catalog hash as source proof.
+    let pristine = fs::read(selected.join("source.txt")).expect("pristine fixture");
+    fs::write(selected.join("source.txt"), "selected source drift").expect("write");
+    let drift = super::super::super::catalog_commands::catalog_command(
+        &store,
+        crate::CatalogCommand::Coverage,
+    )
+    .await
+    .expect("coverage after source drift");
+    assert_eq!(
+        drift.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
+        false
+    );
+    fs::write(selected.join("source.txt"), pristine).expect("restore test fixture");
+    let restored = super::super::super::catalog_commands::catalog_command(
+        &store,
+        crate::CatalogCommand::Coverage,
+    )
+    .await
+    .expect("coverage after fixture restoration");
+    assert_eq!(
+        restored.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
+        true
+    );
+    store
+        .unregister_workspace(owner.path())
+        .expect("withdraw registration");
+    let withdrawn = super::super::super::catalog_commands::catalog_command(
+        &store,
+        crate::CatalogCommand::Coverage,
+    )
+    .await
+    .expect("coverage after owner withdrawal");
+    assert_eq!(
+        withdrawn.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
+        false
+    );
+}
+
+fn assert_current_projection(
+    store: &StateStore,
+    public_coverage: &ResultEnvelopeV2,
+    observation: &ExecutedRead,
+    input: &CallInput,
+    selection: &D1ReadSourceSelectionV1,
+    capability: &CapabilityV1,
+) -> Value {
     let proof = &public_coverage.result["operational_proof"];
     let row = &proof["latest_scoped_observations"][0];
     assert_eq!(proof["source"], "local_redacted_evidence_index");
@@ -130,9 +156,9 @@ async fn ordinary_coverage_authenticates_selected_source_and_rejects_drift() {
     );
     assert_ne!(
         row["input_hash"],
-        cfctl_core::hash_value(&serde_json::to_value(&input).expect("input")).expect("hash")
+        cfctl_core::hash_value(&serde_json::to_value(input).expect("input")).expect("hash")
     );
-    let guide = super::super::super::guide_generation::guide_document(&capability);
+    let guide = super::super::super::guide_generation::guide_document(capability);
     let argv = guide.call_argv.expect("read guide");
     assert!(
         argv.windows(2)
@@ -148,6 +174,15 @@ async fn ordinary_coverage_authenticates_selected_source_and_rejects_drift() {
     assert_eq!(evidence["repository_head"], selection.head);
     assert_eq!(evidence["repository_tree"], selection.tree);
     assert!(evidence["source_binding"].is_object());
+    evidence
+}
+
+fn qualify_frozen_sign_consumer(
+    public_coverage: &ResultEnvelopeV2,
+    evidence: &Value,
+    validated: &ValidatedD1ReadInventory,
+    selection: &D1ReadSourceSelectionV1,
+) {
     // An explicitly selected application checkout lets the local qualification
     // profile exercise its unchanged consumer against this real authenticated
     // native projection. Portable runs still exercise the public handler above.
@@ -200,42 +235,44 @@ print('frozen Sign authenticated_body/read_population accepted native selected-s
                 .contains("accepted native selected-source projection")
         );
     }
-    // Coverage receives no source flags. It must revalidate the authenticated
-    // stored binding, rather than treating a base-catalog hash as source proof.
-    let pristine = fs::read(selected.join("source.txt")).expect("pristine fixture");
-    fs::write(selected.join("source.txt"), "selected source drift").expect("write");
-    let drift = super::super::super::catalog_commands::catalog_command(
-        &store,
-        crate::CatalogCommand::Coverage,
-    )
-    .await
-    .expect("coverage after source drift");
-    assert_eq!(
-        drift.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
-        false
-    );
-    fs::write(selected.join("source.txt"), pristine).expect("restore test fixture");
-    let restored = super::super::super::catalog_commands::catalog_command(
-        &store,
-        crate::CatalogCommand::Coverage,
-    )
-    .await
-    .expect("coverage after fixture restoration");
-    assert_eq!(
-        restored.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
-        true
-    );
+}
+
+fn persist_selected_observation(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> (ValidatedD1ReadInventory, ExecutedRead) {
+    let validated = d1_read_inventory::validate(capability, input).expect("native population");
+    let mut catalog = catalog();
+    catalog.refresh_hash().expect("valid catalog hash");
     store
-        .unregister_workspace(owner.path())
-        .expect("withdraw registration");
-    let withdrawn = super::super::super::catalog_commands::catalog_command(
-        &store,
-        crate::CatalogCommand::Coverage,
+        .write_json(&store.paths().catalog_file(), &catalog)
+        .expect("cached catalog");
+    let mut profiles = ProfilesConfig::default();
+    profiles.profiles.insert(profile().id.clone(), profile());
+    profiles.save(store).expect("profile generation");
+    let attestation =
+        super::super::super::plan_commands::observation_attestation(store, capability)
+            .expect("authority");
+    let scoped = store.with_observation_attestation(&attestation);
+    let observation = persist(
+        &scoped,
+        &catalog,
+        capability,
+        &validated,
+        &profile(),
+        Utc::now(),
+        &result(&validated),
     )
-    .await
-    .expect("coverage after owner withdrawal");
-    assert_eq!(
-        withdrawn.result["operational_proof"]["latest_scoped_observations"][0]["catalog_current"],
-        false
-    );
+    .expect("actual native evidence");
+    crate::telemetry_product::record_operational_proof(
+        &scoped,
+        &catalog,
+        capability,
+        input,
+        Some(&profile().credential_generation_id.expect("generation")),
+        &observation.envelope,
+    )
+    .expect("authenticated index");
+    (validated, observation)
 }

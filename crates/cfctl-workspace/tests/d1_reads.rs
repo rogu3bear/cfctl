@@ -243,6 +243,68 @@ fn explicit_source_cannot_hide_ambiguous_owners_or_changed_committed_pack() {
 }
 
 #[test]
+fn per_query_source_binding_rejects_a_new_discoverable_duplicate() {
+    use cfctl_workspace::{
+        WorkspaceOperationLoad, load_workspace_d1_read_from_checkout,
+        revalidate_workspace_d1_read_registration,
+    };
+    let roots_dir = tempfile::tempdir().expect("registered forest");
+    let linked_dir = tempfile::tempdir().expect("selected checkout parent");
+    let owner = roots_dir.path().join("owner");
+    repository(&owner);
+    let selection = linked_checkout(&owner, &linked_dir.path().join("selected"));
+    let roots = [roots_dir.path().to_path_buf()];
+    let capability = load_workspace_d1_read_from_checkout(
+        &roots,
+        ID,
+        &selection,
+        WorkspaceOperationLoad::Execute,
+    )
+    .expect("unique owner");
+    let contract = capability.workspace_d1_read_inventory.expect("contract");
+    revalidate_workspace_d1_read_registration(&roots, &contract).expect("initial query boundary");
+    repository(&roots_dir.path().join("added-owner"));
+    assert!(revalidate_workspace_d1_read_registration(&roots, &contract).is_err());
+}
+
+#[test]
+fn per_query_source_binding_rejects_shared_origin_drift() {
+    use cfctl_workspace::{
+        WorkspaceOperationLoad, load_workspace_d1_read_from_checkout,
+        revalidate_workspace_d1_read_registration,
+    };
+    let dir = tempfile::tempdir().expect("root");
+    let owner = dir.path().join("owner");
+    repository(&owner);
+    let checkout = dir.path().join("selected");
+    let selection = linked_checkout(&owner, &checkout);
+    let roots = [owner.clone()];
+    let capability = load_workspace_d1_read_from_checkout(
+        &roots,
+        ID,
+        &selection,
+        WorkspaceOperationLoad::Execute,
+    )
+    .expect("selected source");
+    let contract = capability.workspace_d1_read_inventory.expect("contract");
+    revalidate_workspace_d1_read_registration(&roots, &contract).expect("initial origin");
+    git(
+        &owner,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/changed.git",
+        ],
+    );
+    assert_eq!(
+        git(&checkout, &["config", "--get", "remote.origin.url"]),
+        "https://example.invalid/changed.git"
+    );
+    assert!(revalidate_workspace_d1_read_registration(&roots, &contract).is_err());
+}
+
+#[test]
 fn clean_committed_population_derives_its_own_identity_and_public_contract() {
     let root = tempfile::tempdir().expect("root");
     let source_revision = repository(root.path());

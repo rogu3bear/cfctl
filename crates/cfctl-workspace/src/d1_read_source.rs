@@ -60,7 +60,7 @@ fn bind(owner: &Path, requested: &D1ReadSourceSelectionV1) -> Result<D1ReadSourc
         if expected.len() != 40
             || !expected
                 .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
             return Err(invalid(
                 "read source head and tree must be exact lowercase Git identities",
@@ -131,19 +131,16 @@ pub fn revalidate_workspace_d1_read_registration(
         return Ok(());
     };
     let owner = canonical_repository(&binding.registered_repository_root)?;
-    if !roots
-        .iter()
-        .filter(|r| {
-            std::fs::symlink_metadata(r).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-        })
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .any(|r| owner.starts_with(r))
-    {
+    let candidates = operation_identity::discover(roots)?;
+    let owners =
+        operation_identity::select(&candidates, D1_READ_PACK_PATH, &contract.operation.id)?;
+    if owners.len() != 1 || owners[0].path != owner {
         return Err(invalid(
-            "selected read operation owner is no longer registered",
+            "selected read operation owner is no longer uniquely registered",
         ));
     }
     if bind(&owner, &binding.selection)? != *binding
+        || git(&owner, &["config", "--get", "remote.origin.url"])? != contract.repository_origin
         || contract.repository_root != binding.selection.checkout_root
         || contract.repository_head != binding.selection.head
         || contract.repository_tree != binding.selection.tree
