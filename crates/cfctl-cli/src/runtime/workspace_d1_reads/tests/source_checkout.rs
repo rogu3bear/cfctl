@@ -175,6 +175,7 @@ print('frozen Sign authenticated_body/read_population accepted native selected-s
         let mut child = Command::new("python3")
             .args(["-c", script])
             .arg(root)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
