@@ -566,6 +566,37 @@ pub(super) fn known_import_init_response_failure_envelope(
     }
 }
 
+/// The writer's redacted projection also records presence, type and SHA-256 of
+/// each bookmark; it never retains provider error text.
+fn redacted_action_result_projection(result: &serde_json::Map<String, Value>) -> bool {
+    let allowed = [
+        "type",
+        "status",
+        "success",
+        "at_bookmark",
+        "at_bookmark_present",
+        "at_bookmark_is_string",
+        "at_bookmark_sha256",
+        "result",
+        "provider_error_present",
+    ];
+    let nested_allowed = [
+        "final_bookmark",
+        "final_bookmark_present",
+        "final_bookmark_is_string",
+        "final_bookmark_sha256",
+    ];
+    result.keys().all(|key| allowed.contains(&key.as_str()))
+        && result.get("result").is_none_or(|nested| {
+            nested.as_object().is_some_and(|object| {
+                object.contains_key("final_bookmark")
+                    && object
+                        .keys()
+                        .all(|key| nested_allowed.contains(&key.as_str()))
+            })
+        })
+}
+
 pub(super) fn exact_durable_action_response_failure(
     store: &StateStore,
     plan: &PlanV1,
@@ -591,20 +622,7 @@ pub(super) fn exact_durable_action_response_failure(
             else {
                 return false;
             };
-            let allowed = [
-                "type",
-                "status",
-                "success",
-                "at_bookmark",
-                "result",
-                "provider_error_present",
-            ];
-            let projected = result.keys().all(|key| allowed.contains(&key.as_str()))
-                && result.get("result").is_none_or(|nested| {
-                    nested.as_object().is_some_and(|object| {
-                        object.len() == 1 && object.contains_key("final_bookmark")
-                    })
-                });
+            let projected = redacted_action_result_projection(result);
             step_matches
                 && checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
                 && checkpoint.get("operation_id").and_then(Value::as_str)
@@ -691,7 +709,17 @@ pub(super) fn known_import_action_response_failure_envelope(
                 || checkpoint
                     .pointer("/receipt/result/status")
                     .and_then(Value::as_str)
-                    == Some("error");
+                    == Some("error")
+                // D1 also rejects an import action with a nested
+                // `{success:false,error}` that carries no type or status.
+                || (checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                    && checkpoint
+                        .pointer("/receipt/result/provider_error_present")
+                        .and_then(Value::as_bool)
+                        == Some(true));
             let outcome = if provider_rejected {
                 "provider_rejected"
             } else {

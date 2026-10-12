@@ -1102,6 +1102,91 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         assert!(!action_envelope.result.to_string().contains("SECRET"));
     }
 
+    // The writer's current redacted projection of a D1 nested rejection
+    // (`{"success":false,"error":...}` with no type, status or bookmark).
+    for (action, step, error) in [
+        (
+            "ingest",
+            "ingest_response",
+            CloudflareError::D1ImportIngestResponseFailure,
+        ),
+        (
+            "poll",
+            "poll_response_1",
+            CloudflareError::D1ImportPollResponseFailure,
+        ),
+    ] {
+        let rejected_root = tempfile::tempdir().expect("nested rejection root");
+        let rejected_store = StateStore::open(RuntimePaths::from_root(rejected_root.path()))
+            .expect("nested rejection store");
+        let mut rejected_plan = build_plan();
+        let rejected_checkpoint = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: rejected_plan.operation_id.clone(),
+            step: step.to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":action,
+                "provider":"cloudflare",
+                "effect":"d1_import_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&rejected_plan.input).expect("input hash"),
+                "result":{
+                    "type":null,
+                    "status":null,
+                    "success":false,
+                    "at_bookmark":null,
+                    "at_bookmark_present":false,
+                    "at_bookmark_is_string":false,
+                    "at_bookmark_sha256":null,
+                    "result":{
+                        "final_bookmark":null,
+                        "final_bookmark_present":false,
+                        "final_bookmark_is_string":false,
+                        "final_bookmark_sha256":null,
+                    },
+                    "provider_error_present":true,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":true,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":null,
+            }),
+        };
+        persist_d1_import_checkpoint(
+            &rejected_store,
+            &rejected_plan.operation_id,
+            &rejected_checkpoint,
+        )
+        .expect("durable nested rejection");
+        let rejected_envelope = approved_mln_import_execution_error_envelope(
+            &rejected_store,
+            &mut rejected_plan,
+            error,
+            &MemorySecretStore::default(),
+        );
+        assert!(rejected_envelope.performed, "{action}");
+        assert_eq!(
+            rejected_envelope.result["outcome"], "provider_rejected",
+            "{action}"
+        );
+        assert_eq!(
+            rejected_envelope.result["receipt_available"], true,
+            "{action}"
+        );
+        assert_eq!(rejected_envelope.result["response_action"], action);
+        assert_ne!(rejected_plan.status, PlanStatus::Running);
+    }
+
     let exhaustion_root = tempfile::tempdir().expect("poll exhaustion root");
     let exhaustion_store = StateStore::open(RuntimePaths::from_root(exhaustion_root.path()))
         .expect("poll exhaustion store");
