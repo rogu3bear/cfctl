@@ -322,6 +322,26 @@ fn v3_materialization_preserves_bytes_and_rejects_contract_and_source_drift() {
         materialize_workspace_d1_transition(&contract).unwrap(),
         expected
     );
+    let execution = materialize_workspace_d1_transition_execution(&contract).unwrap();
+    let manifest = &compiled.execution;
+    assert_eq!(execution.len(), manifest.execution_length);
+    assert_eq!(sha256(&execution), manifest.execution_sha256);
+    assert_eq!(
+        &execution[..manifest.ledger_offset],
+        &expected[..manifest.ledger_offset]
+    );
+    assert_eq!(
+        &execution[manifest.ledger_offset + manifest.ledger_length..],
+        &expected[manifest.ledger_offset..]
+    );
+    let mut substituted = contract.clone();
+    substituted
+        .transition
+        .as_mut()
+        .unwrap()
+        .execution
+        .ledger_offset += 1;
+    assert!(materialize_workspace_d1_transition_execution(&substituted).is_err());
     for kind in 0..5 {
         let mut bad = contract.clone();
         let compiled = bad.transition.as_mut().unwrap();
@@ -339,6 +359,51 @@ fn v3_materialization_preserves_bytes_and_rejects_contract_and_source_drift() {
     git(root.path(), &["add", "capture.sql"]);
     git(root.path(), &["commit", "-qm", "changed assertion"]);
     assert!(materialize_workspace_d1_transition(&contract).is_err());
+}
+
+#[test]
+fn v3_native_verification_contract_is_distinct_and_does_not_activate_blocked_source() {
+    use cfctl_core::workspace_d1::transition::{Observation, Observations, assurance};
+    let (root, op) = fixture(172);
+    let operations = operations(root.path(), &op);
+    fs::write(
+        root.path().join(PACK_RELATIVE_PATH),
+        toml::to_string(&json!({"schema_version":3,"operation":operations})).unwrap(),
+    )
+    .unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "native contract fixture"]);
+    let blocked =
+        load_workspace_d1_migration_capability(&[root.path().to_path_buf()], &operations[0].id)
+            .unwrap()
+            .unwrap();
+    assert!(!blocked.verification_contract_supported());
+    let mut native = blocked.clone();
+    native.adapter_status = AdapterStatus::Native;
+    assert!(!native.verification_contract_supported());
+    let compiled = native
+        .workspace_d1_migration
+        .as_mut()
+        .unwrap()
+        .transition
+        .as_mut()
+        .unwrap();
+    let observation = Observation {
+        capability_id: "fixture.read".into(),
+        inventory: compiled.declaration.assertions.preconditions.clone(),
+    };
+    compiled.declaration.assurance = Some(assurance::Declaration::FullIntegrityV1 {
+        diagnostic: observation.clone(),
+    });
+    compiled.declaration.observations = Some(Observations {
+        baseline: observation.clone(),
+        terminal: observation,
+    });
+    assert!(native.verification_contract_supported());
+    native.verification.strategy = "workspace_d1_migration_ledger_and_schema_assertions".into();
+    assert!(!native.verification_contract_supported());
+    assert_eq!(blocked.adapter_status, AdapterStatus::Blocked);
+    assert!(!blocked.verification_contract_supported());
 }
 
 #[test]

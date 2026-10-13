@@ -5,6 +5,26 @@ use cfctl_core::workspace_d1::transition::{
 
 use super::{Result, invariant, sha256};
 
+pub(super) fn materialize(
+    source: &[u8],
+    compiled: &cfctl_core::workspace_d1::transition::Compiled,
+) -> Result<Vec<u8>> {
+    let expected = compile(source, &compiled.segments, &compiled.declaration.target)?;
+    if expected != compiled.execution {
+        return Err(invariant("native execution manifest changed"));
+    }
+    let mut bytes = Vec::with_capacity(expected.execution_length);
+    bytes.extend_from_slice(&source[..expected.ledger_offset]);
+    bytes.extend_from_slice(&ledger_sql(&compiled.declaration.target)?);
+    bytes.extend_from_slice(&source[expected.ledger_offset..]);
+    if bytes.len() != expected.execution_length || sha256(&bytes) != expected.execution_sha256 {
+        return Err(invariant(
+            "native execution bytes differ from their manifest",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The installed ledger must independently qualify this exact table/column/default
 /// contract. No ledger bootstrap or inferred predecessor entries are generated.
 fn ledger_sql(target: &Target) -> Result<Vec<u8>> {

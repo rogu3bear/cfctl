@@ -1,4 +1,4 @@
-//! Unregistered native source producers. No public command or provider effect.
+//! Authenticated local producers. Policy and rollback activation remain gated.
 use super::{
     CallInput, Declaration, EvidenceClass, ExecutionRecord, Identity, PlanStatus, PolicyDecision,
     PopulationPhase, ProofRef, Qualification, Result, Scope, Stage, StateStore, TransportReceipt,
@@ -24,25 +24,10 @@ pub(super) fn population_source(
     scope: &Scope<'_>,
     now: chrono::DateTime<Utc>,
 ) -> Result<(OperationalProofV1, String)> {
-    let (expected, phase) = target;
+    let (expected, _) = target;
     let proof = read(store, reference, scope, now)?;
     let value = store.read_evidence_value(&reference.evidence_hash)?;
-    let capability = if let Some(binding) = value.get("synthetic_binding") {
-        let binding: PopulationBinding = serde_json::from_value(binding.clone())
-            .map_err(|_| invalid("synthetic read binding is not the closed native record"))?;
-        if &binding.resource.identity != identity
-            || binding.resource.database_id != database
-            || binding.phase != phase
-        {
-            return Err(invalid(
-                "synthetic read create lineage, phase or target differs",
-            ));
-        }
-        super::synthetic_read::validate_source(store, &binding, expected, scope)?
-    } else {
-        crate::runtime::support::load_workspace_capability(store, &expected.capability_id)?
-            .ok_or_else(|| invalid("synthetic population read is not registered"))?
-    };
+    let capability = population_capability(store, identity, database, target, &value, scope)?;
     let contract = capability
         .workspace_d1_read_inventory
         .as_ref()
@@ -95,11 +80,38 @@ pub(super) fn population_source(
     let states: Vec<_> = results
         .iter()
         .map(|result| {
-            json!({"query_id":result["query_id"],
-        "query_sha256":result["query_sha256"],"rows":result.pointer("/receipt/result/0/results")})
+            json!({"query_id":result["query_id"], "query_sha256":result["query_sha256"],
+            "rows":result.pointer("/receipt/result/0/results")})
         })
         .collect();
     Ok((proof, hash_value(&json!(states))?))
+}
+
+pub(super) fn population_capability(
+    store: &StateStore,
+    identity: &Identity,
+    database: &str,
+    target: (&Observation, ReadPhase),
+    value: &Value,
+    scope: &Scope<'_>,
+) -> Result<cfctl_core::CapabilityV1> {
+    let (expected, phase) = target;
+    Ok(if let Some(binding) = value.get("synthetic_binding") {
+        let binding: PopulationBinding = serde_json::from_value(binding.clone())
+            .map_err(|_| invalid("synthetic read binding is not the closed native record"))?;
+        if &binding.resource.identity != identity
+            || binding.resource.database_id != database
+            || binding.phase != phase
+        {
+            return Err(invalid(
+                "synthetic read create lineage, phase or target differs",
+            ));
+        }
+        super::synthetic_read::validate_source(store, &binding, expected, scope)?
+    } else {
+        crate::runtime::support::load_workspace_capability(store, &expected.capability_id)?
+            .ok_or_else(|| invalid("synthetic population read is not registered"))?
+    })
 }
 
 /// Recompute the semantic digest from the original authenticated native results.
@@ -141,10 +153,6 @@ pub(super) fn validate_population(
     Ok(())
 }
 
-#[expect(
-    dead_code,
-    reason = "prepared native producer stays unregistered until exact public command and admission review"
-)]
 pub(super) fn produce_population(
     store: &StateStore,
     expected: &Identity,
@@ -195,10 +203,6 @@ pub(super) fn produce_population(
     })
 }
 
-#[expect(
-    dead_code,
-    reason = "qualification producer source is unregistered and cannot initiate child effects"
-)]
 pub(super) fn produce_qualification(
     store: &StateStore,
     record: &Qualification,
@@ -281,13 +285,6 @@ pub(super) fn produce_policy(
 }
 
 /// The caller supplies an already admitted private directory, never a new auth store.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "native import progress sink is prepared but not registered for provider execution"
-    )
-)]
 pub(super) fn persist_import_progress(
     store: &StateStore,
     directory: &cfctl_storage::PrivateDirectory,

@@ -84,6 +84,7 @@ pub(super) async fn call_command(
         || arguments.capability_id == cfctl_core::pages_artifact::PRODUCER_ID
         || arguments.capability_id == cfctl_core::d1_reconciliation::RECONCILE_ID
         || arguments.capability_id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID
+        || arguments.capability_id == cfctl_core::workspace_d1::transition::application::PRODUCER_ID
     {
         cached.ok_or_else(|| {
             CliError::Input(
@@ -210,6 +211,19 @@ pub(super) async fn call_command(
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    if capability.id == cfctl_core::workspace_d1::transition::application::PRODUCER_ID {
+        if arguments.profile.is_some()
+            || arguments.account.is_some()
+            || arguments.out.is_some()
+            || arguments.value_out.is_some()
+            || arguments.source_file.is_some()
+            || arguments.credential_in.is_some()
+            || source_selection.is_some()
+        {
+            return Err(CliError::Input("local transition proofs derive exact source/profile identities and accept no credential selection or alternate source/sink".into()));
+        }
+        return super::workspace_d1_transition::proof_command(store, &catalog, &prepared.input);
+    }
     if capability.id == cfctl_core::d1_reconciliation::RECONCILE_ID {
         if arguments.profile.is_some()
             || arguments.account.is_some()

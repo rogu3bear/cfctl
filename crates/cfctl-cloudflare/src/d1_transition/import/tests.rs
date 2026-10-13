@@ -1,6 +1,77 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::wildcard_imports)]
 use super::*;
 
+#[tokio::test]
+async fn native_upload_sends_one_complete_file_without_statement_or_format_rewriting() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    let sql = b"-- comment; retain  spaces\nCREATE INDEX \"exact\"\n ON \"rows\" (\n  \"value\" /* inner; comment */\n );\nINSERT INTO \"rows\" VALUES('semi;colon');\n".to_vec();
+    let expected = sql.clone();
+    let etag = hex::encode(Md5::digest(&sql));
+    let response_etag = etag.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let (header_end, length) = loop {
+            let mut chunk = [0; 4096];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&chunk[..n]);
+            if let Some(index) = received.windows(4).position(|v| v == b"\r\n\r\n") {
+                let header = std::str::from_utf8(&received[..index]).unwrap();
+                assert!(header.starts_with("PUT /immutable.sql "));
+                assert!(!header.to_ascii_lowercase().contains("authorization:"));
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|n| n.parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (index + 4, length);
+            }
+        };
+        while received.len() < header_end + length {
+            let mut chunk = [0; 4096];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(&received[header_end..], expected);
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"{response_etag}\"\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        drop(stream);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let (status, headers) = bounded_d1_import_upload(
+        &client,
+        format!("http://{address}/immutable.sql").parse().unwrap(),
+        sql,
+        5,
+        65536,
+    )
+    .await
+    .unwrap();
+    assert!(status.is_success());
+    assert_eq!(
+        validated_d1_import_upload_etag(&headers, &etag).unwrap(),
+        etag
+    );
+    server.await.unwrap();
+}
+
 #[test]
 fn native_completion_keeps_bookmark_private_and_requires_durable_receipt_identity() {
     let binding = ValidatedImport {

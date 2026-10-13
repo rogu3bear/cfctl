@@ -2215,6 +2215,7 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "workspace_d1_transition_envelope_v3" => workspace_d1::transition::application::contract_supported(self),
             custom_challenge_rule::VERIFY => custom_challenge_rule::supported(self),
             response_header_rule::VERIFY => response_header_rule::supported(self),
             pages_projects::CREATE_STRATEGY | pages_projects::VARIABLES_STRATEGY => {

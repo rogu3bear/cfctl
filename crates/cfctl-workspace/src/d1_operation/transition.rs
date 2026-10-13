@@ -110,6 +110,19 @@ pub fn materialize_workspace_d1_transition(
     Ok(envelope)
 }
 
+/// Rebuild the exact native import file, preserving every source byte. The only
+/// inserted bytes are the compiler-owned ledger statement before cleanup.
+pub fn materialize_workspace_d1_transition_execution(
+    contract: &WorkspaceD1MigrationContractV1,
+) -> Result<Vec<u8>> {
+    let envelope = materialize_workspace_d1_transition(contract)?;
+    let compiled = contract
+        .transition
+        .as_ref()
+        .ok_or_else(|| invariant("V3 execution contract missing"))?;
+    execution::materialize(&envelope, compiled)
+}
+
 pub(super) fn load(
     repository: &super::super::RepositoryNode,
     capability_id: &str,
@@ -187,7 +200,7 @@ pub(super) fn load(
     "workspace:d1-transition-envelope-v3".clone_into(&mut result.path);
     result.adapter_status = AdapterStatus::Blocked;
     result.risk = RiskClass::Irreversible;
-    result.blocked_reason = Some("V3 source envelope compiled; production transport remains disabled pending executor-specific qualification and registration of typed application state proof producers".to_owned());
+    result.blocked_reason = Some("V3 source envelope compiled; native executor and local typed proof production are implemented, but provider execution remains disabled pending separately admitted isolated qualification and live capability activation".to_owned());
     "workspace_d1_transition_envelope_v3".clone_into(&mut result.verification.strategy);
     result.selectors = vec![
         selector("account_id", "path"),

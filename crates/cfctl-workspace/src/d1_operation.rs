@@ -1,6 +1,7 @@
 mod transition;
 pub use transition::{
-    materialize_workspace_d1_transition, materialize_workspace_d1_transition_source,
+    materialize_workspace_d1_transition, materialize_workspace_d1_transition_execution,
+    materialize_workspace_d1_transition_source,
 };
 
 use std::{

@@ -1,7 +1,10 @@
-//! Local evidence producers only; no catalog route or provider execution is exposed.
+//! Local typed verification producers; no provider execution is exposed.
 use super::{
     EvidenceClass, ExecutionRecord, Identity, PlanStatus, Result, Scope, StateStore,
     TransportReceipt, Utc, Value, case_validation, case_verifier, invalid, producers, read,
+};
+use crate::runtime::plan_commands::{
+    persist_transaction_stage, persist_transaction_stage_with_artifact,
 };
 use cfctl_core::{
     EvidenceV1, PlanV2, TransactionStageV1,
@@ -43,10 +46,6 @@ fn applied(store: &StateStore, plan: &PlanV2) -> Result<ExecutionRecord> {
     serde_json::from_value(store.read_evidence_value(hash)?)
         .map_err(|_| invalid("native execution apply artifact malformed"))
 }
-#[expect(
-    dead_code,
-    reason = "source-prepared case verifier is unregistered until native qualification and public admission"
-)]
 pub(super) fn produce_case(
     store: &StateStore,
     case: &CaseRef,
@@ -69,10 +68,6 @@ pub(super) fn produce_case(
     )?;
     write_verified_execution(store, &plan, record)
 }
-#[expect(
-    dead_code,
-    reason = "source-prepared distinct writer verifier has no public dispatch or resource authority"
-)]
 pub(super) fn produce_writer(
     store: &StateStore,
     case: &CaseRef,
@@ -124,10 +119,6 @@ pub(super) fn produce_writer(
     }
     write_verified_execution(store, &plan, record)
 }
-#[expect(
-    dead_code,
-    reason = "source-prepared poll verifier cannot init, upload, ingest or create approval"
-)]
 pub(super) fn produce_poll(
     store: &StateStore,
     case: &CaseRef,
@@ -186,10 +177,12 @@ pub(super) fn produce_poll(
         receipt,
     };
     verified.validate().map_err(invalid)?;
-    Ok(store.write_evidence(
+    let evidence = store.write_evidence(
         EvidenceClass::PostChangeVerification,
         &serde_json::to_value(verified)?,
-    )?)
+    )?;
+    record_verification(store, &plan, &evidence, false)?;
+    Ok(evidence)
 }
 
 fn write_verified_execution(
@@ -203,6 +196,7 @@ fn write_verified_execution(
         .and_then(|value| value.get("evidence_hash"))
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("verified execution apply hash missing"))?;
+    let rolled_back = record.terminal().map_err(invalid)?.stage == super::Stage::RolledBack;
     let verified = VerifiedExecutionRecord {
         schema_version: 1,
         kind: VERIFIED_EXECUTION_KIND.into(),
@@ -210,8 +204,45 @@ fn write_verified_execution(
         execution: record,
     };
     verified.validate().map_err(invalid)?;
-    Ok(store.write_evidence(
+    let evidence = store.write_evidence(
         EvidenceClass::PostChangeVerification,
         &serde_json::to_value(verified)?,
-    )?)
+    )?;
+    record_verification(store, plan, &evidence, rolled_back)?;
+    Ok(evidence)
+}
+
+pub(super) fn record_verification(
+    store: &StateStore,
+    plan: &PlanV2,
+    evidence: &EvidenceV1,
+    rolled_back: bool,
+) -> Result<()> {
+    pending(plan)?;
+    if evidence.class != EvidenceClass::PostChangeVerification {
+        return Err(invalid(
+            "native verification requires its typed verification evidence",
+        ));
+    }
+    let mut pending = plan.plan.clone();
+    if pending.transaction_stage == TransactionStageV1::BoundaryResponsePersisted {
+        persist_transaction_stage(
+            store,
+            &mut pending,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )?;
+    }
+    pending.status = if rolled_back {
+        PlanStatus::RectificationRequired
+    } else {
+        PlanStatus::Verified
+    };
+    persist_transaction_stage_with_artifact(
+        store,
+        &mut pending,
+        TransactionStageV1::VerificationResponsePersisted,
+        serde_json::json!({"state":"passed","evidence_hash":evidence.content_hash,
+            "native_typed_verification":true,"rolled_back":rolled_back,"no_replay":true}),
+    )?;
+    persist_transaction_stage(store, &mut pending, TransactionStageV1::Closed)
 }

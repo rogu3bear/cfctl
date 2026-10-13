@@ -41,7 +41,7 @@ pub use d1_evidence::{
 };
 pub use d1_operation::{
     load_workspace_d1_migration_capability, materialize_workspace_d1_transition,
-    materialize_workspace_d1_transition_source,
+    materialize_workspace_d1_transition_execution, materialize_workspace_d1_transition_source,
 };
 pub use d1_policy_projection::load_workspace_d1_policy_projection_capability;
 pub use d1_qualification::{

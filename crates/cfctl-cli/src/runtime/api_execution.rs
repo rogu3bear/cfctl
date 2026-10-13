@@ -32,6 +32,12 @@ pub(super) async fn execute_api_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
+    if plan.capability.path == "workspace:d1-transition-envelope-v3" {
+        return Box::pin(super::workspace_d1_transition::execute(
+            store, plan, credential,
+        ))
+        .await;
+    }
     if plan.capability.id == cfctl_core::r2_restore::RESTORE_ID {
         return super::r2_restore_execution::execute(
             store,

@@ -7,11 +7,17 @@ pub(super) fn population(join: &Join<'_, '_>, full_scan: bool) -> Result<()> {
             .read_evidence_value(&join.case.after.evidence_hash)?,
     )
     .map_err(|_| invalid("case audit lacks its native complete population"))?;
-    let capability = crate::runtime::support::load_workspace_capability(
+    let native = join
+        .store
+        .read_evidence_value(&population.source.evidence_hash)?;
+    let capability = super::super::producers::population_capability(
         join.store,
-        &population.source_inventory.capability_id,
-    )?
-    .ok_or_else(|| invalid("case audit native inventory missing"))?;
+        join.identity,
+        &population.database_id,
+        (&population.source_inventory, population.phase.into()),
+        &native,
+        join.scope,
+    )?;
     let inventory = &capability
         .workspace_d1_read_inventory
         .as_ref()

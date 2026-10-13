@@ -2,6 +2,62 @@
 use super::*;
 
 #[test]
+fn public_local_producer_refuses_substituted_catalog_selectors_and_claimed_verdicts() {
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::runtime::tests::authenticated_test_store(
+        cfctl_storage::RuntimePaths::from_root(root.path()),
+    );
+    let capability = cfctl_catalog::d1_transition_proof_capability();
+    let mut catalog = cfctl_catalog::CatalogSnapshot {
+        schema_version: 2,
+        generated_at: Utc::now(),
+        source_url: String::new(),
+        source_hash: String::new(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::from([(capability.id.clone(), capability)]),
+    };
+    catalog.refresh_hash().unwrap();
+    let proof = json!({"proof_hash":format!("sha256:{}","a".repeat(64)),
+        "evidence_hash":format!("sha256:{}","b".repeat(64))});
+    let request = json!({"action":"application", "operation_id":"351df28d-1459-4135-b7d6-af9e666eddfc",
+        "terminal_assertions":proof,"diagnostic":proof});
+    for body in [
+        request.clone(),
+        json!({"action":"application","passed":true}),
+        json!({"action":"aggregate","qualification":{"passed":true}}),
+    ] {
+        let input = CallInput {
+            body: Some(body),
+            ..CallInput::default()
+        };
+        assert!(proof_command(&store, &catalog, &input).is_err());
+    }
+    let input = CallInput {
+        selectors: json!({"database_id":"substitute"}),
+        body: Some(request.clone()),
+        ..CallInput::default()
+    };
+    assert!(proof_command(&store, &catalog, &input).is_err());
+    catalog
+        .capabilities
+        .get_mut(cfctl_core::workspace_d1::transition::application::PRODUCER_ID)
+        .unwrap()
+        .path = "substitute".into();
+    let input = CallInput {
+        body: Some(request),
+        ..CallInput::default()
+    };
+    let error = proof_command(&store, &catalog, &input).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("differs from its native contract")
+    );
+    assert!(store.list_plans().unwrap().is_empty());
+    assert!(store.list_operational_proofs().unwrap().is_empty());
+}
+
+#[test]
 fn runtime4_rejects_legacy_effect_success_flags_and_missing_assurance() {
     let legacy = serde_json::to_value(super::super::tests::binding()).unwrap();
     assert!(serde_json::from_value::<RuntimeBindingV4>(legacy.clone()).is_err());

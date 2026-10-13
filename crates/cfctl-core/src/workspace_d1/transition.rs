@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 pub mod admission;
+pub mod application;
 pub mod assurance;
 pub mod execution;
 pub mod proofs;

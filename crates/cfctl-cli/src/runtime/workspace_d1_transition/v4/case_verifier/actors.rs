@@ -118,11 +118,20 @@ pub(in super::super) fn writer_record(
         .concurrency
         .as_ref()
         .ok_or_else(|| invalid("concurrent writer source missing"))?;
-    let capability = crate::runtime::support::load_workspace_capability(
+    let native = join
+        .store
+        .read_evidence_value(&proof.post_writer_observation.evidence_hash)?;
+    let capability = producers::population_capability(
         join.store,
-        &proof.source.post_writer_inventory.capability_id,
-    )?
-    .ok_or_else(|| invalid("writer source repository is not registered"))?;
+        join.identity,
+        &join.case.synthetic_database_id,
+        (
+            &proof.source.post_writer_inventory,
+            cfctl_core::workspace_d1::transition::admission::resource::ReadPhase::PostWriter,
+        ),
+        &native,
+        join.scope,
+    )?;
     let contract = capability
         .workspace_d1_read_inventory
         .as_ref()

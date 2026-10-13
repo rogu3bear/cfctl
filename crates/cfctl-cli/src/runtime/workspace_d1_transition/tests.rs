@@ -305,7 +305,7 @@ fn v3_prepare_rejects_absent_native_receipts_and_legacy_boundary_stays_closed() 
     assert!(
         error
             .to_string()
-            .contains("V3 production transport is disabled")
+            .contains("native source owner is no longer registered")
     );
     assert!(store.list_operational_proofs().unwrap().is_empty());
 }

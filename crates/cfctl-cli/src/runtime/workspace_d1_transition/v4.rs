@@ -15,14 +15,31 @@ use super::{
     Utc, Value, WorkspaceD1MigrationContractV1, canonical_digest, effect, hash_value, invalid,
     observations, publication, read, validate_export,
 };
+mod application;
 mod case_validation;
 mod case_verifier;
 mod completed;
 mod diagnostic;
 mod producers;
+mod proof_command;
 mod resource;
 mod synthetic_read;
 mod verification_producers;
+pub(in crate::runtime) use proof_command::run as proof_command;
+
+#[derive(Default)]
+struct AdmissionCache {
+    verified: std::collections::BTreeSet<String>,
+    visiting: std::collections::BTreeSet<String>,
+}
+
+pub(super) fn persist_import_progress(
+    store: &StateStore,
+    directory: &cfctl_storage::PrivateDirectory,
+    progress: &cfctl_cloudflare::d1_transition::import::Progress,
+) -> Result<String> {
+    producers::persist_import_progress(store, directory, progress)
+}
 
 fn qualification(
     store: &StateStore,
@@ -234,6 +251,45 @@ pub(super) fn prepare(
     if binding.schema_version != 4 {
         return Err(invalid("V4 runtime version differs"));
     }
+    Ok(Some(serde_json::to_value(admit(
+        store,
+        contract,
+        &binding,
+        scope,
+        Utc::now(),
+    )?)?))
+}
+
+pub(super) fn admit(
+    store: &StateStore,
+    contract: &WorkspaceD1MigrationContractV1,
+    binding: &RuntimeBindingV4,
+    scope: &Scope<'_>,
+    now: chrono::DateTime<Utc>,
+) -> Result<super::native::Target> {
+    admit_cached(
+        store,
+        contract,
+        binding,
+        scope,
+        now,
+        &mut AdmissionCache::default(),
+    )
+}
+
+fn admit_cached(
+    store: &StateStore,
+    contract: &WorkspaceD1MigrationContractV1,
+    binding: &RuntimeBindingV4,
+    scope: &Scope<'_>,
+    now: chrono::DateTime<Utc>,
+    cache: &mut AdmissionCache,
+) -> Result<super::native::Target> {
+    if binding.schema_version != 4 {
+        return Err(invalid(
+            "native execution requires typed V4 runtime admission",
+        ));
+    }
     let compiled = contract
         .transition
         .as_ref()
@@ -244,7 +300,6 @@ pub(super) fn prepare(
         .as_ref()
         .ok_or_else(|| invalid("V4 requires explicit source assurance mode"))?;
     policy(store, contract, assurance, &binding.assurance, scope)?;
-    let now = Utc::now();
     let baseline = read(store, &binding.observed_baseline, scope, now)?;
     validate_export(&baseline, compiled, now, false)?;
     let recovery = read(store, &binding.recovery, scope, now)?;
@@ -285,13 +340,22 @@ pub(super) fn prepare(
         scope,
         now,
     )?;
-    let completed = completed::validate(store, &binding, scope, now)?;
+    compiled
+        .validate_completed(
+            &binding
+                .completed
+                .iter()
+                .map(|c| c.sequence)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(invalid)?;
+    let completed = completed::validate(store, contract, binding, scope, now, cache)?;
     let lineage = RuntimeBinding {
         schema_version: 3,
         observed_baseline: binding.observed_baseline.clone(),
-        baseline_assertions: binding.baseline_assertions,
+        baseline_assertions: binding.baseline_assertions.clone(),
         completed,
-        recovery: binding.recovery,
+        recovery: binding.recovery.clone(),
         provider_qualification: EffectRef {
             operation_id: String::new(),
             evidence_hash: String::new(),
@@ -299,7 +363,9 @@ pub(super) fn prepare(
         publication: binding.publication.clone(),
     };
     super::validate_lineage(compiled, &lineage)?;
-    super::validate_completed_observations(store, contract, compiled, &lineage, scope, now)?;
+    // Typed application verification authenticates terminal reads after the
+    // atomic commit. Requiring them to follow their own derived verification
+    // would make a completed transition impossible to consume.
     if let Some(publication) = &binding.publication {
         let verified = publication::validate(store, contract, publication, scope, now)?;
         if recovery.observed_at <= verified {
@@ -308,9 +374,7 @@ pub(super) fn prepare(
     } else if compiled.step().map_err(invalid)?.phase == Phase::PostDeploy {
         return Err(invalid("V4 post-deploy transition lacks publication"));
     }
-    Err(invalid(
-        "V4 typed proofs resolved; native provider adapter and qualification producers remain disabled pending reviewed admission",
-    ))
+    super::native::Target::new(contract, binding, scope)
 }
 
 #[cfg(test)]

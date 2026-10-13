@@ -8,7 +8,7 @@ Each operation binds an exact target sequence, filename and source `{path, sha25
 
 Four tracked assertion sources—`preconditions`, `capture`, `preservation`, `cleanup`—surround the original migration source. The compiler concatenates those five byte sequences without rewriting SQL, removing PRAGMAs or adding transaction statements. Each segment must be nonempty NUL-free UTF-8 ending in a newline. Total size is limited to 1 MiB. The result records source identities, segment offsets/lengths, compiler identity, complete byte length and SHA256. This binds reviewed bytes; it does not prove SQL syntax, assertion correctness, atomicity, or application preservation. The application owns those semantics.
 
-Compiler revision `workspace-d1-envelope-v3.3` additionally records a separate
+Compiler revision `workspace-d1-envelope-v3.4` additionally records a separate
 `workspace-d1-execution-v1` manifest. It binds exactly one compiler-owned
 `INSERT INTO "d1_migrations" ("name") VALUES (...)` after preservation and before
 cleanup, using the manifest-selected target filename as an escaped SQL literal.
@@ -19,19 +19,19 @@ digest, and the complete execution length/digest; the combined bytes retain the
 source preparation only: actual installed ledger columns/defaults, target-once
 semantics, typed qualification and remote atomic failure behavior still require
 proof. It neither bootstraps history nor enables a provider executor. Existing
-V3 runtime and legacy execution blocks remain in force.
+Legacy execution remains closed. Native V4 admission and local proof derivation are implemented; live capability activation remains separately gated.
 
 Runtime intake first reconstructs the envelope from the current clean, committed pack. It rejects a changed repository, declaration, compiler identity, segment order, offsets, lengths or bytes, and checks the complete envelope digest again. This source check creates no import stage or provider operation.
 
 Fresh runtime references belong outside the tracked source. `RuntimeBinding` requires observed baseline, baseline assertions, completed transitions, fresh recovery and provider qualification; post-deploy transitions also require publication and verification. Read references bind `{proof_hash, evidence_hash}` to native `OperationalProofV1` records. Effect references bind `{operation_id, evidence_hash}` to the exact verified `PlanV2` and its verification artifact. References never carry a caller-selected success boolean. The runtime authenticates stored evidence and checks scope, catalog, build, credential generation, outcome and time. Full-export references additionally require their native governed execution binding and exact database input; recovery expires after 600 seconds.
 
-An optional `observations` declaration binds `baseline` and `terminal` to existing native workspace D1 read capability IDs and committed inventory `Source` identities. Declarations without these bindings remain blocked. Every query must require exactly one non-null integer `passed=1`, with matching finite allowlist and integer bounds; caller parameters and private output are rejected. Runtime intake revalidates all native results and joins the read call, inventory, full source contract, repository, account, database, profile, credential generation, catalog and build. Current baseline observations must follow the original observed baseline and be at most 600 seconds old; completed terminal observations must start after their exact effect verification evidence. Identical adjacent boundary inventories may be shared without merging different state predicates. These observations are not an atomic fence or row-preservation proof. Generic schema reads cannot become application preservation assertions, and a verified unrelated plan cannot become executor atomicity qualification. The current intake ends with a closed error even when all native identities resolve. It issues no success token. Publication receipt binding now resolves as described below; the unregistered V4 source preparation described below must still receive source admission and provider-specific atomic preservation/qualification before this boundary can be enabled. Changing the adapter status alone is insufficient: core legacy verification and runtime execution explicitly reject V3.
+An optional `observations` declaration binds `baseline` and `terminal` to existing native workspace D1 read capability IDs and committed inventory `Source` identities. Declarations without these bindings remain blocked. Every query must require exactly one non-null integer `passed=1`, with matching finite allowlist and integer bounds; caller parameters and private output are rejected. Runtime intake revalidates all native results and joins the read call, inventory, full source contract, repository, account, database, profile, credential generation, catalog and build. Current baseline observations must follow the original observed baseline and be at most 600 seconds old; typed completed terminal observations must follow their exact atomic commit and precede the application verification derived from them. Identical adjacent boundary inventories may be shared without merging different state predicates. These observations are not an atomic fence or row-preservation proof. Generic schema reads cannot become application preservation assertions, and a verified unrelated plan cannot become executor atomicity qualification. Runtime version 3 remains closed. Version 4 admits an exact native target only after all typed source, assurance, qualification and lineage joins pass. Publication receipt binding resolves as described below. The registered provider capability remains blocked pending isolated provider qualification and separate activation; changing adapter status alone cannot satisfy those gates. The legacy verifier cannot certify V3.
 
 Publication intake requires the verified deploy effect, or a verified upload followed by its exact version promotion. `PublicationRef.upload` is required for promotion; `verification`, `version` and `settings` reference fresh native deployment-list, version-detail and settings reads. The join binds the migration repository and HEAD, committed configuration or its governed private overlay, Worker name, artifact digest/message, sole active version at 100 percent, and the exact D1 binding in version resources and current settings. The Worker profile and credential generation must agree across its publication and read receipts; they may differ from the D1 migration profile. Fresh recovery must follow all three publication reads. This is control-plane publication evidence, not application runtime acceptance or a lock against a later external deployment.
 
 A qualified future effect must enforce migration-relevant preconditions atomically and preserve or correctly transform all eligible data committed before execution. Compatible writes after a recovery snapshot are allowed. An export is recovery evidence, not a compare-and-swap precondition. Native file-import query unavailability must be disclosed without inventing a duration bound. Local D1 batch tests and upstream import behavior are separate evidence classes from actual remote envelope execution.
 
-## Typed runtime intake version 4 (source preparation)
+## Typed runtime intake version 4
 
 Compiler revision `workspace-d1-envelope-v3.4` adds an optional source-owned
 `assurance` declaration. Its absence preserves the existing V3 intake; runtime
@@ -51,7 +51,7 @@ response, full-scan access path, exact schema format and performance bound.
 Every child re-resolves its native plan, authenticated verification evidence,
 atomic checkpoint chain and temporally bracketing synthetic observations.
 Production database IDs cannot be used as synthetic qualification targets.
-The native qualification/population producers are implemented but not registered;
+The local qualification/population producers are registered through the native proof capability;
 existing generic import, legacy Wrangler or unrelated Verified plans cannot
 stand in for these records. Matrix presence alone is not remote qualification.
 
@@ -59,7 +59,7 @@ Each completed transition must join its own original baseline, predecessor,
 source/envelope/execution identities, assurance identity and qualification.
 The exact native plan must reference the apply artifact containing that atomic
 execution record. The existing terminal `passed=1` inventory is still required
-after effect verification. A different target's qualification cannot substitute
+after atomic commit and authenticated by its typed application verification. A different target's qualification cannot substitute
 for an earlier transition's qualification.
 
 `cfctl-cloudflare::d1_transition` implements one-dispatch orchestration. It
@@ -69,7 +69,7 @@ checkpoint. Loss of a response, cancellation after intent, malformed terminal
 evidence or failure to persist a terminal checkpoint cannot authorize replay.
 Reconciliation accepts a separately authenticated provider disposition and
 never resends SQL. A pending or ambiguous effect remains held. This orchestration
-has an unregistered native file-import adapter that reuses the existing
+has a native file-import adapter routed only for exact consumed V4 plans that reuses the existing
 presigned-URL, strong ETag and nested response validators. It requires a consumed,
 boundary-attempted exact approved plan, sends the complete immutable bytes once,
 uses no transport retries, durably retains private bookmark resume identity,
@@ -77,14 +77,48 @@ and bounds requests, response size and its observation window. A separately
 approved poll-only continuation cannot init, upload or ingest. Provider errors
 remain uncertain until the authenticated native error and complete synthetic
 before/after population prove zero delta; they do not directly produce rollback
-success. Native qualification/population/policy and rollback reconciliation
-producers are implemented as unregistered source. Population hashes are
+success. Native qualification and population producers are available locally. Policy activation and rollback reconciliation remain unregistered. Population hashes are
 recomputed from authenticated native read results, and successful cases require
 the reviewed exact synthetic final-state oracle. Persistence uses the existing
 authenticated evidence store and owned private file sink. Provider status and
 rollback semantics must still be qualified before production wiring. The source tests exercise failure
 and interruption boundaries with synthetic callbacks; they are not provider
 atomicity evidence.
+
+## Local native proof production
+
+`cfctl call workspace-d1-transition-produce-proof --body-stdin --json < request.json`
+uses the existing authenticated local evidence store and cached catalog. Its
+closed request has one `action`: `application`, `population`, `case`, `writer`,
+`poll`, or `aggregate`. It accepts no caller verdict, SQL, file path, profile
+override or provider selector. Every reference is authenticated again against
+the registered committed source, native plan, catalog, build and credential
+generation metadata. It never opens a credential or sends a provider request.
+Population returns both hashes in `proof_reference`; other actions return the
+content-addressed typed evidence hash.
+
+Application requests contain `operation_id`, `terminal_assertions` and
+`diagnostic`. Successful verification closes only that pending new native
+operation, after joining its approved plan, original V4 admission, immutable
+atomic apply record, exact post-commit predicates and assurance diagnostic.
+The result reports `plan_status_changed=true`. Missing or substituted receipts
+cannot close a plan. Legacy import operations, including a consumed uncertain
+operation, cannot acquire this proof or be replayed through this command.
+Case, writer and poll actions likewise bind verification to their exact pending
+plan journal. A proved rollback retains `RectificationRequired` status. Within
+one admission, immutable completed application receipts are authenticated once
+and memoized, keeping prefix validation bounded without skipping source or
+lineage checks.
+
+The executor publishes a create-only private operation claim before transport,
+then authenticated checkpoints and private progress. It imports the complete
+execution file without SQL splitting, comment removal or whitespace rewriting.
+A failed recording step preserves the claim and returns a pending rectification
+result with `no_replay=true`; inability to persist that disposition is disclosed.
+A commit remains pending until the application producer verifies its reads.
+These local implementations and tests do not establish D1 failure atomicity,
+enable a blocked qualification role, activate a managed assurance policy, install
+the CLI, authorize credentials, or approve provider effects.
 
 ## Managed-D1 assurance proposal version 1
 

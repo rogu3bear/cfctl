@@ -11,9 +11,13 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
 use super::prelude::{CallInput, CliError, Result, StateStore};
+mod native;
 mod observations;
 mod publication;
 mod v4;
+
+pub(super) use native::{execute, validate_bound_plan};
+pub(super) use v4::proof_command;
 
 struct Scope<'a> {
     account: &'a str,

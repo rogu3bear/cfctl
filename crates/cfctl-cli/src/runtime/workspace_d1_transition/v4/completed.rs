@@ -8,9 +8,11 @@ use cfctl_core::workspace_d1::transition::proofs::Completed;
 
 pub(super) fn validate(
     store: &StateStore,
+    contract: &super::WorkspaceD1MigrationContractV1,
     binding: &RuntimeBindingV4,
     scope: &Scope<'_>,
     now: chrono::DateTime<Utc>,
+    cache: &mut super::AdmissionCache,
 ) -> Result<Vec<CompletedRef>> {
     let mut predecessor = binding.observed_baseline.evidence_hash.clone();
     let mut completed = Vec::new();
@@ -22,12 +24,35 @@ pub(super) fn validate(
             .workspace_d1_migration
             .as_ref()
             .ok_or_else(|| invalid("completed V4 plan is not a transition"))?;
+        let transition = prior
+            .transition
+            .as_ref()
+            .ok_or_else(|| invalid("completed source missing"))?;
+        let current = contract
+            .transition
+            .as_ref()
+            .ok_or_else(|| invalid("current source missing"))?;
+        if prior.repository_head != contract.repository_head
+            || prior.operation_pack_sha256 != contract.operation_pack_sha256
+            || transition.declaration.target.sequence != item.sequence
+            || current
+                .scheduled_targets
+                .iter()
+                .find(|target| target.sequence == item.sequence)
+                != Some(&transition.declaration.target)
+        {
+            return Err(invalid(
+                "completed source, sequence or scheduled target differs",
+            ));
+        }
         let record = authenticate(
             store,
             item,
             &plan,
             &binding.observed_baseline.evidence_hash,
             &predecessor,
+            scope,
+            cache,
         )?;
         let terminal = record.terminal().map_err(invalid)?;
         let prior_input: CallInput = serde_json::from_value(plan.plan.input.clone())
@@ -79,6 +104,8 @@ fn authenticate(
     plan: &cfctl_core::PlanV2,
     baseline: &str,
     predecessor: &str,
+    scope: &Scope<'_>,
+    cache: &mut super::AdmissionCache,
 ) -> Result<ExecutionRecord> {
     let prior = plan
         .plan
@@ -122,16 +149,37 @@ fn authenticate(
         ));
     }
     let verified = store.load_evidence(&item.effect.evidence_hash)?;
-    let verified_record = super::case_verifier::verified_execution(
-        store,
-        plan,
-        &item.effect.evidence_hash,
-        verified.generated_at,
-    )?;
-    if verified_record != record {
+    let application: cfctl_core::workspace_d1::transition::application::ApplicationVerification =
+        serde_json::from_value(store.read_evidence_value(&item.effect.evidence_hash)?)
+            .map_err(|_| invalid("completed transition lacks typed application verification"))?;
+    if application.terminal_assertions != item.preservation {
+        return Err(invalid(
+            "completed transition substituted its application preservation read",
+        ));
+    }
+    if application.verified_execution.execution != record {
         return Err(invalid(
             "completed verification substituted its atomic apply record",
         ));
+    }
+    // The schedule is a prefix DAG: authenticate each immutable application
+    // receipt once per admission, rather than recursively expanding every
+    // predecessor's entire prefix. Scope and time are fixed by this receipt.
+    let hash = &item.effect.evidence_hash;
+    if !cache.verified.contains(hash) {
+        if !cache.visiting.insert(hash.clone()) {
+            return Err(invalid("cyclic completed application proof"));
+        }
+        super::application::validate_cached(
+            store,
+            plan,
+            &application,
+            scope,
+            verified.generated_at,
+            cache,
+        )?;
+        cache.visiting.remove(hash);
+        cache.verified.insert(hash.clone());
     }
     super::case_verifier::checkpoint_times(store, &record, verified.generated_at)?;
     if evidence.generated_at > verified.generated_at {

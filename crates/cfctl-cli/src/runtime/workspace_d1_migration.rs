@@ -220,10 +220,6 @@ pub(super) fn validate_bound_plan_for_rectification(
     validate_bound_plan_inner(store, plan, false)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "legacy admission retains existing checks and rejects the disabled V3 executor before any state access"
-)]
 fn validate_bound_plan_inner(
     store: &StateStore,
     plan: &PlanV1,
@@ -233,9 +229,7 @@ fn validate_bound_plan_inner(
         return Ok(());
     };
     if contract.transition.is_some() {
-        return Err(CliError::Input(
-            "workspace D1 V3 production transport is disabled".to_owned(),
-        ));
+        return super::workspace_d1_transition::validate_bound_plan(store, plan);
     }
     let current = load(store, &plan.capability.id)?.ok_or_else(|| {
         CliError::Input(

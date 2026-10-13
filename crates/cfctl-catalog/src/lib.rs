@@ -1,6 +1,8 @@
 //! Cloudflare capability catalog normalization and indexing.
 
 mod d1_reconciliation;
+mod d1_transition;
+pub use d1_transition::proof_capability as d1_transition_proof_capability;
 mod request_schema;
 mod turnstile_secret;
 use request_schema::{normalize_request_schema_contract, request_schema_contract};
@@ -2678,6 +2680,7 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
             .insert(capability.id.clone(), capability);
     }
     for capability in vec![
+        d1_transition::proof_capability(),
         pages_artifact::capability(),
         workspace_d1_qualification_observer_capability(),
         workspace_d1_qualification_producer_capability(),
