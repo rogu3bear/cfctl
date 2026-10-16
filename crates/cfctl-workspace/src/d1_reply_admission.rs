@@ -16,7 +16,7 @@ use super::{
     Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
 };
 
-const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-reply-admission.toml";
+pub(super) const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-reply-admission.toml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

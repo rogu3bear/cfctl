@@ -214,7 +214,7 @@ pub(super) fn load_selected(
     }
 }
 
-fn committed_pack_paths(repository: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn committed_pack_paths(repository: &Path) -> Result<Vec<PathBuf>> {
     let Some(listing) = git_optional(
         repository,
         &["ls-tree", "-r", "--name-only", "HEAD", OPERATIONS_PREFIX],
@@ -255,7 +255,13 @@ fn is_workspace_operation_document(value: &toml::Value) -> bool {
         .get("schema_version")
         .and_then(toml::Value::as_integer)
         == Some(2)
-        && value.get("contract").and_then(toml::Value::as_str) == Some(WORKSPACE_OPERATION_CONTRACT)
+        && declares_workspace_operation_contract(value)
+}
+
+// Ownership survives an unsupported schema; execution still requires the
+// supported document version in is_workspace_operation_document and bind_v2.
+pub(super) fn declares_workspace_operation_contract(value: &toml::Value) -> bool {
+    value.get("contract").and_then(toml::Value::as_str) == Some(WORKSPACE_OPERATION_CONTRACT)
 }
 
 fn bind_v2(

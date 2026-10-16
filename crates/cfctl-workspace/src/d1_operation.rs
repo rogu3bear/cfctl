@@ -24,7 +24,7 @@ use super::{
     Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
 };
 
-const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-migrations.toml";
+pub(super) const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-migrations.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Deserialize)]

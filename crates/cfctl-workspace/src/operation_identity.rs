@@ -46,6 +46,9 @@ fn load_with(
     mode: WorkspaceOperationLoad,
 ) -> Result<Option<cfctl_core::CapabilityV1>> {
     let candidates = discover(roots)?;
+    // Resolve committed ownership before a binder's ordering can select a
+    // different carrier for the same logical operation.
+    super::operation_claims::unique_pack_claim(&candidates, capability_id)?;
     if let Some(capability) =
         super::operation_pack::load_selected(&candidates, capability_id, mode)?
     {
@@ -103,6 +106,7 @@ pub(super) fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
         for entry in WalkDir::new(root)
             .follow_links(false)
+            .follow_root_links(false)
             .into_iter()
             .filter_entry(included_entry)
             .filter_map(std::result::Result::ok)

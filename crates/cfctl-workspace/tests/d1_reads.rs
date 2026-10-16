@@ -402,3 +402,176 @@ fn a_committed_symlink_is_not_a_source_or_inventory_authority() {
     commit(root.path());
     assert!(load_workspace_operation_capability(&[root.path().to_path_buf()], ID).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_registered_symlink_cannot_supply_nested_operation_owners() {
+    use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
+    let root = tempfile::tempdir().expect("root");
+    let outside = tempfile::tempdir().expect("outside");
+    repository(&outside.path().join("nested-owner"));
+    let link = root.path().join("legacy-root");
+    std::os::unix::fs::symlink(outside.path(), &link).expect("root link");
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(&link)]).expect("graph");
+    assert!(graph.repositories.is_empty());
+    assert_eq!(graph.skipped_roots.len(), 1);
+    let roots = [link];
+    assert!(
+        load_workspace_operation_capability(&roots, ID)
+            .expect("execute")
+            .is_none()
+    );
+    assert!(
+        inspect_workspace_operation_capability(&roots, ID)
+            .expect("inspect")
+            .is_none()
+    );
+    assert!(
+        inspect_workspace_operation_capability(&[outside.path().to_path_buf()], ID)
+            .expect("resolved directory remains supported")
+            .is_some()
+    );
+}
+
+fn competing_claim(root: &Path, pack: &str, schema: u8) {
+    fs::create_dir_all(root.join(".cfctl/operations")).expect("pack directory");
+    if !root.join(".git").exists() {
+        git(root, &["init", "-q"]);
+    }
+    let marker = if pack.ends_with("generic.toml") {
+        "contract = \"workspace_operation_v1\"\n"
+    } else {
+        ""
+    };
+    fs::write(
+        root.join(pack),
+        format!("schema_version = {schema}\n{marker}[[operation]]\nid = {ID:?}\n"),
+    )
+    .expect("claim");
+    commit(root);
+}
+
+const COMPETING_PACKS: [(&str, u8); 4] = [
+    (".cfctl/operations/generic.toml", 2),
+    (".cfctl/operations/generic.toml", 99),
+    (".cfctl/operations/d1-evidence.toml", 1),
+    (".cfctl/operations/d1-evidence.toml", 99),
+];
+
+#[test]
+fn explicit_and_default_lookup_reject_cross_carrier_committed_claims() {
+    use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
+    for (pack, schema) in COMPETING_PACKS {
+        for same_repository in [false, true] {
+            let dir = tempfile::tempdir().expect("root");
+            let owner = dir.path().join("owner");
+            repository(&owner);
+            let selection = linked_checkout(&owner, &dir.path().join("checkout"));
+            let competitor = if same_repository {
+                owner.clone()
+            } else {
+                dir.path().join("other")
+            };
+            competing_claim(&competitor, pack, schema);
+            let roots = if same_repository {
+                vec![owner]
+            } else {
+                vec![owner, competitor]
+            };
+            for mode in [
+                WorkspaceOperationLoad::Inspect,
+                WorkspaceOperationLoad::Execute,
+            ] {
+                let error = load_workspace_d1_read_from_checkout(&roots, ID, &selection, mode)
+                    .expect_err("an explicit source cannot choose between carriers");
+                assert!(error.to_string().contains("ambiguous"), "{error}");
+            }
+            let error = inspect_workspace_operation_capability(&roots, ID)
+                .expect_err("inspection cannot choose by loader order");
+            assert!(error.to_string().contains("ambiguous"), "{error}");
+            let error = load_workspace_operation_capability(&roots, ID)
+                .expect_err("execution cannot choose by loader order");
+            assert!(error.to_string().contains("ambiguous"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn selected_checkout_cannot_add_a_competing_carrier() {
+    use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
+    for (pack, schema) in COMPETING_PACKS {
+        let dir = tempfile::tempdir().expect("root");
+        let owner = dir.path().join("owner");
+        repository(&owner);
+        let checkout = dir.path().join("checkout");
+        let mut selection = linked_checkout(&owner, &checkout);
+        competing_claim(&checkout, pack, schema);
+        selection.head = git(&checkout, &["rev-parse", "HEAD"]);
+        selection.tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+        // The registered owner remains unique and the D1 read pack is identical.
+        assert!(
+            inspect_workspace_operation_capability(std::slice::from_ref(&owner), ID)
+                .expect("registered owner remains unambiguous")
+                .is_some()
+        );
+        for mode in [
+            WorkspaceOperationLoad::Inspect,
+            WorkspaceOperationLoad::Execute,
+        ] {
+            let error = load_workspace_d1_read_from_checkout(
+                std::slice::from_ref(&owner),
+                ID,
+                &selection,
+                mode,
+            )
+            .expect_err("selected checkout has two committed claims");
+            assert!(error.to_string().contains("ambiguous"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn per_query_reacquisition_rejects_a_late_cross_carrier_claim() {
+    use cfctl_workspace::{
+        WorkspaceOperationLoad, load_workspace_d1_read_from_checkout,
+        revalidate_workspace_d1_read_registration,
+    };
+    for (pack, schema) in COMPETING_PACKS {
+        let dir = tempfile::tempdir().expect("root");
+        let owner = dir.path().join("owner");
+        repository(&owner);
+        let selection = linked_checkout(&owner, &dir.path().join("checkout"));
+        let other = dir.path().join("late-owner");
+        let roots = [owner, other.clone()];
+        let capability = load_workspace_d1_read_from_checkout(
+            &roots,
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Execute,
+        )
+        .expect("unique source initially");
+        let contract = capability.workspace_d1_read_inventory.expect("contract");
+        revalidate_workspace_d1_read_registration(&roots, &contract).expect("initial boundary");
+        competing_claim(&other, pack, schema);
+        let error = revalidate_workspace_d1_read_registration(&roots, &contract)
+            .expect_err("next boundary must reacquire cross-carrier ownership");
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+    }
+}
+
+#[test]
+fn recognizing_an_unsupported_generic_claim_does_not_enable_its_execution() {
+    let root = tempfile::tempdir().expect("root");
+    competing_claim(root.path(), ".cfctl/operations/generic.toml", 99);
+    let roots = [root.path().to_path_buf()];
+    assert!(
+        inspect_workspace_operation_capability(&roots, ID)
+            .expect("unsupported schema remains unbound")
+            .is_none()
+    );
+    assert!(
+        load_workspace_operation_capability(&roots, ID)
+            .expect("unsupported schema cannot execute")
+            .is_none()
+    );
+}

@@ -15,7 +15,7 @@ use super::{
     Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
 };
 
-const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-evidence.toml";
+pub(super) const PACK_RELATIVE_PATH: &str = ".cfctl/operations/d1-evidence.toml";
 const PACK_SCHEMA_VERSION: u8 = 1;
 pub const MAILDESK_D1_EVIDENCE_COLUMNS_V1: &[&str] = &[
     "active_policy_digest",

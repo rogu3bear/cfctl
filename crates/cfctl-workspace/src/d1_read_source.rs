@@ -94,8 +94,8 @@ fn bind(owner: &Path, requested: &D1ReadSourceSelectionV1) -> Result<D1ReadSourc
     })
 }
 
-/// Default lookup remains unchanged. Explicit selection still requires a unique
-/// registered operation identity and never admits an arbitrary clone by URL.
+/// Explicit selection requires one committed operation claim across carriers in
+/// both the registered forest and selected checkout; it never admits a clone by URL.
 pub fn load_workspace_d1_read_from_checkout(
     roots: &[PathBuf],
     capability_id: &str,
@@ -103,14 +103,10 @@ pub fn load_workspace_d1_read_from_checkout(
     mode: operation_identity::WorkspaceOperationLoad,
 ) -> Result<CapabilityV1> {
     let candidates = operation_identity::discover(roots)?;
-    let owners = operation_identity::select(&candidates, D1_READ_PACK_PATH, capability_id)?;
-    if owners.len() != 1 {
-        return Err(invalid(
-            "source selection requires one registered D1 read operation owner",
-        ));
-    }
-    let binding = bind(&owners[0].path, selection)?;
+    let owner = unique_read_owner(&candidates, capability_id)?;
+    let binding = bind(&owner, selection)?;
     let checkout = PathBuf::from(&binding.selection.checkout_root);
+    unique_read_owner(std::slice::from_ref(&checkout), capability_id)?;
     let mut capability = super::d1_reads::load_selected(&[checkout], capability_id, mode)?
         .ok_or_else(|| invalid("selected D1 read operation disappeared"))?;
     capability
@@ -132,9 +128,7 @@ pub fn revalidate_workspace_d1_read_registration(
     };
     let owner = canonical_repository(&binding.registered_repository_root)?;
     let candidates = operation_identity::discover(roots)?;
-    let owners =
-        operation_identity::select(&candidates, D1_READ_PACK_PATH, &contract.operation.id)?;
-    if owners.len() != 1 || owners[0].path != owner {
+    if unique_read_owner(&candidates, &contract.operation.id)? != owner {
         return Err(invalid(
             "selected read operation owner is no longer uniquely registered",
         ));
@@ -149,5 +143,16 @@ pub fn revalidate_workspace_d1_read_registration(
             "selected read operation ownership or source identity changed",
         ));
     }
+    unique_read_owner(
+        &[PathBuf::from(&binding.selection.checkout_root)],
+        &contract.operation.id,
+    )?;
     Ok(())
+}
+
+fn unique_read_owner(candidates: &[PathBuf], id: &str) -> Result<PathBuf> {
+    super::operation_claims::unique_pack_claim(candidates, id)?
+        .filter(|(_, pack)| pack == Path::new(D1_READ_PACK_PATH))
+        .map(|(owner, _)| owner)
+        .ok_or_else(|| invalid("source selection requires one committed D1 read operation owner"))
 }

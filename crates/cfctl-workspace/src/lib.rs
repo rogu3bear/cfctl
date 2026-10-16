@@ -24,6 +24,7 @@ pub use d1_read_source::{
     load_workspace_d1_read_from_checkout, revalidate_workspace_d1_read_registration,
 };
 pub use d1_reads::revalidate_workspace_d1_read_inventory;
+mod operation_claims;
 mod operation_identity;
 mod operation_pack;
 pub use operation_identity::{
