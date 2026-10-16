@@ -336,6 +336,88 @@ fn direct_deployment(id: &str) -> Value {
 }
 
 #[test]
+fn latest_preview_keeps_direct_source_admission_bound_to_both_deployments() {
+    let canonical = direct_deployment("11111111-1111-4111-8111-111111111111");
+    let mut latest = direct_deployment("22222222-2222-4222-8222-222222222222");
+    latest["environment"] = json!("preview");
+    latest["deployment_trigger"]["metadata"]["branch"] = json!("stage");
+    let response = omitted_source_project(canonical, latest);
+    let receipt =
+        apply_project_response(&direct_upload(), "acct", "aos-web", Some("main"), &response)
+            .expect("latest preview must not prevent future production admission");
+    assert_eq!(
+        receipt["source_mode_basis"],
+        "omitted_source_exact_direct_production_and_preview"
+    );
+    assert!(receipt_source_mode_is_bound(&receipt, "direct_upload"));
+    for pointer in [
+        "/corroborating_preview/deployment_id",
+        "/corroborating_preview/branch",
+        "/corroborating_preview/commit_hash",
+    ] {
+        let mut wrong = receipt.clone();
+        *wrong.pointer_mut(pointer).expect("field") = json!("");
+        assert!(!receipt_source_mode_is_bound(&wrong, "direct_upload"));
+    }
+    let mut wrong = response;
+    wrong.result["latest_deployment"]["deployment_trigger"]["metadata"]["branch"] = json!("main");
+    assert!(
+        apply_project_response(&direct_upload(), "acct", "aos-web", Some("main"), &wrong).is_err()
+    );
+}
+
+#[test]
+fn preview_project_admission_protects_production_and_requires_a_different_branch() {
+    let mut response = omitted_source_project(Value::Null, Value::Null);
+    response.result["source"] = Value::Null;
+    response.result["subdomain"] = json!("aos-web.pages.dev");
+    let receipt = apply_project_response_for_environment(
+        &direct_upload(),
+        "acct",
+        "aos-web",
+        Some("stage"),
+        PagesDeploymentEnvironmentV1::Preview,
+        &response,
+        None,
+    )
+    .expect("explicit preview");
+    assert_eq!(receipt["requested_branch"], "stage");
+    assert_eq!(
+        receipt["protected_production"]["canonical_deployment"],
+        Value::Null
+    );
+    assert!(
+        apply_project_response_for_environment(
+            &direct_upload(),
+            "acct",
+            "aos-web",
+            Some("main"),
+            PagesDeploymentEnvironmentV1::Preview,
+            &response,
+            None
+        )
+        .is_err()
+    );
+    response
+        .result
+        .as_object_mut()
+        .expect("project")
+        .remove("canonical_deployment");
+    assert!(
+        apply_project_response_for_environment(
+            &direct_upload(),
+            "acct",
+            "aos-web",
+            Some("stage"),
+            PagesDeploymentEnvironmentV1::Preview,
+            &response,
+            None
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn omitted_project_source_requires_consistent_direct_deployment_evidence() {
     let id = "ff88ab4a-f284-4f06-86e0-c8ae3b459b60";
     let exact = omitted_source_project(direct_deployment(id), direct_deployment(id));

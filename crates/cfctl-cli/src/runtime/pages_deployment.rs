@@ -6,6 +6,7 @@ use std::{
 };
 
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1};
+use cfctl_core::pages_deployment::PagesDeploymentEnvironmentV1;
 use cfctl_core::{CapabilityV1, PlanV1, hash_value};
 use cfctl_workspace::{RepositoryNode, WorkspaceGraph};
 use serde_json::{Value, json};
@@ -296,7 +297,7 @@ fn repository_owning_path<'a>(
         .max_by_key(|repository| repository.path.components().count())
 }
 
-fn full_git_sha(value: &str) -> bool {
+pub(super) fn full_git_sha(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
@@ -553,6 +554,7 @@ pub(super) fn prepare_target(
     if !binds_artifact(capability) {
         return Ok(None);
     }
+    let environment = super::pages_intent::requested(capability, input)?;
     let root = artifact_root(input)?;
     let immutable = super::pages_immutable::requested(input);
     let source = if immutable {
@@ -612,6 +614,7 @@ pub(super) fn prepare_target(
     Ok(Some(json!({
         "schema_version": if immutable { 2 } else { 1 },
         "project_name": project_name(capability, input)?,
+        "environment": environment.as_str(),
         "source": source,
         "artifact": artifact,
         "provider_request": {
@@ -879,6 +882,7 @@ pub(super) fn validate_bound_plan(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn apply_project_response(
     capability: &CapabilityV1,
     account_id: &str,
@@ -896,11 +900,36 @@ pub(super) fn apply_project_response(
     )
 }
 
+#[cfg(test)]
 pub(super) fn apply_project_response_with_create_proof(
     capability: &CapabilityV1,
     account_id: &str,
     project_name: &str,
     expected_branch: Option<&str>,
+    response: &CloudflareResponseV1,
+    create_proof: Option<&Value>,
+) -> Result<Value, CliError> {
+    apply_project_response_for_environment(
+        capability,
+        account_id,
+        project_name,
+        expected_branch,
+        PagesDeploymentEnvironmentV1::Production,
+        response,
+        create_proof,
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one project admission receipt binds source mode, environment, production protection and optional direct-create proof"
+)]
+pub(super) fn apply_project_response_for_environment(
+    capability: &CapabilityV1,
+    account_id: &str,
+    project_name: &str,
+    expected_branch: Option<&str>,
+    environment: PagesDeploymentEnvironmentV1,
     response: &CloudflareResponseV1,
     create_proof: Option<&Value>,
 ) -> Result<Value, CliError> {
@@ -947,7 +976,16 @@ pub(super) fn apply_project_response_with_create_proof(
         if let Some(deployment_id) = deployment_id {
             (
                 "direct_upload",
-                "omitted_source_exact_direct_deployment",
+                if response
+                    .result
+                    .pointer("/latest_deployment/environment")
+                    .and_then(Value::as_str)
+                    == Some("preview")
+                {
+                    "omitted_source_exact_direct_production_and_preview"
+                } else {
+                    "omitted_source_exact_direct_deployment"
+                },
                 Some(deployment_id),
             )
         } else if create_proof.is_some()
@@ -977,6 +1015,7 @@ pub(super) fn apply_project_response_with_create_proof(
         production_branch,
         source_mode,
         expected_branch,
+        environment,
     )?;
     let mut receipt = json!({
         "schema_version": 1,
@@ -991,6 +1030,23 @@ pub(super) fn apply_project_response_with_create_proof(
     });
     if let Some(deployment_id) = corroborating_deployment_id {
         receipt["corroborating_deployment_id"] = json!(deployment_id);
+    }
+    if source_mode_basis == "omitted_source_exact_direct_production_and_preview" {
+        let latest = &response.result["latest_deployment"];
+        receipt["corroborating_preview"] = json!({
+            "deployment_id":latest["id"],
+            "branch":latest.pointer("/deployment_trigger/metadata/branch"),
+            "commit_hash":latest.pointer("/deployment_trigger/metadata/commit_hash"),
+        });
+    }
+    if environment == PagesDeploymentEnvironmentV1::Preview {
+        receipt["deployment_environment"] = json!("preview");
+        receipt["requested_branch"] = json!(expected_branch);
+        receipt["protected_production"] = super::pages_preview::protected_snapshot(
+            &response.result,
+            project_name,
+            production_branch,
+        )?;
     }
     if source_mode_basis == "omitted_source_authenticated_direct_create" {
         receipt["project_id"] = response.result["id"].clone();
@@ -1010,6 +1066,7 @@ fn validate_project_deployment_mode(
     production_branch: &str,
     source_mode: &str,
     expected_branch: Option<&str>,
+    environment: PagesDeploymentEnvironmentV1,
 ) -> Result<(), CliError> {
     let expected_mode = if binds_artifact(capability) {
         "direct_upload"
@@ -1027,10 +1084,12 @@ fn validate_project_deployment_mode(
             capability.id
         )));
     }
-    if expected_branch.is_some_and(|branch| branch != production_branch) {
-        return Err(CliError::Input(format!(
-            "Pages direct-upload branch does not match project production branch `{production_branch}`; the deployment boundary was not crossed"
-        )));
+    if let Some(branch) = expected_branch {
+        super::pages_intent::validate_branch(environment, branch, production_branch)?;
+    } else if environment == PagesDeploymentEnvironmentV1::Preview {
+        return Err(CliError::Input(
+            "Pages preview omitted its source branch".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1051,6 +1110,23 @@ fn omitted_source_direct_deployment_id<'a>(
     let canonical = project.get("canonical_deployment")?;
     let latest = project.get("latest_deployment")?;
     let canonical_id = direct_deployment_evidence(canonical, project_name, production_branch)?;
+    if latest.get("environment").and_then(Value::as_str) == Some("preview") {
+        let branch = latest
+            .pointer("/deployment_trigger/metadata/branch")
+            .and_then(Value::as_str)
+            .filter(|branch| !branch.is_empty() && *branch != production_branch)?;
+        let latest_id = direct_deployment_evidence_for_environment(
+            latest,
+            project_name,
+            branch,
+            PagesDeploymentEnvironmentV1::Preview,
+        )?;
+        latest
+            .pointer("/deployment_trigger/metadata/commit_hash")
+            .and_then(Value::as_str)
+            .filter(|commit| full_git_sha(commit))?;
+        return (canonical_id != latest_id).then_some(canonical_id);
+    }
     let latest_id = direct_deployment_evidence(latest, project_name, production_branch)?;
     (canonical_id == latest_id).then_some(canonical_id)
 }
@@ -1060,12 +1136,26 @@ fn direct_deployment_evidence<'a>(
     project_name: &str,
     production_branch: &str,
 ) -> Option<&'a str> {
+    direct_deployment_evidence_for_environment(
+        deployment,
+        project_name,
+        production_branch,
+        PagesDeploymentEnvironmentV1::Production,
+    )
+}
+
+fn direct_deployment_evidence_for_environment<'a>(
+    deployment: &'a Value,
+    project_name: &str,
+    branch: &str,
+    environment: PagesDeploymentEnvironmentV1,
+) -> Option<&'a str> {
     let id = deployment
         .get("id")?
         .as_str()
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())?;
     if deployment.get("project_name").and_then(Value::as_str) != Some(project_name)
-        || deployment.get("environment").and_then(Value::as_str) != Some("production")
+        || deployment.get("environment").and_then(Value::as_str) != Some(environment.as_str())
         || deployment
             .pointer("/deployment_trigger/type")
             .and_then(Value::as_str)
@@ -1073,7 +1163,7 @@ fn direct_deployment_evidence<'a>(
         || deployment
             .pointer("/deployment_trigger/metadata/branch")
             .and_then(Value::as_str)
-            != Some(production_branch)
+            != Some(branch)
         || deployment
             .get("source")
             .is_some_and(|source| !source.is_null())
@@ -1116,6 +1206,22 @@ pub(super) fn receipt_source_mode_is_bound(receipt: &Value, expected_mode: &str)
         }
         (Some("direct_upload"), Some("omitted_source_exact_direct_deployment"), Some(id)) => {
             expected_mode == "direct_upload" && uuid::Uuid::parse_str(id).is_ok()
+        }
+        (
+            Some("direct_upload"),
+            Some("omitted_source_exact_direct_production_and_preview"),
+            Some(id),
+        ) => {
+            let preview = &receipt["corroborating_preview"];
+            expected_mode == "direct_upload"
+                && uuid::Uuid::parse_str(id).is_ok()
+                && preview["deployment_id"].as_str().is_some_and(|preview_id| {
+                    preview_id != id && uuid::Uuid::parse_str(preview_id).is_ok()
+                })
+                && preview["branch"].as_str().is_some_and(|branch| {
+                    !branch.is_empty() && Some(branch) != receipt["production_branch"].as_str()
+                })
+                && preview["commit_hash"].as_str().is_some_and(full_git_sha)
         }
         (Some("direct_upload"), Some("omitted_source_authenticated_direct_create"), None) => {
             expected_mode == "direct_upload"
@@ -1221,9 +1327,25 @@ pub(super) fn structured_output_matches(
     branch: &str,
     commit_hash: &str,
 ) -> bool {
+    structured_output_matches_for_environment(
+        value,
+        project_name,
+        branch,
+        commit_hash,
+        PagesDeploymentEnvironmentV1::Production,
+    )
+}
+
+pub(super) fn structured_output_matches_for_environment(
+    value: &Value,
+    project_name: &str,
+    production_branch: &str,
+    commit_hash: &str,
+    environment: PagesDeploymentEnvironmentV1,
+) -> bool {
     value.get("pages_project").and_then(Value::as_str) == Some(project_name)
-        && value.get("environment").and_then(Value::as_str) == Some("production")
-        && value.get("production_branch").and_then(Value::as_str) == Some(branch)
+        && value.get("environment").and_then(Value::as_str) == Some(environment.as_str())
+        && value.get("production_branch").and_then(Value::as_str) == Some(production_branch)
         && value
             .pointer("/deployment_trigger/metadata/commit_hash")
             .and_then(Value::as_str)
@@ -1268,12 +1390,31 @@ pub(super) fn deployment_matches_returned_id(
     }
 }
 
+#[cfg(test)]
 pub(super) fn matching_deployment_ids(
     value: &Value,
     prior_ids: &BTreeSet<String>,
     project_name: &str,
     branch: &str,
     commit_hash: &str,
+) -> BTreeSet<String> {
+    matching_deployment_ids_for_environment(
+        value,
+        prior_ids,
+        project_name,
+        branch,
+        commit_hash,
+        PagesDeploymentEnvironmentV1::Production,
+    )
+}
+
+pub(super) fn matching_deployment_ids_for_environment(
+    value: &Value,
+    prior_ids: &BTreeSet<String>,
+    project_name: &str,
+    branch: &str,
+    commit_hash: &str,
+    environment: PagesDeploymentEnvironmentV1,
 ) -> BTreeSet<String> {
     let mut matches = BTreeSet::new();
     collect_matching_deployments(
@@ -1282,6 +1423,7 @@ pub(super) fn matching_deployment_ids(
         project_name,
         branch,
         commit_hash,
+        environment,
         &mut matches,
     );
     matches
@@ -1293,6 +1435,7 @@ fn collect_matching_deployments(
     project_name: &str,
     branch: &str,
     commit_hash: &str,
+    environment: PagesDeploymentEnvironmentV1,
     matches: &mut BTreeSet<String>,
 ) {
     match value {
@@ -1303,13 +1446,14 @@ fn collect_matching_deployments(
                 project_name,
                 branch,
                 commit_hash,
+                environment,
                 matches,
             );
         }),
         Value::Object(fields) => {
             let id = fields.get("id").and_then(Value::as_str);
             let exact = fields.get("project_name").and_then(Value::as_str) == Some(project_name)
-                && fields.get("environment").and_then(Value::as_str) == Some("production")
+                && fields.get("environment").and_then(Value::as_str) == Some(environment.as_str())
                 && value
                     .pointer("/deployment_trigger/metadata/branch")
                     .and_then(Value::as_str)
@@ -1331,6 +1475,7 @@ fn collect_matching_deployments(
                     project_name,
                     branch,
                     commit_hash,
+                    environment,
                     matches,
                 );
             });

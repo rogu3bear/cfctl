@@ -322,6 +322,7 @@ pub(super) async fn read_live_pages_deployment_project_state(
         ));
     }
     let project_name = pages_deployment::project_name(capability, input)?;
+    let environment = super::pages_intent::requested(capability, input)?;
     let project_read = catalog
         .get(pages_deployment::PROJECT_READ_CAPABILITY_ID)
         .ok_or_else(|| capability_missing(pages_deployment::PROJECT_READ_CAPABILITY_ID))?;
@@ -356,12 +357,14 @@ pub(super) async fn read_live_pages_deployment_project_state(
     let expected_branch = pages_deployment::binds_artifact(capability)
         .then(|| input.query.get("branch").and_then(Value::as_str))
         .flatten();
-    let result = pages_deployment::apply_project_response(
+    let result = pages_deployment::apply_project_response_for_environment(
         capability,
         account_id,
         project_name,
         expected_branch,
+        environment,
         &project,
+        None,
     );
     let mut receipt = match result {
         Ok(receipt) => receipt,
@@ -377,11 +380,12 @@ pub(super) async fn read_live_pages_deployment_project_state(
                 project_name,
                 &project.result,
             )?;
-            pages_deployment::apply_project_response_with_create_proof(
+            pages_deployment::apply_project_response_for_environment(
                 capability,
                 account_id,
                 project_name,
                 expected_branch,
+                environment,
                 &project,
                 Some(&proof),
             )?
@@ -437,12 +441,13 @@ pub(super) async fn read_live_pages_deployment_project_state(
                 CliError::Input("Pages direct-upload plan omitted its commit identity".to_owned())
             })?;
         let prior_ids = pages_deployment::deployment_ids(&deployments.result);
-        let prior_matches = pages_deployment::matching_deployment_ids(
+        let prior_matches = pages_deployment::matching_deployment_ids_for_environment(
             &deployments.result,
             &BTreeSet::new(),
             project_name,
             branch,
             commit_hash,
+            environment,
         );
         if !prior_matches.is_empty() {
             return Err(CliError::Input(

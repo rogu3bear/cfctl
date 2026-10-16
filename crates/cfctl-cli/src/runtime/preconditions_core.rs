@@ -376,6 +376,7 @@ pub(super) fn required_pages_deployment_project_state_precondition(
         || receipt.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str())
         || receipt.get("project_name").and_then(Value::as_str) != Some(project_name)
         || !pages_deployment::receipt_source_mode_is_bound(receipt, expected_mode)
+        || !super::pages_intent::receipt_matches(&plan.capability, &input, receipt)?
         || (pages_deployment::binds_artifact(&plan.capability)
             && receipt
                 .get("prior_exact_identity_count")

@@ -1023,7 +1023,8 @@ single-writer change freeze from the final reread through verification.
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate
 `wrangler.pages` command. Bind the built directory, existing project,
-production branch, and exact source commit in the plan:
+source branch, and exact source commit in the plan. Omitted `environment`
+retains production intent:
 
 ```bash
 cfctl call wrangler.pages-deploy \
@@ -1052,13 +1053,20 @@ closed bundle's size and SHA-256. Bare imports or ancestor `node_modules`
 resolution fail planning. A runtime `import(...)` that survives bundling also
 fails closed because esbuild does not report every non-literal dynamic import
 in its metafile. A live exact-project read must then establish direct-upload
-mode, and the requested branch must equal the project's production branch.
+mode. Production intent requires the project's production branch. Explicit
+`--query environment=preview` requires a different branch and binds the
+protected canonical production projection; see the
+[preview deployment contract](../pages-direct-setup.md#explicit-preview-deployment).
 Explicit `source: null` remains authoritative. A provider response that omits
 `source` is compatible when the same response also carries matching
 canonical and latest production deployments with one exact UUID, project, and
 branch; a successful `ad_hoc` deployment whose repository clone/build stages
 remain idle; no nested Git source; and no configured repository build command
-or root. A direct-upload output directory such as `target/site` is retained as
+or root. An exact separate latest preview can also corroborate direct mode
+alongside canonical production: its branch differs, its commit is a full SHA,
+and both deployment identities and the preview branch/commit are hash-bound.
+It must carry the same successful ad-hoc/idle-build evidence. A direct-upload
+output directory such as `target/site` is retained as
 project configuration, not misclassified as repository-build evidence.
 For an initial project with no deployment yet, the separate
 [direct-upload setup contract](../pages-direct-setup.md) permits an authenticated
@@ -1086,10 +1094,13 @@ worker, so no second project dependency resolution can alter the request.
 There are no implicit
 `wrangler.toml`, Functions, dotenv, or current-directory inputs. Wrangler's
 governed structured-output file must return one canonical deployment ID with
-the exact project, production branch, environment, and commit. The verifier
-requires that ID to be absent from the pre-plan deployment set, waits for the
-same ID and identity to appear in the collection, and polls only that exact
-detail resource. Only terminal `success` passes; ambiguity,
+the exact project, authenticated production branch, environment, and commit.
+The verifier requires that ID to be absent from the pre-plan deployment set.
+Production verification waits for the same ID and identity in the collection,
+then polls only that exact detail resource. Preview verification polls the
+exact detail path, proves the requested source branch, projects only returned
+Pages URLs/aliases, and rereads the project to confirm unchanged canonical
+production. Only terminal deploy `success` passes; ambiguity,
 identity drift, provider error, timeout, failure, or cancellation requires
 rectification and never authorizes replay. Automatic rollback is not
 implemented. Restoring a prior artifact is a separate reviewed deployment and

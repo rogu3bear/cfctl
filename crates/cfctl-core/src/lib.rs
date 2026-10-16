@@ -4,6 +4,7 @@ pub mod d1_read_inventory;
 pub mod d1_reconciliation;
 mod email_routing;
 pub mod pages_artifact;
+pub mod pages_deployment;
 pub mod pages_projects;
 pub mod turnstile_secret;
 pub mod worker_frozen_upload;

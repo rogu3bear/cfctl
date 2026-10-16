@@ -1,5 +1,37 @@
 # Direct-upload Pages project setup
 
+## Explicit preview deployment
+
+The qualified `wrangler.pages-deploy` catalog entry has an optional query
+`environment` with exactly `production` and `preview`; omission retains
+production behavior. This is cfctl intent metadata, removed before invoking
+Wrangler. Preview requires `--query environment=preview` and the exact clean
+registered checkout's branch and commit. Its branch must differ from the
+authenticated project's production branch. The immutable reproduction recipe
+below remains production-only; an archive receipt cannot qualify a preview.
+
+Planning binds direct-upload source mode, prior deployment IDs, and a filtered
+projection of the project's production branch, Pages subdomain and canonical
+production deployment. Execution repeats those preconditions before the
+one-use upload. A latest preview deployment can corroborate omitted direct
+source alongside the separate canonical production deployment; both identities
+are bound, and Git/build pipeline evidence still refuses admission.
+
+Verification reads the exact new helper-returned deployment ID through the
+bound account/project API path. The deployment must reach deploy success with
+the reviewed preview branch and commit. Provider-returned immutable URL and
+aliases must belong to the authenticated project subdomain, and a fresh
+project read must preserve the protected production projection. Success adds
+typed `verified_deployment` to the result. It includes the exact immutable URL,
+provider alias, branch, commit and production-preservation scope; cfctl never
+guesses a branch slug. Project environment-variable values are excluded.
+
+This proof covers observed deployment identity and canonical production
+preservation. Effective resource isolation, custom-domain/DNS association,
+serving behavior and application acceptance require their own checks and
+authority. A failed post-upload check requires rectification, never replay.
+Source support does not install the binary or refresh an existing catalog.
+
 ## Deploy an immutable artifact while development advances
 
 The optional `artifact_receipt` query selector on `wrangler.pages-deploy`

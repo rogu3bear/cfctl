@@ -94,6 +94,11 @@ pub(super) async fn complete_delegated_plan(
     if let Some(deployment_id) = verification.get("deployment_id").and_then(Value::as_str) {
         receipt["deployment_id"] = Value::String(deployment_id.to_owned());
     }
+    if verification.get("passed").and_then(Value::as_bool) == Some(true)
+        && let Some(identity) = verification.get("verified_deployment")
+    {
+        receipt["verified_deployment"] = identity.clone();
+    }
     let verification_evidence =
         store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
@@ -475,6 +480,14 @@ pub(super) async fn verify_delegated_cli_plan(
                 "branch": branch,
             });
         };
+        match super::pages_intent::requested(&plan.capability, input) {
+            Ok(cfctl_core::pages_deployment::PagesDeploymentEnvironmentV1::Preview) => {
+                return super::pages_preview_verify::verify(catalog, plan, receipt, credential)
+                    .await;
+            }
+            Err(error) => return json!({"passed":false,"basis":error.to_string()}),
+            Ok(cfctl_core::pages_deployment::PagesDeploymentEnvironmentV1::Production) => {}
+        }
         return verify_wrangler_pages_production_deployment(
             catalog,
             plan,
