@@ -132,6 +132,8 @@ joins respectively. All four D1 consumers use them. Reads do not construct a
 migration contract or evaluate fake recovery fields. Captured private bytes are
 bounded and hashed once; launch rechecks their identity and uses the existing
 immutable private stage. A changed config cannot redirect a reviewed launch.
+Public committed pack/template bounds remain with their typed source owners;
+the private production-config capture limit does not impose a new Git-blob limit.
 
 Migration-only manifest selection, exact ledger prefix/order, schema assertions,
 recovery chronology, canary/qualification joins and production eligibility stay

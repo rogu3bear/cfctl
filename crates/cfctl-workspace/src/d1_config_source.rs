@@ -80,9 +80,9 @@ impl D1ConfigSource<'_> {
                 return Err(rejected());
             }
             let bytes = git_blob(root, path)?.ok_or_else(rejected)?;
-            if bytes.len() > 1_048_576
-                || format!("sha256:{}", hex::encode(Sha256::digest(&bytes))) != digest
-            {
+            // Typed binders own public source limits. The separate private
+            // production-config capture limit must not narrow these Git blobs.
+            if format!("sha256:{}", hex::encode(Sha256::digest(&bytes))) != digest {
                 return Err(rejected());
             }
             Ok(bytes)

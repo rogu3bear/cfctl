@@ -113,12 +113,35 @@ pub(in crate::runtime) fn characterize(mut bind: impl FnMut(Value, &CallInput) -
     fs::write(&template_path, template).expect("restore template");
     let alias = root_path.join("alias.toml");
     symlink(&config_path, &alias).expect("config alias");
-    let mut alias_input = input;
+    let mut alias_input = input.clone();
     alias_input.query["config"] = json!(alias);
     assert!(
-        bind(common, &alias_input).is_err(),
+        bind(common.clone(), &alias_input).is_err(),
         "a config alias must not be canonicalized into authority"
     );
+    // Public committed source is not borrowed private input. The original
+    // consumers permit large comments in these documents while the private
+    // production config remains within its separate 1 MiB capture contract.
+    let mut public_source = common;
+    let padding = format!("#{}\n", "x".repeat(1_048_576));
+    for (path, digest_field) in [
+        (pack, "operation_pack_sha256"),
+        ("wrangler.toml", "config_template_sha256"),
+    ] {
+        let mut bytes = fs::read(root_path.join(path)).expect("committed public source");
+        bytes.extend_from_slice(padding.as_bytes());
+        fs::write(root_path.join(path), &bytes).expect("large public comments");
+        git(&["add", path]);
+        git(&["commit", "-qm", "large public source fixture"]);
+        public_source["repository_head"] = json!(git(&["rev-parse", "HEAD"]));
+        public_source[digest_field] =
+            json!(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))));
+        assert_eq!(
+            bind(public_source.clone(), &input)
+                .expect("public source keeps its existing size contract"),
+            expected
+        );
+    }
 }
 
 pub(in crate::runtime) fn extend(mut common: Value, extra: Value) -> Value {
