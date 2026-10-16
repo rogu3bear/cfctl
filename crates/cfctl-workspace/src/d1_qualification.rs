@@ -42,11 +42,13 @@ pub fn load_workspace_d1_qualification_source(
     capability_id: &str,
     mode: WorkspaceOperationLoad,
 ) -> Result<Option<BoundQualificationSource>> {
-    source_selected(
-        &super::operation_identity::discover(roots)?,
-        capability_id,
-        mode,
-    )
+    let candidates = super::operation_identity::discover(roots)?;
+    if super::operation_identity::unique_typed_owner(&candidates, PACK_PATH, capability_id)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    source_selected(&candidates, capability_id, mode)
 }
 
 pub(super) fn load_selected(
@@ -63,6 +65,12 @@ pub(super) fn load_selected(
         .iter()
         .find(|op| op.id == capability_id)
         .ok_or_else(|| invalid("qualification operation changed during bind"))?;
+    Ok(Some(capability(operation)))
+}
+
+fn capability(
+    operation: &cfctl_core::workspace_d1::transition::admission::Operation,
+) -> CapabilityV1 {
     let mut capability = CapabilityV1::new(
         &operation.id,
         &operation.title,
@@ -96,7 +104,7 @@ pub(super) fn load_selected(
     capability.verification.strategy = "workspace_d1_transition_qualification_source_v1".into();
     capability.adapter_status = AdapterStatus::Blocked;
     capability.blocked_reason = Some("Committed synthetic source is bound; native PlanV2 resource/permission/cost/executor/verifier admission is still required. Production transition execution remains disabled.".into());
-    Ok(Some(capability))
+    capability
 }
 
 fn source_selected(
@@ -125,7 +133,7 @@ fn source_selected(
     if !pack.operation.iter().any(|op| op.id == capability_id) {
         return Err(invalid("selected qualification id disappeared"));
     }
-    let transition = super::d1_operation::load_selected(
+    let transition = super::operation_identity::load_selected(
         std::slice::from_ref(&repository.path),
         &pack.transition_operation_id,
         mode,

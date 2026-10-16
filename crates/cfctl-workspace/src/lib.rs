@@ -31,7 +31,7 @@ mod operation_identity;
 mod operation_pack;
 pub use operation_identity::{
     WorkspaceOperationLoad, inspect_workspace_operation_capability,
-    load_workspace_operation_capability,
+    load_workspace_operation_capability, workspace_operation_is_claimed,
 };
 mod reply_subdomain_ingress;
 

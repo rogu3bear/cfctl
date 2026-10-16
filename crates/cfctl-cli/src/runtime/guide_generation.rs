@@ -121,6 +121,7 @@ pub(super) async fn resolve_command(
     // Workspace loaders resolve exact operation IDs, not natural-language
     // provider searches. A dirty or missing registered application must not
     // prevent discovering a provider capability or inspecting a workspace id.
+    super::support::reject_catalog_workspace_collision(store, &catalog, intent)?;
     let workspace = if catalog.get(intent).is_some() || intent.chars().any(char::is_whitespace) {
         None
     } else {

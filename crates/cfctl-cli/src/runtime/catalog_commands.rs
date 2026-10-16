@@ -60,6 +60,11 @@ pub(super) async fn catalog_command(
                 ));
             }
             let catalog = ensure_catalog(store).await?;
+            super::support::reject_catalog_workspace_collision(
+                store,
+                &catalog,
+                &selector.capability_id,
+            )?;
             let capability = if let Some(capability) = catalog.get(&selector.capability_id) {
                 capability.clone()
             } else {
@@ -250,6 +255,7 @@ pub(super) async fn guide_command(
         ));
     }
     let catalog = ensure_catalog(store).await?;
+    super::support::reject_catalog_workspace_collision(store, &catalog, capability_id)?;
     let capability = if let Some(capability) = catalog.get(capability_id) {
         capability.clone()
     } else {

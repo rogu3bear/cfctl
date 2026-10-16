@@ -362,6 +362,10 @@ pub(super) fn approve_plan(
 ) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&arguments.operation_id)?;
     let mut plan = load_validated_plan(store, &arguments.operation_id)?;
+    if store.paths().catalog_file().is_file() {
+        let catalog = CatalogSnapshot::load(&store.paths().catalog_file())?;
+        super::support::reject_catalog_workspace_collision(store, &catalog, &plan.capability.id)?;
+    }
     ensure_plan_execution_contract(store, &plan)?;
     let attestation = observation_attestation(store, &plan.capability)?;
     let scoped_store = store.with_observation_attestation(&attestation);
@@ -486,6 +490,7 @@ pub(super) async fn run_plan(
     let store = &scoped_store;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
+    super::support::reject_catalog_workspace_collision(store, &catalog, &plan.capability.id)?;
     ensure_plan_execution_contract(store, &plan)?;
     if plan.catalog_hash != catalog.schema_hash {
         return Err(CliError::Input(format!(
@@ -625,6 +630,10 @@ pub(super) async fn run_plan(
 /// consumption gate, where the authority's blast-radius bounds are validated
 /// against the exact resolved execution input and consumption is recorded
 /// against the authority instead of a per-operation approval.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the authority lock, identity admission, durable reservation and consumption in their auditable order."
+)]
 pub(super) async fn run_plan_under_standing_authority(
     store: &StateStore,
     operation_id: &str,
@@ -641,6 +650,7 @@ pub(super) async fn run_plan_under_standing_authority(
     store.bind_plan_authority_hash(operation_id, &authority_snapshot.content_hash)?;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, operation_id)?;
+    super::support::reject_catalog_workspace_collision(store, &catalog, &plan.capability.id)?;
     ensure_plan_execution_contract(store, &plan)?;
     if plan.catalog_hash != catalog.schema_hash {
         return Err(CliError::Input(format!(

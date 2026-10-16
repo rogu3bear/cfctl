@@ -234,12 +234,36 @@ pub(super) fn inspect_workspace_capability(
     )
 }
 
+/// Join independent authority inventories before applying either lookup path.
+/// Identity discovery does not bind a competitor or read its private config.
+pub(super) fn reject_catalog_workspace_collision(
+    store: &StateStore,
+    catalog: &cfctl_catalog::CatalogSnapshot,
+    capability_id: &str,
+) -> Result<()> {
+    if catalog.get(capability_id).is_some()
+        && cfctl_workspace::workspace_operation_is_claimed(
+            &store.workspace_roots()?,
+            capability_id,
+        )?
+    {
+        return Err(CliError::Input(format!(
+            "capability `{capability_id}` has conflicting provider and workspace ownership; resolve the committed identity collision before inspection or execution"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn workspace_capability_with_source(
     store: &StateStore,
     capability_id: &str,
     selection: Option<&cfctl_core::d1_read_inventory::D1ReadSourceSelectionV1>,
     mode: cfctl_workspace::WorkspaceOperationLoad,
 ) -> Result<Option<CapabilityV1>> {
+    if store.paths().catalog_file().is_file() {
+        let catalog = cfctl_catalog::CatalogSnapshot::load(&store.paths().catalog_file())?;
+        reject_catalog_workspace_collision(store, &catalog, capability_id)?;
+    }
     let roots = store.workspace_roots()?;
     let capability = if let Some(selection) = selection {
         Some(cfctl_workspace::load_workspace_d1_read_from_checkout(

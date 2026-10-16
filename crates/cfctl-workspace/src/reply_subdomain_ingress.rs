@@ -8,21 +8,23 @@ use cfctl_core::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    RegisteredRoot, Result, WorkspaceError, WorkspaceGraph, git_blob, git_optional,
-    operation_identity::WorkspaceOperationLoad,
+    Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
 };
 
 pub const CAPABILITY_ID: &str = "star-maildesk-cf.reply-subdomain-ingress-read";
 pub const ACTIVATE_CAPABILITY_ID: &str = "star-maildesk-cf.reply-subdomain-ingress-activate";
 pub const PROJECTION: &str = "workspace_reply_subdomain_ingress_v1";
-const SURFACE_PATH: &str = "ops/cfctl/maildesk-cf.surface.md";
+pub(super) const SURFACE_PATH: &str = "ops/cfctl/maildesk-cf.surface.md";
 const CONSUMER_PATH: &str = "scripts/maildesk-control-plane-capabilities.ts";
 
 pub fn load_workspace_reply_subdomain_ingress_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    load_selected(roots, capability_id, WorkspaceOperationLoad::Execute)
+    Ok(
+        super::load_workspace_operation_capability(roots, capability_id)?
+            .filter(|capability| capability.workspace_reply_subdomain_ingress.is_some()),
+    )
 }
 
 pub(super) fn load_selected(
@@ -38,19 +40,17 @@ pub(super) fn load_selected(
     } else {
         "read"
     };
-    let registered = roots
-        .iter()
-        .filter(|path| path.is_dir())
-        .map(|path| RegisteredRoot::new(path))
-        .collect::<Vec<_>>();
-    let graph = WorkspaceGraph::discover(&registered)?;
     let mut matches = Vec::new();
-    for repository in &graph.repositories {
-        let surface_path = repository.path.join(SURFACE_PATH);
-        let consumer_path = repository.path.join(CONSUMER_PATH);
-        if !surface_path.is_file() || !consumer_path.is_file() {
+    for root in roots {
+        if !claims_identity(root, capability_id)? {
             continue;
         }
+        let mut repositories = std::collections::BTreeMap::new();
+        super::register_repository(root, &mut repositories)?;
+        let repository = repositories
+            .values()
+            .next()
+            .ok_or_else(|| invariant("selected ingress owner disappeared"))?;
         if mode.requires_clean_worktree() && repository.git.dirty {
             return Err(invariant(format!(
                 "reply-subdomain ingress authority repository `{}` must be clean",
@@ -89,6 +89,16 @@ pub(super) fn load_selected(
             "workspace operation id `{capability_id}` is ambiguous across {count} registered repositories"
         ))),
     }
+}
+
+pub(super) fn claims_identity(repository: &std::path::Path, capability_id: &str) -> Result<bool> {
+    if !matches!(capability_id, CAPABILITY_ID | ACTIVATE_CAPABILITY_ID) {
+        return Ok(false);
+    }
+    Ok(
+        git_blob(repository, std::path::Path::new(SURFACE_PATH))?.is_some()
+            && git_blob(repository, std::path::Path::new(CONSUMER_PATH))?.is_some(),
+    )
 }
 
 fn capability(contract: WorkspaceReplySubdomainIngressContractV1) -> CapabilityV1 {

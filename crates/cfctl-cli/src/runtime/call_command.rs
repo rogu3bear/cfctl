@@ -88,6 +88,13 @@ pub(super) async fn call_command(
     } else {
         None
     };
+    if let Some(catalog) = &cached {
+        super::support::reject_catalog_workspace_collision(
+            store,
+            catalog,
+            &arguments.capability_id,
+        )?;
+    }
     let workspace_read = if source_selection.is_some()
         || (arguments.max_pages.is_none()
             && cached
@@ -123,6 +130,7 @@ pub(super) async fn call_command(
     } else {
         ensure_catalog(store).await?
     };
+    super::support::reject_catalog_workspace_collision(store, &catalog, &arguments.capability_id)?;
     let capability = if let Some(capability) = workspace_read {
         capability
     } else if let Some(capability) = catalog.get(&arguments.capability_id) {

@@ -344,3 +344,115 @@ async fn entitlement_read_cancellation_cannot_become_a_successful_empty_inventor
         assert!(response.is_err(), "cancellation is incomplete evidence");
     }
 }
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The same conflicting source is exercised through all four public lookup entrypoints."
+)]
+async fn workspace_claim_cannot_shadow_a_provider_catalog_identity() {
+    use super::*;
+    use clap::Parser as _;
+    let root = tempfile::tempdir().expect("root");
+    let store = authenticated_test_store(RuntimePaths::from_root(&root.path().join("state")));
+    let source = root.path().join("source");
+    fs::create_dir_all(source.join(".cfctl/operations")).expect("source");
+    let id = "r2-get-bucket";
+    let snapshot = oauth_r2_catalog();
+    assert!(snapshot.get(id).is_some());
+    snapshot
+        .save(&store.paths().catalog_file())
+        .expect("fresh synthetic catalog");
+    fs::write(
+        source.join(".cfctl/operations/d1-evidence.toml"),
+        format!("schema_version = 1\n[[operation]]\nid = {id:?}\n"),
+    )
+    .expect("competing selected claim");
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .output()
+                .expect("git")
+                .status
+                .success()
+        );
+    }
+    store
+        .register_workspace(&source, None)
+        .expect("registered source");
+    let result = catalog_command(
+        &store,
+        CatalogCommand::Show(CapabilitySelector {
+            capability_id: id.into(),
+            source_checkout: crate::source_checkout::SourceCheckoutArgs::default(),
+        }),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "provider preference must not erase a competing workspace claim"
+    );
+    assert!(
+        result
+            .expect_err("collision")
+            .to_string()
+            .contains("provider and workspace")
+    );
+    let parsed =
+        crate::Cli::try_parse_from(["cfctl", "call", id, "--json"]).expect("public call grammar");
+    let Some(crate::Command::Call(arguments)) = parsed.command else {
+        panic!("call parser");
+    };
+    assert!(
+        Box::pin(call_command(&store, arguments))
+            .await
+            .expect_err("call collision before credentials")
+            .to_string()
+            .contains("provider and workspace")
+    );
+    let result = guide_command(
+        &store,
+        &crate::GuideArgs {
+            capability_id: Some(id.into()),
+            topic: None,
+            source_checkout: crate::source_checkout::SourceCheckoutArgs::default(),
+        },
+    )
+    .await;
+    assert!(
+        result
+            .expect_err("guide collision")
+            .to_string()
+            .contains("provider and workspace")
+    );
+    let result = resolve_command(
+        &store,
+        crate::ResolveArgs {
+            intent: id.into(),
+            account: None,
+            limit: 5,
+        },
+    )
+    .await;
+    assert!(
+        result
+            .expect_err("resolve collision")
+            .to_string()
+            .contains("provider and workspace")
+    );
+}

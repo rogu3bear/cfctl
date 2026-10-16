@@ -84,3 +84,33 @@ fn qualification_population_rejects_noninventory_input() {
     let (root, source) = fixture();
     assert!(bind_inventory(root.path(), &source, WorkspaceOperationLoad::Inspect).is_err());
 }
+
+#[test]
+fn every_declared_qualification_resource_role_stays_blocked() {
+    use cfctl_core::workspace_d1::transition::admission::{Operation, REQUIRED_ROLES};
+    use cfctl_core::{AdapterStatus, CapabilityAuthorityScopeV1};
+    // Scope: the actual nine-role source vocabulary and the production factory,
+    // not an alternate inventory of catalog support states.
+    for role in REQUIRED_ROLES {
+        let operation = Operation {
+            id: format!("fixture.{role:?}"),
+            title: "Source fixture".into(),
+            description: "Frozen source, no provider admission".into(),
+            role,
+        };
+        let capability = super::capability(&operation);
+        assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+        assert_eq!(
+            capability.authority_scope,
+            Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
+        );
+        assert_eq!(capability.path, role.path());
+        assert_eq!(capability.mutating, role.mutates());
+        assert!(
+            capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+    }
+}

@@ -165,7 +165,15 @@ pub fn revalidate_workspace_d1_read_registration(
             "selected read operation owner is no longer uniquely registered",
         ));
     }
-    if bind(&owner, &binding.selection)? != *binding
+    let checkout = PathBuf::from(&binding.selection.checkout_root);
+    if operation_identity::unique_typed_owner(
+        std::slice::from_ref(&checkout),
+        D1_READ_PACK_PATH,
+        &contract.operation.id,
+    )?
+    .as_ref()
+        != Some(&checkout)
+        || bind(&owner, &binding.selection)? != *binding
         || git(&owner, &["config", "--get", "remote.origin.url"])? != contract.repository_origin
         || contract.repository_root != binding.selection.checkout_root
         || contract.repository_head != binding.selection.head
@@ -194,8 +202,6 @@ pub fn revalidate_workspace_d1_read_registration(
 }
 
 fn unique_read_owner(candidates: &[PathBuf], id: &str) -> Result<PathBuf> {
-    super::operation_claims::unique_pack_claim(candidates, id)?
-        .filter(|(_, pack)| pack == Path::new(D1_READ_PACK_PATH))
-        .map(|(owner, _)| owner)
+    operation_identity::unique_typed_owner(candidates, D1_READ_PACK_PATH, id)?
         .ok_or_else(|| invalid("source selection requires one registered D1 read operation owner"))
 }

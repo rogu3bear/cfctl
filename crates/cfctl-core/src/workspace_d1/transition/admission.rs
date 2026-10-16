@@ -28,6 +28,20 @@ pub enum Role {
     Policy,
 }
 
+/// Exact source roles required by a qualification pack. Registration of these
+/// declarations never supplies their independent provider admission.
+pub const REQUIRED_ROLES: [Role; 9] = [
+    Role::Create,
+    Role::Seed,
+    Role::Execute,
+    Role::Writer,
+    Role::Poll,
+    Role::Cleanup,
+    Role::Population,
+    Role::Aggregate,
+    Role::Policy,
+];
+
 impl Role {
     #[must_use]
     pub const fn path(self) -> &'static str {
@@ -116,7 +130,6 @@ fn source(value: &Source) -> bool {
 
 impl Pack {
     pub fn validate(&self) -> Result<(), &'static str> {
-        use Role::{Aggregate, Cleanup, Create, Execute, Policy, Poll, Population, Seed, Writer};
         let roles: BTreeSet<_> = self.operation.iter().map(|op| op.role).collect();
         let ids: BTreeSet<_> = self.operation.iter().map(|op| op.id.as_str()).collect();
         if self.schema_version != 1
@@ -125,11 +138,8 @@ impl Pack {
             || self.maximum_live_databases != 1
             || self.maximum_database_lifetimes != 10
             || self.resets_allowed
-            || self.operation.len() != 9
-            || roles
-                != BTreeSet::from([
-                    Create, Seed, Execute, Writer, Poll, Cleanup, Population, Aggregate, Policy,
-                ])
+            || self.operation.len() != REQUIRED_ROLES.len()
+            || roles != BTreeSet::from(REQUIRED_ROLES)
             || ids.len() != self.operation.len()
             || self.operation.iter().any(|op| {
                 !valid_id(&op.id)
@@ -143,7 +153,7 @@ impl Pack {
         let population = self
             .operation
             .iter()
-            .find(|op| op.role == Population)
+            .find(|op| op.role == Role::Population)
             .ok_or("qualification population operation missing")?;
         let required = BTreeSet::from([
             Case::Success,

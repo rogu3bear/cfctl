@@ -10,13 +10,12 @@
 //! until semantic equivalence tests pass.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
-use cfctl_core::{CapabilityV1, WorkspaceOperationContractV1};
+use cfctl_core::CapabilityV1;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::{
     Result, WorkspaceError, git_blob, git_optional, operation_identity::WorkspaceOperationLoad,
@@ -28,7 +27,6 @@ const WORKSPACE_OPERATION_CONTRACT: &str = "workspace_operation_v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct PackV2 {
     schema_version: u8,
     contract: String,
@@ -37,7 +35,6 @@ struct PackV2 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct OperationV2 {
     id: String,
     title: String,
@@ -45,21 +42,20 @@ struct OperationV2 {
     substrate: SubstrateV2,
     effect: EffectV2,
     #[serde(default)]
-    input: Vec<InputV2>,
+    input: Vec<toml::Value>,
     verification: VerificationV2,
     #[serde(default)]
-    evidence: Option<EvidenceV2>,
+    evidence: Option<toml::Value>,
     #[serde(default)]
     projection: Option<ProjectionV2>,
     #[serde(default)]
-    compensation: Option<CompensationV2>,
+    compensation: Option<toml::Value>,
     #[serde(default)]
-    compiler: Option<CompilerV2>,
+    compiler: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct SubstrateV2 {
     adapter: String,
     #[serde(default)]
@@ -76,7 +72,6 @@ struct SubstrateV2 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct EffectV2 {
     mutates: bool,
     #[serde(default)]
@@ -87,22 +82,10 @@ struct EffectV2 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct InputV2 {
-    name: String,
-    #[serde(rename = "type")]
-    value_type: String,
-    #[serde(default)]
-    required: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct VerificationV2 {
     strategy: VerificationStrategyV2,
     #[serde(default)]
-    digest: Vec<DigestV2>,
+    digest: Vec<toml::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -114,39 +97,8 @@ enum VerificationStrategyV2 {
     CardinalityDigest,
 }
 
-impl VerificationStrategyV2 {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::RowShape => "row_shape",
-            Self::AssertionRows => "assertion_rows",
-            Self::DigestReadback => "digest_readback",
-            Self::CardinalityDigest => "cardinality_digest",
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct DigestV2 {
-    key: String,
-    source: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct EvidenceV2 {
-    adapter: String,
-    #[serde(default)]
-    required_keys: Vec<String>,
-    #[serde(default)]
-    exact_keys: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct ProjectionV2 {
     #[serde(default)]
     name: Option<String>,
@@ -154,30 +106,6 @@ struct ProjectionV2 {
     columns: Vec<String>,
     #[serde(default)]
     raw_digest_columns: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct CompensationV2 {
-    #[serde(default)]
-    recovery_capability_id: Option<String>,
-    #[serde(default)]
-    recovery_max_age_seconds: Option<u64>,
-    #[serde(default)]
-    rollback_capability_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct CompilerV2 {
-    path: String,
-    sha256: String,
-    runtime: String,
-    runtime_version: String,
-    runtime_sha256: String,
-    input_contract: String,
 }
 
 pub(super) fn load_selected(
@@ -277,7 +205,21 @@ fn bind_v2(
     )
     .map_err(|error| invariant(format!("workspace operation pack is invalid: {error}")))?;
     if pack.schema_version != 2 || pack.contract != WORKSPACE_OPERATION_CONTRACT {
-        return Ok(None);
+        return Err(invariant(
+            "selected workspace operation format or schema is unsupported",
+        ));
+    }
+    if pack
+        .operation
+        .iter()
+        .map(|operation| &operation.id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != pack.operation.len()
+    {
+        return Err(invariant(
+            "workspace operation ids are ambiguous within the committed pack",
+        ));
     }
     let Some(operation) = pack
         .operation
@@ -301,22 +243,6 @@ fn bind_v2(
     let origin = git_optional(&repository.path, &["config", "--get", "remote.origin.url"])?
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invariant("workspace operation repository has no origin"))?;
-    let bound = WorkspaceOperationContractV1 {
-        repository_root: repository.path.display().to_string(),
-        repository_head: head.to_owned(),
-        repository_origin: origin.clone(),
-        operation_pack_path: pack_path.display().to_string(),
-        operation_pack_sha256: format!("sha256:{}", hex::encode(Sha256::digest(pack_bytes))),
-        id: operation.id.clone(),
-        substrate_adapter: operation.substrate.adapter.clone(),
-        mutates: operation.effect.mutates,
-        verification_strategy: operation.verification.strategy.as_str().to_owned(),
-    };
-    if bound.id != capability_id || bound.verification_strategy.is_empty() {
-        return Err(invariant(
-            "workspace operation identity drifted during bind",
-        ));
-    }
     bind_axes(
         repository, mode, pack_path, pack_bytes, head, origin, operation,
     )
@@ -341,6 +267,7 @@ fn bind_axes(
         )
         && operation.compiler.is_none()
     {
+        validate_supported_declaration(operation)?;
         let declaration =
             super::d1_evidence::OperationDeclaration {
                 id: operation.id.clone(),
@@ -394,6 +321,60 @@ fn bind_axes(
     )))
 }
 
+// The generic carrier currently selects a fixed typed read. It cannot alter
+// that read's query, projected row contract, authority or acceptance predicates.
+fn validate_supported_declaration(operation: &OperationV2) -> Result<()> {
+    if !operation.effect.performs_on_call
+        || !operation.effect.tables.is_empty()
+        || !operation.input.is_empty()
+        || !operation.verification.digest.is_empty()
+        || operation.evidence.is_some()
+        || operation.compensation.is_some()
+    {
+        return Err(invariant(
+            "workspace D1 evidence requires performs_on_call=true and no custom input, effect tables, verification digests, evidence or compensation declarations",
+        ));
+    }
+    let projection = operation
+        .projection
+        .as_ref()
+        .ok_or_else(|| invariant("workspace D1 evidence pack omitted projection.name"))?;
+    if !projection.raw_digest_columns.is_empty() {
+        return Err(invariant(
+            "workspace D1 evidence does not support raw_digest_columns",
+        ));
+    }
+    let expected: BTreeSet<&str> = match projection.name.as_deref() {
+        Some("maildesk_v1") => super::d1_evidence::MAILDESK_D1_EVIDENCE_COLUMNS_V1
+            .iter()
+            .chain(super::d1_evidence::MAILDESK_D1_POLICY_IDENTITY_COLUMNS_V2)
+            .chain(super::d1_evidence::MAILDESK_D1_ROUTE_HEALTH_COLUMNS_V2)
+            .copied()
+            .collect(),
+        Some(super::d1_evidence::MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1) => {
+            super::d1_evidence::MAILDESK_INBOUND_ACCEPTANCE_COLUMNS_V1
+                .iter()
+                .copied()
+                .collect()
+        }
+        _ => return Ok(()), // The existing typed binder rejects an unknown projection.
+    };
+    if !projection.columns.is_empty()
+        && (projection.columns.len() != expected.len()
+            || projection
+                .columns
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                != expected)
+    {
+        return Err(invariant(
+            "projection.columns must equal the complete fixed typed projection; a narrowed or enlarged declaration is unsupported",
+        ));
+    }
+    Ok(())
+}
+
 fn invariant(message: impl Into<String>) -> WorkspaceError {
     WorkspaceError::DiscoveryInvariant(message.into())
 }
@@ -409,6 +390,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::{fs, process::Command};
     use tempfile::TempDir;
 
@@ -422,7 +404,7 @@ mod tests {
         assert!(status.success());
     }
 
-    const V2_EVIDENCE: &str = r#"schema_version = 2
+    pub(super) const V2_EVIDENCE: &str = r#"schema_version = 2
 contract = "workspace_operation_v1"
 
 [[operation]]
@@ -447,10 +429,10 @@ strategy = "row_shape"
 
 [operation.projection]
 name = "maildesk_v1"
-columns = ["active_policy_digest"]
+columns = []
 "#;
 
-    fn fixture(pack: &str) -> TempDir {
+    pub(super) fn fixture(pack: &str) -> TempDir {
         let root = tempfile::tempdir().expect("temp repository");
         git(root.path(), &["init", "-q"]);
         git(root.path(), &["config", "user.email", "test@example.com"]);
@@ -476,7 +458,7 @@ columns = ["active_policy_digest"]
         root
     }
 
-    fn fixture_named(relative: &str, pack: &str) -> TempDir {
+    pub(super) fn fixture_named(relative: &str, pack: &str) -> TempDir {
         let root = tempfile::tempdir().expect("temp repository");
         git(root.path(), &["init", "-q"]);
         git(root.path(), &["config", "user.email", "test@example.com"]);
@@ -630,3 +612,7 @@ wrangler_version = "4.100.0"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "operation_pack/rectification_tests.rs"]
+mod rectification_tests;

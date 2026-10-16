@@ -45,32 +45,124 @@ fn load_with(
     capability_id: &str,
     mode: WorkspaceOperationLoad,
 ) -> Result<Option<cfctl_core::CapabilityV1>> {
-    let candidates = discover(roots)?;
-    // Resolve committed ownership before a binder's ordering can select a
-    // different carrier for the same logical operation.
-    super::operation_claims::unique_pack_claim(&candidates, capability_id)?;
-    if let Some(capability) =
-        super::operation_pack::load_selected(&candidates, capability_id, mode)?
-    {
-        return Ok(Some(capability));
-    }
-    for loader in [
-        super::d1_operation::load_selected,
-        super::d1_qualification::load_selected,
-        super::d1_policy_projection::load_selected,
-        super::d1_reply_admission::load_selected,
-        super::d1_reads::load_selected,
-    ] {
-        if let Some(capability) = loader(&candidates, capability_id, mode)? {
-            return Ok(Some(capability));
+    load_selected(&discover(roots)?, capability_id, mode)
+}
+
+pub(super) fn load_selected(
+    candidates: &[PathBuf],
+    capability_id: &str,
+    mode: WorkspaceOperationLoad,
+) -> Result<Option<cfctl_core::CapabilityV1>> {
+    let Some(claim) = unique_claim(candidates, capability_id)? else {
+        return Ok(None);
+    };
+    let selected = std::slice::from_ref(&claim.repository);
+    let capability = match claim.carrier {
+        Carrier::Generic => super::operation_pack::load_selected(selected, capability_id, mode),
+        Carrier::Migration => super::d1_operation::load_selected(selected, capability_id, mode),
+        Carrier::Qualification => {
+            super::d1_qualification::load_selected(selected, capability_id, mode)
         }
+        Carrier::Projection => {
+            super::d1_policy_projection::load_selected(selected, capability_id, mode)
+        }
+        Carrier::Reply => super::d1_reply_admission::load_selected(selected, capability_id, mode),
+        Carrier::Reads => super::d1_reads::load_selected(selected, capability_id, mode),
+        Carrier::Evidence => super::d1_evidence::load_selected(selected, capability_id, mode),
+        Carrier::Ingress => {
+            super::reply_subdomain_ingress::load_selected(selected, capability_id, mode)
+        }
+    }?;
+    capability.map(Some).ok_or_else(|| WorkspaceError::DiscoveryInvariant(
+        "the selected workspace declaration has no supported binding; no alternative owner may replace it".into()
+    ))
+}
+
+/// Identity-only observation for joining the independent provider catalog.
+/// A claim is not proof of supported semantics, clean source or executability.
+pub fn workspace_operation_is_claimed(roots: &[PathBuf], capability_id: &str) -> Result<bool> {
+    Ok(unique_claim(&discover(roots)?, capability_id)?.is_some())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carrier {
+    Generic,
+    Migration,
+    Qualification,
+    Projection,
+    Reply,
+    Reads,
+    Evidence,
+    Ingress,
+}
+impl Carrier {
+    fn typed_pack(path: &Path) -> Option<Self> {
+        [
+            (super::d1_operation::PACK_RELATIVE_PATH, Self::Migration),
+            (
+                cfctl_core::workspace_d1::transition::admission::PACK_PATH,
+                Self::Qualification,
+            ),
+            (
+                super::d1_policy_projection::PACK_RELATIVE_PATH,
+                Self::Projection,
+            ),
+            (super::d1_reply_admission::PACK_RELATIVE_PATH, Self::Reply),
+            (
+                cfctl_core::d1_read_inventory::D1_READ_PACK_PATH,
+                Self::Reads,
+            ),
+            (super::d1_evidence::PACK_RELATIVE_PATH, Self::Evidence),
+        ]
+        .into_iter()
+        .find_map(|(name, carrier)| (path == Path::new(name)).then_some(carrier))
     }
-    if let Some(capability) =
-        super::reply_subdomain_ingress::load_selected(roots, capability_id, mode)?
-    {
-        return Ok(Some(capability));
-    }
-    super::d1_evidence::load_selected(&candidates, capability_id, mode)
+}
+struct Claim {
+    repository: PathBuf,
+    pack: PathBuf,
+    carrier: Carrier,
+}
+
+fn unique_claim(candidates: &[PathBuf], capability_id: &str) -> Result<Option<Claim>> {
+    let Some((repository, pack)) =
+        super::operation_claims::unique_pack_claim(candidates, capability_id)?
+    else {
+        return Ok(None);
+    };
+    let carrier = if pack == Path::new(super::reply_subdomain_ingress::SURFACE_PATH) {
+        Carrier::Ingress
+    } else {
+        let bytes = git_blob(&repository, &pack)?.ok_or_else(|| {
+            WorkspaceError::DiscoveryInvariant("selected committed operation disappeared".into())
+        })?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            WorkspaceError::DiscoveryInvariant("committed operation pack is not UTF-8".into())
+        })?;
+        let document: toml::Value = toml::from_str(text).map_err(|_| {
+            WorkspaceError::DiscoveryInvariant("committed operation pack is invalid TOML".into())
+        })?;
+        if super::operation_pack::declares_workspace_operation_contract(&document) {
+            Carrier::Generic
+        } else {
+            Carrier::typed_pack(&pack).ok_or_else(|| {
+                WorkspaceError::DiscoveryInvariant("selected operation carrier is unsupported".into())
+            })?
+        }
+    };
+    Ok(Some(Claim { repository, pack, carrier }))
+}
+
+// Explicit linked-checkout and typed source consumers keep their selected scope,
+// but their selector cannot waive cross-carrier or in-pack uniqueness.
+pub(super) fn unique_typed_owner(
+    candidates: &[PathBuf],
+    pack: &str,
+    id: &str,
+) -> Result<Option<PathBuf>> {
+    Ok(unique_claim(candidates, id)?
+        .filter(|claim| claim.carrier != Carrier::Generic && claim.pack == Path::new(pack))
+        .map(|claim| claim.repository))
 }
 
 #[cfg(test)]
@@ -132,19 +224,13 @@ pub(super) fn contains(repository: &Path, pack: &str, capability_id: &str) -> Re
     let Some(bytes) = git_blob(repository, Path::new(pack))? else {
         return Ok(false);
     };
-    let invalid = WorkspaceError::DiscoveryInvariant;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| invalid("committed operation pack is not UTF-8".to_owned()))?;
-    let value: toml::Value = toml::from_str(text)
-        .map_err(|error| invalid(format!("committed operation pack is invalid: {error}")))?;
-    Ok(value
-        .get("operation")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|operations| {
-            operations.iter().any(|operation| {
-                operation.get("id").and_then(toml::Value::as_str) == Some(capability_id)
-            })
-        }))
+    let count = matching_ids(&pack_document(&bytes)?, capability_id);
+    if count > 1 {
+        return Err(WorkspaceError::DiscoveryInvariant(
+            "workspace operation id is ambiguous within its committed pack".into(),
+        ));
+    }
+    Ok(count == 1)
 }
 
 #[cfg(test)]

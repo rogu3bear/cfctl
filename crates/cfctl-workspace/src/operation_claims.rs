@@ -34,6 +34,16 @@ pub(super) fn unique_pack_claim(
                 selected = Some((repository.clone(), path.clone()));
             }
         }
+        // The ingress contract is another committed carrier, not a binder
+        // fallback that can override an existing pack declaration.
+        if super::reply_subdomain_ingress::claims_identity(repository, capability_id)? {
+            if selected.is_some() {
+                return Err(invalid(&format!(
+                    "workspace operation id `{capability_id}` is ambiguous across committed pack declarations"
+                )));
+            }
+            selected = Some((repository.clone(), super::reply_subdomain_ingress::SURFACE_PATH.into()));
+        }
     }
     Ok(selected)
 }

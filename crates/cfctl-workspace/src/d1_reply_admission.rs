@@ -59,10 +59,9 @@ pub fn load_workspace_d1_reply_admission_capability(
     roots: &[PathBuf],
     capability_id: &str,
 ) -> Result<Option<CapabilityV1>> {
-    load_selected(
-        &super::operation_identity::discover(roots)?,
-        capability_id,
-        WorkspaceOperationLoad::Execute,
+    Ok(
+        super::load_workspace_operation_capability(roots, capability_id)?
+            .filter(|capability| capability.workspace_d1_reply_admission.is_some()),
     )
 }
 
