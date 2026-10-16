@@ -241,6 +241,9 @@ replay. Synthetic diagnostics are not provider responses. Known responses remain
 attached to the original operation through apply-evidence, journal, secret-sink,
 verification, cleanup and closure failures. Mutations have no automatic retry;
 explicit multi-stage protocols keep their separately bounded stages.
+An already-persisted verification result also survives a later local closure
+failure: command success remains false, while its completed verification state,
+basis and evidence remain visible under the original consumed operation.
 
 Borrowed private input and managed private storage retain distinct policies.
 `cfctl-storage` captures borrowed input through a no-follow descriptor, validates

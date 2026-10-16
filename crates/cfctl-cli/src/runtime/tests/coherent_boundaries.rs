@@ -526,6 +526,126 @@ async fn mutation_boundary_launched_process_cannot_be_erased_by_receipt_boolean(
 }
 
 #[cfg(unix)]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One actual process, persisted verification and final-save fault prove the complete retention sequence."
+)]
+async fn delegated_final_save_failure_retains_durable_verification_facts() {
+    use super::super::api_execution::{FINALIZATION_TEST_HOOK, FinalizationTestStage};
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().expect("runtime");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
+    let program = root.path().join("success.sh");
+    fs::write(&program, "#!/bin/sh\nexit 0\n").expect("actual process fixture");
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).expect("mode");
+    let mut capability = CapabilityV1::new("wrangler.deploy", "Fixture", "CLI", "wrangler deploy");
+    capability.adapter_status = AdapterStatus::DelegatedCli;
+    // Exercise the actual verifier's local refusal, without provider access.
+    capability.verification.strategy = "fixture_unavailable".into();
+    let mut plan = PlanV1::draft(
+        "fixture",
+        "account",
+        "catalog-fixture",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+        .expect("intent");
+    store.save_plan(&plan).expect("persist intent");
+    let cache = root.path().join("process-cache");
+    fs::create_dir(&cache).expect("cache");
+    let input = CallInput {
+        selectors: json!({}),
+        query: json!({}),
+        ..CallInput::default()
+    };
+    let credential = AuthCredential::Bearer {
+        token: "synthetic-only".into(),
+    };
+    let boundary = cfctl_core::BoundaryObservation::default();
+    let receipt = run_delegated_cli_with_timeout(
+        &plan.capability,
+        &input,
+        &credential,
+        Some("account"),
+        &cache,
+        Some(&program),
+        Some(Path::new("/bin/sh")),
+        Duration::from_secs(1),
+        Some(&boundary),
+    )
+    .await
+    .expect("real process receipt");
+    assert_eq!(receipt["exit_status"], 0);
+    let plans = store.paths().data_dir.join("plans");
+    let retained = root.path().join("retained-plans");
+    let fault = std::sync::Arc::new(move |stage| {
+        if stage == FinalizationTestStage::Closure {
+            fs::rename(&plans, &retained).expect("preserve consumed journal");
+            fs::write(&plans, "block final save").expect("final save fault");
+        }
+    });
+    let catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: String::new(),
+        source_hash: String::new(),
+        schema_hash: "catalog-fixture".into(),
+        capabilities: BTreeMap::new(),
+    };
+    let envelope = FINALIZATION_TEST_HOOK
+        .scope(
+            fault,
+            complete_delegated_plan(
+                &store,
+                &catalog,
+                &mut plan,
+                &input,
+                &credential,
+                &MemorySecretStore::default(),
+                DelegatedReceipt {
+                    value: receipt,
+                    boundary,
+                },
+            ),
+        )
+        .await;
+    assert!(!envelope.ok);
+    assert!(envelope.performed);
+    assert_eq!(
+        envelope.operation_id.as_deref(),
+        Some(plan.operation_id.as_str())
+    );
+    assert_eq!(envelope.result["exit_status"], 0);
+    assert_eq!(
+        envelope.verification.state,
+        VerificationState::Failed,
+        "a final local save failure must not erase a completed verification result"
+    );
+    assert!(
+        envelope
+            .verification
+            .basis
+            .as_deref()
+            .is_some_and(|basis| basis.contains("fixture_unavailable"))
+    );
+    let verification = envelope
+        .evidence
+        .iter()
+        .find(|item| item.class == EvidenceClass::PostChangeVerification)
+        .expect("retain already persisted verification evidence");
+    let value = store
+        .read_evidence_value(&verification.content_hash)
+        .expect("read verification");
+    assert_eq!(value["passed"], false);
+    assert!(plan.mark_consumed().is_err());
+}
+
+#[cfg(unix)]
 #[test]
 fn private_credential_capture_refuses_terminal_symlinks_and_hard_links() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};

@@ -30,6 +30,14 @@ pub(super) struct DelegatedReceipt {
     pub(super) boundary: BoundaryObservation,
 }
 
+/// Present only after both the verification evidence and its journal checkpoint
+/// were saved. A later closure failure cannot erase these completed facts.
+struct CompletedDelegatedVerification {
+    state: VerificationState,
+    basis: String,
+    evidence: EvidenceV1,
+}
+
 pub(super) async fn execute_delegated_plan(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -104,6 +112,7 @@ pub(super) async fn complete_delegated_plan(
                 None,
                 &CliError::Storage(error),
                 performed,
+                None,
             );
         }
     };
@@ -117,10 +126,12 @@ pub(super) async fn complete_delegated_plan(
             Some(evidence),
             &error,
             performed,
+            None,
         );
     }
-    let recovery_receipt = receipt.clone();
+    let mut recovery_receipt = receipt.clone();
     let recovery_evidence = evidence.clone();
+    let mut completed_verification = None;
     let result = async {
     if !performed {
         return Ok(pre_mutation_refusal_envelope(plan, receipt, evidence));
@@ -148,6 +159,7 @@ pub(super) async fn complete_delegated_plan(
     {
         receipt["verified_deployment"] = identity.clone();
     }
+    recovery_receipt = receipt.clone();
     let verification_evidence =
         store.write_observation_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
@@ -174,6 +186,15 @@ pub(super) async fn complete_delegated_plan(
             "evidence_hash": verification_evidence.content_hash,
         }),
     )?;
+    completed_verification = Some(CompletedDelegatedVerification {
+        state: if passed { VerificationState::Passed } else { VerificationState::Failed },
+        basis: basis.clone(),
+        evidence: verification_evidence.clone(),
+    });
+    #[cfg(test)]
+    let _ = super::api_execution::FINALIZATION_TEST_HOOK.try_with(|hook| {
+        hook(super::api_execution::FinalizationTestStage::Closure);
+    });
     if passed {
         persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
     } else {
@@ -216,17 +237,19 @@ pub(super) async fn complete_delegated_plan(
             Some(recovery_evidence),
             &error,
             performed,
+            completed_verification,
         ),
     }
 }
 
-pub(super) fn delegated_post_response_failure(
+fn delegated_post_response_failure(
     store: &StateStore,
     plan: &mut PlanV1,
     receipt: Value,
     evidence: Option<EvidenceV1>,
     error: &CliError,
     performed: bool,
+    completed_verification: Option<CompletedDelegatedVerification>,
 ) -> ResultEnvelopeV2 {
     plan.status = PlanStatus::RectificationRequired;
     let persistence = if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted {
@@ -250,7 +273,7 @@ pub(super) fn delegated_post_response_failure(
             plan,
             stage,
             json!({"state":"recovery_required", "boundary_crossed":performed,
-                "receipt_available":true, "verification_completed":false}),
+                "receipt_available":true, "verification_completed":completed_verification.is_some()}),
         )
     } else {
         Err(CliError::Input(
@@ -264,7 +287,7 @@ pub(super) fn delegated_post_response_failure(
             format!("{error}; recovery persistence also failed: {persistence_error}")
         }
     };
-    super::api_boundary::post_boundary_failure_envelope(
+    let mut envelope = super::api_boundary::post_boundary_failure_envelope(
         plan,
         receipt,
         evidence,
@@ -272,7 +295,13 @@ pub(super) fn delegated_post_response_failure(
         &CliError::Input(message),
         performed,
         "the delegated boundary returned a receipt; local persistence or verification failed, so inspect the consumed plan and live state without replay",
-    )
+    );
+    if let Some(completed) = completed_verification {
+        envelope.evidence.push(completed.evidence);
+        envelope.verification.state = completed.state;
+        envelope.verification.basis = Some(completed.basis);
+    }
+    envelope
 }
 
 pub(super) fn persist_delegated_boundary_result(
