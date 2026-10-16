@@ -11,7 +11,7 @@ use super::{
     },
     read_execution::credential_generation_for_read,
     support::cli_io,
-    workspace_d1_migration,
+    workspace_d1_recovery,
 };
 use std::{fs, path::Component};
 
@@ -126,12 +126,11 @@ pub(super) fn prepare_plan_target(
     let Some(contract) = capability.workspace_d1_policy_projection.as_ref() else {
         return Ok(None);
     };
-    let config_contract = config_contract(contract);
-    let config = workspace_d1_migration::validated_config(&config_contract, input)?;
+    let config = super::workspace_d1_config::validated_config(contract.into(), input)?;
     let expected = expected_projection(input)?;
     let stage = stage_private_projection(store, source)?;
     let generation = credential_generation_for_read(profile)?;
-    let recovery = workspace_d1_migration::fresh_recovery_proof(
+    let recovery = workspace_d1_recovery::fresh_recovery_proof(
         store,
         catalog,
         input,
@@ -211,7 +210,7 @@ fn validate_bound_plan_inner(
     }
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let expected = expected_projection(&input)?;
-    let config = workspace_d1_migration::validated_config(&config_contract(contract), &input)?;
+    let config = super::workspace_d1_config::validated_config(contract.into(), &input)?;
     let target = target(plan)?;
     require_string(target, "repository_head", &contract.repository_head)?;
     require_string(
@@ -238,7 +237,7 @@ fn validate_bound_plan_inner(
     }
     validate_private_stage(store, target)?;
     if require_fresh_recovery {
-        workspace_d1_migration::validate_recovery_target(
+        workspace_d1_recovery::validate_recovery_target(
             store,
             target,
             &plan.catalog_hash,
@@ -246,7 +245,7 @@ fn validate_bound_plan_inner(
             Utc::now(),
         )
     } else {
-        workspace_d1_migration::validate_recovery_target_identity(
+        workspace_d1_recovery::validate_recovery_target_identity(
             store,
             target,
             &plan.catalog_hash,
@@ -260,6 +259,7 @@ pub(super) async fn run(
     store: &StateStore,
     plan: &PlanV1,
     credential: &AuthCredential,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<Value> {
     validate_bound_plan(store, plan)?;
     let contract = plan
@@ -276,7 +276,7 @@ pub(super) async fn run(
     let stage = private_stage(target)?;
     let stage_path = private_stage_path(store, stage)?;
 
-    let version = workspace_d1_migration::run_wrangler(
+    let version = super::workspace_d1_execution::run_wrangler(
         &["--version".to_owned()],
         Path::new(&contract.repository_root),
         credential,
@@ -286,14 +286,14 @@ pub(super) async fn run(
     )
     .await
     .map_err(CliError::delegated_mutation_not_attempted)?;
-    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
+    let observed_version = super::workspace_d1_execution::parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(
             "workspace D1 projection requires Wrangler {}, observed {}",
             contract.wrangler_version, observed_version
         )));
     }
-    let apply = workspace_d1_migration::run_wrangler_with_config_identity(
+    let apply = super::workspace_d1_execution::run_wrangler_with_config_identity(
         &[
             "d1".to_owned(),
             "execute".to_owned(),
@@ -312,6 +312,7 @@ pub(super) async fn run(
         config_sha256,
         &contract.config_template_sha256,
         &contract.database_binding,
+        Some(boundary),
     )
     .await?;
     Ok(json!({
@@ -402,7 +403,7 @@ async fn verify_inner_with_authority(
             CliError::Input("workspace D1 target omitted expected_route_count".to_owned())
         })?;
     let count_sql = route_count_sql(contract, policy_sha)?;
-    let count_rows = workspace_d1_migration::execute_json_query_with_config_identity(
+    let count_rows = super::workspace_d1_execution::execute_json_query_with_config_identity(
         database_name,
         &contract.database_binding,
         config,
@@ -431,7 +432,7 @@ async fn verify_inner_with_authority(
         desired_key = state_key(&contract.desired_state_digest_key)?,
         projection_key = state_key(&contract.projection_digest_key)?,
     );
-    let state_rows = workspace_d1_migration::execute_json_query_with_config_identity(
+    let state_rows = super::workspace_d1_execution::execute_json_query_with_config_identity(
         database_name,
         &contract.database_binding,
         config,
@@ -687,31 +688,6 @@ fn capture_projection(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
-}
-
-fn config_contract(
-    contract: &cfctl_core::WorkspaceD1PolicyProjectionContractV1,
-) -> cfctl_core::WorkspaceD1MigrationContractV1 {
-    cfctl_core::WorkspaceD1MigrationContractV1 {
-        repository_root: contract.repository_root.clone(),
-        repository_head: contract.repository_head.clone(),
-        repository_origin: contract.repository_origin.clone(),
-        operation_pack_path: contract.operation_pack_path.clone(),
-        operation_pack_sha256: contract.operation_pack_sha256.clone(),
-        config_template_path: contract.config_template_path.clone(),
-        config_template_sha256: contract.config_template_sha256.clone(),
-        production_config_path: contract.production_config_path.clone(),
-        migrations_dir: String::new(),
-        database_binding: contract.database_binding.clone(),
-        wrangler_version: contract.wrangler_version.clone(),
-        migrations: Vec::new(),
-        assertions: Vec::new(),
-        recovery_capability_id: contract.recovery_capability_id.clone(),
-        recovery_max_age_seconds: contract.recovery_max_age_seconds,
-        rollback_capability_id: contract.rollback_capability_id.clone(),
-        transition: None,
-        manifest_migration: None,
-    }
 }
 
 fn target(plan: &PlanV1) -> Result<&Map<String, Value>> {

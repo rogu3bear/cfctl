@@ -102,23 +102,6 @@ pub(super) fn receipt_is_complete(receipt: &Value) -> bool {
         && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
 }
 
-pub(super) fn is_unperformed_fresh_precondition_failure(receipt: &Value) -> bool {
-    receipt.get("adapter").and_then(Value::as_str) == Some(ACTIVATION_APPLY_PROJECTION)
-        && receipt.get("success").and_then(Value::as_bool) == Some(false)
-        && receipt.get("boundary_crossed").and_then(Value::as_bool) == Some(false)
-        && receipt.get("failure_code").and_then(Value::as_str)
-            == Some("CFCTL_WORKSPACE_REPLY_SUBDOMAIN_FRESH_PRECONDITION_FAILED")
-        && receipt
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| !status.is_empty())
-        && receipt
-            .get("provider_output_retained")
-            .and_then(Value::as_bool)
-            == Some(false)
-        && receipt.get("body_returned").and_then(Value::as_bool) == Some(false)
-}
-
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -690,6 +673,7 @@ pub(super) async fn run(
     store: &StateStore,
     plan: &PlanV1,
     credential: &AuthCredential,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<Value> {
     validate_bound_plan(store, plan)?;
     let catalog = ensure_catalog(store).await?;
@@ -716,7 +700,8 @@ pub(super) async fn run(
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let desired = target(&input, &plan.account_id)?;
     let bound = activation_target(plan)?;
-    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let executor = Executor::new(super::support::mutation_http_client()?, API_BASE_URL)?
+        .with_boundary_observation(boundary.clone());
     let parent_zone =
         match resolve_active_parent_zone_id(&executor, zone_capability, &desired, credential).await
         {
@@ -818,14 +803,20 @@ pub(super) async fn run(
         )
         .await
     else {
-        return Ok(activation_apply_receipt(plan, &desired, false, None, true));
+        return Ok(activation_apply_receipt(
+            plan,
+            &desired,
+            false,
+            None,
+            boundary.mutation_attempted(),
+        ));
     };
     Ok(activation_apply_receipt(
         plan,
         &desired,
         response.success,
         Some(response.status),
-        true,
+        boundary.mutation_attempted(),
     ))
 }
 

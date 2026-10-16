@@ -16,6 +16,10 @@ use cfctl_core::r2_restore::{
     RESTORE_ID, RestoreObservationKindV1 as ObservationKind, RestoreSelectionV1,
 };
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the one PUT, retained response and independent verification in one auditable consumed-operation sequence."
+)]
 pub(super) async fn execute(
     store: &StateStore,
     catalog_hash: &str,
@@ -52,50 +56,72 @@ pub(super) async fn execute(
             return Ok(no_response(store, plan, &error, &progress, secrets));
         }
     };
-    let (response_value, apply_evidence, lineage_evidence) =
-        match process_api_boundary_response(store, plan, &response, secrets)? {
-            ApiBoundaryResponseOutcome::Ready {
-                response_value,
-                apply_evidence,
-                lineage_evidence,
-            } => (response_value, apply_evidence, lineage_evidence),
-            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
-        };
-    let verification = if response.success {
-        persist_transaction_stage(
-            store,
-            plan,
-            TransactionStageV1::VerificationAttemptPersisted,
-        )?;
-        let result = readback_within_window(
-            &executor,
-            plan,
-            input,
-            &loaded.selection,
-            token_id,
-            credential,
-        )
-        .await;
-        let outcome = match result {
-            Ok(verification) => r2_restore_projection::persist_observation(
+    let (response_value, apply_evidence, lineage_evidence) = match process_api_boundary_response(
+        store,
+        plan,
+        &response,
+        secrets,
+        progress.put_attempted(),
+    )? {
+        ApiBoundaryResponseOutcome::Ready {
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+        } => (response_value, apply_evidence, lineage_evidence),
+        ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+    };
+    let verification_result = async {
+        if response.success {
+            persist_transaction_stage(
                 store,
                 plan,
+                TransactionStageV1::VerificationAttemptPersisted,
+            )?;
+            let result = readback_within_window(
+                &executor,
+                plan,
+                input,
                 &loaded.selection,
-                &loaded.source_window,
-                verification,
-                ObservationKind::ImmediatePostWrite,
-            )?,
-            Err(error) => verification_error_outcome(store, plan, &error)?,
-        };
-        persist_transaction_stage_with_artifact(
-            store,
-            plan,
-            TransactionStageV1::VerificationResponsePersisted,
-            verification_response_artifact(&outcome)?,
-        )?;
-        outcome
-    } else {
-        verify_api_plan(store, &executor, plan, &response, input, credential).await?
+                token_id,
+                credential,
+            )
+            .await;
+            let outcome = match result {
+                Ok(verification) => r2_restore_projection::persist_observation(
+                    store,
+                    plan,
+                    &loaded.selection,
+                    &loaded.source_window,
+                    verification,
+                    ObservationKind::ImmediatePostWrite,
+                )?,
+                Err(error) => verification_error_outcome(store, plan, &error)?,
+            };
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::VerificationResponsePersisted,
+                verification_response_artifact(&outcome)?,
+            )?;
+            Ok(outcome)
+        } else {
+            verify_api_plan(store, &executor, plan, &response, input, credential).await
+        }
+    }
+    .await;
+    let verification = match verification_result {
+        Ok(verification) => verification,
+        Err(error) => {
+            return Ok(post_boundary_failure_envelope(
+                plan,
+                response_value,
+                Some(apply_evidence),
+                lineage_evidence,
+                &error,
+                progress.put_attempted(),
+                "the conditional PUT response was received, but local verification could not finish; rectify without replay",
+            ));
+        }
     };
     let finalization = if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
         persist_transaction_stage(store, plan, TransactionStageV1::Closed)
@@ -108,7 +134,7 @@ pub(super) async fn execute(
         apply_evidence,
         lineage_evidence,
         verification,
-        response.success,
+        progress.put_attempted(),
         finalization.err().as_ref(),
     );
     envelope.result["native_restore_limits"] = json!({"max_put_attempts":1,"max_provider_requests":5,
@@ -195,7 +221,7 @@ fn no_response(
         None,
         None,
         &CliError::Input(failures.join("; ")),
-        false,
+        progress.put_attempted(),
         basis,
     )
 }

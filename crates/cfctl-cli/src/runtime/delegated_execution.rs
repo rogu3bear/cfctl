@@ -6,6 +6,9 @@ use super::governed_cli::run_quick_tunnel;
 use super::governed_cli::verify_quick_tunnel_plan;
 use super::plan_commands::persist_transaction_stage;
 use super::plan_commands::persist_transaction_stage_with_artifact;
+use super::plan_commands::{
+    delegated_pre_response_failure_envelope, persist_delegated_pre_response_failure,
+};
 use super::prelude::{
     AuthCredential, BTreeSet, CallInput, CatalogSnapshot, CliError, Duration, ErrorV1,
     EvidenceClass, EvidenceV1, Executor, Path, PathBuf, PlanStatus, PlanV1, ProcessCommand, Result,
@@ -18,7 +21,14 @@ use super::{
     pages_deployment, worker_deployment, workspace_d1_migration, workspace_d1_projection,
     workspace_d1_reply_admission, workspace_reply_subdomain_ingress,
 };
-use cfctl_core::hash_value;
+use cfctl_core::{BoundaryObservation, hash_value};
+
+/// A receipt and the invocation owner's launch observation are independent.
+/// Receipt JSON is never allowed to establish the absence of a mutation.
+pub(super) struct DelegatedReceipt {
+    pub(super) value: Value,
+    pub(super) boundary: BoundaryObservation,
+}
 
 pub(super) async fn execute_delegated_plan(
     store: &StateStore,
@@ -27,9 +37,40 @@ pub(super) async fn execute_delegated_plan(
     input: &CallInput,
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
-) -> Result<ResultEnvelopeV2> {
-    let receipt = Box::pin(run_delegated_plan_boundary(store, plan, input, credential)).await?;
-    Ok(complete_delegated_plan(store, catalog, plan, input, credential, secrets, receipt).await)
+) -> ResultEnvelopeV2 {
+    let boundary = BoundaryObservation::default();
+    match Box::pin(run_delegated_plan_boundary(
+        store, plan, input, credential, &boundary,
+    ))
+    .await
+    {
+        Ok(value) => {
+            complete_delegated_plan(
+                store,
+                catalog,
+                plan,
+                input,
+                credential,
+                secrets,
+                DelegatedReceipt { value, boundary },
+            )
+            .await
+        }
+        Err(error) => {
+            let persistence =
+                persist_delegated_pre_response_failure(store, plan, secrets, &boundary);
+            let mut envelope = delegated_pre_response_failure_envelope(plan, &error, &boundary);
+            if let Err(persistence_error) = persistence
+                && let Some(error) = envelope.error.as_mut()
+            {
+                error.message = format!(
+                    "{}; recovery persistence also failed: {persistence_error}",
+                    error.message
+                );
+            }
+            envelope
+        }
+    }
 }
 
 /// The boundary returned a receipt. All subsequent errors are post-boundary,
@@ -45,8 +86,10 @@ pub(super) async fn complete_delegated_plan(
     input: &CallInput,
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
-    mut receipt: Value,
+    observed: DelegatedReceipt,
 ) -> ResultEnvelopeV2 {
+    let performed = observed.boundary.mutation_attempted();
+    let mut receipt = observed.value;
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -60,23 +103,29 @@ pub(super) async fn complete_delegated_plan(
                 receipt,
                 None,
                 &CliError::Storage(error),
+                performed,
             );
         }
     };
-    if let Err(error) =
-        persist_delegated_boundary_result(store, plan, success, &receipt, &evidence, secrets)
-    {
-        return delegated_post_response_failure(store, plan, receipt, Some(evidence), &error);
+    if let Err(error) = persist_delegated_boundary_result(
+        store, plan, success, &receipt, &evidence, secrets, performed,
+    ) {
+        return delegated_post_response_failure(
+            store,
+            plan,
+            receipt,
+            Some(evidence),
+            &error,
+            performed,
+        );
     }
     let recovery_receipt = receipt.clone();
     let recovery_evidence = evidence.clone();
     let result = async {
+    if !performed {
+        return Ok(pre_mutation_refusal_envelope(plan, receipt, evidence));
+    }
     if !success {
-        if workspace_reply_subdomain_ingress::is_unperformed_fresh_precondition_failure(&receipt) {
-            return Ok(reply_subdomain_fresh_precondition_failure_envelope(
-                plan, receipt, evidence,
-            ));
-        }
         // A delegated CLI can fail after applying part of a mutation (Wrangler
         // may upload and promote a Worker before a trigger update fails). Keep
         // the transaction open for rectification and report that the boundary
@@ -166,6 +215,7 @@ pub(super) async fn complete_delegated_plan(
             recovery_receipt,
             Some(recovery_evidence),
             &error,
+            performed,
         ),
     }
 }
@@ -176,11 +226,8 @@ pub(super) fn delegated_post_response_failure(
     receipt: Value,
     evidence: Option<EvidenceV1>,
     error: &CliError,
+    performed: bool,
 ) -> ResultEnvelopeV2 {
-    let performed = receipt
-        .get("boundary_crossed")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     plan.status = PlanStatus::RectificationRequired;
     let persistence = if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted {
         persist_transaction_stage_with_artifact(
@@ -235,6 +282,7 @@ pub(super) fn persist_delegated_boundary_result(
     receipt: &Value,
     evidence: &EvidenceV1,
     secrets: &dyn SecretStore,
+    performed: bool,
 ) -> Result<()> {
     // The status recorded by each checkpoint is part of the journal hash. A
     // failing delegated command can have crossed a mutation boundary, so bind
@@ -251,7 +299,7 @@ pub(super) fn persist_delegated_boundary_result(
             "adapter": "delegated_cli",
             "apply_evidence_hash": evidence.content_hash,
             "success": success,
-            "boundary_crossed": receipt.get("boundary_crossed").and_then(Value::as_bool),
+            "boundary_crossed": performed,
         }),
     )?;
     persist_secret_lifecycle(store, plan, success, Some(receipt), secrets).map(|_| ())
@@ -262,6 +310,7 @@ pub(super) async fn run_delegated_plan_boundary(
     plan: &PlanV1,
     input: &CallInput,
     credential: &AuthCredential,
+    boundary: &BoundaryObservation,
 ) -> Result<Value> {
     if plan
         .capability
@@ -270,18 +319,21 @@ pub(super) async fn run_delegated_plan_boundary(
         .is_some_and(|contract| contract.operation_kind == "activate")
     {
         return Box::pin(workspace_reply_subdomain_ingress::run(
-            store, plan, credential,
+            store, plan, credential, boundary,
         ))
         .await;
     }
     if plan.capability.workspace_d1_migration.is_some() {
-        return workspace_d1_migration::run(store, plan, credential).await;
+        return workspace_d1_migration::run(store, plan, credential, boundary).await;
     }
     if plan.capability.workspace_d1_policy_projection.is_some() {
-        return workspace_d1_projection::run(store, plan, credential).await;
+        return workspace_d1_projection::run(store, plan, credential, boundary).await;
     }
     if plan.capability.workspace_d1_reply_admission.is_some() {
-        return Box::pin(workspace_d1_reply_admission::run(store, plan, credential)).await;
+        return Box::pin(workspace_d1_reply_admission::run(
+            store, plan, credential, boundary,
+        ))
+        .await;
     }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let mut delegated_input =
@@ -314,7 +366,7 @@ pub(super) async fn run_delegated_plan_boundary(
     let planned_config = worker_deployment::planned_config_execution(adapter_targets)?;
     let frozen = super::worker_frozen_upload::stage(&plan.capability, input, adapter_targets)?;
     let receipt = if plan.capability.id == "cloudflared.tunnel" {
-        run_quick_tunnel(store, plan, input).await?
+        run_quick_tunnel(store, plan, input, boundary).await?
     } else if let Some(frozen) = &frozen {
         super::governed_cli::run_delegated_cli_with_frozen_artifact(
             &plan.capability,
@@ -324,6 +376,7 @@ pub(super) async fn run_delegated_plan_boundary(
             &store.paths().cache_dir,
             planned_config.as_ref(),
             frozen,
+            boundary,
         )
         .await?
     } else {
@@ -336,6 +389,7 @@ pub(super) async fn run_delegated_plan_boundary(
             bound_program.as_deref(),
             bound_interpreter.as_deref(),
             planned_config.as_ref(),
+            Some(boundary),
         )
         .await?
     };
@@ -371,7 +425,7 @@ pub(super) fn delegated_cli_failure_envelope(
     envelope
 }
 
-pub(super) fn reply_subdomain_fresh_precondition_failure_envelope(
+pub(super) fn pre_mutation_refusal_envelope(
     plan: &PlanV1,
     receipt: Value,
     evidence: EvidenceV1,
@@ -391,12 +445,17 @@ pub(super) fn reply_subdomain_fresh_precondition_failure_envelope(
     envelope.policy_decision = Some(plan.policy.clone());
     envelope.verification.state = VerificationState::Failed;
     envelope.verification.basis = Some(format!(
-        "fresh reply-subdomain provider precondition `{status}` stopped before the catch-all PUT"
+        "fresh provider precondition `{status}` stopped before mutation dispatch"
     ));
     envelope.error = Some(ErrorV1 {
-        code: "CFCTL_WORKSPACE_REPLY_SUBDOMAIN_FRESH_PRECONDITION_FAILED".to_owned(),
+        code: envelope
+            .result
+            .get("failure_code")
+            .and_then(Value::as_str)
+            .unwrap_or("CFCTL_DELEGATED_MUTATION_NOT_ATTEMPTED")
+            .to_owned(),
         message: format!(
-            "fresh reply-subdomain provider state `{status}` no longer matches the approved plan; the catch-all PUT was not attempted"
+            "fresh provider state `{status}` no longer matches the approved plan; mutation dispatch was not attempted"
         ),
         next_step: Some(format!(
             "The plan is consumed and must not be replayed. Inspect `cfctl plans status {} --json`, reconcile `{status}`, and create a fresh PlanV2.",

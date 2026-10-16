@@ -43,10 +43,30 @@ impl S3Transport {
         &self,
         target: &S3Target<'_>,
         method: Method,
+        headers: BTreeMap<String, String>,
+        body: Option<Vec<u8>>,
+        token_id: &str,
+        credential: &AuthCredential,
+    ) -> Result<Response> {
+        self.send_observed(target, method, headers, body, token_id, credential, None)
+            .await
+    }
+
+    // The only write caller supplies its invocation observation. Local signing
+    // and request validation happen before the mutation dispatch witness.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the existing S3 request and optional invocation observation remain explicit"
+    )]
+    pub(crate) async fn send_observed(
+        &self,
+        target: &S3Target<'_>,
+        method: Method,
         mut headers: BTreeMap<String, String>,
         body: Option<Vec<u8>>,
         token_id: &str,
         credential: &AuthCredential,
+        boundary: Option<&cfctl_core::BoundaryObservation>,
     ) -> Result<Response> {
         let token = credential.bearer_token().ok_or_else(rejected)?;
         if token_id.len() != 32 || !token_id.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -80,6 +100,9 @@ impl S3Transport {
             Utc::now(),
             &payload_hash,
         )?;
+        if let Some(boundary) = boundary {
+            boundary.record_dispatch(cfctl_core::DispatchKind::Mutation);
+        }
         // No retry, redirect, alternative endpoint or response-bearing error.
         self.client.execute(request).await.map_err(|_| rejected())
     }

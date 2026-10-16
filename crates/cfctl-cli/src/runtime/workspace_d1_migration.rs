@@ -1,6 +1,14 @@
+use super::workspace_d1_execution::{
+    MigrationSelection, execute_json_query_with_expected_config, parse_wrangler_version,
+    run_wrangler, run_wrangler_with_migration_selection,
+};
+use super::workspace_d1_recovery::{
+    fresh_recovery_proof, require_target_string, target_string, validate_recovery_target,
+    validate_recovery_target_identity,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -11,26 +19,18 @@ use sha2::{Digest, Sha256};
 use tokio::time::Duration;
 
 use super::{
-    governed_cli::{governed_cli_workspace_env, redact_subprocess_text},
     prelude::{
         AuthCredential, CallInput, CapabilityV1, CatalogSnapshot, CliError,
         OperationalProofOutcomeV1, PlanV1, ProfileMetadata, Result, StateStore,
     },
     read_execution::credential_generation_for_read,
     support::cli_io,
-    worker_deployment, workspace_d1_evidence, workspace_d1_projection, workspace_d1_qualification,
-    workspace_d1_reply_admission,
+    workspace_d1_qualification,
 };
 
 const TARGET_KEY: &str = "workspace_d1_migration";
 const QUERY_TIMEOUT: Duration = Duration::from_mins(2);
 const APPLY_TIMEOUT: Duration = Duration::from_mins(5);
-
-struct MigrationSelection {
-    dir: String,
-    pattern: String,
-    table: String,
-}
 
 fn require_manifest_production_eligibility(
     contract: &cfctl_core::WorkspaceD1MigrationContractV1,
@@ -332,6 +332,7 @@ pub(super) async fn run(
     store: &StateStore,
     plan: &PlanV1,
     credential: &AuthCredential,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<Value> {
     validate_bound_plan(store, plan)?;
     let contract = plan
@@ -422,6 +423,7 @@ pub(super) async fn run(
         Some(&contract.config_template_sha256),
         Some(&contract.database_binding),
         migration_selection.as_ref(),
+        boundary,
     )
     .await?;
     Ok(json!({
@@ -652,207 +654,32 @@ fn assertion_rows_pass(rows: &[Map<String, Value>], expected_count: usize) -> bo
             .collect()
 }
 
-#[derive(Debug)]
-pub(super) struct ValidatedConfig {
-    pub(super) path: String,
-    pub(super) sha256: String,
-    pub(super) database_name: String,
-    pub(super) database_id: String,
-}
-
-#[allow(clippy::too_many_lines)]
-pub(super) fn validated_config(
+fn validated_config(
     contract: &cfctl_core::WorkspaceD1MigrationContractV1,
     input: &CallInput,
-) -> Result<ValidatedConfig> {
-    let root = fs::canonicalize(&contract.repository_root)
-        .map_err(|source| cli_io(Path::new(&contract.repository_root), source))?;
-    let expected = root.join(&contract.production_config_path);
-    let raw = if let Some(manifest) = &contract.manifest_migration {
+) -> Result<super::workspace_d1_config::ValidatedConfig> {
+    let mut selected = input.clone();
+    if let Some(manifest) = &contract.manifest_migration {
         if input.query.get("migration").and_then(Value::as_str) != Some(&manifest.ledger_name) {
             return Err(CliError::Input(
                 "workspace D1 manifest operation requires its exact sole target migration"
                     .to_owned(),
             ));
         }
-        expected.to_str().ok_or_else(|| {
-            CliError::Input("workspace D1 production config path is not UTF-8".to_owned())
-        })?
-    } else {
-        input
-            .query
-            .get("config")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                CliError::Input("workspace D1 migration requires query config".to_owned())
-            })?
-    };
-    let canonical = fs::canonicalize(raw).map_err(|source| cli_io(Path::new(raw), source))?;
-    if canonical != expected {
-        return Err(CliError::Input(format!(
-            "workspace D1 migration config must be the contract path {}",
-            expected.display()
-        )));
+        selected.query["config"] =
+            json!(Path::new(&contract.repository_root).join(&contract.production_config_path));
     }
-    let metadata = fs::symlink_metadata(&canonical).map_err(|source| cli_io(&canonical, source))?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > 1_048_576
-    {
-        return Err(CliError::Input(
-            "workspace D1 migration production config must be a regular file of at most 1 MiB"
-                .to_owned(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(CliError::Input(
-                "workspace D1 migration production config must not grant group or world permissions"
-                    .to_owned(),
-            ));
-        }
-    }
-    let production_bytes = fs::read(&canonical).map_err(|source| cli_io(&canonical, source))?;
-    let template_path = root.join(&contract.config_template_path);
-    let template_bytes =
-        fs::read(&template_path).map_err(|source| cli_io(&template_path, source))?;
-    if sha256(&template_bytes) != contract.config_template_sha256 {
-        return Err(CliError::Input(
-            "workspace D1 migration tracked config template drifted from its contract".to_owned(),
-        ));
-    }
-    let template: toml::Value = toml::from_str(
-        std::str::from_utf8(&template_bytes)
-            .map_err(|_| CliError::Input("tracked Wrangler config is not UTF-8".to_owned()))?,
-    )
-    .map_err(|error| CliError::Input(format!("tracked Wrangler config is invalid: {error}")))?;
-    let template = serde_json::to_value(template)
-        .map_err(|_| CliError::Input("tracked Wrangler config is invalid".to_owned()))?;
-    let mut production = parse_private_production_config(&production_bytes)?;
-    let identity = worker_deployment::normalize_workspace_d1_private_config(
-        &mut production,
-        &template,
-        &contract.database_binding,
-    )?;
-    if production != template {
-        return Err(CliError::Input(
-            "production Wrangler config differs from the tracked template outside the closed private-config overlay"
-                .to_owned(),
-        ));
-    }
-    let selected_database = input
-        .selectors
-        .get("database_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("workspace D1 migration requires database_id".to_owned()))?;
-    if selected_database != identity.database_id {
-        return Err(CliError::Input(
-            "workspace D1 migration database selector differs from production config".to_owned(),
-        ));
-    }
+    let config = super::workspace_d1_config::validated_config(contract.into(), &selected)?;
     if let Some(manifest) = &contract.manifest_migration
-        && (identity.database_name != manifest.database_name
-            || identity.database_id != manifest.database_id)
+        && (config.database_name != manifest.database_name
+            || config.database_id != manifest.database_id)
     {
         return Err(CliError::Input(
             "workspace D1 production identity differs from the manifest operation contract"
                 .to_owned(),
         ));
     }
-    Ok(ValidatedConfig {
-        path: canonical.display().to_string(),
-        sha256: sha256(&production_bytes),
-        database_name: identity.database_name,
-        database_id: identity.database_id,
-    })
-}
-
-fn parse_private_production_config(bytes: &[u8]) -> Result<Value> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| CliError::Input("production Wrangler config is not UTF-8".to_owned()))?;
-    let parsed: toml::Value = toml::from_str(text)
-        .map_err(|_| CliError::Input("production Wrangler config is invalid".to_owned()))?;
-    serde_json::to_value(parsed)
-        .map_err(|_| CliError::Input("production Wrangler config is invalid".to_owned()))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the recovery proof is valid only when target, catalog, profile, account, credential generation, freshness bound, and observation time are evaluated together"
-)]
-pub(super) fn fresh_recovery_proof(
-    store: &StateStore,
-    catalog: &CatalogSnapshot,
-    input: &CallInput,
-    profile_id: &str,
-    account_id: &str,
-    generation: &str,
-    max_age_seconds: u64,
-    now: chrono::DateTime<Utc>,
-) -> Result<Value> {
-    let database_id = input
-        .selectors
-        .get("database_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("workspace D1 migration requires database_id".to_owned()))?;
-    let bookmark_input = CallInput {
-        selectors: json!({"account_id": account_id, "database_id": database_id}),
-        query: json!({}),
-        ..CallInput::default()
-    };
-    let input_hash = hash_value(&serde_json::to_value(bookmark_input)?)?;
-    let floor = now - ChronoDuration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX));
-    let matches = store
-        .list_operational_proofs()?
-        .into_iter()
-        .filter(|proof| {
-            proof.capability_id == "d1-time-travel-get-bookmark"
-                && proof.catalog_hash == catalog.schema_hash
-                && proof.input_hash == input_hash
-                && proof.profile_id.as_deref() == Some(profile_id)
-                && proof.account_id.as_deref() == Some(account_id)
-                && proof.credential_generation_id.as_deref() == Some(generation)
-                && proof.outcome == OperationalProofOutcomeV1::Succeeded
-                && proof.observed_at >= floor
-                && proof.observed_at < now
-        })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(CliError::Input(
-            "workspace D1 migration requires exactly one fresh successful time-travel bookmark proof bound to the target, catalog, profile, account, and credential generation"
-                .to_owned(),
-        ));
-    }
-    let proof = &matches[0];
-    let evidence = store.read_evidence_value(&proof.evidence.content_hash)?;
-    let bookmark = evidence
-        .pointer("/result/bookmark")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            CliError::Input("recovery evidence omitted the exact bookmark".to_owned())
-        })?;
-    if evidence.get("status").and_then(Value::as_u64) != Some(200)
-        || evidence.get("success").and_then(Value::as_bool) != Some(true)
-    {
-        return Err(CliError::Input(
-            "recovery evidence does not prove a successful bookmark read".to_owned(),
-        ));
-    }
-    Ok(json!({
-        "capability_id": proof.capability_id,
-        "observed_at": proof.observed_at,
-        "evidence_hash": proof.evidence.content_hash,
-        "bookmark": bookmark,
-        "bookmark_hash": hash_value(&Value::String(bookmark.to_owned()))?,
-        "catalog_hash": proof.catalog_hash,
-        "input_hash": proof.input_hash,
-        "profile_id": profile_id,
-        "account_id": account_id,
-        "credential_generation_id": generation,
-    }))
+    Ok(config)
 }
 
 #[expect(
@@ -982,75 +809,6 @@ fn validate_full_export_target(
     Ok(())
 }
 
-pub(super) fn validate_recovery_target(
-    store: &StateStore,
-    target: &Map<String, Value>,
-    catalog_hash: &str,
-    max_age_seconds: u64,
-    now: chrono::DateTime<Utc>,
-) -> Result<()> {
-    let recovery = validate_recovery_target_identity(store, target, catalog_hash, now)?;
-    let observed_at = recovery
-        .get("observed_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("workspace D1 recovery time is missing".to_owned()))?
-        .parse::<chrono::DateTime<Utc>>()
-        .map_err(|_| CliError::Input("workspace D1 recovery time is invalid".to_owned()))?;
-    let age = now.signed_duration_since(observed_at);
-    if age > ChronoDuration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX)) {
-        return Err(CliError::Input(
-            "workspace D1 recovery bookmark is no longer fresh; create a new plan".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_recovery_target_identity<'a>(
-    store: &StateStore,
-    target: &'a Map<String, Value>,
-    catalog_hash: &str,
-    now: chrono::DateTime<Utc>,
-) -> Result<&'a Map<String, Value>> {
-    let recovery = target
-        .get("recovery")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            CliError::Input("workspace D1 plan omitted recovery authority".to_owned())
-        })?;
-    let observed_at = recovery
-        .get("observed_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("workspace D1 recovery time is missing".to_owned()))?
-        .parse::<chrono::DateTime<Utc>>()
-        .map_err(|_| CliError::Input("workspace D1 recovery time is invalid".to_owned()))?;
-    if now.signed_duration_since(observed_at) < ChronoDuration::zero() {
-        return Err(CliError::Input(
-            "workspace D1 recovery bookmark observation is in the future".to_owned(),
-        ));
-    }
-    let evidence_hash = recovery_string(recovery, "evidence_hash")?;
-    require_target_string(recovery, "catalog_hash", catalog_hash)?;
-    require_target_string(recovery, "profile_id", target_string(target, "profile_id")?)?;
-    require_target_string(recovery, "account_id", target_string(target, "account_id")?)?;
-    require_target_string(
-        recovery,
-        "credential_generation_id",
-        target_string(target, "credential_generation_id")?,
-    )?;
-    let evidence = store.read_evidence_value(evidence_hash)?;
-    let bookmark = evidence
-        .pointer("/result/bookmark")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("recovery evidence omitted bookmark readback".to_owned()))?;
-    require_target_string(recovery, "bookmark", bookmark)?;
-    require_target_string(
-        recovery,
-        "bookmark_hash",
-        &hash_value(&Value::String(bookmark.to_owned()))?,
-    )?;
-    Ok(recovery)
-}
-
 fn target(plan: &PlanV1) -> Result<&Map<String, Value>> {
     plan.targets
         .get("adapter")
@@ -1059,28 +817,6 @@ fn target(plan: &PlanV1) -> Result<&Map<String, Value>> {
         .ok_or_else(|| {
             CliError::Input("workspace D1 migration plan omitted adapter authority".to_owned())
         })
-}
-
-fn target_string<'a>(target: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
-    target
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CliError::Input(format!("workspace D1 target omitted {field}")))
-}
-
-fn recovery_string<'a>(target: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
-    target_string(target, field)
-}
-
-fn require_target_string(target: &Map<String, Value>, field: &str, expected: &str) -> Result<()> {
-    if target_string(target, field)? == expected {
-        Ok(())
-    } else {
-        Err(CliError::Input(format!(
-            "workspace D1 target {field} drifted; create a new plan"
-        )))
-    }
 }
 
 #[expect(
@@ -1144,525 +880,13 @@ async fn read_ledger(
 }
 
 #[expect(
-    clippy::too_many_arguments,
-    reason = "the two immutable config identities are boundary inputs alongside the fixed query authority"
-)]
-pub(super) async fn execute_json_query_with_config_identity(
-    database: &str,
-    database_binding: &str,
-    config: &str,
-    sql: &str,
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    expected_config_sha256: &str,
-    expected_template_sha256: &str,
-) -> Result<Vec<Map<String, Value>>> {
-    execute_json_query_with_expected_config(
-        database,
-        Some(database_binding),
-        config,
-        sql,
-        root,
-        credential,
-        account_id,
-        cache_dir,
-        Some(expected_config_sha256),
-        Some(expected_template_sha256),
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the exact config content identity is a security-boundary input alongside the fixed query authority"
-)]
-async fn execute_json_query_with_expected_config(
-    database: &str,
-    database_binding: Option<&str>,
-    config: &str,
-    sql: &str,
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    expected_config_sha256: Option<&str>,
-    expected_template_sha256: Option<&str>,
-) -> Result<Vec<Map<String, Value>>> {
-    let arguments = [
-        "d1".to_owned(),
-        "execute".to_owned(),
-        database.to_owned(),
-        "--remote".to_owned(),
-        "--config".to_owned(),
-        config.to_owned(),
-        "--command".to_owned(),
-        sql.to_owned(),
-        "--json".to_owned(),
-    ];
-    let output = run_wrangler_with_expected_config(
-        &arguments,
-        root,
-        credential,
-        account_id,
-        cache_dir,
-        QUERY_TIMEOUT,
-        expected_config_sha256,
-        expected_template_sha256,
-        database_binding,
-    )
-    .await?;
-    if output.success {
-        return parse_query_rows(&output.stdout);
-    }
-    let failure = QueryFailureDiagnostic::from(&output);
-    Err(CliError::Input(format!(
-        "fixed Wrangler D1 readback failed (exit_status={}, stdout_hash={}, stderr_hash={})",
-        failure.exit_status, failure.stdout_hash, failure.stderr_hash
-    )))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct QueryFailureDiagnostic {
-    exit_status: String,
-    stdout_hash: String,
-    stderr_hash: String,
-}
-
-impl From<&WranglerOutput> for QueryFailureDiagnostic {
-    fn from(output: &WranglerOutput) -> Self {
-        Self {
-            exit_status: output
-                .exit_status
-                .map_or_else(|| "signal".to_owned(), |status| status.to_string()),
-            stdout_hash: sha256(output.stdout.as_bytes()),
-            stderr_hash: sha256(output.stderr.as_bytes()),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct WranglerOutput {
-    pub(super) success: bool,
-    pub(super) exit_status: Option<i32>,
-    pub(super) stdout: String,
-    pub(super) stderr: String,
-    pub(super) provider_output_retained: bool,
-    pub(super) private_config_sha256: Option<String>,
-}
-
-pub(super) async fn run_wrangler(
-    arguments: &[String],
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    timeout: Duration,
-) -> Result<WranglerOutput> {
-    run_wrangler_with_expected_config(
-        arguments, root, credential, account_id, cache_dir, timeout, None, None, None,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the two immutable config identities are boundary inputs, not ambient subprocess state"
-)]
-pub(super) async fn run_wrangler_with_config_identity(
-    arguments: &[String],
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    timeout: Duration,
-    expected_config_sha256: &str,
-    expected_template_sha256: &str,
-    database_binding: &str,
-) -> Result<WranglerOutput> {
-    run_wrangler_with_expected_config(
-        arguments,
-        root,
-        credential,
-        account_id,
-        cache_dir,
-        timeout,
-        Some(expected_config_sha256),
-        Some(expected_template_sha256),
-        Some(database_binding),
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the immutable config identity is a boundary input, not ambient subprocess state"
-)]
-async fn run_wrangler_with_expected_config(
-    arguments: &[String],
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    timeout: Duration,
-    expected_config_sha256: Option<&str>,
-    expected_template_sha256: Option<&str>,
-    database_binding: Option<&str>,
-) -> Result<WranglerOutput> {
-    let local_wrangler = root.join("node_modules/wrangler/bin/wrangler.js");
-    let program = if local_wrangler.is_file() {
-        local_wrangler.as_path()
-    } else {
-        Path::new("wrangler")
-    };
-    run_wrangler_program(
-        program,
-        arguments,
-        root,
-        credential,
-        account_id,
-        cache_dir,
-        timeout,
-        expected_config_sha256,
-        expected_template_sha256,
-        database_binding,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the closed one-file migration selection joins the immutable private-config identities at the subprocess boundary"
-)]
-async fn run_wrangler_with_migration_selection(
-    arguments: &[String],
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    timeout: Duration,
-    expected_config_sha256: Option<&str>,
-    expected_template_sha256: Option<&str>,
-    database_binding: Option<&str>,
-    migration: Option<&MigrationSelection>,
-) -> Result<WranglerOutput> {
-    let local_wrangler = root.join("node_modules/wrangler/bin/wrangler.js");
-    let program = if local_wrangler.is_file() {
-        local_wrangler.as_path()
-    } else {
-        Path::new("wrangler")
-    };
-    run_wrangler_program_inner(
-        program,
-        arguments,
-        root,
-        credential,
-        account_id,
-        cache_dir,
-        timeout,
-        expected_config_sha256,
-        expected_template_sha256,
-        database_binding,
-        migration,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the test seam retains both immutable config identities at the subprocess boundary"
-)]
-async fn run_wrangler_program(
-    program: &Path,
-    arguments: &[String],
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    timeout: Duration,
-    expected_config_sha256: Option<&str>,
-    expected_template_sha256: Option<&str>,
-    database_binding: Option<&str>,
-) -> Result<WranglerOutput> {
-    run_wrangler_program_inner(
-        program,
-        arguments,
-        root,
-        credential,
-        account_id,
-        cache_dir,
-        timeout,
-        expected_config_sha256,
-        expected_template_sha256,
-        database_binding,
-        None,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the test seam retains immutable config identities and the optional closed migration selection at one subprocess boundary"
-)]
-async fn run_wrangler_program_inner(
-    program: &Path,
-    arguments: &[String],
-    root: &Path,
-    credential: &AuthCredential,
-    account_id: &str,
-    cache_dir: &Path,
-    timeout: Duration,
-    expected_config_sha256: Option<&str>,
-    expected_template_sha256: Option<&str>,
-    database_binding: Option<&str>,
-    migration: Option<&MigrationSelection>,
-) -> Result<WranglerOutput> {
-    let mut execution_arguments = arguments.to_vec();
-    let private_config = bind_private_config_from_arguments_inner(
-        &mut execution_arguments,
-        expected_config_sha256,
-        expected_template_sha256,
-        database_binding,
-        migration,
-    )?;
-    let token = credential.bearer_token().ok_or_else(|| {
-        CliError::Input(
-            "workspace D1 migrations require a scoped API-token profile; global-key execution is forbidden"
-                .to_owned(),
-        )
-    })?;
-    let mut command = processkit::Command::new(program)
-        .args(&execution_arguments)
-        .current_dir(root)
-        .env_clear()
-        .env("PATH", env::var_os("PATH").unwrap_or_default())
-        .env("HOME", env::var_os("HOME").unwrap_or_default())
-        .env("NO_COLOR", "1")
-        .env("CLOUDFLARE_API_TOKEN", token)
-        .stdin(processkit::Stdin::empty())
-        .timeout(timeout);
-    for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
-        command = command.env(name, value);
-    }
-    let running = command
-        .start()
-        .await
-        .map_err(|_| CliError::SubprocessNotStarted {
-            label: "workspace D1 migration Wrangler".to_owned(),
-        })?;
-    let output =
-        running
-            .output_bytes()
-            .await
-            .map_err(|_| CliError::SubprocessReceiptUnavailable {
-                label: "workspace D1 migration Wrangler".to_owned(),
-            })?;
-    if output.timed_out() {
-        return Err(CliError::SubprocessTimeout {
-            label: "workspace D1 migration Wrangler".to_owned(),
-            timeout_seconds: timeout.as_secs(),
-        });
-    }
-    if let Some(private_config) = private_config {
-        let (success, stdout) = if output.is_success()
-            && execution_arguments
-                .iter()
-                .any(|argument| argument == "--json")
-        {
-            match project_private_json_query_with_guard(
-                output.stdout(),
-                &execution_arguments,
-                &private_config,
-            ) {
-                Ok(projected) => (true, projected),
-                Err(()) => (false, String::new()),
-            }
-        } else {
-            (output.is_success(), String::new())
-        };
-        return Ok(WranglerOutput {
-            success,
-            exit_status: output.code(),
-            stdout,
-            stderr: String::new(),
-            provider_output_retained: false,
-            private_config_sha256: Some(private_config.content_sha256().to_owned()),
-        });
-    }
-    Ok(WranglerOutput {
-        success: output.is_success(),
-        exit_status: output.code(),
-        stdout: redact_subprocess_text(&String::from_utf8_lossy(output.stdout()), credential),
-        stderr: redact_subprocess_text(output.stderr(), credential),
-        provider_output_retained: true,
-        private_config_sha256: None,
-    })
-}
-
-fn bind_private_config_from_arguments_inner(
-    arguments: &mut [String],
-    expected_config_sha256: Option<&str>,
-    expected_template_sha256: Option<&str>,
-    database_binding: Option<&str>,
-    migration: Option<&MigrationSelection>,
-) -> Result<Option<worker_deployment::BoundPrivateConfig>> {
-    if arguments
-        .iter()
-        .any(|argument| argument.starts_with("--config="))
-    {
-        return Err(CliError::Input(
-            "workspace D1 Wrangler arguments must bind config as one exact --config path pair"
-                .to_owned(),
-        ));
-    }
-    let positions = arguments
-        .windows(2)
-        .enumerate()
-        .filter_map(|(index, pair)| (pair[0] == "--config").then_some(index + 1))
-        .collect::<Vec<_>>();
-    if positions.is_empty() {
-        return Ok(None);
-    }
-    if positions.len() != 1
-        || arguments
-            .last()
-            .is_some_and(|argument| argument == "--config")
-    {
-        return Err(CliError::Input(
-            "workspace D1 Wrangler arguments require exactly one complete --config path pair"
-                .to_owned(),
-        ));
-    }
-    let position = positions[0];
-    let config = Path::new(&arguments[position]);
-    let template = if config.file_name().and_then(std::ffi::OsStr::to_str)
-        == Some("wrangler.production.toml")
-    {
-        config.with_file_name("wrangler.toml")
-    } else {
-        worker_deployment::private_config_template_path(config).ok_or_else(|| {
-            CliError::Input(
-                "workspace D1 closed operation contract requires a private production config"
-                    .to_owned(),
-            )
-        })?
-    };
-    let database_binding = database_binding.ok_or_else(|| {
-        CliError::Input(
-            "workspace D1 private execution requires the planned database binding".to_owned(),
-        )
-    })?;
-    let mut bound = worker_deployment::bind_workspace_d1_private_config_for_execution(
-        config,
-        &template,
-        expected_config_sha256,
-        expected_template_sha256,
-        database_binding,
-    )?;
-    if let Some(migration) = migration {
-        stage_migration_selection(&mut bound, database_binding, migration)?;
-    }
-    let bound = Some(bound);
-    if let Some(bound) = &bound {
-        arguments[position] = bound.path().display().to_string();
-    }
-    Ok(bound)
-}
-
-fn stage_migration_selection(
-    bound: &mut worker_deployment::BoundPrivateConfig,
-    database_binding: &str,
-    migration: &MigrationSelection,
-) -> Result<()> {
-    let text = fs::read_to_string(bound.path()).map_err(|source| cli_io(bound.path(), source))?;
-    let mut document: toml::Value = toml::from_str(&text)
-        .map_err(|_| CliError::Input("workspace D1 staged config is invalid".to_owned()))?;
-    let databases = document
-        .get_mut("d1_databases")
-        .and_then(toml::Value::as_array_mut)
-        .ok_or_else(|| CliError::Input("workspace D1 config omitted bindings".to_owned()))?;
-    let mut selected = databases
-        .iter_mut()
-        .filter(|database| {
-            database.get("binding").and_then(toml::Value::as_str) == Some(database_binding)
-        })
-        .collect::<Vec<_>>();
-    if selected.len() != 1 {
-        return Err(CliError::Input(
-            "workspace D1 config did not contain exactly one selected binding".to_owned(),
-        ));
-    }
-    let table = selected[0]
-        .as_table_mut()
-        .ok_or_else(|| CliError::Input("workspace D1 selected binding was invalid".to_owned()))?;
-    table.insert(
-        "migrations_dir".to_owned(),
-        toml::Value::String(migration.dir.clone()),
-    );
-    table.insert(
-        "migrations_pattern".to_owned(),
-        toml::Value::String(migration.pattern.clone()),
-    );
-    table.insert(
-        "migrations_table".to_owned(),
-        toml::Value::String(migration.table.clone()),
-    );
-    let bytes = toml::to_string(&document).map_err(|_| {
-        CliError::Input("workspace D1 staged config could not be rendered".to_owned())
-    })?;
-    bound.replace_staged_bytes(bytes.as_bytes())
-}
-
-#[cfg(test)]
-fn project_private_json_query(
-    stdout: &[u8],
-    arguments: &[String],
-) -> std::result::Result<String, ()> {
-    project_private_json_query_inner(stdout, arguments, None)
-}
-
-fn project_private_json_query_with_guard(
-    stdout: &[u8],
-    arguments: &[String],
-    private_config: &worker_deployment::BoundPrivateConfig,
-) -> std::result::Result<String, ()> {
-    project_private_json_query_inner(stdout, arguments, Some(private_config))
-}
-
-fn project_private_json_query_inner(
-    stdout: &[u8],
-    arguments: &[String],
-    private_config: Option<&worker_deployment::BoundPrivateConfig>,
-) -> std::result::Result<String, ()> {
-    let text = std::str::from_utf8(stdout).map_err(|_| ())?;
-    let sql = arguments
-        .windows(2)
-        .filter_map(|pair| (pair[0] == "--command").then_some(pair[1].as_str()))
-        .collect::<Vec<_>>();
-    if sql.len() != 1 {
-        return Err(());
-    }
-    let rows = parse_query_rows(text).map_err(|_| ())?;
-    project_migration_query_rows(sql[0], &rows)
-        .or_else(|| workspace_d1_evidence::project_private_query_rows(sql[0], &rows))
-        .or_else(|| workspace_d1_projection::project_private_query_rows(sql[0], &rows))
-        .or_else(|| workspace_d1_reply_admission::project_private_query_rows(sql[0], &rows))
-        .ok_or(())?
-        .map_err(|_| ())?;
-    if private_config.is_some_and(|private_config| {
-        private_config.retained_rows_contain_private_representation(&rows)
-    }) {
-        return Err(());
-    }
-    serde_json::to_string(&json!([{"success": true, "results": rows}])).map_err(|_| ())
-}
-
-#[expect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "migration ledger names intentionally require the canonical lowercase .sql suffix; case-insensitive matching would widen the closed private query schema"
 )]
-fn project_migration_query_rows(sql: &str, rows: &[Map<String, Value>]) -> Option<Result<()>> {
+pub(super) fn project_private_query_rows(
+    sql: &str,
+    rows: &[Map<String, Value>],
+) -> Option<Result<()>> {
     if sql == "PRAGMA integrity_check" {
         return Some((|| {
             if rows.len() != 1
@@ -1740,34 +964,6 @@ fn private_query_shape_error() -> CliError {
 
 fn private_query_value_error() -> CliError {
     CliError::Input("private D1 readback contained an invalid typed value".to_owned())
-}
-
-pub(super) fn parse_query_rows(stdout: &str) -> Result<Vec<Map<String, Value>>> {
-    let value: Value = serde_json::from_str(stdout.trim())
-        .map_err(|error| CliError::Input(format!("Wrangler D1 readback was not JSON: {error}")))?;
-    let envelopes = value
-        .as_array()
-        .ok_or_else(|| CliError::Input("Wrangler D1 readback was not an array".to_owned()))?;
-    let mut rows = Vec::new();
-    for envelope in envelopes {
-        if envelope.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(CliError::Input(
-                "Wrangler D1 readback reported an unsuccessful query".to_owned(),
-            ));
-        }
-        let results = envelope
-            .get("results")
-            .and_then(Value::as_array)
-            .ok_or_else(|| CliError::Input("Wrangler D1 readback omitted results".to_owned()))?;
-        for row in results {
-            rows.push(
-                row.as_object().cloned().ok_or_else(|| {
-                    CliError::Input("Wrangler D1 result row is invalid".to_owned())
-                })?,
-            );
-        }
-    }
-    Ok(rows)
 }
 
 fn declared_migration_names(
@@ -1962,20 +1158,6 @@ fn identifier(value: Option<&str>) -> Result<&str> {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         })
         .ok_or_else(|| CliError::Input("workspace D1 assertion identifier is invalid".to_owned()))
-}
-
-pub(super) fn parse_wrangler_version(stdout: &str) -> Result<String> {
-    stdout
-        .split_whitespace()
-        .find(|part| {
-            let components = part.split('.').collect::<Vec<_>>();
-            components.len() == 3
-                && components.iter().all(|component| {
-                    !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
-                })
-        })
-        .map(str::to_owned)
-        .ok_or_else(|| CliError::Input("Wrangler version output was invalid".to_owned()))
 }
 
 pub(super) fn sha256(bytes: &[u8]) -> String {

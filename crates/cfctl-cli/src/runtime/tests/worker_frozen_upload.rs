@@ -364,7 +364,13 @@ mod real_wrangler {
         FROZEN_TRANSPORT_TEST_LAUNCHER
             .scope(
                 fixture.launcher.clone(),
-                run_delegated_plan_boundary(&store, plan, input, &credential()),
+                run_delegated_plan_boundary(
+                    &store,
+                    plan,
+                    input,
+                    &credential(),
+                    &cfctl_core::BoundaryObservation::default(),
+                ),
             )
             .await
     }
@@ -400,6 +406,7 @@ mod real_wrangler {
                 Some(&fixture.launcher),
                 None,
                 Duration::from_mins(1),
+                None,
             )
             .await
             .expect("ordinary control receipt");

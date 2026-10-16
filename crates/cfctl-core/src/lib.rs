@@ -1,5 +1,8 @@
 //! Versioned domain contracts for the cfctl control plane.
 
+mod boundary_observation;
+pub use boundary_observation::{BoundaryObservation, DispatchKind};
+
 pub mod d1_read_inventory;
 pub mod d1_reconciliation;
 mod email_routing;

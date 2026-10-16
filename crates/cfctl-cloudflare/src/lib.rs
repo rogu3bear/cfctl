@@ -2771,6 +2771,7 @@ pub struct Executor {
     upload_client: reqwest::Client,
     builder: RequestBuilder,
     max_retries: usize,
+    boundary_observation: Option<cfctl_core::BoundaryObservation>,
     #[cfg(test)]
     r2_test_origin: Option<Url>,
 }
@@ -2959,10 +2960,12 @@ impl Executor {
         Ok(Self {
             client,
             upload_client: reqwest::Client::builder()
+                .retry(reqwest::retry::never())
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             builder: RequestBuilder::new(base_url)?,
             max_retries: 3,
+            boundary_observation: None,
             #[cfg(test)]
             r2_test_origin: None,
         })
@@ -2972,6 +2975,23 @@ impl Executor {
     pub const fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
         self
+    }
+
+    /// Observe this invocation's actual sends without changing any wire or
+    /// stored evidence contract. Cloned protocol stages share the observation.
+    #[must_use]
+    pub fn with_boundary_observation(
+        mut self,
+        observation: cfctl_core::BoundaryObservation,
+    ) -> Self {
+        self.boundary_observation = Some(observation);
+        self
+    }
+
+    fn record_dispatch(&self, kind: cfctl_core::DispatchKind) {
+        if let Some(observation) = &self.boundary_observation {
+            observation.record_dispatch(kind);
+        }
     }
 
     async fn execute_r2_buckets_list_read(
@@ -3495,7 +3515,7 @@ impl Executor {
         } else {
             self.clone()
         };
-        match sender.send(&request, credential).await {
+        match sender.send_mutation(&request, credential).await {
             Ok(response) => {
                 plan.status = if response.success {
                     PlanStatus::Running
@@ -3591,7 +3611,7 @@ impl Executor {
                 .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
         );
         request.binary_body = Some(payload.bytes);
-        match self.send(&request, credential).await {
+        match self.send_mutation(&request, credential).await {
             Ok(response) => {
                 plan.status = if response.success {
                     PlanStatus::Running
@@ -3742,7 +3762,7 @@ impl Executor {
         match self
             .clone()
             .with_max_retries(0)
-            .send(&request, credential)
+            .send_mutation(&request, credential)
             .await
         {
             Ok(response) => {
@@ -3836,7 +3856,7 @@ impl Executor {
         let restore = self
             .clone()
             .with_max_retries(0)
-            .send(&restore_request, credential)
+            .send_mutation(&restore_request, credential)
             .await?;
         if !restore.success {
             plan.status = PlanStatus::Failed;
@@ -6910,6 +6930,20 @@ impl Executor {
         self.send_with_output(request, credential, None).await
     }
 
+    async fn send_mutation(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        self.send_with_dispatch(
+            request,
+            credential,
+            None,
+            cfctl_core::DispatchKind::Mutation,
+        )
+        .await
+    }
+
     async fn send_r2_conditional_identity_read(
         &self,
         request: &PreparedRequest,
@@ -6959,13 +6993,32 @@ impl Executor {
         credential: &AuthCredential,
         output_path: Option<&Path>,
     ) -> Result<CloudflareResponseV1> {
+        self.send_with_dispatch(
+            request,
+            credential,
+            output_path,
+            cfctl_core::DispatchKind::Read,
+        )
+        .await
+    }
+
+    async fn send_with_dispatch(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        output_path: Option<&Path>,
+        dispatch: cfctl_core::DispatchKind,
+    ) -> Result<CloudflareResponseV1> {
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| CloudflareError::InvalidMethod(request.method.clone()))?;
-        let retry_limit = if request
-            .headers
-            .get(reqwest::header::IF_NONE_MATCH)
-            .and_then(|value| value.to_str().ok())
-            == Some("*")
+        // Read retries do not authorize repeating a consumed mutation. An
+        // uncertain write is reconciled by the operation's existing lifecycle.
+        let retry_limit = if dispatch == cfctl_core::DispatchKind::Mutation
+            || request
+                .headers
+                .get(reqwest::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                == Some("*")
         {
             0
         } else {
@@ -6986,7 +7039,9 @@ impl Executor {
             } else if let Some(body) = &request.body {
                 outgoing = outgoing.json(body);
             }
-            let response = outgoing.send().await?;
+            let outgoing = outgoing.build()?;
+            self.record_dispatch(dispatch);
+            let response = self.client.execute(outgoing).await?;
             let status = response.status();
             let retry_after = response
                 .headers()

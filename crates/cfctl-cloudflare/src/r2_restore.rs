@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 use url::Url;
@@ -24,7 +24,7 @@ use url::Url;
 #[derive(Default)]
 pub struct RestoreProgress {
     requests: AtomicU32,
-    put_attempted: AtomicBool,
+    put: cfctl_core::BoundaryObservation,
 }
 impl RestoreProgress {
     #[must_use]
@@ -33,7 +33,7 @@ impl RestoreProgress {
     }
     #[must_use]
     pub fn put_attempted(&self) -> bool {
-        self.put_attempted.load(Ordering::Relaxed)
+        self.put.mutation_attempted()
     }
     fn request(&self) -> Result<()> {
         if self.requests.fetch_add(1, Ordering::Relaxed) >= 5 {
@@ -254,15 +254,15 @@ impl Executor {
             .validate(Utc::now())
             .map_err(|_| rejected())?;
         progress.request()?;
-        progress.put_attempted.store(true, Ordering::Relaxed);
         let response = transport
-            .send(
+            .send_observed(
                 &target,
                 Method::PUT,
                 headers,
                 Some(source),
                 token_id,
                 credential,
+                Some(&progress.put),
             )
             .await?;
         let status = response.status().as_u16();

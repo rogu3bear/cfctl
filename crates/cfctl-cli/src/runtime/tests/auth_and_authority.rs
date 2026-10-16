@@ -1214,6 +1214,7 @@ pub(super) fn successful_response_still_sinks_the_secret_when_apply_evidence_per
         &mut plan,
         &response,
         &MemorySecretStore::default(),
+        true,
     )
     .expect("a local evidence failure returns a recovery envelope")
     {
@@ -1299,6 +1300,7 @@ pub(super) fn successful_response_still_sinks_the_secret_when_boundary_receipt_p
         &mut plan,
         &response,
         &MemorySecretStore::default(),
+        true,
     )
     .expect("a receipt persistence failure returns a recovery envelope")
     {
@@ -1352,10 +1354,14 @@ pub(super) fn transport_error_after_boundary_attempt_returns_unknown_no_replay_e
         &mut plan,
         &transport_error,
         &MemorySecretStore::default(),
+        true,
     );
 
     assert!(!envelope.ok);
-    assert!(!envelope.performed);
+    assert!(
+        envelope.performed,
+        "the explicit transport witness survives the missing response"
+    );
     assert_eq!(
         envelope.operation_id.as_deref(),
         Some(plan.operation_id.as_str())

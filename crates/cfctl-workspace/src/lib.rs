@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
+mod d1_config_source;
+pub use d1_config_source::D1ConfigSource;
 mod d1_evidence;
 mod d1_operation;
 mod d1_policy_projection;

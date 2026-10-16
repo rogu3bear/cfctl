@@ -1103,19 +1103,24 @@ fn apply_create_token_envelope(store: &StorageStateStore, plan: &mut PlanV1) -> 
         etag: None,
         cf_ray: None,
     };
-    let (response_value, apply_evidence, lineage_evidence) =
-        match process_api_boundary_response(store, plan, &response, &MemorySecretStore::default())
-            .expect("create-token apply is locally durable")
-        {
-            ApiBoundaryResponseOutcome::Ready {
-                response_value,
-                apply_evidence,
-                lineage_evidence,
-            } => (response_value, apply_evidence, lineage_evidence),
-            ApiBoundaryResponseOutcome::Recovery(envelope) => {
-                panic!("create-token apply must not enter recovery: {envelope:?}")
-            }
-        };
+    let (response_value, apply_evidence, lineage_evidence) = match process_api_boundary_response(
+        store,
+        plan,
+        &response,
+        &MemorySecretStore::default(),
+        true,
+    )
+    .expect("create-token apply is locally durable")
+    {
+        ApiBoundaryResponseOutcome::Ready {
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+        } => (response_value, apply_evidence, lineage_evidence),
+        ApiBoundaryResponseOutcome::Recovery(envelope) => {
+            panic!("create-token apply must not enter recovery: {envelope:?}")
+        }
+    };
     api_plan_result_envelope(
         plan,
         response_value,
@@ -1238,7 +1243,7 @@ pub(super) async fn create_token_missing_value_out_fails_before_the_post() {
         error.to_string().contains("value_out"),
         "missing sink must name value_out: {error}"
     );
-    let error = execute_api_plan(
+    let envelope = execute_api_plan(
         &store,
         "catalog-sha",
         &mut plan,
@@ -1249,10 +1254,23 @@ pub(super) async fn create_token_missing_value_out_fails_before_the_post() {
         &MemorySecretStore::default(),
     )
     .await
-    .expect_err("create-token must not POST without value_out");
+    .expect("operation-bound pre-dispatch refusal");
+    assert!(!envelope.ok);
     assert!(
-        error.to_string().contains("value_out"),
-        "execute_api_plan must fail on the sink, not a provider call: {error}"
+        !envelope.performed,
+        "create-token must not POST without value_out"
+    );
+    assert_eq!(
+        envelope.operation_id.as_deref(),
+        Some(plan.operation_id.as_str())
+    );
+    assert_eq!(envelope.result["outcome"], "not_attempted");
+    assert!(
+        envelope
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("value_out")),
+        "execute_api_plan must fail on the sink, not a provider call"
     );
 }
 

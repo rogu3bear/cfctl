@@ -219,7 +219,7 @@ async fn pages_setup_native_create_receipt_admits_only_exact_current_initial_pro
         .await
         .expect("Pages setup fixture succeeds");
     assert!(matches!(
-        process_api_boundary_response(&store, &mut plan, &apply, &secrets)
+        process_api_boundary_response(&store, &mut plan, &apply, &secrets, true)
             .expect("Pages setup fixture succeeds"),
         ApiBoundaryResponseOutcome::Ready { .. }
     ));
@@ -465,7 +465,7 @@ async fn pages_setup_secret_input_is_resolved_once_cleaned_and_never_written_to_
         .await
         .expect("Pages setup fixture succeeds");
     assert!(matches!(
-        process_api_boundary_response(&store, &mut draft, &apply, &secrets)
+        process_api_boundary_response(&store, &mut draft, &apply, &secrets, true)
             .expect("Pages setup fixture succeeds"),
         ApiBoundaryResponseOutcome::Ready { .. }
     ));
@@ -656,7 +656,7 @@ async fn pages_setup_uncertain_http_status_requires_rectification_without_verifi
         }];
         let secrets = MemorySecretStore::default();
         assert!(matches!(
-            process_api_boundary_response(&store, &mut plan, &uncertain, &secrets)
+            process_api_boundary_response(&store, &mut plan, &uncertain, &secrets, true)
                 .expect("Pages setup fixture succeeds"),
             ApiBoundaryResponseOutcome::Ready { .. }
         ));

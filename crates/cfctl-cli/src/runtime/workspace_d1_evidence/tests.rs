@@ -494,7 +494,7 @@ fn inbound_acceptance_query_is_compiler_owned_and_projects_one_exact_binding() {
     assert!(!query.sql.contains("__MAILDESK_"));
 
     let row = inbound_row();
-    let config = workspace_d1_migration::ValidatedConfig {
+    let config = crate::runtime::workspace_d1_config::ValidatedConfig {
         path: "wrangler.production.toml".to_owned(),
         sha256: format!("sha256:{}", "d".repeat(64)),
         database_name: "maildesk-production".to_owned(),
@@ -519,7 +519,7 @@ fn inbound_acceptance_query_is_compiler_owned_and_projects_one_exact_binding() {
 #[test]
 fn inbound_acceptance_zero_multiple_and_mismatched_rows_fail_closed() {
     let input = inbound_input();
-    let config = workspace_d1_migration::ValidatedConfig {
+    let config = crate::runtime::workspace_d1_config::ValidatedConfig {
         path: "wrangler.production.toml".to_owned(),
         sha256: format!("sha256:{}", "d".repeat(64)),
         database_name: "maildesk-production".to_owned(),
@@ -659,4 +659,16 @@ fn historical_policy_aggregate_does_not_fabricate_new_observations() {
         serde_json::from_value(historical).expect("historical compatibility");
     assert!(restored.revision_r2_key.is_none());
     assert!(restored.projection_policy_sha256.is_none());
+}
+
+#[test]
+fn workspace_d1_evidence_config_consumer_characterization() {
+    use crate::runtime::tests::d1_config_characterization::{characterize, extend};
+    characterize(|common, input| {
+        let contract: cfctl_core::WorkspaceD1EvidenceContractV1 = serde_json::from_value(
+            extend(common, json!({"projection":"maildesk_v1", "query_sha256":format!("sha256:{}", "a".repeat(64))}))
+        ).expect("typed source contract");
+        crate::runtime::workspace_d1_config::validated_config((&contract).into(), input)
+            .map(|config| config.sha256)
+    });
 }

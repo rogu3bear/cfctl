@@ -13,6 +13,7 @@ use super::support::http_client;
 use super::{pages_deployment, worker_deployment};
 use cfctl_agent::build_ui_action;
 use cfctl_core::redact_json;
+use cfctl_core::{BoundaryObservation, DispatchKind};
 
 const WRANGLER_ACCOUNT_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const WRANGLER_CACHE_ENV: &str = "WRANGLER_CACHE_DIR";
@@ -55,30 +56,49 @@ pub(super) fn execute_governed_ui_plan(
         ),
         true,
     )?;
-    let evidence =
-        store.write_evidence(EvidenceClass::AgentAction, &serde_json::to_value(&action)?)?;
+    let action_value = serde_json::to_value(&action)?;
+    let result = json!({
+        "agent_action": action,
+        "performed": false,
+        "message": "Approved UI action prepared. No dashboard action is executed by this producer; hash-bound completion evidence remains required."
+    });
+    let mut failures = Vec::new();
+    let evidence = match store.write_evidence(EvidenceClass::AgentAction, &action_value) {
+        Ok(evidence) => Some(evidence),
+        Err(error) => {
+            failures.push(format!("UI action evidence persistence failed: {error}"));
+            None
+        }
+    };
     plan.status = PlanStatus::RectificationRequired;
-    persist_transaction_stage_with_artifact(
+    if let Err(error) = persist_transaction_stage_with_artifact(
         store,
         plan,
         TransactionStageV1::BoundaryResponsePersisted,
-        json!({
-            "adapter": "governed_ui",
-            "agent_action_evidence_hash": evidence.content_hash,
-            "performed": false,
-            "success": false,
-        }),
-    )?;
-    persist_secret_lifecycle(store, plan, false, None, secrets)?;
-    let mut envelope = ResultEnvelopeV2::success(
-        "plans run",
-        json!({
-            "agent_action": action,
-            "performed": false,
-            "message": "Approved UI action handed off. cfctl does not claim the dashboard change was performed until hash-bound before/after evidence is returned."
-        }),
-    )
-    .with_evidence(evidence);
+        json!({ "adapter": "governed_ui",
+            "agent_action_evidence_hash": evidence.as_ref().map(|value| &value.content_hash),
+            "performed": false, "success": false }),
+    ) {
+        failures.push(format!("UI handoff checkpoint failed: {error}"));
+    }
+    if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+        failures.push(format!("UI handoff lifecycle failed: {error}"));
+    }
+    if !failures.is_empty() {
+        return Ok(super::api_boundary::post_boundary_failure_envelope(
+            plan,
+            result,
+            evidence,
+            None,
+            &CliError::Input(failures.join("; ")),
+            false,
+            "the UI action was prepared without launching a dashboard action, but local custody is incomplete; preserve the consumed operation",
+        ));
+    }
+    let mut envelope = ResultEnvelopeV2::success("plans run", result);
+    if let Some(evidence) = evidence {
+        envelope.evidence.push(evidence);
+    }
     envelope.performed = false;
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());
@@ -111,6 +131,7 @@ pub(super) async fn run_delegated_cli(
         governed_delegated_cli_timeout(&capability.id),
         None,
         None,
+        None,
     )
     .await
 }
@@ -128,6 +149,7 @@ pub(super) async fn run_delegated_cli_with_private_config_identity(
     program_override: Option<&Path>,
     interpreter_override: Option<&Path>,
     planned_config: Option<&worker_deployment::PlannedConfigExecution>,
+    boundary: Option<&BoundaryObservation>,
 ) -> Result<Value> {
     run_delegated_cli_with_timeout_and_private_config_identity(
         capability,
@@ -140,6 +162,7 @@ pub(super) async fn run_delegated_cli_with_private_config_identity(
         governed_delegated_cli_timeout(&capability.id),
         planned_config,
         None,
+        boundary,
     )
     .await
 }
@@ -158,6 +181,7 @@ pub(super) async fn run_delegated_cli_with_timeout(
     program_override: Option<&Path>,
     interpreter_override: Option<&Path>,
     timeout: Duration,
+    boundary: Option<&BoundaryObservation>,
 ) -> Result<Value> {
     run_delegated_cli_with_timeout_and_private_config_identity(
         capability,
@@ -170,6 +194,7 @@ pub(super) async fn run_delegated_cli_with_timeout(
         timeout,
         None,
         None,
+        boundary,
     )
     .await
 }
@@ -193,6 +218,7 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
     timeout: Duration,
     planned_config: Option<&worker_deployment::PlannedConfigExecution>,
     frozen_artifact: Option<&super::worker_frozen_upload::BoundFrozenArtifact>,
+    boundary: Option<&BoundaryObservation>,
 ) -> Result<Value> {
     let bound_private_config =
         worker_deployment::bind_private_config_for_execution(capability, input, planned_config)?;
@@ -337,6 +363,9 @@ async fn run_delegated_cli_with_timeout_and_private_config_identity(
         .map_err(|_| CliError::SubprocessNotStarted {
             label: label.clone(),
         })?;
+    if let Some(boundary) = boundary {
+        boundary.record_dispatch(DispatchKind::Mutation);
+    }
     let output =
         running
             .output_bytes()
@@ -404,6 +433,10 @@ pub(super) fn governed_delegated_cli_timeout(capability_id: &str) -> Duration {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen artifact, captured config, credential, target and actual dispatch witness have distinct custody."
+)]
 pub(super) async fn run_delegated_cli_with_frozen_artifact(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -412,6 +445,7 @@ pub(super) async fn run_delegated_cli_with_frozen_artifact(
     cache_dir: &Path,
     planned_config: Option<&worker_deployment::PlannedConfigExecution>,
     frozen: &super::worker_frozen_upload::BoundFrozenArtifact,
+    boundary: &BoundaryObservation,
 ) -> Result<Value> {
     let program = frozen.executable()?;
     let interpreter = frozen.interpreter()?;
@@ -440,6 +474,7 @@ pub(super) async fn run_delegated_cli_with_frozen_artifact(
         timeout,
         planned_config,
         Some(frozen),
+        Some(boundary),
     )
     .await
 }
@@ -464,6 +499,7 @@ pub(super) async fn run_quick_tunnel(
     store: &StateStore,
     plan: &PlanV1,
     input: &CallInput,
+    boundary: &BoundaryObservation,
 ) -> Result<Value> {
     let (origin, health_path) = quick_tunnel_request(input)?;
     let runtime_dir = store
@@ -477,6 +513,7 @@ pub(super) async fn run_quick_tunnel(
     })?;
     let log_path = runtime_dir.join("cloudflared.log");
     let mut child = spawn_quick_tunnel_process(&origin, &runtime_dir, &log_path)?;
+    boundary.record_dispatch(DispatchKind::Mutation);
     let Some(pid) = child.id() else {
         return Err(CliError::Input(
             "cloudflared started without an observable process id".to_owned(),

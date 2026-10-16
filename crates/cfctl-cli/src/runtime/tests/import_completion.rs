@@ -658,6 +658,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
             "D1 import upload transport failed; presigned URL redacted; do not replay".to_owned(),
         ),
         &MemorySecretStore::default(),
+        true,
     );
     assert_eq!(timeout_envelope.result["receipt_available"], false);
     assert!(
@@ -718,6 +719,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
             &mut upload_plan,
             CloudflareError::D1ImportUploadResponseIntegrityFailure,
             &MemorySecretStore::default(),
+            true,
         );
         assert!(envelope.performed, "{name}");
         assert_eq!(envelope.result["outcome"], expected_outcome, "{name}");
@@ -770,6 +772,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut missing_evidence_plan,
         CloudflareError::D1ImportUploadResponseIntegrityFailure,
         &MemorySecretStore::default(),
+        true,
     );
     assert_eq!(
         invalid_receipt.result["outcome"],
@@ -815,6 +818,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut duplicate_plan,
         CloudflareError::D1ImportUploadResponseIntegrityFailure,
         &MemorySecretStore::default(),
+        true,
     );
     assert_eq!(
         duplicate_receipt.result["outcome"],
@@ -875,6 +879,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut init_plan,
         CloudflareError::D1ImportInitResponseFailure,
         &MemorySecretStore::default(),
+        true,
     );
     assert!(init_envelope.performed);
     assert_eq!(init_envelope.result["outcome"], "invalid_provider_response");
@@ -1087,6 +1092,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
             &mut action_plan,
             error,
             &MemorySecretStore::default(),
+            true,
         );
         assert!(action_envelope.performed, "{action}");
         assert_eq!(
@@ -1173,6 +1179,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
             &mut rejected_plan,
             error,
             &MemorySecretStore::default(),
+            true,
         );
         assert!(rejected_envelope.performed, "{action}");
         assert_eq!(
@@ -1391,6 +1398,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut exhaustion_plan,
         CloudflareError::D1ImportPollInProgressExhausted,
         &MemorySecretStore::default(),
+        true,
     );
     assert!(exhaustion_envelope.performed);
     assert_eq!(
@@ -1436,6 +1444,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut plan,
         CloudflareError::D1ImportProviderFailure,
         &MemorySecretStore::default(),
+        true,
     );
     assert!(!envelope.ok);
     assert!(envelope.performed);
@@ -1478,6 +1487,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut init_plan,
         CloudflareError::D1ImportProviderFailure,
         &MemorySecretStore::default(),
+        true,
     );
     assert_eq!(init_envelope.result["outcome"], "provider_rejected");
     assert_eq!(init_envelope.result["receipt_available"], true);
@@ -1691,6 +1701,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
             &mut invalid_plan,
             CloudflareError::D1ImportProviderFailure,
             &MemorySecretStore::default(),
+            true,
         );
         assert_eq!(
             invalid.result["outcome"],
@@ -1709,6 +1720,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
         &mut transport_plan,
         CloudflareError::InvalidRequestBody("injected transport timeout".to_owned()),
         &MemorySecretStore::default(),
+        true,
     );
     assert_eq!(transport.result["outcome"], "unknown");
     assert_eq!(transport.result["receipt_available"], false);
@@ -1717,7 +1729,7 @@ pub(super) fn approved_mln_provider_failure_uses_its_durable_receipt_not_transpo
             .verification
             .basis
             .as_deref()
-            .is_some_and(|basis| basis.contains("no Cloudflare response was received"))
+            .is_some_and(|basis| basis.contains("no complete Cloudflare response was received"))
     );
     assert_eq!(transport_plan.status, PlanStatus::RectificationRequired);
 }

@@ -671,6 +671,7 @@ pub(super) fn build_poll_child_lineage(generations: usize) -> PollChildLineageFi
                     &mut child,
                     &response,
                     &MemorySecretStore::default(),
+                    true,
                 )
                 .expect("production completion lifecycle"),
                 super::ApiBoundaryResponseOutcome::Ready { .. }

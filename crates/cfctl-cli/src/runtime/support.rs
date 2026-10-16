@@ -16,12 +16,19 @@ pub(super) fn http_client() -> Result<reqwest::Client> {
     http_client_with_private_capture(false)
 }
 
+pub(super) fn mutation_http_client() -> Result<reqwest::Client> {
+    // A redirect can repeat a consumed write at a different target. Disable
+    // both transparent retries and redirects at the production transport seam.
+    http_client_with_private_capture(true)
+}
+
 pub(super) fn private_capture_http_client() -> Result<reqwest::Client> {
     http_client_with_private_capture(true)
 }
 
 fn http_client_with_private_capture(private_capture: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
+        .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_mins(2))
         .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")));

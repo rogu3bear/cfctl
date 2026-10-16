@@ -18,14 +18,65 @@ use super::prelude::{
 };
 use super::r2_private_upload;
 use super::secret_io::preflight_secret_sink;
-use super::support::http_client;
+use super::support::mutation_http_client;
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one consumed-plan executor keeps managed stage selection, durable provider boundary, verification, and cleanup in a single auditable state machine"
-)]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FinalizationTestStage {
+    Response,
+    Verification,
+    Closure,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static FINALIZATION_TEST_HOOK: std::sync::Arc<dyn Fn(FinalizationTestStage) + Send + Sync>;
+}
+
+#[cfg(test)]
+fn finalization_test_stage(stage: FinalizationTestStage) {
+    let _ = FINALIZATION_TEST_HOOK.try_with(|hook| hook(stage));
+}
+
 pub(super) async fn execute_api_plan(
     store: &StateStore,
+    catalog_hash: &str,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+) -> Result<ResultEnvelopeV2> {
+    let executor = match mutation_http_client()
+        .and_then(|client| Executor::new(client, API_BASE_URL).map_err(CliError::from))
+    {
+        Ok(executor) => executor,
+        Err(error) => {
+            return Ok(process_api_transport_failure(
+                store, plan, &error, secrets, false,
+            ));
+        }
+    };
+    execute_api_plan_with_executor(
+        store,
+        &executor,
+        catalog_hash,
+        plan,
+        execution_input,
+        credential,
+        secrets,
+    )
+    .await
+}
+
+/// Keep transport injection at the existing execution owner so loopback tests
+/// exercise the same dispatch, receipt persistence and finalization as the CLI.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one consumed-plan executor keeps preparation, actual dispatch, retained response and finalization in one auditable sequence"
+)]
+pub(super) async fn execute_api_plan_with_executor(
+    store: &StateStore,
+    executor: &Executor,
     catalog_hash: &str,
     plan: &mut PlanV1,
     execution_input: &CallInput,
@@ -49,36 +100,59 @@ pub(super) async fn execute_api_plan(
         )
         .await;
     }
-    preflight_secret_sink(plan)?;
-    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let boundary = cfctl_core::BoundaryObservation::default();
+    let executor = executor.clone().with_boundary_observation(boundary.clone());
     let is_reviewed_schema_migration = plan.capability.id == "d1-apply-reviewed-schema-migration";
-    if is_reviewed_schema_migration {
-        validate_managed_reviewed_git_stage_authority(plan)?;
+    let preparation = preflight_secret_sink(plan).and_then(|()| {
+        if is_reviewed_schema_migration {
+            validate_managed_reviewed_git_stage_authority(plan)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = preparation {
+        return Ok(process_api_transport_failure(
+            store, plan, &error, secrets, false,
+        ));
     }
     if plan.capability.d1_approved_mln_import_poll_resume.is_some() {
-        return execute_approved_mln_import_poll_resume_plan(
+        let result = execute_approved_mln_import_poll_resume_plan(
             store,
             &executor,
             plan,
             execution_input,
             credential,
             secrets,
+            &boundary,
         )
         .await;
+        return Ok(result.unwrap_or_else(|error| {
+            process_api_transport_failure(store, plan, &error, secrets, boundary.attempted())
+        }));
     }
     if plan.capability.d1_approved_mln_import.is_some() && !is_reviewed_schema_migration {
-        return Box::pin(execute_approved_mln_import_plan(
+        let result = Box::pin(execute_approved_mln_import_plan(
             store,
             &executor,
             plan,
             execution_input,
             credential,
             secrets,
+            &boundary,
         ))
         .await;
+        return Ok(result.unwrap_or_else(|error| {
+            process_api_transport_failure(store, plan, &error, secrets, boundary.attempted())
+        }));
     }
     let response_result = if plan.capability.r2_private_file_upload.is_some() {
-        let upload = r2_private_upload::load(store, plan, secrets)?;
+        let upload = match r2_private_upload::load(store, plan, secrets) {
+            Ok(upload) => upload,
+            Err(error) => {
+                return Ok(process_api_transport_failure(
+                    store, plan, &error, secrets, false,
+                ));
+            }
+        };
         executor
             .execute_r2_private_file_upload(
                 plan,
@@ -101,19 +175,34 @@ pub(super) async fn execute_api_plan(
         Ok(response) => response,
         Err(error) => {
             let error = CliError::from(error);
-            return Ok(process_api_transport_failure(store, plan, &error, secrets));
+            return Ok(process_api_transport_failure(
+                store,
+                plan,
+                &error,
+                secrets,
+                boundary.mutation_attempted(),
+            ));
         }
     };
-    let (response_value, apply_evidence, lineage_evidence) =
-        match process_api_boundary_response(store, plan, &response, secrets)? {
-            ApiBoundaryResponseOutcome::Ready {
-                response_value,
-                apply_evidence,
-                lineage_evidence,
-            } => (response_value, apply_evidence, lineage_evidence),
-            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
-        };
-    let performed = response.success;
+    #[cfg(test)]
+    finalization_test_stage(FinalizationTestStage::Response);
+    let (response_value, apply_evidence, lineage_evidence) = match process_api_boundary_response(
+        store,
+        plan,
+        &response,
+        secrets,
+        boundary.mutation_attempted(),
+    )? {
+        ApiBoundaryResponseOutcome::Ready {
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+        } => (response_value, apply_evidence, lineage_evidence),
+        ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+    };
+    let performed = boundary.mutation_attempted();
+    #[cfg(test)]
+    finalization_test_stage(FinalizationTestStage::Verification);
     let verification = match verify_api_plan(
         store,
         &executor,
@@ -138,6 +227,8 @@ pub(super) async fn execute_api_plan(
         }
     };
     let finalization: Result<()> = (|| {
+        #[cfg(test)]
+        finalization_test_stage(FinalizationTestStage::Closure);
         if plan.status == PlanStatus::Verified && plan.capability.r2_private_file_upload.is_some() {
             r2_private_upload::discard(store, plan, secrets)?;
         }
@@ -170,6 +261,7 @@ pub(super) async fn execute_approved_mln_import_poll_resume_plan(
     execution_input: &CallInput,
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<ResultEnvelopeV2> {
     let bookmark = plan
         .targets
@@ -192,12 +284,17 @@ pub(super) async fn execute_approved_mln_import_poll_resume_plan(
         Ok(response) => response,
         Err(error) => {
             return Ok(approved_mln_import_execution_error_envelope(
-                store, plan, error, secrets,
+                store,
+                plan,
+                error,
+                secrets,
+                boundary.attempted(),
             ));
         }
     };
     let (response_value, apply_evidence, lineage_evidence) =
-        match process_api_boundary_response(store, plan, &response, secrets)? {
+        match process_api_boundary_response(store, plan, &response, secrets, boundary.attempted())?
+        {
             ApiBoundaryResponseOutcome::Ready {
                 response_value,
                 apply_evidence,
@@ -214,20 +311,30 @@ pub(super) async fn execute_approved_mln_import_poll_resume_plan(
             &CliError::Input(
                 "Cloudflare did not complete the approved poll continuation".to_owned(),
             ),
-            true,
+            boundary.attempted(),
             "the poll-only boundary was crossed but provider completion was not proven",
         ));
     }
     if let Err(error) = exact_durable_resume_provider_complete_boundary(store, plan) {
         plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
+        if let Err(error) = store.save_plan(plan) {
+            return Ok(post_boundary_failure_envelope(
+                plan,
+                response_value,
+                Some(apply_evidence),
+                lineage_evidence,
+                &CliError::from(error),
+                boundary.attempted(),
+                "the import response was received, but its local checkpoint failed; preserve the consumed operation and rectify without replay",
+            ));
+        }
         return Ok(post_boundary_failure_envelope(
             plan,
             response_value,
             Some(apply_evidence),
             lineage_evidence,
             &error,
-            true,
+            boundary.attempted(),
             "the poll-only boundary was crossed but exact durable provider completion was not proven",
         ));
     }
@@ -250,7 +357,7 @@ pub(super) async fn execute_approved_mln_import_poll_resume_plan(
                     Some(apply_evidence),
                     lineage_evidence,
                     &error,
-                    true,
+                    boundary.attempted(),
                     "the reviewed-Git D1 import completed through a poll child, but its exact source receipt could not be persisted",
                 ));
             }
@@ -268,16 +375,26 @@ pub(super) async fn execute_approved_mln_import_poll_resume_plan(
             apply_evidence,
             lineage_evidence,
             verification,
-            true,
+            boundary.attempted(),
             finalization_error.as_ref(),
         ));
     }
     plan.status = PlanStatus::Running;
-    store.save_plan(plan)?;
+    if let Err(error) = store.save_plan(plan) {
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::from(error),
+            boundary.attempted(),
+            "the import response was received, but its local checkpoint failed; preserve the consumed operation and rectify without replay",
+        ));
+    }
     let mut envelope =
         ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
     envelope.ok = false;
-    envelope.performed = true;
+    envelope.performed = boundary.attempted();
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());
     envelope.profile_id = Some(plan.profile_id.clone());

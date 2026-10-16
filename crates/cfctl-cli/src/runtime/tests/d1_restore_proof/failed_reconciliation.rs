@@ -43,8 +43,14 @@ async fn execute_failed_fixture_readback(
         .execute_consumed_plan_with_input(&mut plan, &catalog().schema_hash, &credential, &input)
         .await
         .expect("single restore");
-    process_api_boundary_response(&store, &mut plan, &apply, &MemorySecretStore::default())
-        .expect("persist apply");
+    process_api_boundary_response(
+        &store,
+        &mut plan,
+        &apply,
+        &MemorySecretStore::default(),
+        true,
+    )
+    .expect("persist apply");
     let outcome = verify_api_plan(&store, &executor, &mut plan, &apply, &input, &credential)
         .await
         .expect("persist authenticated failed verification");

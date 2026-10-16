@@ -555,3 +555,15 @@ writeFileSync(output, JSON.stringify({ sealed: seal(JSON.parse(readFileSync(inpu
         "unsupported compiler path must not retain a private candidate stage",
     );
 }
+
+#[test]
+fn workspace_d1_reply_admission_config_consumer_characterization() {
+    use crate::runtime::tests::d1_config_characterization::{characterize, extend};
+    characterize(|common, input| {
+        let contract: cfctl_core::WorkspaceD1ReplyAdmissionContractV1 = serde_json::from_value(
+            extend(common, json!({"operation_kind":"activate","compiler_path":"compiler.ts","compiler_sha256":"fixture","compiler_runtime":"bun","compiler_runtime_version":"1.3.14","compiler_runtime_sha256":"fixture","admission_table":"reply_admissions","input_contract":"maildesk_reply_admission_compiler_input_v1","mutation_projection":"maildesk_reply_admission_insert_v1","recovery_capability_id":"d1-time-travel-get-bookmark","recovery_max_age_seconds":600,"rollback_capability_id":"d1-restore-exact-bookmark"}))
+        ).expect("typed source contract");
+        crate::runtime::workspace_d1_config::validated_config((&contract).into(), input)
+            .map(|config| config.sha256)
+    });
+}

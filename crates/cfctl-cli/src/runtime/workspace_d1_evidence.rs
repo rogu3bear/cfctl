@@ -6,7 +6,7 @@ use std::{
 use cfctl_core::{
     MaildeskD1EvidenceV1, MaildeskD1RouteHealthEvidenceV2, MaildeskD1RouteHealthRecordV2,
     MaildeskRouteKindV2, MaildeskRouteProviderV2, MaildeskRouteReadinessStatusV2,
-    WorkspaceD1EvidenceContractV1, WorkspaceD1MigrationContractV1,
+    WorkspaceD1EvidenceContractV1,
 };
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
@@ -19,10 +19,7 @@ use cfctl_workspace::{
     MAILDESK_INBOUND_ACCEPTANCE_SQL_V1,
 };
 
-use super::{
-    prelude::{AuthCredential, CallInput, CapabilityV1, CliError, Result, StateStore},
-    workspace_d1_migration,
-};
+use super::prelude::{AuthCredential, CallInput, CapabilityV1, CliError, Result, StateStore};
 
 const QUERY_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_MAP_KEYS: usize = 64;
@@ -352,7 +349,7 @@ pub(super) async fn execute(
         )
         .into());
     }
-    let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
+    let config = super::workspace_d1_config::validated_config(contract.into(), input)?;
     let compiler_query = compiler_query(contract, input)?;
     if sha256(compiler_query.template.as_bytes()) != contract.query_sha256 {
         return Err(CliError::Input(
@@ -361,7 +358,7 @@ pub(super) async fn execute(
         )
         .into());
     }
-    let version = workspace_d1_migration::run_wrangler(
+    let version = super::workspace_d1_execution::run_wrangler(
         &["--version".to_owned()],
         Path::new(&contract.repository_root),
         credential,
@@ -373,10 +370,10 @@ pub(super) async fn execute(
     .map_err(|error| {
         WorkspaceD1EvidenceFailure::before_boundary(FailureStage::WranglerVersion, error)
     })?;
-    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)
+    let observed_version = super::workspace_d1_execution::parse_wrangler_version(&version.stdout)
         .map_err(|error| {
-            WorkspaceD1EvidenceFailure::before_boundary(FailureStage::WranglerVersion, error)
-        })?;
+        WorkspaceD1EvidenceFailure::before_boundary(FailureStage::WranglerVersion, error)
+    })?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(WorkspaceD1EvidenceFailure::before_boundary(
             FailureStage::WranglerVersion,
@@ -386,7 +383,7 @@ pub(super) async fn execute(
             )),
         ));
     }
-    let query = workspace_d1_migration::run_wrangler_with_config_identity(
+    let query = super::workspace_d1_execution::run_wrangler_with_config_identity(
         &compiler_query_arguments(&config.database_name, &config.path, &compiler_query.sql),
         Path::new(&contract.repository_root),
         credential,
@@ -396,6 +393,7 @@ pub(super) async fn execute(
         &config.sha256,
         &contract.config_template_sha256,
         &contract.database_binding,
+        None,
     )
     .await
     .map_err(|error| {
@@ -412,7 +410,7 @@ pub(super) async fn execute(
             )),
         ));
     }
-    let rows = workspace_d1_migration::parse_query_rows(&query.stdout).map_err(|error| {
+    let rows = super::workspace_d1_execution::parse_query_rows(&query.stdout).map_err(|error| {
         WorkspaceD1EvidenceFailure::after_boundary(FailureStage::ProviderProjection, error)
     })?;
     if contract.projection == MAILDESK_INBOUND_ACCEPTANCE_PROJECTION_V1 {
@@ -498,7 +496,7 @@ fn project_inbound_acceptance(
     input: &CallInput,
     rows: Vec<Map<String, Value>>,
     observed_version: &str,
-    config: &workspace_d1_migration::ValidatedConfig,
+    config: &super::workspace_d1_config::ValidatedConfig,
 ) -> Result<Value> {
     let match_count = rows.len();
     let fingerprint = bare_digest_selector(input, "delivery_fingerprint_sha256")?;
@@ -1149,29 +1147,6 @@ fn require_exact_map_keys(
         )));
     }
     Ok(())
-}
-
-fn config_contract(contract: &WorkspaceD1EvidenceContractV1) -> WorkspaceD1MigrationContractV1 {
-    WorkspaceD1MigrationContractV1 {
-        repository_root: contract.repository_root.clone(),
-        repository_head: contract.repository_head.clone(),
-        repository_origin: contract.repository_origin.clone(),
-        operation_pack_path: contract.operation_pack_path.clone(),
-        operation_pack_sha256: contract.operation_pack_sha256.clone(),
-        config_template_path: contract.config_template_path.clone(),
-        config_template_sha256: contract.config_template_sha256.clone(),
-        production_config_path: contract.production_config_path.clone(),
-        migrations_dir: String::new(),
-        database_binding: contract.database_binding.clone(),
-        wrangler_version: contract.wrangler_version.clone(),
-        migrations: Vec::new(),
-        assertions: Vec::new(),
-        recovery_capability_id: String::new(),
-        recovery_max_age_seconds: 0,
-        rollback_capability_id: String::new(),
-        transition: None,
-        manifest_migration: None,
-    }
 }
 
 fn sha256(bytes: &[u8]) -> String {

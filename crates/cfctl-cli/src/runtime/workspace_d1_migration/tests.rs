@@ -1,4 +1,10 @@
 #![allow(clippy::wildcard_imports, reason = "white-box domain tests")]
+use crate::runtime::worker_deployment;
+use crate::runtime::workspace_d1_config::parse_private_production_config;
+use crate::runtime::workspace_d1_execution::{
+    QueryFailureDiagnostic, WranglerOutput, parse_query_rows, project_private_json_query,
+    run_wrangler_program, stage_migration_selection,
+};
 
 use super::*;
 use cfctl_core::{EvidenceClass, WorkspaceD1MigrationFileV1, WorkspaceD1SchemaAssertionV1};
@@ -60,6 +66,7 @@ async fn workspace_d1_timeout_terminates_and_reaps_the_full_wrangler_process_tre
             "fixture-account",
             &task_cache,
             Duration::from_secs(5),
+            None,
             None,
             None,
             None,
@@ -135,6 +142,7 @@ async fn workspace_d1_timeout_windows_job_contains_the_full_wrangler_tree() {
             "fixture-account",
             &task_cache,
             Duration::from_secs(5),
+            None,
             None,
             None,
             None,
@@ -447,6 +455,7 @@ printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e70
         Some(&expected_sha256),
         Some(&expected_template_sha256),
         Some("DB"),
+        None,
     )
     .await
     .expect("typed private D1 projection");
@@ -512,6 +521,7 @@ printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e70
         Some(&expected_sha256),
         Some(&expected_template_sha256),
         Some("DB"),
+        None,
     )
     .await
     .expect("private-representation collision projection");
@@ -555,6 +565,7 @@ printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e70
         Some(&expected_sha256),
         Some(&expected_template_sha256),
         Some("DB"),
+        None,
     )
     .await
     .expect("private D1 apply projection");
@@ -589,6 +600,7 @@ printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e70
         Some(&expected_sha256),
         Some(&expected_template_sha256),
         Some("DB"),
+        None,
     )
     .await
     .expect("private D1 failure projection");
@@ -629,6 +641,7 @@ printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e70
         Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
         Some(&expected_template_sha256),
         Some("DB"),
+        None,
     )
     .await
     .expect_err("persistent config identity drift must fail before launch");
@@ -650,6 +663,7 @@ printf '%s\n' '{PRIVATE_SENDER}' '{PRIVATE_DOMAINS}' 'enabled' '73656e6465722e70
         Some(&expected_sha256),
         Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
         Some("DB"),
+        None,
     )
     .await
     .expect_err("persistent template identity drift must fail before launch");
@@ -1385,4 +1399,15 @@ fn workspace_d1_shared_overlay_closes_selected_identity_shape() {
     worker_deployment::normalize_workspace_d1_private_config(&mut extra, &template, "DB")
         .expect("validate selected identity without hiding extras");
     assert_ne!(extra, template);
+}
+
+#[test]
+fn workspace_d1_migration_config_consumer_characterization() {
+    use crate::runtime::tests::d1_config_characterization::{characterize, extend};
+    characterize(|common, input| {
+        let contract: cfctl_core::WorkspaceD1MigrationContractV1 = serde_json::from_value(
+            extend(common, json!({"migrations_dir":"migrations", "migrations":[], "assertions":[], "recovery_capability_id":"d1-time-travel-get-bookmark", "recovery_max_age_seconds":600,"rollback_capability_id":"d1-restore-exact-bookmark"}))
+        ).expect("typed source contract");
+        validated_config(&contract, input).map(|config| config.sha256)
+    });
 }

@@ -43,7 +43,7 @@ pub(super) fn reply_subdomain_fresh_precondition_failure_is_not_promoted_to_a_pa
         "provider_output_retained":false,
         "body_returned":false,
     });
-    let envelope = super::reply_subdomain_fresh_precondition_failure_envelope(
+    let envelope = super::pre_mutation_refusal_envelope(
         &plan,
         receipt,
         EvidenceV1::new(EvidenceClass::Apply, "sha256:evidence", "evidence.json"),
@@ -537,6 +537,7 @@ pub(super) async fn governed_delegated_timeout_terminates_the_full_build_process
             Some(&task_program),
             Some(Path::new("/bin/sh")),
             Duration::from_secs(5),
+            None,
         )
         .await
     });
@@ -599,6 +600,7 @@ pub(super) async fn delegated_launch_failure_is_typed_as_not_started() {
         Some(&missing_program),
         None,
         Duration::from_secs(1),
+        None,
     )
     .await
     .expect_err("missing delegated executable must fail before launch");
@@ -647,6 +649,7 @@ pub(super) async fn governed_delegated_timeout_windows_job_contains_the_full_bui
             Some(&task_program),
             Some(Path::new("powershell.exe")),
             Duration::from_secs(5),
+            None,
         )
         .await
     });

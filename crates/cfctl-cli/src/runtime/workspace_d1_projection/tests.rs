@@ -125,3 +125,15 @@ fn state_keys_and_identifiers_fail_closed() {
     assert!(state_key("active_policy_sha256").is_ok());
     assert!(state_key("active' OR 1=1").is_err());
 }
+
+#[test]
+fn workspace_d1_projection_config_consumer_characterization() {
+    use crate::runtime::tests::d1_config_characterization::{characterize, extend};
+    characterize(|common, input| {
+        let contract: cfctl_core::WorkspaceD1PolicyProjectionContractV1 = serde_json::from_value(
+            extend(common, json!({"route_table":"alias_routes","route_policy_sha_column":"policy_sha256","runtime_state_table":"runtime_state","runtime_state_key_column":"key","runtime_state_value_column":"value","active_policy_key":"active_policy_sha256","desired_state_digest_key":"desired_state_sha256","projection_digest_key":"projection_sha256","recovery_capability_id":"d1-time-travel-get-bookmark","recovery_max_age_seconds":600,"rollback_capability_id":"d1-restore-exact-bookmark"}))
+        ).expect("typed source contract");
+        crate::runtime::workspace_d1_config::validated_config((&contract).into(), input)
+            .map(|config| config.sha256)
+    });
+}

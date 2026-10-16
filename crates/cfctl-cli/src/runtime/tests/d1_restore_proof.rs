@@ -131,8 +131,14 @@ async fn executed_plan(store: &StorageStateStore) -> PlanV1 {
         .await
         .expect("native restore execution");
     assert!(matches!(
-        process_api_boundary_response(store, &mut plan, &apply, &MemorySecretStore::default())
-            .expect("persist native apply"),
+        process_api_boundary_response(
+            store,
+            &mut plan,
+            &apply,
+            &MemorySecretStore::default(),
+            true
+        )
+        .expect("persist native apply"),
         ApiBoundaryResponseOutcome::Ready { .. }
     ));
     let outcome = verify_api_plan(store, &executor, &mut plan, &apply, &input(), &credential)

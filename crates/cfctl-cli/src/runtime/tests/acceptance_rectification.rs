@@ -57,7 +57,10 @@ async fn returned_delegated_receipt_survives_evidence_and_recovery_storage_failu
                 token: "fixture".to_owned(),
             },
             &MemorySecretStore::default(),
-            receipt,
+            DelegatedReceipt {
+                value: receipt,
+                boundary: dispatched_boundary(),
+            },
         )
         .await;
         assert!(!envelope.ok);
@@ -149,8 +152,14 @@ fn unattested_observations_complete_apply_verify_and_recovery_without_qualifying
         result_info: None,
     };
     assert!(matches!(
-        process_api_boundary_response(&scoped, &mut plan, &response, &MemorySecretStore::default())
-            .expect("acceptance fixture and expected result"),
+        process_api_boundary_response(
+            &scoped,
+            &mut plan,
+            &response,
+            &MemorySecretStore::default(),
+            true
+        )
+        .expect("acceptance fixture and expected result"),
         ApiBoundaryResponseOutcome::Ready { .. }
     ));
     let verification = verification_outcome(

@@ -254,6 +254,7 @@ printf '%s\n' \
         Some(&success_program),
         Some(Path::new("/bin/sh")),
         Some(&planned),
+        None,
     )
     .await
     .expect("private Worker boundary receipt");
@@ -329,6 +330,7 @@ printf '%s\n' \
             Some(&collision_program),
             Some(Path::new("/bin/sh")),
             Some(&planned),
+            None,
         )
         .await
         .expect("private Worker collision receipt");
@@ -387,6 +389,7 @@ printf '%s\n' \
         Some(&failure_program),
         Some(Path::new("/bin/sh")),
         Some(&planned),
+        None,
     )
     .await
     .expect("failed private Worker boundary receipt");
@@ -563,6 +566,7 @@ printf '%s\n' \
             Some(&success_program),
             Some(Path::new("/bin/sh")),
             Some(&planned),
+            None,
         )
         .await
         .is_err(),

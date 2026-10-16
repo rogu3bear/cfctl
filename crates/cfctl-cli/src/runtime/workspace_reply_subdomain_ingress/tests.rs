@@ -816,24 +816,8 @@ fn activation_execution_rebinds_zone_owner_plan_and_exact_apply_payload() {
         Some("fresh_parent_zone_drifted")
     );
 
-    let failure_receipt = json!({
-        "adapter":ACTIVATION_APPLY_PROJECTION,
-        "success":false,
-        "boundary_crossed":false,
-        "schema_version":1,
-        "cfctl_operation_id":"00000000-0000-4000-8000-000000000000",
-        "reply_domain_sha256":sha256(target.reply_domain.as_bytes()),
-        "worker_target_sha256":sha256(target.worker_script_name.as_bytes()),
-        "status":"fresh_account_plan_drifted",
-        "provider_status":Value::Null,
-        "failure_code":"CFCTL_WORKSPACE_REPLY_SUBDOMAIN_FRESH_PRECONDITION_FAILED",
-        "provider_output_retained":false,
-        "body_returned":false,
-    });
-    assert!(is_unperformed_fresh_precondition_failure(&failure_receipt));
-    let mut promoted = failure_receipt.clone();
-    promoted["boundary_crossed"] = Value::Bool(true);
-    assert!(!is_unperformed_fresh_precondition_failure(&promoted));
+    // Dispatch classification is now exercised through the real read and
+    // finalization path below, not a predicate over an arbitrary receipt bit.
 }
 
 #[test]
@@ -903,4 +887,148 @@ fn provider_capability(
         body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
     });
     capability
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One fixture demonstrates the actual read, mutation refusal and durable evidence together."
+)]
+async fn fresh_precondition_read_refusal_keeps_its_evidence_without_claiming_a_mutation() {
+    use crate::runtime::{
+        delegated_execution::{DelegatedReceipt, complete_delegated_plan},
+        tests::authenticated_test_store,
+    };
+    use cfctl_auth::MemorySecretStore;
+    use cfctl_core::{BoundaryObservation, ResponseContractV1, SelectorV1, TransactionStageV1};
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("read");
+        let mut bytes = [0; 8192];
+        let count = socket.read(&mut bytes).await.expect("request");
+        assert!(String::from_utf8_lossy(&bytes[..count]).starts_with("GET /zones?"));
+        let body = r#"{"success":false,"result":null,"errors":[{"code":10000,"message":"private-read-sentinel"}]}"#;
+        socket.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("response");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "no mutation or read retry"
+        );
+    });
+    let boundary = BoundaryObservation::default();
+    let executor = Executor::new(
+        super::super::support::mutation_http_client().expect("client"),
+        &format!("http://{address}"),
+    )
+    .expect("executor")
+    .with_boundary_observation(boundary.clone());
+    let mut zone = CapabilityV1::new(ZONE_LIST_ID, "Read zones", "GET", ZONE_LIST_PATH);
+    zone.selectors = ["name", "account.id", "page", "per_page"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.into(),
+            location: "query".into(),
+            required: false,
+            value_type: if matches!(name, "page" | "per_page") {
+                "integer"
+            } else {
+                "string"
+            }
+            .into(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    zone.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".into()],
+        success_media_types: vec!["application/json".into()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let credential = AuthCredential::Bearer {
+        token: "synthetic-only".into(),
+    };
+    let desired = target();
+    let read_receipt = resolve_active_parent_zone_id(&executor, &zone, &desired, &credential)
+        .await
+        .expect_err("fresh read refusal");
+    server.await.expect("one actual read");
+    assert!(boundary.attempted());
+    assert!(!boundary.mutation_attempted());
+    let root = tempfile::tempdir().expect("runtime");
+    let store = authenticated_test_store(cfctl_storage::RuntimePaths::from_root(root.path()));
+    let mut plan = PlanV1::draft(
+        "fixture",
+        &desired.account_id,
+        "catalog-fixture",
+        CapabilityV1::new(
+            "fixture.activation",
+            "Activation",
+            "PUT",
+            "workspace:activation",
+        ),
+        json!({}),
+    )
+    .expect("plan");
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+        .expect("intent");
+    store.save_plan(&plan).expect("persist");
+    let receipt = activation_precondition_receipt(&plan, &desired, receipt_status(&read_receipt));
+    let status = receipt["status"].clone();
+    let catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: chrono::Utc::now(),
+        source_url: String::new(),
+        source_hash: String::new(),
+        schema_hash: "catalog-fixture".into(),
+        capabilities: std::collections::BTreeMap::default(),
+    };
+    let envelope = complete_delegated_plan(
+        &store,
+        &catalog,
+        &mut plan,
+        &CallInput::default(),
+        &credential,
+        &MemorySecretStore::default(),
+        DelegatedReceipt {
+            value: receipt,
+            boundary,
+        },
+    )
+    .await;
+    assert!(!envelope.ok);
+    assert!(
+        !envelope.performed,
+        "the envelope reports the absent activation, not the preceding read"
+    );
+    assert_eq!(envelope.result["status"], status);
+    let evidence = envelope
+        .evidence
+        .first()
+        .expect("retained body-free precondition result");
+    assert_eq!(
+        store
+            .read_evidence_value(&evidence.content_hash)
+            .expect("evidence")["status"],
+        status
+    );
+    assert!(
+        !serde_json::to_string(&envelope)
+            .expect("public result")
+            .contains("private-read-sentinel")
+    );
+    assert!(
+        store
+            .load_plan(&plan.operation_id)
+            .expect("consumed plan")
+            .mark_consumed()
+            .is_err()
+    );
 }

@@ -99,8 +99,14 @@ async fn custom_challenge_ambiguous_patch_is_single_attempt_and_keeps_authentica
             .unwrap();
         assert_eq!(response.status, status);
         assert_eq!(plan.status, PlanStatus::RectificationRequired);
-        process_api_boundary_response(&store, &mut plan, &response, &MemorySecretStore::default())
-            .unwrap();
+        process_api_boundary_response(
+            &store,
+            &mut plan,
+            &response,
+            &MemorySecretStore::default(),
+            true,
+        )
+        .unwrap();
         assert_eq!(
             store.load_plan(&plan.operation_id).unwrap().status,
             PlanStatus::RectificationRequired

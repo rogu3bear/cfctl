@@ -1272,7 +1272,7 @@ async fn execute_consumed_plan_inner(
         return result;
     }
     if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
-        let result = Box::pin(execute_delegated_plan(
+        let mut envelope = Box::pin(execute_delegated_plan(
             store,
             catalog,
             plan,
@@ -1281,48 +1281,41 @@ async fn execute_consumed_plan_inner(
             secrets,
         ))
         .await;
-        return match result {
-            Ok(mut envelope) => {
-                prepend_live_precondition_evidence(&mut envelope, evidence);
-                Ok(envelope)
-            }
-            Err(error)
-                if plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted =>
-            {
-                let persistence =
-                    persist_delegated_pre_response_failure(store, plan, &error, secrets);
-                let mut envelope = delegated_pre_response_failure_envelope(plan, &error);
-                if let Err(persistence_error) = persistence
-                    && let Some(error) = envelope.error.as_mut()
-                {
-                    error.message = format!(
-                        "{}; recovery persistence also failed: {persistence_error}",
-                        error.message
-                    );
-                }
-                prepend_live_precondition_evidence(&mut envelope, evidence);
-                Ok(envelope)
-            }
-            Err(error) => Err(error),
-        };
+        prepend_live_precondition_evidence(&mut envelope, evidence);
+        return Ok(envelope);
     }
     if plan.capability.adapter_status == AdapterStatus::GovernedUi {
-        let mut result = execute_governed_ui_plan(store, plan, execution_input, secrets);
-        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
-        {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_transaction_stage_with_artifact(
-                store,
-                plan,
-                TransactionStageV1::BoundaryResponsePersisted,
-                boundary_failure_artifact("governed_ui", "handoff_failed"),
-            )?;
-            persist_secret_lifecycle(store, plan, false, None, secrets)?;
-        }
-        if let Ok(envelope) = &mut result {
-            prepend_live_precondition_evidence(envelope, evidence);
-        }
-        return result;
+        let mut envelope = match execute_governed_ui_plan(store, plan, execution_input, secrets) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                // This producer only prepares AgentActionV1. It never launches
+                // a browser or submits the dashboard action, even on failure.
+                plan.status = PlanStatus::RectificationRequired;
+                let mut failures = vec![error.to_string()];
+                if let Err(error) = persist_transaction_stage_with_artifact(
+                    store,
+                    plan,
+                    TransactionStageV1::BoundaryResponsePersisted,
+                    boundary_failure_artifact("governed_ui", "handoff_failed"),
+                ) {
+                    failures.push(format!("UI handoff checkpoint failed: {error}"));
+                }
+                if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                    failures.push(format!("UI handoff lifecycle failed: {error}"));
+                }
+                super::api_boundary::post_boundary_failure_envelope(
+                    plan,
+                    json!({"adapter":"governed_ui", "agent_action_available":false, "performed":false}),
+                    None,
+                    None,
+                    &CliError::Input(failures.join("; ")),
+                    false,
+                    "UI handoff preparation failed before any dashboard action; consumption remains non-replayable",
+                )
+            }
+        };
+        prepend_live_precondition_evidence(&mut envelope, evidence);
+        return Ok(envelope);
     }
     let mut envelope = Box::pin(execute_api_plan(
         store,
@@ -1340,11 +1333,11 @@ async fn execute_consumed_plan_inner(
 pub(super) fn persist_delegated_pre_response_failure(
     store: &StateStore,
     plan: &mut PlanV1,
-    error: &CliError,
     secrets: &dyn SecretStore,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<()> {
     plan.status = PlanStatus::RectificationRequired;
-    let outcome = if delegated_mutation_was_attempted(error) {
+    let outcome = if boundary.mutation_attempted() {
         "no_receipt"
     } else {
         "not_attempted"
@@ -1362,6 +1355,7 @@ pub(super) fn persist_delegated_pre_response_failure(
 pub(super) fn delegated_pre_response_failure_envelope(
     plan: &PlanV1,
     error: &CliError,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> ResultEnvelopeV2 {
     let next_step = format!(
         "Do not replay the mutation; run `cfctl plans status {} --json`, then `cfctl plans rectify {} --json`.",
@@ -1373,7 +1367,7 @@ pub(super) fn delegated_pre_response_failure_envelope(
         &error.to_string(),
         Some(&next_step),
     );
-    let performed = delegated_mutation_was_attempted(error);
+    let performed = boundary.mutation_attempted();
     envelope.result = json!({
         "success": false,
         "outcome": if performed { "unknown" } else { "not_attempted" },
@@ -1399,13 +1393,6 @@ pub(super) fn delegated_pre_response_failure_envelope(
             .to_owned()
     });
     envelope
-}
-
-pub(super) fn delegated_mutation_was_attempted(error: &CliError) -> bool {
-    matches!(
-        error,
-        CliError::SubprocessTimeout { .. } | CliError::SubprocessReceiptUnavailable { .. }
-    )
 }
 
 pub(super) fn prepend_live_precondition_evidence(

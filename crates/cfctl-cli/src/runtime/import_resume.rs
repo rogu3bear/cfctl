@@ -737,6 +737,7 @@ pub(super) fn approved_mln_import_execution_error_envelope(
     plan: &mut PlanV1,
     error: CloudflareError,
     secrets: &dyn SecretStore,
+    performed: bool,
 ) -> ResultEnvelopeV2 {
     if matches!(error, CloudflareError::D1ImportProviderFailure) {
         return known_import_provider_failure_envelope(store, plan, secrets);
@@ -767,9 +768,7 @@ pub(super) fn approved_mln_import_execution_error_envelope(
         plan.status = PlanStatus::RectificationRequired;
     }
     let _ = store.save_plan(plan);
-    let mut envelope = process_api_transport_failure(store, plan, &CliError::from(error), secrets);
-    envelope.performed = true;
-    envelope
+    process_api_transport_failure(store, plan, &CliError::from(error), secrets, performed)
 }
 
 pub(super) fn persist_d1_import_checkpoint(
@@ -831,6 +830,7 @@ pub(super) async fn execute_approved_mln_import_plan(
     execution_input: &CallInput,
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<ResultEnvelopeV2> {
     let stage_path = plan
         .targets
@@ -868,12 +868,17 @@ pub(super) async fn execute_approved_mln_import_plan(
         Ok(response) => response,
         Err(error) => {
             return Ok(approved_mln_import_execution_error_envelope(
-                store, plan, error, secrets,
+                store,
+                plan,
+                error,
+                secrets,
+                boundary.attempted(),
             ));
         }
     };
     let (response_value, apply_evidence, lineage_evidence) =
-        match process_api_boundary_response(store, plan, &response, secrets)? {
+        match process_api_boundary_response(store, plan, &response, secrets, boundary.attempted())?
+        {
             ApiBoundaryResponseOutcome::Ready {
                 response_value,
                 apply_evidence,
@@ -891,7 +896,7 @@ pub(super) async fn execute_approved_mln_import_plan(
             Some(apply_evidence),
             lineage_evidence,
             &error,
-            true,
+            boundary.attempted(),
             "the import boundary was crossed but provider completion was not proven",
         ));
     }
@@ -904,7 +909,7 @@ pub(super) async fn execute_approved_mln_import_plan(
             Some(apply_evidence),
             lineage_evidence,
             &error,
-            true,
+            boundary.attempted(),
             "the import boundary was crossed but exact durable provider completion was not proven",
         ));
     }
@@ -935,7 +940,7 @@ pub(super) async fn execute_approved_mln_import_plan(
                     Some(apply_evidence),
                     lineage_evidence,
                     &error,
-                    true,
+                    boundary.attempted(),
                     &format!(
                         "the {subject} import completed, but its schema-marker verification could not be persisted"
                     ),
@@ -955,7 +960,7 @@ pub(super) async fn execute_approved_mln_import_plan(
             apply_evidence,
             lineage_evidence,
             verification,
-            true,
+            boundary.attempted(),
             finalization_error.as_ref(),
         ));
     }
@@ -963,7 +968,17 @@ pub(super) async fn execute_approved_mln_import_plan(
         plan.status,
         PlanStatus::RectificationRequired | PlanStatus::Failed
     ) {
-        store.save_plan(plan)?;
+        if let Err(error) = store.save_plan(plan) {
+            return Ok(post_boundary_failure_envelope(
+                plan,
+                response_value,
+                Some(apply_evidence),
+                lineage_evidence,
+                &CliError::from(error),
+                boundary.attempted(),
+                "the import response was received, but its local checkpoint failed; preserve the consumed operation and rectify without replay",
+            ));
+        }
         return Ok(post_boundary_failure_envelope(
             plan,
             response_value,
@@ -972,16 +987,26 @@ pub(super) async fn execute_approved_mln_import_plan(
             &CliError::Input(
                 "approved MLN import ended in a terminal failure state; do not replay".to_owned(),
             ),
-            true,
+            boundary.attempted(),
             "terminal import evidence cannot be overwritten by a pending-proof state",
         ));
     }
     plan.status = PlanStatus::Running;
-    store.save_plan(plan)?;
+    if let Err(error) = store.save_plan(plan) {
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::from(error),
+            boundary.attempted(),
+            "the import response was received, but its local checkpoint failed; preserve the consumed operation and rectify without replay",
+        ));
+    }
     let mut envelope =
         ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
     envelope.ok = false;
-    envelope.performed = true;
+    envelope.performed = boundary.attempted();
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());
     envelope.profile_id = Some(plan.profile_id.clone());

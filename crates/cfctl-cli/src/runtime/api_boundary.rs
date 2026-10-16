@@ -39,6 +39,7 @@ pub(super) fn process_api_boundary_response(
     plan: &mut PlanV1,
     response: &CloudflareResponseV1,
     secrets: &dyn SecretStore,
+    performed: bool,
 ) -> Result<ApiBoundaryResponseOutcome> {
     let response_value =
         redact_response_for_capability(&plan.capability, &serde_json::to_value(response)?);
@@ -90,7 +91,7 @@ pub(super) fn process_api_boundary_response(
                 apply_evidence,
                 lifecycle.lineage_evidence,
                 &error,
-                response.success,
+                performed,
                 verification_basis,
             ),
         ));
@@ -116,16 +117,28 @@ pub(super) fn process_api_transport_failure(
     plan: &mut PlanV1,
     transport_error: &CliError,
     secrets: &dyn SecretStore,
+    performed: bool,
 ) -> ResultEnvelopeV2 {
     plan.status = PlanStatus::RectificationRequired;
-    let mut failures = vec![format!(
-        "Cloudflare mutation outcome is unknown after the request crossed the boundary: {transport_error}"
-    )];
+    let mut failures = vec![if performed {
+        format!(
+            "Cloudflare mutation outcome is unknown after transport dispatch: {transport_error}"
+        )
+    } else {
+        format!("The consumed operation stopped before mutation dispatch: {transport_error}")
+    }];
     if let Err(error) = persist_transaction_stage_with_artifact(
         store,
         plan,
         TransactionStageV1::BoundaryResponsePersisted,
-        boundary_failure_artifact("dynamic_api", "transport_error"),
+        boundary_failure_artifact(
+            "dynamic_api",
+            if performed {
+                "transport_error"
+            } else {
+                "not_attempted"
+            },
+        ),
     ) {
         failures.push(format!(
             "unknown-outcome boundary receipt persistence failed: {error}"
@@ -141,14 +154,18 @@ pub(super) fn process_api_transport_failure(
         plan,
         json!({
             "success": false,
-            "outcome": "unknown",
+            "outcome": if performed { "unknown" } else { "not_attempted" },
             "receipt_available": false,
         }),
         None,
         None,
         &error,
-        false,
-        "the mutation request was sent, but no Cloudflare response was received; the remote outcome is unknown and must be rectified without replay",
+        performed,
+        if performed {
+            "the transport was dispatched, but no complete Cloudflare response was received; the remote outcome is unknown and must be rectified without replay"
+        } else {
+            "the consumed operation stopped before mutation dispatch; consumption is retained and cannot be replayed"
+        },
     )
 }
 
@@ -486,21 +503,21 @@ pub(super) fn persist_secret_lifecycle_and_reconcile_lineage(
         (Err(sink_error), Ok(lineage_evidence)) => PostBoundaryLifecycleOutcome {
             lineage_evidence,
             error: Some(CliError::Input(format!(
-                "the Cloudflare boundary response was persisted, but the secret sink failed: {sink_error}. Do not replay the mutation; run `cfctl plans rectify {}`",
+                "the secret sink failed after response processing: {sink_error}. Do not replay the mutation; run `cfctl plans rectify {}`",
                 plan.operation_id
             ))),
         },
         (Ok(_), Err(lineage_error)) => PostBoundaryLifecycleOutcome {
             lineage_evidence: None,
             error: Some(CliError::Input(format!(
-                "the Cloudflare boundary response was persisted, but standing token lineage reconciliation failed: {lineage_error}. Do not replay the mutation; run `cfctl plans rectify {}`",
+                "standing token lineage reconciliation failed after response processing: {lineage_error}. Do not replay the mutation; run `cfctl plans rectify {}`",
                 plan.operation_id
             ))),
         },
         (Err(sink_error), Err(lineage_error)) => PostBoundaryLifecycleOutcome {
             lineage_evidence: None,
             error: Some(CliError::Input(format!(
-                "the Cloudflare boundary response was persisted, but both the secret sink and standing token lineage reconciliation failed (sink: {sink_error}; lineage: {lineage_error}). Do not replay the mutation; run `cfctl plans rectify {}`",
+                "both the secret sink and standing token lineage reconciliation failed after response processing (sink: {sink_error}; lineage: {lineage_error}). Do not replay the mutation; run `cfctl plans rectify {}`",
                 plan.operation_id
             ))),
         },

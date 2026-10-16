@@ -733,6 +733,7 @@ pub(super) fn delegated_failure_status_precedes_durable_boundary_receipts() {
         &receipt,
         &evidence,
         &MemorySecretStore::default(),
+        true,
     )
     .expect("a failed delegated boundary remains durably rectifiable");
 
@@ -792,11 +793,12 @@ pub(super) fn delegated_timeout_persists_unknown_outcome_and_returns_no_replay_g
     super::persist_delegated_pre_response_failure(
         &store,
         &mut plan,
-        &timeout,
         &MemorySecretStore::default(),
+        &dispatched_boundary(),
     )
     .expect("persist timeout recovery state");
-    let envelope = super::delegated_pre_response_failure_envelope(&plan, &timeout);
+    let envelope =
+        super::delegated_pre_response_failure_envelope(&plan, &timeout, &dispatched_boundary());
 
     let durable = store
         .load_plan(&plan.operation_id)

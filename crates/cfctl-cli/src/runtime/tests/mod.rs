@@ -184,6 +184,14 @@ pub(super) fn authenticated_test_store(paths: RuntimePaths) -> StorageStateStore
     StateStore::open(paths).expect("authenticated test state store")
 }
 
+/// Legacy finalizer fixtures explicitly model a recorded launch. Tests of
+/// actual dispatch use their real executor/process observer instead.
+fn dispatched_boundary() -> cfctl_core::BoundaryObservation {
+    let observation = cfctl_core::BoundaryObservation::default();
+    observation.record_dispatch(cfctl_core::DispatchKind::Mutation);
+    observation
+}
+
 #[test]
 fn authenticated_test_store_reopens_the_same_authority() {
     let root = tempfile::tempdir().expect("runtime root");
@@ -234,8 +242,11 @@ mod workflows_and_resolve;
 use workflows_and_resolve::*;
 mod access_application;
 mod access_oauth;
+mod coherent_boundaries;
 mod envelope_success;
 mod resolve_acceptance;
 use access_application::*;
 mod access_policy;
 mod import_exhaustion;
+
+pub(super) mod d1_config_characterization;

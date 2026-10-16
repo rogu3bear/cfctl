@@ -10,7 +10,7 @@ use super::{
         OpenOptionsExt, Path, PathBuf, PermissionsExt, PlanV1, ProfileMetadata, Read, Result,
         StateStore, Stdio, Write,
     },
-    workspace_d1_migration,
+    workspace_d1_recovery,
 };
 use std::{
     fs,
@@ -175,7 +175,7 @@ pub(super) fn prepare_plan_target(
     let Some(contract) = capability.workspace_d1_reply_admission.as_ref() else {
         return Ok(None);
     };
-    let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
+    let config = super::workspace_d1_config::validated_config(contract.into(), input)?;
     let compiler_runtime = compiler_runtime(store, contract)?;
     let bytes = compile_private_candidate(store, contract, source, &compiler_runtime)?;
     let (candidate, generation) = control_plane_binding::validate_candidate(
@@ -185,7 +185,7 @@ pub(super) fn prepare_plan_target(
         config.database_id.as_str(),
     )?;
     let stage = stage_private_candidate(store, &bytes)?;
-    let recovery = workspace_d1_migration::fresh_recovery_proof(
+    let recovery = workspace_d1_recovery::fresh_recovery_proof(
         store,
         catalog,
         input,
@@ -252,7 +252,7 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
         ));
     }
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
-    let config = workspace_d1_migration::validated_config(&config_contract(contract), &input)?;
+    let config = super::workspace_d1_config::validated_config(contract.into(), &input)?;
     let target = target(plan)?;
     for (k, v) in [
         ("repository_head", contract.repository_head.as_str()),
@@ -335,7 +335,7 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
     ] {
         require(target, k, v)?;
     }
-    workspace_d1_migration::validate_recovery_target(
+    workspace_d1_recovery::validate_recovery_target(
         store,
         target,
         &plan.catalog_hash,
@@ -348,6 +348,7 @@ pub(super) async fn run(
     store: &StateStore,
     plan: &PlanV1,
     credential: &AuthCredential,
+    boundary: &cfctl_core::BoundaryObservation,
 ) -> Result<Value> {
     validate_bound_plan(store, plan)?;
     let contract = plan
@@ -363,7 +364,7 @@ pub(super) async fn run(
     let bytes = read_private_candidate(&private_stage_path(store, stage(target)?)?)?;
     let candidate = validate_candidate_bytes(&bytes)?;
     validate_candidate_fresh(&candidate, Utc::now())?;
-    let version = workspace_d1_migration::run_wrangler(
+    let version = super::workspace_d1_execution::run_wrangler(
         &["--version".to_owned()],
         root,
         credential,
@@ -373,7 +374,7 @@ pub(super) async fn run(
     )
     .await
     .map_err(CliError::delegated_mutation_not_attempted)?;
-    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
+    let observed_version = super::workspace_d1_execution::parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(
             "workspace reply admission requires Wrangler {}, observed {observed_version}",
@@ -382,7 +383,7 @@ pub(super) async fn run(
     }
     let sql = insert_sql(&contract.admission_table, &candidate.record)?;
     let sql_path = private_sql(store, &sql)?;
-    let result = workspace_d1_migration::run_wrangler_with_config_identity(
+    let result = super::workspace_d1_execution::run_wrangler_with_config_identity(
         &[
             "d1".into(),
             "execute".into(),
@@ -401,15 +402,13 @@ pub(super) async fn run(
         config_sha256,
         &contract.config_template_sha256,
         &contract.database_binding,
+        Some(boundary),
     )
     .await;
     let _ = fs::remove_file(&sql_path);
     let result = match result {
         Ok(result) => result,
-        Err(
-            error @ (CliError::SubprocessNotStarted { .. }
-            | CliError::DelegatedMutationNotAttempted { .. }),
-        ) => return Err(error),
+        Err(error) if !boundary.mutation_attempted() => return Err(error),
         Err(_) => {
             return Ok(json!({
             "adapter":"workspace_d1_reply_admission_v1",
@@ -585,7 +584,7 @@ pub(super) async fn read(
                 .to_owned(),
         ));
     }
-    let config = workspace_d1_migration::validated_config(&config_contract(contract), input)?;
+    let config = super::workspace_d1_config::validated_config(contract.into(), input)?;
     let runtime = compiler_runtime(store, contract)?;
     let bytes = compile_private_candidate(store, contract, source, &runtime)?;
     let (candidate, _generation) = control_plane_binding::validate_candidate(
@@ -615,7 +614,7 @@ pub(super) async fn read(
             )));
         }
     }
-    let version = workspace_d1_migration::run_wrangler(
+    let version = super::workspace_d1_execution::run_wrangler(
         &["--version".to_owned()],
         Path::new(&contract.repository_root),
         credential,
@@ -624,7 +623,7 @@ pub(super) async fn read(
         READ_TIMEOUT,
     )
     .await?;
-    let observed_version = workspace_d1_migration::parse_wrangler_version(&version.stdout)?;
+    let observed_version = super::workspace_d1_execution::parse_wrangler_version(&version.stdout)?;
     if !version.success || observed_version != contract.wrangler_version {
         return Err(CliError::Input(format!(
             "workspace reply-admission read requires Wrangler {}, observed {observed_version}",
@@ -638,7 +637,7 @@ pub(super) async fn read(
         escape(candidate.record["id"].as_str().unwrap_or_default()),
         escape(candidate.transaction_sha256.trim_start_matches("sha256:")),
     );
-    let rows = workspace_d1_migration::execute_json_query_with_config_identity(
+    let rows = super::workspace_d1_execution::execute_json_query_with_config_identity(
         &config.database_name,
         &contract.database_binding,
         &config.path,
@@ -757,7 +756,7 @@ async fn verify_inner(
         identifier(&contract.admission_table)?,
         escape(&id)
     );
-    let rows = workspace_d1_migration::execute_json_query_with_config_identity(
+    let rows = super::workspace_d1_execution::execute_json_query_with_config_identity(
         string(target, "database_name")?,
         &contract.database_binding,
         string(target, "production_config")?,
@@ -1961,30 +1960,6 @@ fn identifier(s: &str) -> Result<&str> {
 }
 fn escape(s: &str) -> String {
     s.replace('\'', "''")
-}
-fn config_contract(
-    c: &cfctl_core::WorkspaceD1ReplyAdmissionContractV1,
-) -> cfctl_core::WorkspaceD1MigrationContractV1 {
-    cfctl_core::WorkspaceD1MigrationContractV1 {
-        repository_root: c.repository_root.clone(),
-        repository_head: c.repository_head.clone(),
-        repository_origin: c.repository_origin.clone(),
-        operation_pack_path: c.operation_pack_path.clone(),
-        operation_pack_sha256: c.operation_pack_sha256.clone(),
-        config_template_path: c.config_template_path.clone(),
-        config_template_sha256: c.config_template_sha256.clone(),
-        production_config_path: c.production_config_path.clone(),
-        migrations_dir: String::new(),
-        database_binding: c.database_binding.clone(),
-        wrangler_version: c.wrangler_version.clone(),
-        migrations: vec![],
-        assertions: vec![],
-        recovery_capability_id: c.recovery_capability_id.clone(),
-        recovery_max_age_seconds: c.recovery_max_age_seconds,
-        rollback_capability_id: c.rollback_capability_id.clone(),
-        transition: None,
-        manifest_migration: None,
-    }
 }
 
 mod apple_mail_inbox_source;
