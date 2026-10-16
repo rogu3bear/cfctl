@@ -270,6 +270,9 @@ fn managed_skill(agent: AgentKind) -> &'static str {
 // The operator skill adds a task-adaptive playbook around these invariants;
 // Cursor receives the same invariants in a compact always-applied rule.
 
+/// Clone-safe source orientation; local harness adapters are not product truth.
+pub const FRAGMENT_SOURCE_CHECKOUT: &str = "For cfctl source work, start with the tracked `NORTH_STAR.md`, `ANCHOR.md` and `LAYERS.md`, then `docs/agent-landing.md`. Follow `CONTRIBUTING.md` for the current proof gate and `docs/architecture.md` for implementation boundaries. Local harness guidance is optional and lower-scope; ignored historical sidecars do not configure the gate. Source-only work uses isolated test runtimes rather than operator credentials or runtime records.";
+
 /// Fail-closed doctor contract: a doctor never launches a different PATH cfctl.
 pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. PATH matching the running executable is not proof PATH git_commit matches this checkout HEAD; that comparison is `path_build.checkout_head` and is unhealthy when PATH git_commit differs from this cfctl checkout HEAD. Drifted managed instructions are also unhealthy.";
 
@@ -280,19 +283,19 @@ pub const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resol
 pub const FRAGMENT_WORKFLOW_FIRST: &str = "For telemetry investigations and audits, prefer the governed workflow ranked by `cfctl resolve` over assembling unrelated raw capabilities. Calling a native workflow returns a component preview, exact selector requirements, and a bounded profile/account/input-scoped proof projection; it does not execute the components or aggregate mutation authority. Run only steps with `available:true` and a non-null `call_argv`; blocked, contract-gapped, missing, or cyclic steps expose guidance but no runnable call. Run bounded reads individually and keep every mutation in its own plan/approve/run/verify lifecycle.";
 
 /// Source posture, live state, boundary crossing, and verification are distinct claims.
-pub const FRAGMENT_EVIDENCE_TRUTH: &str = "Keep evidence classes separate: source configuration describes intended posture; a successful performed read can establish bounded live state, while a performed failure can establish a denial or availability outcome; a plan is preview; and an apply receipt with `performed:true` proves only that a mutation boundary was crossed. Only successful post-change verification proves the intended outcome. Artifact presence alone is never verification.";
+pub const FRAGMENT_EVIDENCE_TRUTH: &str = "Keep evidence classes separate: source configuration describes intended posture; a successful performed read can establish bounded live state, while a performed failure can establish a denial or availability outcome; a plan is preview; and an apply result with `performed:true` records an observed transport dispatch attempt or subprocess launch, including a rejected or uncertain outcome. Only successful post-change verification proves the intended outcome. Artifact presence alone is never verification.";
 
 /// Stable envelope fields tell the operator what happened and what remains safe.
-pub const FRAGMENT_ENVELOPE_READING: &str = "Read every `ResultEnvelopeV2` before deciding the next action: `ok` is command success, `performed` says whether an external boundary was crossed, `policy_decision` explains authority, `verification.state` names proof status, `evidence` carries redacted receipts, and `error.next_step` is the governed recovery command when present. Never flatten those fields into one success claim.";
+pub const FRAGMENT_ENVELOPE_READING: &str = "Read every `ResultEnvelopeV2` before deciding the next action: `ok` is command success, `performed` reports observed external dispatch/launch independently of provider acceptance, `policy_decision` explains authority, `verification.state` names proof status, `evidence` carries redacted receipts, and `error.next_step` is the governed recovery command when present. Never flatten those fields into one success claim.";
 
 /// Cross-process replacement and proof freshness are bound to credential lineage.
 pub const FRAGMENT_CREDENTIAL_FRESHNESS: &str = "Operational proof is scoped to profile, account, input, catalog, and credential generation. Treat `credential_unbound` and `credential_drifted` as historical audit rows, never current proof; re-import or log in again when the active profile has no valid generation, then repeat the bounded read. For one audit page, `call audit-logs-v2-get-account-audit-logs --max-pages 1` requires explicit matching profile/account selectors, an existing private_file API-token profile, a fresh cached catalog, since/before UTC within ten minutes, limit 1..100, and direction asc. It sends at most one request with no retries, redirects, refresh or continuation; bounds are 16 MiB of body and 30 seconds. Its LiveRead receipt is excluded from ordinary operational proof. First-page absence does not establish whole-window absence or attribution; a further attempt requires separate authorization.";
 
 /// An uncertain mutation boundary is a recovery problem, not permission to replay.
-pub const FRAGMENT_RECOVERY: &str = "If a mutation result has `performed:true`, a transport failure follows a boundary attempt, or execution state is uncertain, do not replay `call` or `plans run`. Inspect `cfctl plans status <operation-id> --json`, reload the capability guide, and use only its emitted `resume`, `rectify`, or cancellation path. Preserve the original operation ID and receipts.";
+pub const FRAGMENT_RECOVERY: &str = "If a mutation result has `performed:true`, a transport failure follows a boundary attempt, or execution state is uncertain, do not replay `call` or `plans run`. Inspect `cfctl plans status <operation-id> --json`, reload the capability guide, and use only its emitted `resume`, `rectify`, or cancellation path. Preserve the original operation ID and receipts. A consumed operation remains non-replayable even when a local pre-dispatch refusal reports `performed:false`.";
 
 /// Secrets only move through explicit private ingress and sink surfaces.
-pub const FRAGMENT_SECRET_IO: &str = "Keep secrets out of arguments, stdout, plans, logs, and evidence. Import through stdin or a mode-0600 `--value-in` file, send secret request bodies with `--body-stdin`, and require a new mode-0600 `--value-out` or `--out` sink for secret or bounded bulk output. Never inspect or echo the secret to prove success.";
+pub const FRAGMENT_SECRET_IO: &str = "Keep secrets out of arguments, stdout, plans, logs, and evidence. Import through stdin or a mode-0600 `--value-in` file, send secret request bodies with `--body-stdin`, and require a new mode-0600 `--value-out` or `--out` sink for secret or bounded bulk output. Credential stdin, private credential files and bundles are bounded to 65,536 bytes including whitespace. File inputs use storage-owned capture; this does not change secret request-body limits. Never inspect or echo the secret to prove success.";
 
 /// App source and the account control plane have distinct owners.
 pub const FRAGMENT_APP_BOUNDARY: &str = "Application repositories own checked-in Wrangler configuration and their repo-local deploy gates; cfctl owns account and live-edge truth. Follow the app's deploy contract when the task is source deployment, then use cataloged cfctl reads for live verification. Never infer edge state from a successful local build or source diff.";
@@ -327,6 +330,7 @@ pub const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (
 /// than restating the fragment bodies, so a fragment added above is covered the
 /// moment it exists instead of the moment somebody remembers to assert it.
 pub const MANAGED_FRAGMENTS: &[&str] = &[
+    FRAGMENT_SOURCE_CHECKOUT,
     FRAGMENT_DOCTOR_TRUST,
     FRAGMENT_RESOLVE_PRIMARY,
     FRAGMENT_WORKFLOW_FIRST,
@@ -366,17 +370,20 @@ pub fn managed_documents() -> [(&'static str, &'static str); 2] {
 /// The managed-skill contract number carried in the installed front matter.
 /// Bump this when the installed document's contract changes; `agents doctor`
 /// compares whole strings, so every install goes stale on purpose when it moves.
-pub const MANAGED_SKILL_CONTRACT: u32 = 10;
+pub const MANAGED_SKILL_CONTRACT: u32 = 11;
 
 static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
 static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);
 
 fn build_managed_operator_skill() -> String {
     let header = format!(
-        "---\nname: cfctl\ndescription: Operate Cloudflare accounts and edge resources safely through cfctl, including capability discovery, live reads, workspace impact, mutation planning and approval, apply and verification, recovery, token governance, event reconciliation, telemetry workflows, and evidence-backed completion. Use for any Cloudflare inspection, configuration, deployment-adjacent account work, troubleshooting, security response, or credential lifecycle task.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare control through cfctl\n\nUse `cfctl` as the only public account-control surface. Do not use archived shell verbs, backend scripts, raw HTTP, direct provider integrations, or an unclassified dashboard path to route around the catalog.\n\n## Establish trust\n\n1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor --json`.\n2. Load `cfctl guide --topic system --json` when the task is unfamiliar or the runtime is unhealthy.\n3. "
+        "---\nname: cfctl\ndescription: Operate Cloudflare accounts and edge resources safely through cfctl, including capability discovery, live reads, workspace impact, mutation planning and approval, apply and verification, recovery, token governance, event reconciliation, telemetry workflows, and evidence-backed completion. Use for any Cloudflare inspection, configuration, deployment-adjacent account work, troubleshooting, security response, or credential lifecycle task.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare control through cfctl\n\nUse `cfctl` as the only public account-control surface. Do not use archived shell verbs, backend scripts, raw HTTP, direct provider integrations, or an unclassified dashboard path to route around the catalog."
     );
     [
         header.as_str(),
+        "\n\n## Source checkout guidance\n\n",
+        FRAGMENT_SOURCE_CHECKOUT,
+        "\n\n## Establish trust for authorized operator work\n\n1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor --json`.\n2. Load `cfctl guide --topic system --json` when the task is unfamiliar or the runtime is unhealthy.\n3. ",
         FRAGMENT_DOCTOR_TRUST,
         "\n\n## Resolve before acting\n\n4. ",
         FRAGMENT_RESOLVE_PRIMARY,
@@ -417,7 +424,9 @@ fn build_managed_operator_skill() -> String {
 
 fn build_managed_cursor_rule() -> String {
     [
-        "---\ndescription: Route Cloudflare discovery, live reads, plans, applies, recovery, and verification through the governed cfctl v2 control plane\nalwaysApply: true\n---\n\nStart with `cfctl version --json`, `cfctl doctor --json`, and `cfctl guide --topic system --json`. ",
+        "---\ndescription: Route Cloudflare discovery, live reads, plans, applies, recovery, and verification through the governed cfctl v2 control plane\nalwaysApply: true\n---\n\n",
+        FRAGMENT_SOURCE_CHECKOUT,
+        " For authorized operator work, start with `cfctl version --json`, `cfctl doctor --json`, and `cfctl guide --topic system --json`. ",
         FRAGMENT_DOCTOR_TRUST,
         " ",
         FRAGMENT_RESOLVE_PRIMARY,

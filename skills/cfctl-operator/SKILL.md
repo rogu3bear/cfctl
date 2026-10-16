@@ -11,9 +11,14 @@ Cloudflare.
 
 ## Workflow
 
-1. Read the repository `AGENTS.md`. Use local `./cfctl` if `cfctl` is absent
-   from `PATH`.
-2. Orient and refresh current official capability data:
+1. In a cfctl checkout, read the tracked `NORTH_STAR.md`, `ANCHOR.md`, `LAYERS.md`
+   and `docs/agent-landing.md`. Source changes follow `CONTRIBUTING.md` and
+   `docs/architecture.md`. Local harness guidance is optional and lower-scope;
+   ignored `AGENTS.md` and historical `LOCAL_CI.md` are not clone prerequisites
+   or a proof-gate bypass. Use local `./cfctl` if `cfctl` is absent from `PATH`.
+2. Select orientation commands appropriate to the authorized task. Runtime
+   health, catalog refresh, source tests and live reads have distinct effects.
+   Source-only work uses isolated tests. For operator work needing current data:
 
    ```bash
    cfctl version --json
@@ -82,8 +87,13 @@ Cloudflare.
 - Profiles and workspaces pin one account; ambiguity fails closed.
 - Running-build, PATH-build, and managed-instruction drift is unhealthy; repair
   installation before relying on the operator surface.
-- Secrets enter through stdin or the platform secret store. Secret-producing
-  calls require a new `--value-out` destination.
+- Credential stdin and private file intake are limited to 65,536 bytes including
+  whitespace; files use bounded owned, no-follow capture. Secret-producing calls
+  require a new `--value-out` destination. Secret request-body handling retains
+  its separate contract.
+- `performed` records observed external dispatch/launch, independently of command
+  success, provider acceptance and verification. A local pre-launch refusal does
+  not revive consumed approval; uncertain and rejected mutations cannot replay.
 - Mutation contracts must know risk, effect, cost, permissions, entitlement,
   verification, and rollback or irreversibility.
 - Deletes, purges, identity/security/ownership changes, external sends,

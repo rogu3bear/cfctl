@@ -938,8 +938,40 @@ fn validate_command_refs(path: &str, content: &str) -> Result<(), TaskError> {
 /// authority — but they live in Rust source, which the tracked-file lint does
 /// not scan. This binds the commands they teach to the same command tree.
 fn verify_managed_agent_documents() -> Result<(), TaskError> {
+    validate_source_guidance_references(
+        cfctl_agent::FRAGMENT_SOURCE_CHECKOUT,
+        &tracked_files(repository_root()?)?,
+    )?;
     for (label, document) in cfctl_agent::managed_documents() {
         validate_extracted_command_refs(label, extract_prose_command_refs(document, true, false))?;
+    }
+    Ok(())
+}
+
+/// The generated source onboarding must resolve in a clean clone. Check actual
+/// tracked identities, rather than accepting an ignored local adapter by name.
+fn validate_source_guidance_references(
+    fragment: &str,
+    tracked: &[String],
+) -> Result<(), TaskError> {
+    let references = fragment
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|reference| {
+            Path::new(reference)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        })
+        .collect::<Vec<_>>();
+    if references.is_empty()
+        || references
+            .iter()
+            .any(|reference| !tracked.iter().any(|path| path == reference))
+    {
+        return Err(TaskError::InvalidSourceContract(
+            "managed source guidance must reference existing tracked Markdown owners available in a clone".into()
+        ));
     }
     Ok(())
 }
@@ -5027,5 +5059,35 @@ chmod +x "$8/$6/debug/xtask"
         assert!(!preview_run.status.success());
         assert!(String::from_utf8_lossy(&preview_run.stderr).contains("unsigned assembly"));
         assert!(render_linux_installer_text(template, "bad", "bad", Some(("", "issuer"))).is_err());
+    }
+    #[test]
+    fn managed_source_guidance_refuses_missing_or_ignored_clone_prerequisites() {
+        let tracked = vec![
+            "NORTH_STAR.md".into(),
+            "ANCHOR.md".into(),
+            "LAYERS.md".into(),
+            "docs/agent-landing.md".into(),
+            "CONTRIBUTING.md".into(),
+            "docs/architecture.md".into(),
+        ];
+        super::validate_source_guidance_references(cfctl_agent::FRAGMENT_SOURCE_CHECKOUT, &tracked)
+            .expect("clone-safe generated guidance");
+        assert!(
+            super::validate_source_guidance_references("Start from `AGENTS.md`", &tracked).is_err()
+        );
+        assert!(
+            super::validate_source_guidance_references(
+                "Start from `docs/v2-architecture.md`",
+                &tracked
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_source_guidance_references(
+                cfctl_agent::FRAGMENT_SOURCE_CHECKOUT,
+                &tracked[..5]
+            )
+            .is_err()
+        );
     }
 }

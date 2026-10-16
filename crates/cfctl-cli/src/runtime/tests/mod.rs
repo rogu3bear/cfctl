@@ -250,3 +250,5 @@ mod access_policy;
 mod import_exhaustion;
 
 pub(super) mod d1_config_characterization;
+
+mod proof_surface_contract;

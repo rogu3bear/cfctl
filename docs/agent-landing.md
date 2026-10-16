@@ -4,6 +4,15 @@
 Cloudflare APIs, official docs, Wrangler, cloudflared, and governed UI
 fallbacks without an MCP dependency.
 
+For source work, read the tracked [NORTH_STAR](../NORTH_STAR.md),
+[ANCHOR](../ANCHOR.md) and [LAYERS](../LAYERS.md), followed by
+[CONTRIBUTING](../CONTRIBUTING.md) and the [architecture](architecture.md).
+A clone does not need ignored `AGENTS.md` or `CLAUDE.md` files to understand the
+public contract. Local harness guidance is optional and lower-scope. Historical
+ignored sidecars such as `LOCAL_CI.md` do not configure the current proof gate.
+Source-only work uses isolated test runtimes; the operational commands below
+have distinct runtime, catalog and provider effects and require the task's scope.
+
 ## Orient
 
 ```bash

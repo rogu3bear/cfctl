@@ -150,8 +150,10 @@ tripwire is deliberate.
 
 Gate logic lives in `.githooks/pre-push-gate.sh`, which is not pinned, so it can
 change without re-pinning. The gate accepts only `CFCTL_PRE_PUSH_GATE=on`;
-there is no proof bypass. It verifies the clean canonical checkout and rechecks
-its branch, HEAD, pushed ref and source after verification. It creates no linked
+there is no proof bypass. Ignored historical sidecars such as `LOCAL_CI.md` are
+inert and do not override this tracked gate or its current guard paths. It verifies
+the clean canonical checkout and rechecks its branch, HEAD, pushed ref and source
+after verification. It creates no linked
 checkout and strips inherited Git context from proof subprocesses.
 
 One exact checked-out branch or one new annotated tag peeling to checked-out

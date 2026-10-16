@@ -31,12 +31,12 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("## Choose the control lane"));
     assert!(content.contains("## Read truth from the envelope"));
     assert!(content.contains("## Close honestly"));
-    assert!(content.contains("`performed` says whether an external boundary was crossed"));
+    assert!(content.contains(cfctl_agent::FRAGMENT_ENVELOPE_READING));
     assert!(content.contains("credential_unbound"));
     assert!(content.contains("cfctl plans status <operation-id> --json"));
     assert!(content.contains("Artifact presence alone is never verification"));
     assert!(content.contains("planned**, **applied**, **verified**, or **blocked"));
-    assert!(content.contains("contract: 10"));
+    assert!(content.contains("contract: 11"));
     assert!(content.contains("cfctl policy admission list --json"));
     assert!(content.contains("fully pinned PlanV2"));
     assert!(content.contains("events-consume-queue-batch"));
@@ -265,7 +265,23 @@ fn managed_skill_contract_header_is_single_sourced() {
         "contract: {}",
         cfctl_agent::MANAGED_SKILL_CONTRACT
     )));
-    assert!(skill.contains("contract: 10"));
+    assert!(skill.contains("contract: 11"));
+}
+
+#[test]
+fn managed_source_orientation_precedes_operator_runtime_commands() {
+    for (label, document) in cfctl_agent::managed_documents() {
+        let source = document
+            .find(cfctl_agent::FRAGMENT_SOURCE_CHECKOUT)
+            .expect("generated source guidance");
+        let runtime = document
+            .find("`cfctl version --json`")
+            .expect("operator orientation");
+        assert!(
+            source < runtime,
+            "{label} must explain source-only scope before operator runtime commands"
+        );
+    }
 }
 
 fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {

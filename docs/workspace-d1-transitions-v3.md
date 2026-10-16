@@ -189,7 +189,7 @@ SQL echoes, substrings and unknown provider wrapping cannot. Capturing a private
 error does not prove rollback, and all full-population and checkpoint joins remain
 required. This preparation does not enable a public qualification executor.
 
-The unregistered qualification source now routes each of the ten cases through
+The source-bound qualification verifier routes each of the ten cases through
 its own evidence requirements. Failure cases require the exact approved sentinel
 in a recognized structured native error plus complete zero-delta population
 proof. The writer case requires a distinct approved committed writer, a complete
@@ -218,12 +218,12 @@ from their exact consumed approved plans and apply artifacts. They cannot dispat
 approve or register an operation. Rollback reconciliation produces an apply
 record; only the common case verifier can produce its post-change verification.
 Bound inventory and writer inputs must also match their committed Git blobs,
-current repository revision and local bytes. These later additions are source
-preparation. The affected native transition tests pass, including source-drift,
-case-specific verification and evidence-lineage checks. The revised synthetic
-companion also passes native inventory validation. These are local proofs;
-earlier full or partial verifier results do not qualify changed inputs, and
-provider execution remains unqualified. Public V3 execution remains disabled.
+current repository revision and local bytes. These helpers are reached by the
+registered local proof actions described above.
+Their source and native tests cover drift, case-specific verification and evidence
+lineage; those local proofs do not qualify provider execution. Earlier full or
+partial verifier results do not qualify changed inputs. Public V3 execution
+remains disabled.
 
 Checkpoint lineage and stored evidence have separate hash domains. Lineage uses
 compact canonical values; authenticated evidence storage hashes its immutable
@@ -240,9 +240,11 @@ storage rule that one immutable content body cannot acquire conflicting evidence
 classes. Qualification, writer, poll and completed-lineage consumers join both
 identities; generic verification flags and bare apply bodies cannot substitute.
 Native regression tests now cover these hash-domain and class-identity joins.
-The qualification, writer, poll, population and policy routes remain
-unregistered; passing local tests does not create callable operations or admit
-their resource, permission, cost or approval contracts.
+The local `case`, `writer`, `poll`, `population` and `aggregate` proof actions are
+registered under `workspace-d1-transition-produce-proof`. Their names do not
+activate the separately derived provider/resource roles. All nine derived roles
+remain Blocked, and managed policy activation remains unregistered. Local tests
+cannot admit their resource, permission, cost, lifetime or cleanup contracts.
 
 ### Committed synthetic source binding
 

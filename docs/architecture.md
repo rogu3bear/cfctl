@@ -28,12 +28,12 @@ flowchart TD
 | `cfctl-cli` | Public command parser, human/JSON rendering, orchestration |
 | `cfctl-core` | Versioned contracts, hashes, evidence, redaction, plan lifecycle |
 | `cfctl-auth` | OAuth PKCE, profiles, account selection, ordinary credential storage with governed mode-0600 fallback, and the separate evidence-integrity key with no automatic fallback; explicit fresh private epochs use storage-owned private files |
-| `cfctl-cloudflare` | Schema-validated HTTP execution, retries, pagination, conditionals, and idempotency |
+| `cfctl-cloudflare` | Schema-validated HTTP execution, bounded read retries, one-use mutation dispatch, pagination, conditionals, and idempotency |
 | `cfctl-catalog` | Official OpenAPI/docs/changelog/CLI ingestion and SQLite search index |
 | `cfctl-planner` | Risk, impact, cost, and approval policy |
 | `cfctl-workspace` | Registered-root Git/IaC discovery, exact local diffs, and repository/resource graph |
 | `cfctl-agent` | Agent discovery, maintained instructions, recursion-safe handoff |
-| `cfctl-storage` | Platform paths, atomic plans and locks, immutable evidence bodies and descriptors, authenticated proof envelopes, capability-held evidence directories, lifecycle locking, generation-usage scans, and bounded recent-proof projections |
+| `cfctl-storage` | Platform paths, bounded descriptor-held private-input capture, atomic plans and locks, immutable evidence bodies and descriptors, authenticated proof envelopes, capability-held evidence directories, lifecycle locking, generation-usage scans, and bounded recent-proof projections |
 | `cfctl-registry` | Rebuildable SQLite projection for scopes, normalized resources, observations, desired declarations, ownership, provider coverage, events, authorities, and operation maturity |
 | `xtask` | Local verification, reproducible release assembly, publication |
 
@@ -143,6 +143,43 @@ is consumer-first: adopt the operation pack in each owning repository, prove
 plan and receipt compatibility, then remove the compiled projection and its
 frozen exception.
 
+## Application compatibility and removal conditions
+
+The eleven application-extension fields and five legacy catalog IDs remain a
+non-growing compatibility boundary. The existing core field-inventory and
+catalog authority tests enforce it. Shared mechanics were extracted; application
+acceptance has not migrated out of these typed owners.
+
+| Retained adapter / contract | Existing consumer and distinct invariant | Evidence required before removal |
+|---|---|---|
+| `mln-0142-post-import-schema`, `mln-0143-data-invariants` | MLNavigator/Founder: exact reviewed schema and migration-specific data invariants, never generic query success. | Owning source contract and consumer cutover with the same valid/invalid projections, provenance, plan and proof joins. |
+| `d1-import-approved-mln-migration`, `d1-resume-approved-mln-import-poll` | MLNavigator/Founder: immutable managed import, durable protocol checkpoints, exact poll lineage and separate post-import acceptance. Consumed uncertainty cannot replay. | Equivalent one-use execution, interrupted-response recovery, checkpoint chronology, post-import proof and actual application cutover. |
+| `d1-import-approved-osint-research-migration` | OSINT Research Center: reviewed import bytes and exact schema-marker acceptance. | Source-owned replacement with equivalent staging, recovery and marker predicates, followed by consumer cutover. |
+| `workspace_d1_migration` | Maildesk migrations and Founder manifest/transition source: exact ledger ordering and schema, manifest target, recovery and canary/qualification joins. V3 source is distinct from V4 runtime. | Equivalent source and native consumer qualification, compatibility of every receipt and held behavior, and owning repositories cut over. |
+| `workspace_d1_policy_projection` | Maildesk: private projection staging plus exact route count and policy/desired-state/projection digest readback. | Equivalent private custody, account/database/generation/recovery joins and all postcondition refusal cases in the replacement consumer. |
+| `workspace_d1_reply_admission` | Maildesk: committed compiler and direct digest/version-pinned Bun, exact reply identity, closed candidate and body-free admission/read receipts. | Equivalent compiler closure, inbox-source and admission identity predicates, receipts and actual consumer cutover. |
+| `workspace_d1_evidence` | Maildesk: fixed provider-row normalization, complete unique active routes with policy/enabled-state equality, bounded counts and positive complete inbound provider acceptance. | Full semantic equivalence, including partial/duplicate/disabled/wrong-policy/oversized routes and incomplete acceptance, then consumer cutover. A generic `row_shape` declaration is insufficient. |
+| `workspace_reply_subdomain_ingress`, `email_routing_subdomain_dns` | Maildesk: exact requested domain/Worker, account/zone ownership, bounded DNS and catch-all inventories, target lock and fresh activation preconditions. | Equivalent provider normalization, complete identity and activation predicates, redaction and per-target locking before removing the adapter. |
+| `workspace_d1_read_inventory` | Sign and Founder: committed read populations, exact source/query bytes, bounded native rows and explicit linked-checkout selection. | Native source-consumer equivalence and both owners' cutover; no arbitrary caller SQL or raw private-row fallback. |
+
+Provider response shape, pagination, bounds and typed redaction remain
+`cfctl-cloudflare` responsibilities. Registered source/config/tool identity is
+bound by `cfctl-workspace` and the narrow CLI execution support. Existing typed
+compatibility modules retain application meaning until the evidence above
+exists. Approval, durable consumption, lock ordering, recovery and authenticated
+evidence remain control-plane responsibilities.
+
+The same separation governs qualification: the native local proof actions
+`application`, `population`, `case`, `writer`, `poll` and `aggregate` are
+registered; the nine source-derived resource roles remain Blocked. The aggregate
+is schema 2 and requires all ten cases, including preservation-predicate failure.
+Managed-D1 policy activation remains separately held. Local proofs cannot close
+a legacy uncertain import or qualify provider atomicity. R2 capture, conditional
+restore, exact-target equality and combined recovery remain separate, with
+`metadata_atomic_precondition:false` and writer exclusion unqualified. Worker
+upload, promotion, sole-active readback, artifact/static-asset identity and
+application behavior likewise remain separate proof planes.
+
 Most of the catalog is therefore inventory, not capability: the large majority
 of mutating operations are unexecutable because their contracts are
 incomplete, and only a governed core carries complete risk, effect, cost,
@@ -193,6 +230,25 @@ validates the journal on both writes and reads. The storage crash matrix drops
 volatile state and reopens the real local store between each journal
 transition, proving recovery at every persisted stage; it does not claim
 account-backed network mutation proof.
+
+`performed` is an execution fact, independent of command success or provider
+acceptance. API transport dispatch and subprocess launch supply invocation-owned
+observations; response booleans and application error strings cannot erase them.
+A rejected response or a launched process without a receipt can therefore report
+`performed:true` while `ok:false` and verification is failed or unknown. A local
+refusal before dispatch reports false, but durable consumption still prohibits
+replay. Synthetic diagnostics are not provider responses. Known responses remain
+attached to the original operation through apply-evidence, journal, secret-sink,
+verification, cleanup and closure failures. Mutations have no automatic retry;
+explicit multi-stage protocols keep their separately bounded stages.
+
+Borrowed private input and managed private storage retain distinct policies.
+`cfctl-storage` captures borrowed input through a no-follow descriptor, validates
+ownership/mode/link count, reads a finite limit plus one overflow byte and
+rechecks descriptor and named custody. Credential inputs use 64 KiB; D1 private
+projections retain 64 MiB and exact mode 0600. Managed `PrivateDirectory` keeps its
+mode-0700 parent and mode-0600 file contract. Neither policy changes evidence-key
+authority or ordinary credential fallback.
 
 Live reads also write `OperationalProofV1` index rows beside their immutable
 evidence. Each row binds the capability, catalog hash, redacted input hash,
