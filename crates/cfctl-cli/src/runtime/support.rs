@@ -102,40 +102,45 @@ pub(super) fn read_import_secret(
         (false, None) => Err(CliError::Input(format!(
             "the {label} must be supplied out-of-band: add `--stdin` or `--value-in <mode-0600 path>`; values in command arguments are forbidden"
         ))),
-        (true, None) => read_stdin(),
+        (true, None) => read_credential_stream(std::io::stdin().lock()),
         (false, Some(path)) => read_secret_file(path),
     }
 }
 
-/// Read a secret from a file that no other user can read. On Unix any group or
-/// other permission bit fails closed, mirroring the mode-0600 sink that
-/// `--value-out` writes.
+/// A credential, bundle or rotation sink has a deliberately finite 64 KiB
+/// input contract, independent of SQL/object limits. Whitespace is preserved.
+pub(super) const MAX_CREDENTIAL_INPUT_BYTES: u64 = 64 * 1024;
+
+pub(super) fn read_credential_stream(reader: impl std::io::Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_CREDENTIAL_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| credential_input_error())?;
+    if bytes.len() as u64 > MAX_CREDENTIAL_INPUT_BYTES {
+        return Err(credential_input_error());
+    }
+    String::from_utf8(bytes).map_err(|_| credential_input_error())
+}
+
+fn credential_input_error() -> CliError {
+    CliError::Input(
+        "credential input must be UTF-8 and at most 65536 bytes; no value was disclosed".to_owned(),
+    )
+}
+
 pub(super) fn read_secret_file(path: &Path) -> Result<String> {
     read_private_secret_file(path, "--value-in")
 }
 
 pub(super) fn read_private_secret_file(path: &Path, option: &str) -> Result<String> {
-    let metadata = fs::metadata(path).map_err(|source| cli_io(path, source))?;
-    if !metadata.is_file() {
-        return Err(CliError::Input(format!(
-            "`{option}` path is not a regular file: {}",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(CliError::Input(format!(
-                "`{option}` file {} must not be readable by group or others; run `chmod 600 {}` (current mode {:04o})",
-                path.display(),
-                path.display(),
-                mode & 0o7777
-            )));
-        }
-    }
-    fs::read_to_string(path).map_err(|source| cli_io(path, source))
+    let bytes = cfctl_storage::capture_private_input(
+        path,
+        MAX_CREDENTIAL_INPUT_BYTES,
+        cfctl_storage::PrivateInputPermissions::OwnerRead,
+    )
+    .map_err(|error| CliError::Input(format!("`{option}`: {error}")))?;
+    String::from_utf8(bytes).map_err(|_| credential_input_error())
 }
 
 pub(super) fn read_r2_log_retrieval_credentials(path: &Path) -> Result<R2LogRetrievalCredentials> {

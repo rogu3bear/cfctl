@@ -6,7 +6,7 @@ use tokio::time::Duration;
 use super::{
     prelude::{
         AuthCredential, BTreeMap, BTreeSet, CallInput, CapabilityV1, CatalogSnapshot, CliError,
-        OpenOptions, OpenOptionsExt, Path, PathBuf, PermissionsExt, PlanV1, ProfileMetadata, Read,
+        OpenOptions, OpenOptionsExt, Path, PathBuf, PermissionsExt, PlanV1, ProfileMetadata,
         Result, StateStore, Uuid, Write,
     },
     read_execution::credential_generation_for_read,
@@ -570,7 +570,7 @@ fn stage_private_projection(store: &StateStore, source: &Path) -> Result<Value> 
             "workspace D1 policy projection source must be an absolute normalized path".to_owned(),
         ));
     }
-    let bytes = read_private_regular_file(source, MAX_PROJECTION_BYTES)?;
+    let bytes = capture_projection(source)?;
     if std::str::from_utf8(&bytes).is_err() {
         return Err(CliError::Input(
             "workspace D1 policy projection source is not UTF-8".to_owned(),
@@ -648,7 +648,7 @@ fn validate_private_stage_object(store: &StateStore, stage: &Map<String, Value>)
         .and_then(Value::as_u64)
         .filter(|value| *value > 0 && *value <= MAX_PROJECTION_BYTES)
         .ok_or_else(|| CliError::Input("workspace D1 private stage size is invalid".to_owned()))?;
-    let bytes = read_private_regular_file(&path, MAX_PROJECTION_BYTES)?;
+    let bytes = capture_projection(&path)?;
     if bytes.len() as u64 != expected_bytes || sha256(&bytes) != expected_sha {
         return Err(CliError::Input(
             "workspace D1 private stage digest drifted; create a new plan".to_owned(),
@@ -674,49 +674,19 @@ fn private_stage_path(store: &StateStore, stage: &Map<String, Value>) -> Result<
         .join("d1-policy-projection.sql"))
 }
 
-fn read_private_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
-    reject_symlink_components(path)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(|error| cli_io(path, error))?;
-    let metadata = file.metadata().map_err(|error| cli_io(path, error))?;
-    #[cfg(unix)]
-    let private_mode = metadata.permissions().mode() & 0o777 == 0o600;
-    #[cfg(not(unix))]
-    let private_mode = true;
-    if !metadata.is_file() || !private_mode || metadata.len() == 0 || metadata.len() > maximum {
-        return Err(CliError::Input(format!(
-            "workspace D1 private file must be a non-empty mode-0600 regular file of at most {maximum} bytes"
-        )));
-    }
-    let capacity = usize::try_from(metadata.len())
-        .map_err(|_| CliError::Input("workspace D1 private file exceeds this host".to_owned()))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)
-        .map_err(|error| cli_io(path, error))?;
-    if bytes.len() as u64 != metadata.len() {
+fn capture_projection(path: &Path) -> Result<Vec<u8>> {
+    let bytes = cfctl_storage::capture_private_input(
+        path,
+        MAX_PROJECTION_BYTES,
+        cfctl_storage::PrivateInputPermissions::OwnerReadWrite,
+    )
+    .map_err(|error| CliError::Input(error.to_string()))?;
+    if bytes.is_empty() {
         return Err(CliError::Input(
-            "workspace D1 private file changed while it was read".to_owned(),
+            "workspace D1 private projection must not be empty".to_owned(),
         ));
     }
     Ok(bytes)
-}
-
-fn reject_symlink_components(path: &Path) -> Result<()> {
-    let mut cursor = PathBuf::new();
-    for component in path.components() {
-        cursor.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&cursor).map_err(|error| cli_io(&cursor, error))?;
-        if metadata.file_type().is_symlink() {
-            return Err(CliError::Input(format!(
-                "workspace D1 private path has symlink component `{}`",
-                cursor.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn config_contract(

@@ -2,6 +2,8 @@
 
 mod private_runtime;
 pub use private_runtime::*;
+mod private_input;
+pub use private_input::{PrivateInputError, PrivateInputPermissions, capture_private_input};
 mod private_files;
 pub use private_files::{PrivateDirectory, PrivateFileSecretStore, PrivatePublicationError};
 mod private_authority;

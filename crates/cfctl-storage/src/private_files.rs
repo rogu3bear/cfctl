@@ -6,7 +6,7 @@ use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::{
     fs,
-    io::{Read as _, Write as _},
+    io::Write as _,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -244,14 +244,8 @@ impl PrivateDirectory {
         };
         let mut file = fs::File::from(descriptor);
         Self::validate_file(&file, maximum)?;
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(maximum + 1)
-            .read_to_end(&mut bytes)
+        let bytes = crate::private_input::read_bounded_private_bytes(&mut file, maximum)
             .map_err(|_| failure())?;
-        if bytes.len() as u64 > maximum {
-            return Err(failure());
-        }
         Self::validate_file(&file, maximum)?;
         self.validate_address()?;
         Ok(Some(bytes))
@@ -369,7 +363,7 @@ impl PrivateDirectory {
     clippy::unnecessary_cast,
     reason = "macOS dev_t is signed while MetadataExt exposes its bits as u64; Linux already uses u64"
 )]
-fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+pub(crate) fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
     (stat.st_dev as u64, stat.st_ino)
 }
 

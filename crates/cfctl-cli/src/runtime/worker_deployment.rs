@@ -888,10 +888,6 @@ enum PrivateConfigOverlay<'a> {
     WorkspaceD1 { database_binding: &'a str },
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one binding transaction keeps no-follow capture, bounded bytes, production and template hashes, closed-overlay equality, immutable staging, and staged-byte readback under one private-config lifetime"
-)]
 fn bind_private_config_path_with_template_and_overlay_for_execution(
     config: &Path,
     template_path: &Path,
@@ -899,57 +895,12 @@ fn bind_private_config_path_with_template_and_overlay_for_execution(
     expected_template_sha256: Option<&str>,
     overlay: PrivateConfigOverlay<'_>,
 ) -> Result<BoundPrivateConfig, CliError> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut source_file = options.open(config).map_err(|source| CliError::Io {
-        path: config.display().to_string(),
-        source,
-    })?;
-    let metadata = source_file.metadata().map_err(|source| CliError::Io {
-        path: config.display().to_string(),
-        source,
-    })?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > 1_048_576
-    {
-        return Err(CliError::Input(
-            "private Worker production config must be a regular file of at most 1 MiB".to_owned(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(CliError::Input(
-                "private Worker production config must not grant group or world permissions"
-                    .to_owned(),
-            ));
-        }
-    }
-    let production_len = usize::try_from(metadata.len()).map_err(|_| {
-        CliError::Input(
-            "private Worker production config size exceeded this platform's addressable memory"
-                .to_owned(),
-        )
-    })?;
-    let mut production_bytes = Vec::with_capacity(production_len);
-    source_file
-        .read_to_end(&mut production_bytes)
-        .map_err(|source| CliError::Io {
-            path: config.display().to_string(),
-            source,
-        })?;
-    if production_bytes.len() > 1_048_576 {
-        return Err(CliError::Input(
-            "private Worker production config must be at most 1 MiB".to_owned(),
-        ));
-    }
+    let production_bytes = cfctl_storage::capture_private_input(
+        config,
+        1_048_576,
+        cfctl_storage::PrivateInputPermissions::OwnerRead,
+    )
+    .map_err(|error| CliError::Input(error.to_string()))?;
     let content_sha256 = hex::encode(Sha256::digest(&production_bytes));
     if expected_sha256.is_some_and(|expected| {
         expected.strip_prefix("sha256:").unwrap_or(expected) != content_sha256

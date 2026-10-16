@@ -181,6 +181,15 @@ The credential lives in the platform keyring (Keychain on macOS, Secret
 Service on Linux) and falls back to a mode-0600 file store when the keyring is
 unavailable; `cfctl doctor` reports which backend is active. If a wrapper
 routes stdin through `cargo`, import with `--value-in` against the same sink.
+Credential stdin, `--value-in`, the private R2 credential bundle, and internal
+rotation-sink reads are limited to 65,536 bytes including whitespace. Whitespace
+is preserved until the existing credential validator processes it. Borrowed files
+must be owned regular files, mode 0400 or 0600, with one hard link and no symbolic
+links in their path. The exact macOS `/tmp` and `/var` system aliases remain
+supported. Their parent directories need not be mode 0700. D1 projection inputs
+retain their separate 64 MiB, nonempty, mode-0600 contract. Each file is captured
+through one held descriptor with bounded reads and identity checks.
+
 `CFCTL_FORCE_IPV4=1` pins outbound calls to IPv4 when an IP-allowlisted token
 needs it.
 
