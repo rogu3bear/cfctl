@@ -1120,6 +1120,15 @@ pub(super) fn guide_stage_document(
     );
     let summary = guide_live_read_summary(stage, &live_reads)
         .unwrap_or_else(|| guide_stage_summary(stage, capability));
+    let summary = if capability.id == cfctl_cloudflare::AUDIT_PAGE_ID
+        && stage == cfctl_core::GuideStage::Discover
+    {
+        format!(
+            "{summary} Optional first-page mode: --max-pages 1 requires explicit matching profile/account, fresh cached catalog, private_file API-token profile, since/before UTC within ten minutes, limit 1..100 and direction asc; one request, no retry/redirect/refresh/continuation, 16 MiB body, 30 seconds. Sampled LiveRead is excluded from operational proof; whole-window completeness and attribution are not established."
+        )
+    } else {
+        summary.to_owned()
+    };
     let evidence_class = if capability.workflow.is_some() {
         if matches!(
             stage,
@@ -1140,7 +1149,7 @@ pub(super) fn guide_stage_document(
         capability_id: capability.id.clone(),
         required: stage_required(stage, capability),
         contract_state,
-        summary: summary.to_owned(),
+        summary,
         evidence_class,
         commands: guide_stage_commands(stage, capability, contract_state, call_argv),
     }

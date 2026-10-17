@@ -1,10 +1,15 @@
 //! Typed Cloudflare request construction and governed execution.
 mod access_create;
+mod audit_page;
 pub mod d1_read_inventory;
 mod d1_sql;
 pub mod d1_transition;
 mod oauth_scopes;
 mod pagination_diagnostic;
+pub use audit_page::{
+    AUDIT_PAGE_ID, AuditPageBoundsV1, BoundedAuditReadV1, execute_bounded_audit_page,
+    validate_audit_page_input,
+};
 mod token_verification;
 mod worker_domains;
 pub use oauth_scopes::validate_oauth_optional_scope_selection;

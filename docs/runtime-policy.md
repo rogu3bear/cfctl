@@ -1,5 +1,35 @@
 # cfctl runtime policy
 
+## One-page audit reads
+
+`cfctl call audit-logs-v2-get-account-audit-logs --max-pages 1` is an opt-in
+sample of the first provider page. Supply explicit `--profile`, `--account`,
+and the matching `--selector account_id=...`, with exactly four `--query`
+filters: `since` and `before` in UTC spanning at most ten minutes, `limit`
+from 1 through 100, and `direction=asc`. The profile must already be an
+API-token profile in the explicitly selected `private_file` runtime, with a
+valid credential generation and an account pin matching the selectors.
+
+This route uses only a fresh cached catalog. It does not synchronize, refresh
+OAuth credentials, follow a redirect, retry a failed request, decompress a
+response, or follow page/cursor metadata. One audit HTTP send is bounded by
+30 seconds and 16,777,216 response-body bytes. Oversized, malformed or
+incomplete responses fail without exporting audit rows. A content hash is
+reported only for a completely received body. Transport failure can leave
+provider completion unknown; no automatic retry follows it.
+
+The unchanged `ResultEnvelopeV2` carries a content-addressed `LiveRead`
+receipt with sibling `cfctl_read_bounds` and `cfctl_read_scope_sha256` fields.
+The scope binds input, profile, credential generation, account and catalog.
+Attempt counters, returned row count, HTTP status and continuation are bounded
+observations. `window_completeness` is always `NOT_ESTABLISHED`; an event absent
+from this page is only not returned on this first page. Neither attribution
+nor complete history is established. The sampled result is excluded from the
+ordinary operational-proof index so it cannot satisfy an unbounded/default
+freshness claim. Preserve the attempt receipt and obtain separate authority
+before another attempt. Calls without `--max-pages` retain their existing
+pagination and proof behavior.
+
 The policy engine, never an agent, classifies a plan as `auto_execute`,
 `approval_required`, or `blocked`.
 

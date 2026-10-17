@@ -26,6 +26,7 @@ use super::r2_credentials::preflight_call_input;
 use super::r2_credentials::prepare_r2_temporary_credentials_input;
 use super::read_execution::apply_operational_proof_index_result;
 use super::read_execution::credential_generation_for_read;
+use super::read_execution::execute_audit_page_read;
 use super::read_execution::execute_read;
 use super::secret_io::is_secret_output_capability;
 use super::security_action_input::prepare_security_action_input;
@@ -48,6 +49,31 @@ pub(super) async fn call_command(
     store: &StateStore,
     arguments: CallArgs,
 ) -> Result<ResultEnvelopeV2> {
+    if arguments.max_pages.is_some() {
+        let mut keys = std::collections::BTreeSet::new();
+        if arguments.max_pages != Some(1)
+            || arguments.capability_id != cfctl_cloudflare::AUDIT_PAGE_ID
+            || arguments.profile.is_none()
+            || arguments.account.is_none()
+            || arguments.body_json.is_some()
+            || arguments.body_stdin
+            || arguments.out.is_some()
+            || arguments.value_out.is_some()
+            || arguments.source_file.is_some()
+            || arguments.credential_in.is_some()
+            || arguments.if_match.is_some()
+            || arguments.if_none_match.is_some()
+            || arguments.source_checkout.source_checkout.is_some()
+            || arguments.query.iter().any(|(k, _)| !keys.insert(k))
+            || arguments.selectors.len() != 1
+            || arguments.selectors[0].0 != "account_id"
+        {
+            return Err(CliError::Input("--max-pages 1 accepts only one audit GET with unique bounded filters and no body, alternate source or sink".into()));
+        }
+        if super::support::catalog_is_stale(store) {
+            return Err(CliError::Input("bounded audit read requires a fresh cached catalog; automatic synchronization is disabled".into()));
+        }
+    }
     let source_selection = arguments
         .source_checkout
         .selection()
@@ -63,10 +89,11 @@ pub(super) async fn call_command(
         None
     };
     let workspace_read = if source_selection.is_some()
-        || cached
-            .as_ref()
-            .and_then(|c| c.get(&arguments.capability_id))
-            .is_none()
+        || (arguments.max_pages.is_none()
+            && cached
+                .as_ref()
+                .and_then(|c| c.get(&arguments.capability_id))
+                .is_none())
     {
         workspace_capability_with_source(
             store,
@@ -78,7 +105,8 @@ pub(super) async fn call_command(
     } else {
         None
     };
-    let catalog = if workspace_read.is_some()
+    let catalog = if arguments.max_pages.is_some()
+        || workspace_read.is_some()
         || arguments.capability_id == cfctl_core::r2_recovery::VERIFY_ID
         || arguments.capability_id == cfctl_core::r2_restore::RESTORE_ID
         || arguments.capability_id == cfctl_core::pages_artifact::PRODUCER_ID
@@ -99,6 +127,8 @@ pub(super) async fn call_command(
         capability
     } else if let Some(capability) = catalog.get(&arguments.capability_id) {
         capability.clone()
+    } else if arguments.max_pages.is_some() {
+        return Err(CliError::Input("bounded audit capability is absent from the cached catalog; no alternate lookup was attempted".into()));
     } else {
         workspace_capability_with_source(
             store,
@@ -108,6 +138,15 @@ pub(super) async fn call_command(
         )?
         .ok_or_else(|| capability_missing(&arguments.capability_id))?
     };
+    if arguments.max_pages.is_some()
+        && (capability.mutating
+            || capability.method != "GET"
+            || capability.path != "/accounts/{account_id}/logs/audit")
+    {
+        return Err(CliError::Input(
+            "bounded audit catalog entry must be the exact non-mutating audit GET".into(),
+        ));
+    }
     if is_secret_output_capability(&capability) && arguments.value_out.is_none() {
         return Err(CliError::Input(
             "secret-producing capabilities require `--value-out <new-path>`; the value is never written to stdout or evidence"
@@ -392,21 +431,36 @@ pub(super) async fn call_command(
             .transpose()?;
         let attestation = super::plan_commands::observation_attestation(store, &capability)?;
         let scoped_store = store.with_observation_attestation(&attestation);
-        let executed = execute_read(
-            &scoped_store,
-            &catalog,
-            &capability,
-            &prepared.input,
-            arguments.profile.as_deref(),
-            arguments.account.as_deref(),
-            arguments.out.as_deref(),
-            arguments.value_out.as_deref(),
-            r2_credentials.as_ref(),
-            arguments.source_file.as_deref(),
-        )
-        .await?;
+        let executed = if arguments.max_pages.is_some() {
+            execute_audit_page_read(
+                &scoped_store,
+                &catalog,
+                &capability,
+                &prepared.input,
+                arguments.profile.as_deref(),
+                arguments.account.as_deref(),
+            )
+            .await?
+        } else {
+            execute_read(
+                &scoped_store,
+                &catalog,
+                &capability,
+                &prepared.input,
+                arguments.profile.as_deref(),
+                arguments.account.as_deref(),
+                arguments.out.as_deref(),
+                arguments.value_out.as_deref(),
+                r2_credentials.as_ref(),
+                arguments.source_file.as_deref(),
+            )
+            .await?
+        };
         let mut envelope = executed.envelope;
         envelope.attestation = Some(attestation.clone());
+        if arguments.max_pages.is_some() {
+            return Ok(envelope);
+        }
         if attestation.state == cfctl_core::AttestationStateV1::UnattestedReversibleEffect {
             if let Some(result) = envelope.result.as_object_mut() {
                 result.insert("operational_proof_indexed".to_owned(), json!(false));

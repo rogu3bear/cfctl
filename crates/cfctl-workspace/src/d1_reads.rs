@@ -159,7 +159,10 @@ pub(super) fn load_selected(
     Ok(Some(capability(contract)))
 }
 
-fn load_pack(root: &Path, mode: WorkspaceOperationLoad) -> Result<(D1ReadPackV1, Vec<u8>)> {
+pub(super) fn load_pack(
+    root: &Path,
+    mode: WorkspaceOperationLoad,
+) -> Result<(D1ReadPackV1, Vec<u8>)> {
     let bytes = bounded_committed(root, D1_READ_PACK_PATH, 256 * 1024, mode)?;
     let pack: D1ReadPackV1 = toml::from_str(
         std::str::from_utf8(&bytes).map_err(|_| invalid("read pack must be UTF-8"))?,

@@ -46,8 +46,19 @@ cfctl catalog show <read-operation-id> \
 
 This route supports committed D1 read inventories only. The operation must still
 have one registered logical owner. The selected checkout must share that owner's
-canonical Git common directory, origin and exact committed operation pack; a
-separate clone with the same remote URL is insufficient. Its HEAD and tree must
+canonical Git common directory and origin; a separate clone with the same remote
+URL is insufficient. The registered and selected committed operations must have
+identical identity, purpose, account, database, profile and inventory path/digest.
+Every registered source path must remain in the selected pack in the same relative
+order. The selected pack may add source inputs, such as a committed publication
+helper and its imported protocol module; each additional input adds its own
+revision and hash constraint. It cannot replace, remove or reorder a registered
+input. Each operation validates its own declared source revision and source
+hashes against its own committed inputs. This permits an exact older
+linked checkout after the registered owner advances those inputs, without copying
+current pins into the older pack or admitting a different read population. The
+selected pack commit/tree and its declared input revision remain distinct,
+authenticated identities. Its HEAD and tree must
 match the explicit flags, and `call` still requires the selected checkout to be
 clean. Inspection reads committed blobs as before. Default lookup and duplicate
 operation rejection remain unchanged. Registration and the evidence runtime do

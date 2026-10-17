@@ -633,6 +633,9 @@ pub struct ResolveArgs {
 #[derive(Debug, Args)]
 pub struct CallArgs {
     pub capability_id: String,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1),
+        help = "Read one audit page only; audit v2 GET, at most 100 rows, no retries or redirects")]
+    pub max_pages: Option<u32>,
     #[command(flatten)]
     pub source_checkout: source_checkout::SourceCheckoutArgs,
     #[arg(long = "selector", value_parser = parse_key_value)]

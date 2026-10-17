@@ -36,6 +36,15 @@ pub(super) struct TestD1SchemaReadV1 {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_D1_SCHEMA_READ: TestD1SchemaReadV1;
+    static TEST_AUDIT_BASE_URL: String;
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_audit_base_url<F: std::future::Future>(
+    url: String,
+    future: F,
+) -> F::Output {
+    TEST_AUDIT_BASE_URL.scope(url, future).await
 }
 
 #[cfg(test)]
@@ -576,10 +585,70 @@ impl ExecutedRead {
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "retain existing explicit read call sites"
+)]
+pub(super) async fn execute_read(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    requested_profile: Option<&str>,
+    requested_account: Option<&str>,
+    output_path: Option<&Path>,
+    secret_output_path: Option<&Path>,
+    r2_credentials: Option<&R2LogRetrievalCredentials>,
+    reply_admission_source: Option<&Path>,
+) -> Result<ExecutedRead> {
+    execute_read_with_mode(
+        store,
+        catalog,
+        capability,
+        input,
+        requested_profile,
+        requested_account,
+        output_path,
+        secret_output_path,
+        r2_credentials,
+        reply_admission_source,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn execute_audit_page_read(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    requested_profile: Option<&str>,
+    requested_account: Option<&str>,
+) -> Result<ExecutedRead> {
+    cfctl_cloudflare::validate_audit_page_input(capability, input)?;
+    if store.private_origin().is_none() {
+        return Err(CliError::Input("bounded audit reads require the existing private_file runtime; no platform credential access was attempted".into()));
+    }
+    execute_read_with_mode(
+        store,
+        catalog,
+        capability,
+        input,
+        requested_profile,
+        requested_account,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "read execution receives explicit catalog, selector, credential generation, private retrieval, and file-output inputs so no authority or destination is hidden in ambient state"
 )]
-pub(super) async fn execute_read(
+async fn execute_read_with_mode(
     store: &StateStore,
     catalog: &CatalogSnapshot,
     capability: &cfctl_core::CapabilityV1,
@@ -590,6 +659,7 @@ pub(super) async fn execute_read(
     secret_output_path: Option<&Path>,
     r2_credentials: Option<&R2LogRetrievalCredentials>,
     reply_admission_source: Option<&Path>,
+    audit_one_page: bool,
 ) -> Result<ExecutedRead> {
     if capability.id == cfctl_core::d1_reconciliation::DIAGNOSTIC_ID {
         return super::d1_failed_query::execute(
@@ -725,13 +795,29 @@ pub(super) async fn execute_read(
     let mln_0143_parents = mln_0143_parent_manifests(store, catalog, capability, input)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
+    if audit_one_page {
+        if profile.kind != cfctl_auth::ProfileKind::ApiToken {
+            return Err(CliError::Input("bounded audit reads require an existing API-token profile; OAuth refresh and global-key profiles are not supported".into()));
+        }
+        if profile
+            .managed_api_token
+            .as_ref()
+            .is_some_and(|m| m.expires_at <= Utc::now())
+        {
+            return Err(CliError::Input(
+                "bounded audit API-token profile has expired; no request was sent".into(),
+            ));
+        }
+    }
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
-    if widget_secret
+    if (widget_secret || audit_one_page)
         && (profile.account_id.as_deref() != account_id.as_deref()
             || input.selectors.get("account_id").and_then(Value::as_str) != account_id.as_deref())
     {
-        return Err(CliError::Input("widget secret read requires agreement between profile, selected account and exact account selector".into()));
+        return Err(CliError::Input(if widget_secret {
+            "widget secret read requires agreement between profile, selected account and exact account selector"
+        } else { "bounded read requires agreement between profile, selected account and exact account selector" }.into()));
     }
     let capture_token_id = if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
         let capture_request = serde_json::from_value(
@@ -768,7 +854,24 @@ pub(super) async fn execute_read(
         },
         API_BASE_URL,
     )?;
-    let response = if let Some(sink) = widget_sink.as_mut() {
+    let mut audit_bounds = None;
+    let response = if audit_one_page {
+        let base_url = API_BASE_URL.to_owned();
+        #[cfg(test)]
+        let base_url = TEST_AUDIT_BASE_URL
+            .try_with(Clone::clone)
+            .unwrap_or(base_url);
+        let read = cfctl_cloudflare::execute_bounded_audit_page(
+            &base_url,
+            super::support::force_ipv4_egress(),
+            capability,
+            input,
+            &credential,
+        )
+        .await?;
+        audit_bounds = Some(read.bounds);
+        read.response
+    } else if let Some(sink) = widget_sink.as_mut() {
         super::turnstile_secret::fetch(&executor, capability, input, &credential, sink).await?
     } else if capability.id == cfctl_core::r2_recovery::CAPTURE_ID {
         super::r2_recovery::capture(
@@ -825,6 +928,21 @@ pub(super) async fn execute_read(
     let mut sanitized =
         redact_response_for_capability(capability, &serde_json::to_value(&response)?);
     if let Some(object) = sanitized.as_object_mut() {
+        if let Some(bounds) = &audit_bounds {
+            let scope = json!({"schema":"cfctl.audit-page-scope/v1", "input_sha256": bounds.input_sha256,
+                "profile_id":profile.id, "credential_generation_id":credential_generation_id,
+                "account_id":account_id,"catalog_hash":catalog.schema_hash});
+            object.insert(
+                "cfctl_read_bounds".into(),
+                json!({"scope":scope,"bounds":bounds}),
+            );
+            object.insert("cfctl_read_scope_sha256".into(), json!(hash_value(&scope)?));
+            object.insert("operational_proof_indexed".into(), json!(false));
+            object.insert(
+                "operational_proof_index_reason".into(),
+                json!("sampled audit page is not the default read scope"),
+            );
+        }
         object.insert(
             "availability".to_owned(),
             live_read_availability(capability, &response),
@@ -967,6 +1085,18 @@ pub(super) async fn execute_read(
             },
             next_step: Some(next_step),
         });
+    }
+    if let Some(bounds) = &audit_bounds {
+        envelope.verification.state = if bounds.failure.is_some() {
+            VerificationState::Failed
+        } else {
+            VerificationState::NotApplicable
+        };
+        envelope.verification.basis = Some("one bounded audit-page dispatch; whole-window completeness and attribution are not established".into());
+        if let Some(reason) = bounds.failure {
+            envelope.error = Some(ErrorV1 { code: "CFCTL_AUDIT_PAGE_INCOMPLETE".into(),
+                message: reason.into(), next_step: Some("Preserve this bounded attempt receipt; do not retry or follow a continuation without a separately authorized attempt.".into()) });
+        }
     }
     Ok(ExecutedRead {
         envelope,

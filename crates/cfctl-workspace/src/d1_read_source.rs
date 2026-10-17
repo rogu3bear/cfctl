@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use cfctl_core::{
     CapabilityV1,
     d1_read_inventory::{
-        D1_READ_PACK_PATH, D1ReadSourceBindingV1, D1ReadSourceSelectionV1,
+        D1_READ_PACK_PATH, D1ReadOperationV1, D1ReadSourceBindingV1, D1ReadSourceSelectionV1,
         WorkspaceD1ReadInventoryContractV1,
     },
 };
 
-use super::{Result, WorkspaceError, git_blob, git_optional, operation_identity};
+use super::{Result, WorkspaceError, git_optional, operation_identity};
 
 fn invalid(message: &str) -> WorkspaceError {
     WorkspaceError::DiscoveryInvariant(message.to_owned())
@@ -74,13 +74,6 @@ fn bind(owner: &Path, requested: &D1ReadSourceSelectionV1) -> Result<D1ReadSourc
             "read source checkout head or tree differs from the explicit selection",
         ));
     }
-    let pack = git_blob(owner, Path::new(D1_READ_PACK_PATH))?
-        .ok_or_else(|| invalid("registered read operation pack disappeared"))?;
-    if git_blob(&checkout, Path::new(D1_READ_PACK_PATH))?.as_ref() != Some(&pack) {
-        return Err(invalid(
-            "read source checkout committed pack differs from its registered owner",
-        ));
-    }
     Ok(D1ReadSourceBindingV1 {
         selection: D1ReadSourceSelectionV1 {
             checkout_root: checkout.display().to_string(),
@@ -92,6 +85,37 @@ fn bind(owner: &Path, requested: &D1ReadSourceSelectionV1) -> Result<D1ReadSourc
         registered_tree: git(owner, &["rev-parse", "HEAD^{tree}"])?,
         git_common_directory: common.display().to_string(),
     })
+}
+
+/// A selected commit may retain older reviewed input bytes, but cannot change
+/// the registered operation's authority, purpose or read inventory. Registered
+/// input paths remain an ordered minimum; additional selected inputs only add
+/// constraints and must validate against the selected commit's own source.
+/// Each revision and input digest is validated against its own committed source;
+/// neither checkout's pins are copied into the other checkout's contract.
+fn same_operation_authority(
+    registered: &D1ReadOperationV1,
+    selected: &D1ReadOperationV1,
+) -> Result<()> {
+    let mut selected_paths = selected.source.iter().map(|source| &source.path);
+    for required in &registered.source {
+        if !selected_paths.any(|path| path == &required.path) {
+            return Err(invalid(
+                "selected read operation omits or reorders registered source paths",
+            ));
+        }
+    }
+    let mut comparable = selected.clone();
+    comparable
+        .source_revision
+        .clone_from(&registered.source_revision);
+    comparable.source.clone_from(&registered.source);
+    if comparable != *registered {
+        return Err(invalid(
+            "selected read operation changes registered authority, purpose or inventory",
+        ));
+    }
+    Ok(())
 }
 
 /// Explicit selection requires one committed operation claim across carriers in
@@ -107,13 +131,21 @@ pub fn load_workspace_d1_read_from_checkout(
     let binding = bind(&owner, selection)?;
     let checkout = PathBuf::from(&binding.selection.checkout_root);
     unique_read_owner(std::slice::from_ref(&checkout), capability_id)?;
+    let registered = super::d1_reads::load_selected(
+        std::slice::from_ref(&owner),
+        capability_id,
+        operation_identity::WorkspaceOperationLoad::Inspect,
+    )?
+    .and_then(|c| c.workspace_d1_read_inventory)
+    .ok_or_else(|| invalid("registered D1 read operation disappeared"))?;
     let mut capability = super::d1_reads::load_selected(&[checkout], capability_id, mode)?
         .ok_or_else(|| invalid("selected D1 read operation disappeared"))?;
-    capability
+    let contract = capability
         .workspace_d1_read_inventory
         .as_mut()
-        .ok_or_else(|| invalid("source selection is supported only for committed D1 reads"))?
-        .source_binding = Some(binding);
+        .ok_or_else(|| invalid("source selection is supported only for committed D1 reads"))?;
+    same_operation_authority(&registered.operation, &contract.operation)?;
+    contract.source_binding = Some(binding);
     Ok(capability)
 }
 
@@ -147,6 +179,17 @@ pub fn revalidate_workspace_d1_read_registration(
         &[PathBuf::from(&binding.selection.checkout_root)],
         &contract.operation.id,
     )?;
+    // Registered HEAD/tree remain pinned. Read their committed pack without
+    // consulting unrelated dirty files or revalidating every input per query.
+    // Selected current bytes are checked independently at the query boundary.
+    let (pack, _) =
+        super::d1_reads::load_pack(&owner, operation_identity::WorkspaceOperationLoad::Inspect)?;
+    let registered = pack
+        .operation
+        .iter()
+        .find(|operation| operation.id == contract.operation.id)
+        .ok_or_else(|| invalid("registered D1 read operation disappeared"))?;
+    same_operation_authority(registered, &contract.operation)?;
     Ok(())
 }
 

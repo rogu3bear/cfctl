@@ -202,7 +202,7 @@ fn source_selection_rejects_clone_dirty_checkout_and_wrong_head_or_tree() {
 }
 
 #[test]
-fn explicit_source_cannot_hide_ambiguous_owners_or_changed_committed_pack() {
+fn explicit_source_cannot_hide_ambiguous_owners_or_changed_operation() {
     use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
     let dir = tempfile::tempdir().expect("root");
     let owner = dir.path().join("owner");
@@ -225,7 +225,10 @@ fn explicit_source_cannot_hide_ambiguous_owners_or_changed_committed_pack() {
     let pack = fs::read_to_string(checkout.join(PACK)).expect("pack");
     fs::write(
         checkout.join(PACK),
-        format!("{pack}\n# different committed pack\n"),
+        pack.replace(
+            "profile_id = \"example-read\"",
+            "profile_id = \"other-read\"",
+        ),
     )
     .expect("write");
     commit(&checkout);
@@ -240,6 +243,323 @@ fn explicit_source_cannot_hide_ambiguous_owners_or_changed_committed_pack() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn older_selected_pack_retains_its_own_input_revision_after_owner_advances() {
+    use cfctl_workspace::{
+        WorkspaceOperationLoad, load_workspace_d1_read_from_checkout,
+        revalidate_workspace_d1_read_registration,
+    };
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().expect("root");
+    let owner = dir.path().join("owner");
+    let input_revision = repository(&owner);
+    let checkout = dir.path().join("checkout");
+    let selection = linked_checkout(&owner, &checkout);
+    let original_pack = fs::read(checkout.join(PACK)).expect("selected pack");
+    let replacement = "new registered publication inputs\n";
+    fs::write(owner.join("source.txt"), replacement).expect("advance owner input");
+    commit(&owner);
+    let owner_input_revision = git(&owner, &["rev-parse", "HEAD"]);
+    let mut pack: cfctl_core::d1_read_inventory::D1ReadPackV1 =
+        toml::from_str(std::str::from_utf8(&original_pack).expect("UTF-8")).expect("pack");
+    pack.operation[0].source_revision = owner_input_revision.clone();
+    pack.operation[0].source[0].sha256 =
+        format!("sha256:{}", hex::encode(Sha256::digest(replacement)));
+    fs::write(owner.join(PACK), toml::to_string(&pack).expect("TOML")).expect("pack");
+    commit(&owner);
+    assert_ne!(
+        fs::read(owner.join(PACK)).expect("owner pack"),
+        original_pack
+    );
+    // Unrelated owner dirt must remain untouched and cannot become read inputs.
+    fs::write(owner.join("source.txt"), "owner's unfinished work").expect("dirty owner");
+    let roots = [owner.clone()];
+    let capability = load_workspace_d1_read_from_checkout(
+        &roots,
+        ID,
+        &selection,
+        WorkspaceOperationLoad::Execute,
+    )
+    .expect("same read authority with separately validated input pins");
+    let contract = capability.workspace_d1_read_inventory.expect("contract");
+    let binding = contract.source_binding.as_ref().expect("binding");
+    assert_eq!(contract.repository_head, selection.head);
+    assert_eq!(contract.operation.source_revision, input_revision);
+    assert_ne!(contract.repository_head, contract.operation.source_revision);
+    assert_ne!(contract.operation.source_revision, owner_input_revision);
+    assert_eq!(binding.registered_head, git(&owner, &["rev-parse", "HEAD"]));
+    revalidate_workspace_d1_read_registration(&roots, &contract).expect("query authorization");
+    revalidate_workspace_d1_read_inventory(&contract).expect("selected current bytes");
+    assert_eq!(
+        fs::read(checkout.join(PACK)).expect("selected pack"),
+        original_pack
+    );
+    assert_eq!(
+        fs::read_to_string(owner.join("source.txt")).expect("owner dirt"),
+        "owner's unfinished work"
+    );
+    // A forged current-byte digest is rejected independently of authorization.
+    let mut wrong = contract.clone();
+    wrong.operation.source[0].sha256 = "sha256:".to_owned() + &"0".repeat(64);
+    assert!(revalidate_workspace_d1_read_inventory(&wrong).is_err());
+    for change in [
+        "account",
+        "database",
+        "profile",
+        "purpose",
+        "inventory",
+        "paths",
+    ] {
+        let mut changed = contract.clone();
+        match change {
+            "account" => changed.operation.account_id = "b".repeat(32),
+            "database" => {
+                changed.operation.database_id = "22222222-2222-4333-8444-555555555555".into();
+            }
+            "profile" => changed.operation.profile_id = "other-read".into(),
+            "purpose" => changed.operation.description = "different purpose".into(),
+            "inventory" => {
+                changed.operation.inventory_sha256 = "sha256:".to_owned() + &"1".repeat(64);
+            }
+            "paths" => changed.operation.source[0].path = "other.txt".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            revalidate_workspace_d1_read_registration(&roots, &changed).is_err(),
+            "per-query {change} drift must fail closed"
+        );
+    }
+}
+
+#[test]
+fn explicit_source_validates_selected_nonancestor_missing_and_forged_own_inputs() {
+    use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
+    for defect in ["nonancestor-revision", "missing-input", "forged-input-pin"] {
+        let dir = tempfile::tempdir().expect("root");
+        let owner = dir.path().join("owner");
+        repository(&owner);
+        let checkout = dir.path().join("checkout");
+        let mut selection = linked_checkout(&owner, &checkout);
+        fs::write(owner.join("owner-only.txt"), "divergent owner commit").expect("owner");
+        commit(&owner);
+        let nonancestor = git(&owner, &["rev-parse", "HEAD"]);
+        let mut pack: cfctl_core::d1_read_inventory::D1ReadPackV1 =
+            toml::from_str(&fs::read_to_string(checkout.join(PACK)).expect("pack")).expect("TOML");
+        match defect {
+            "nonancestor-revision" => pack.operation[0].source_revision = nonancestor,
+            "missing-input" => fs::remove_file(checkout.join("source.txt")).expect("remove input"),
+            "forged-input-pin" => {
+                pack.operation[0].source[0].sha256 = "sha256:".to_owned() + &"0".repeat(64);
+            }
+            _ => unreachable!(),
+        }
+        fs::write(checkout.join(PACK), toml::to_string(&pack).expect("TOML")).expect("pack");
+        commit(&checkout);
+        selection.head = git(&checkout, &["rev-parse", "HEAD"]);
+        selection.tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+        for mode in [
+            WorkspaceOperationLoad::Inspect,
+            WorkspaceOperationLoad::Execute,
+        ] {
+            assert!(
+                load_workspace_d1_read_from_checkout(
+                    std::slice::from_ref(&owner),
+                    ID,
+                    &selection,
+                    mode
+                )
+                .is_err(),
+                "{defect} must be rejected using the selected checkout's own committed inputs"
+            );
+        }
+    }
+}
+
+fn registered_owner_with_two_required_inputs(
+    root: &Path,
+) -> (
+    std::path::PathBuf,
+    cfctl_core::d1_read_inventory::D1ReadPackV1,
+    String,
+) {
+    use cfctl_core::d1_read_inventory::{D1ReadPackV1, D1ReadSourceV1};
+    use sha2::{Digest, Sha256};
+    let owner = root.join("owner");
+    repository(&owner);
+    fs::write(owner.join("required.txt"), "second required input\n").expect("required");
+    commit(&owner);
+    let required_revision = git(&owner, &["rev-parse", "HEAD"]);
+    let mut pack: D1ReadPackV1 =
+        toml::from_str(&fs::read_to_string(owner.join(PACK)).expect("pack")).expect("TOML");
+    pack.operation[0]
+        .source_revision
+        .clone_from(&required_revision);
+    pack.operation[0].source.push(D1ReadSourceV1 {
+        path: "required.txt".into(),
+        sha256: format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(b"second required input\n"))
+        ),
+    });
+    fs::write(owner.join(PACK), toml::to_string(&pack).expect("TOML")).expect("pack");
+    commit(&owner);
+    (owner, pack, required_revision)
+}
+
+#[test]
+fn supplemental_selected_inputs_retain_ordered_minimum_and_validate_own_commits() {
+    use cfctl_core::d1_read_inventory::D1ReadSourceV1;
+    use cfctl_workspace::{
+        WorkspaceOperationLoad, load_workspace_d1_read_from_checkout,
+        revalidate_workspace_d1_read_registration,
+    };
+    use sha2::{Digest, Sha256};
+    for defect in [
+        "none",
+        "missing-required",
+        "reordered-required",
+        "forged-helper",
+        "helper-not-in-revision",
+        "dirty-helper",
+        "missing-helper",
+        "duplicate-helper",
+    ] {
+        let dir = tempfile::tempdir().expect("root");
+        let (owner, mut pack, required_revision) =
+            registered_owner_with_two_required_inputs(dir.path());
+        let checkout = dir.path().join("checkout");
+        let mut selection = linked_checkout(&owner, &checkout);
+        fs::create_dir_all(checkout.join("scripts/lib")).expect("helpers directory");
+        let mut extra = Vec::new();
+        for path in [
+            "scripts/lib/owned_process.py",
+            "scripts/lib/owned_watch_protocol.py",
+            "additional-input.txt",
+        ] {
+            let bytes = format!("supplemental committed input {path}\n");
+            fs::write(checkout.join(path), &bytes).expect("supplemental input");
+            extra.push(D1ReadSourceV1 {
+                path: path.into(),
+                sha256: format!("sha256:{}", hex::encode(Sha256::digest(bytes.as_bytes()))),
+            });
+        }
+        commit(&checkout);
+        pack.operation[0].source_revision = git(&checkout, &["rev-parse", "HEAD"]);
+        let required = pack.operation[0].source.clone();
+        pack.operation[0].source = vec![
+            extra[0].clone(),
+            required[0].clone(),
+            extra[1].clone(),
+            required[1].clone(),
+            extra[2].clone(),
+        ];
+        match defect {
+            "missing-required" => {
+                pack.operation[0].source.remove(1);
+            }
+            "reordered-required" => pack.operation[0].source.swap(1, 3),
+            "forged-helper" => {
+                pack.operation[0].source[0].sha256 = "sha256:".to_owned() + &"0".repeat(64);
+            }
+            "helper-not-in-revision" => pack.operation[0].source_revision = required_revision,
+            "duplicate-helper" => pack.operation[0].source.push(extra[0].clone()),
+            _ => {}
+        }
+        fs::write(checkout.join(PACK), toml::to_string(&pack).expect("TOML")).expect("pack");
+        commit(&checkout);
+        selection.head = git(&checkout, &["rev-parse", "HEAD"]);
+        selection.tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+        if defect == "dirty-helper" {
+            fs::write(checkout.join(&extra[0].path), "unreviewed helper\n").expect("dirty helper");
+        } else if defect == "missing-helper" {
+            fs::remove_file(checkout.join(&extra[0].path)).expect("missing helper");
+        }
+        let roots = [owner];
+        let result = load_workspace_d1_read_from_checkout(
+            &roots,
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Execute,
+        );
+        if defect == "none" {
+            let contract = result
+                .expect("additional committed constraints are valid")
+                .workspace_d1_read_inventory
+                .expect("contract");
+            assert_eq!(contract.operation.source.len(), 5);
+            revalidate_workspace_d1_read_registration(&roots, &contract).expect("same authority");
+            revalidate_workspace_d1_read_inventory(&contract).expect("all selected inputs");
+            for reorder in [false, true] {
+                let mut changed = contract.clone();
+                if reorder {
+                    changed.operation.source.swap(1, 3);
+                } else {
+                    changed.operation.source.remove(1);
+                }
+                assert!(revalidate_workspace_d1_read_registration(&roots, &changed).is_err());
+            }
+        } else {
+            assert!(
+                result.is_err(),
+                "supplemental input {defect} must fail closed"
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_committed_query_body_and_inventory_path_cannot_change_authority() {
+    use cfctl_workspace::{WorkspaceOperationLoad, load_workspace_d1_read_from_checkout};
+    use sha2::{Digest, Sha256};
+    for change_query in [false, true] {
+        let dir = tempfile::tempdir().expect("root");
+        let owner = dir.path().join("owner");
+        repository(&owner);
+        let checkout = dir.path().join("checkout");
+        let mut selection = linked_checkout(&owner, &checkout);
+        let mut pack: cfctl_core::d1_read_inventory::D1ReadPackV1 =
+            toml::from_str(&fs::read_to_string(checkout.join(PACK)).expect("pack")).expect("TOML");
+        let inventory = fs::read(checkout.join("inventory.json")).expect("inventory");
+        if change_query {
+            let mut value: serde_json::Value = serde_json::from_slice(&inventory).expect("JSON");
+            let sql = "SELECT COUNT(*) + 1 AS n FROM items;";
+            value["queries"][1]["sql"] = sql.into();
+            value["queries"][1]["sha256"] =
+                format!("sha256:{}", hex::encode(Sha256::digest(sql))).into();
+            let bytes = serde_json::to_vec_pretty(&value).expect("JSON");
+            pack.operation[0].inventory_sha256 =
+                format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+            fs::write(checkout.join("inventory.json"), bytes).expect("changed inventory");
+        } else {
+            fs::write(checkout.join("other-inventory.json"), &inventory)
+                .expect("same bytes elsewhere");
+            pack.operation[0].inventory_path = "other-inventory.json".into();
+        }
+        fs::write(checkout.join(PACK), toml::to_string(&pack).expect("TOML")).expect("pack");
+        commit(&checkout);
+        selection.head = git(&checkout, &["rev-parse", "HEAD"]);
+        selection.tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+        // It is a valid committed read in isolation, but cannot borrow the
+        // registered operation's authority for a different population or path.
+        assert!(
+            load_workspace_operation_capability(&[checkout], ID)
+                .expect("loader")
+                .is_some()
+        );
+        let error = load_workspace_d1_read_from_checkout(
+            &[owner],
+            ID,
+            &selection,
+            WorkspaceOperationLoad::Execute,
+        )
+        .expect_err("changed inventory must not borrow authorization");
+        assert!(
+            error.to_string().contains("registered authority"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

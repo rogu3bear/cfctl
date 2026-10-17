@@ -220,6 +220,7 @@ use permissions_and_kv::*;
 mod catalog_repairs;
 mod provider_capabilities;
 use provider_capabilities::*;
+mod audit_page;
 mod auth_and_authority;
 mod provider_preconditions;
 mod provider_rectification;
