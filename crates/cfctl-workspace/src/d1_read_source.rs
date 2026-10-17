@@ -154,5 +154,5 @@ fn unique_read_owner(candidates: &[PathBuf], id: &str) -> Result<PathBuf> {
     super::operation_claims::unique_pack_claim(candidates, id)?
         .filter(|(_, pack)| pack == Path::new(D1_READ_PACK_PATH))
         .map(|(owner, _)| owner)
-        .ok_or_else(|| invalid("source selection requires one committed D1 read operation owner"))
+        .ok_or_else(|| invalid("source selection requires one registered D1 read operation owner"))
 }
