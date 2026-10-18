@@ -66,6 +66,10 @@ impl FailureEnvelopeContext {
                     operation_id: None,
                 }
             }
+            Some(Command::Deploy(_)) => Self {
+                command: "deploy",
+                operation_id: None,
+            },
             _ => Self::generic(),
         }
     }

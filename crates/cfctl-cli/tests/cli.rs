@@ -57,6 +57,7 @@ fn every_public_command_group_is_parseable() {
             "keys" => vec!["cfctl", "keys", "permissions", "--account", "account-a"],
             "catalog" => vec!["cfctl", "catalog", "coverage"],
             "commands" => vec!["cfctl", "commands"],
+            "deploy" => vec!["cfctl", "deploy", "site"],
             "call" => vec!["cfctl", "call", "dns-records-list"],
             "resolve" => vec!["cfctl", "resolve", "list dns records"],
             "guide" => vec!["cfctl", "guide", "dns-records-delete"],
@@ -194,6 +195,24 @@ fn clap_human_version_behavior_remains_compatible() {
 }
 
 #[test]
+fn json_deploy_without_a_target_is_a_usage_error() {
+    for args in [
+        ["--json", "deploy"].as_slice(),
+        ["--json", "deploy", "site", "--yes"].as_slice(),
+    ] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .args(args)
+            .output()
+            .expect("run invalid deploy invocation");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("usage failure envelope");
+        assert_eq!(envelope["error"]["code"], "CFCTL_USAGE", "{envelope}");
+    }
+}
+
+#[test]
 fn json_parser_failures_are_v2_usage_envelopes_with_exit_two() {
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
         .args(["--json", "keys", "permissions"])
@@ -298,6 +317,113 @@ fn public_command_contract_exactly_matches_the_clap_tree() {
         .collect::<Vec<_>>();
     actual.sort_unstable();
     assert_eq!(actual, PUBLIC_V2_SUBCOMMANDS);
+}
+
+#[test]
+fn deploy_command_reads_only_the_registered_repository_cfctl_toml() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let binary = Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let root = workspace.path();
+    seed_test_fallback_secret(runtime.path());
+    fs::create_dir(root.join("build")).expect("build");
+    fs::write(root.join("build").join("worker.js"), "worker\n").expect("worker");
+    fs::write(
+        root.join("wrangler.toml"),
+        "name = \"cfctl-site\"\nmain = \"build/worker.js\"\n",
+    )
+    .expect("wrangler");
+    fs::write(
+        root.join("cfctl.toml"),
+        r#"schema_version = 1
+
+[target.site]
+lane = "worker"
+name = "cfctl-site"
+config = "wrangler.toml"
+profile_id = "cfctl-site-release-example"
+account_id = "0123456789abcdef0123456789abcdef"
+"#,
+    )
+    .expect("cfctl.toml");
+    let git = |args: &[&str]| {
+        let status = ProcessCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=cfctl test",
+        "-c",
+        "user.email=cfctl-test@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    ]);
+
+    let add = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "workspace",
+            "add",
+            root.to_str().expect("utf-8 workspace"),
+            "--account",
+            "0123456789abcdef0123456789abcdef",
+            "--json",
+        ])
+        .output()
+        .expect("workspace add");
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let deploy = |args: &[&str]| {
+        ProcessCommand::new(binary)
+            .current_dir(root)
+            .env("CFCTL_HOME", runtime.path())
+            .args(args)
+            .output()
+            .expect("deploy")
+    };
+    let unknown = deploy(&["deploy", "other", "--json"]);
+    assert!(!unknown.status.success());
+    let unknown = health_envelope(&unknown, "unknown target");
+    assert_eq!(unknown["command"], "deploy");
+    assert_eq!(unknown["ok"], false);
+    assert_eq!(unknown["performed"], false);
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not declared")),
+        "{unknown}"
+    );
+
+    let unprofiled = deploy(&["deploy", "site", "--json"]);
+    assert!(!unprofiled.status.success());
+    let unprofiled = health_envelope(&unprofiled, "no profile");
+    assert_eq!(unprofiled["command"], "deploy");
+    assert_eq!(unprofiled["performed"], false);
+    assert_eq!(unprofiled["error"]["code"], "CFCTL_NO_PROFILE");
+
+    fs::remove_file(root.join("cfctl.toml")).expect("remove control file");
+    let missing = deploy(&["deploy", "site", "--json"]);
+    assert!(!missing.status.success());
+    let missing = health_envelope(&missing, "missing file");
+    assert_eq!(missing["command"], "deploy");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is missing")),
+        "{missing}"
+    );
 }
 
 #[test]

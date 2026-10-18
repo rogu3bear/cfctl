@@ -160,7 +160,7 @@ pub(super) fn prepare_target(
         validate_artifact_tree_ownership(graph, &repository.path, &artifacts)?;
         let artifact_sha256 = artifact_set_sha256(&repository.path, &artifacts)?;
         (
-            format!("source={source_sha} artifact-sha256={artifact_sha256}"),
+            upload_message(source_sha, &artifact_sha256),
             json!({
                 "artifact": {
                     "roots": artifacts,
@@ -252,6 +252,66 @@ pub(super) fn prepare_target(
     target_object.extend(operation_object.clone());
     super::worker_frozen_upload::attach(capability, input, &snapshot, &mut target)?;
     Ok(Some(target))
+}
+
+fn upload_message(source_sha: &str, artifact_sha256: &str) -> String {
+    format!("source={source_sha} artifact-sha256={artifact_sha256}")
+}
+
+/// Message a `wrangler.versions-upload` plan must carry. Derived from the same
+/// clean source and artifact set `prepare_target` pins. Callers pass `config`
+/// and `name` only; a supplied message is ignored so the file cannot choose it.
+pub(super) fn expected_upload_message(
+    graph: &WorkspaceGraph,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<String, CliError> {
+    if !binds_artifact(capability) {
+        return Err(CliError::Input(
+            "Worker upload message requires an artifact-binding Worker capability".to_owned(),
+        ));
+    }
+    let config = canonical_config(input)?;
+    let snapshot = super::worker_frozen_upload::config_snapshot(capability, input, &config)?;
+    let document = &snapshot.document;
+    let _service_name = validated_service_name(document, input)?;
+    let repository = repository_owning_path(graph, &config).ok_or_else(|| {
+        CliError::Input(format!(
+            "Wrangler configuration `{}` is not owned by a registered repository",
+            config.display()
+        ))
+    })?;
+    if repository.git.dirty {
+        return Err(CliError::Input(format!(
+            "Worker deployment repository `{}` is dirty; commit the reviewed source before planning",
+            repository.path.display()
+        )));
+    }
+    let source_sha = repository.git.head.as_deref().ok_or_else(|| {
+        CliError::Input(format!(
+            "Worker deployment repository `{}` has no readable Git HEAD",
+            repository.path.display()
+        ))
+    })?;
+    if !is_full_source_sha(source_sha) {
+        return Err(CliError::Input(
+            "Worker deployment source identity is not a full lowercase Git SHA".to_owned(),
+        ));
+    }
+    let config_directory = config.parent().ok_or_else(|| {
+        CliError::Input("Wrangler configuration has no containing directory".to_owned())
+    })?;
+    let artifacts = artifact_paths_from_document(config_directory, document, input)?;
+    if artifacts.iter().any(|artifact| {
+        repository_owning_path(graph, artifact).is_none_or(|owner| owner.path != repository.path)
+    }) {
+        return Err(CliError::Input(
+            "every Worker deployment artifact must be owned by the config repository".to_owned(),
+        ));
+    }
+    validate_artifact_tree_ownership(graph, &repository.path, &artifacts)?;
+    let artifact_sha256 = artifact_set_sha256(&repository.path, &artifacts)?;
+    Ok(upload_message(source_sha, &artifact_sha256))
 }
 
 fn deployment_config_section_hash(document: &Value, bindings: bool) -> Result<String, CliError> {

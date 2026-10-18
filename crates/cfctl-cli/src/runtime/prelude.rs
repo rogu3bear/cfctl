@@ -56,16 +56,16 @@ pub(super) use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub(super) use crate::{
     AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, AuthStatusArgs, CallArgs,
-    CatalogCommand, Cli, CloudflarePolicyCommand, Command, DeploymentPlanSetCommand, DocsCommand,
-    EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand, EvidenceKeyCommand,
-    EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanCommand, EvidenceKeyRecoverPlanSelector,
-    EvidenceKeyRetireArgs, GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs,
-    KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand,
-    KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs, KeyRevokeArgs,
-    KeyRotateArgs, KeysCommand, PlanApproveArgs, PlanSelector, PlansCommand, PolicyCommand,
-    ProfileSelector, RegistryCommand, RegistryDeclarationsCommand, RegistryOwnershipCommand,
-    RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand, ResolveArgs, SearchArgs,
-    WorkspaceCommand,
+    CatalogCommand, Cli, CloudflarePolicyCommand, Command, DeployArgs, DeploymentPlanSetCommand,
+    DocsCommand, EventBridgeCommand, EventHistoryArgs, EventReconcileArgs, EventsCommand,
+    EvidenceKeyCommand, EvidenceKeyRecoverArgs, EvidenceKeyRecoverPlanCommand,
+    EvidenceKeyRecoverPlanSelector, EvidenceKeyRetireArgs, GuideArgs, GuideTopicArg,
+    ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
+    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector,
+    KeyRenewAnalyticsProfileArgs, KeyRevokeArgs, KeyRotateArgs, KeysCommand, PlanApproveArgs,
+    PlanSelector, PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand,
+    RegistryDeclarationsCommand, RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg,
+    RegistryScopesCommand, ResolveArgs, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig},
 };
 

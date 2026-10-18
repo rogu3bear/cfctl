@@ -40,6 +40,8 @@ pub enum Command {
     Catalog(CatalogArgs),
     /// Read live state or create a mutation plan.
     Call(CallArgs),
+    /// Create one pinned Worker upload plan from the repository `cfctl.toml`.
+    Deploy(DeployArgs),
     /// Deterministically map a natural-language intent to a capability and the
     /// exact governed commands to run. Reads only; never mutates or launches an
     /// agent; fails closed when the match is ambiguous.
@@ -676,6 +678,12 @@ pub struct CallArgs {
         help = "Private source for governed D1/R2 operations, or a snapshot directory for authenticated R2 capture verification; bytes never enter plan JSON"
     )]
     pub source_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct DeployArgs {
+    /// Named `[target.<name>]` in the repository `cfctl.toml`.
+    pub target: String,
 }
 
 #[derive(Debug, Args)]

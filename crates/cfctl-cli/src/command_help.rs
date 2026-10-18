@@ -24,6 +24,10 @@ const STARTING_PATHS: &[(&str, &str)] = &[
         "read live state or draft a mutation plan",
     ),
     (
+        "cfctl deploy <target>",
+        "draft one Worker upload plan from the repository cfctl.toml",
+    ),
+    (
         "cfctl plans show|approve|run|status <operation-id>",
         "review and advance the durable mutation lifecycle",
     ),
@@ -126,7 +130,7 @@ fn collect_entries(parent: &clap::Command, parent_path: &str, entries: &mut Vec<
 fn render_human(commands: &[Value], catalog_routes: &[Value]) -> String {
     let mut output = String::from("cfctl command language\n\n");
     let _ = writeln!(output, "Grammar: {GRAMMAR}");
-    output.push_str("The area stays first; the action says what happens. Direct operations such as `resolve`, `guide`, and `call` omit the area. Existing paths remain compatible.\n\nStart here:\n");
+    output.push_str("The area stays first; the action says what happens. Direct operations such as `resolve`, `guide`, `call`, and `deploy` omit the area. Existing paths remain compatible.\n\nStart here:\n");
     for (command, purpose) in STARTING_PATHS {
         let _ = writeln!(output, "  {command:<58} {purpose}");
     }

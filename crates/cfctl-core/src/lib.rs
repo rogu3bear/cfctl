@@ -65,6 +65,7 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "call",
     "catalog",
     "commands",
+    "deploy",
     "docs",
     "doctor",
     "events",

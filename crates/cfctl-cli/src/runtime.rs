@@ -24,6 +24,7 @@ mod d1_reconciliation;
 mod d1_restore_proof;
 mod delegated_execution;
 mod delegated_read;
+mod deploy;
 mod docs_commands;
 mod entitlement_state;
 mod error;
@@ -111,6 +112,7 @@ use auth_commands::auth_command;
 use call_command::call_command;
 use catalog_commands::{catalog_command, guide_command, guide_topic_envelope};
 use cfctl_core::render_guide_topic_document_markdown;
+use deploy::deploy_command;
 use docs_commands::docs_command;
 use events_commands::events_command;
 use guide_generation::resolve_command;
@@ -176,6 +178,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Keys(arguments) => Box::pin(keys_command(&store, arguments.command)).await,
         Command::Catalog(arguments) => catalog_command(&store, arguments.command).await,
         Command::Call(arguments) => Box::pin(call_command(&store, arguments)).await,
+        Command::Deploy(arguments) => Box::pin(deploy_command(&store, arguments)).await,
         Command::Resolve(arguments) => resolve_command(&store, arguments).await,
         Command::Guide(arguments) => guide_command(&store, &arguments).await,
         Command::Plans(arguments) => Box::pin(plans_command(&store, arguments.command)).await,
