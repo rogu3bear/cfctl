@@ -885,13 +885,32 @@ fn recognizing_an_unsupported_generic_claim_does_not_enable_its_execution() {
     competing_claim(root.path(), ".cfctl/operations/generic.toml", 99);
     let roots = [root.path().to_path_buf()];
     assert!(
-        inspect_workspace_operation_capability(&roots, ID)
-            .expect("unsupported schema remains unbound")
-            .is_none()
+        cfctl_workspace::workspace_operation_is_claimed(&roots, ID)
+            .expect("unsupported semantics retain the committed identity claim")
     );
-    assert!(
-        load_workspace_operation_capability(&roots, ID)
-            .expect("unsupported schema cannot execute")
-            .is_none()
-    );
+    for result in [
+        inspect_workspace_operation_capability(&roots, ID),
+        load_workspace_operation_capability(&roots, ID),
+    ] {
+        let error = result.expect_err("a claimed unsupported declaration must reject binding");
+        assert!(
+            matches!(
+                &error,
+                cfctl_workspace::WorkspaceError::DiscoveryInvariant(message)
+                    if message.contains("no supported binding")
+                        && message.contains("no alternative owner may replace it")
+            ),
+            "unexpected binding rejection: {error}"
+        );
+    }
+    for result in [
+        inspect_workspace_operation_capability(&roots, "example.unclaimed"),
+        load_workspace_operation_capability(&roots, "example.unclaimed"),
+    ] {
+        assert!(
+            result
+                .expect("an unclaimed identity remains unknown")
+                .is_none()
+        );
+    }
 }
