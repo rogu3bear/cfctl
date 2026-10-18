@@ -502,12 +502,16 @@ fn path_text(path: &Path) -> Result<String> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::super::prelude::WorkspaceGraph;
-    use super::*;
+    use super::{
+        FILE_NAME, admit_worker_lane, deploy_root, parse_deploy_file, path_text, read_deploy_file,
+        resolve_config, select_target, upload_input, upload_projection,
+    };
     use crate::Cli;
-    use cfctl_core::{AdapterStatus, EffectClass, RiskClass};
+    use cfctl_core::{AdapterStatus, CapabilityV1, EffectClass, RiskClass};
     use cfctl_workspace::RegisteredRoot;
     use clap::Parser as _;
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
 
     const PROFILE_ID: &str = "cfctl-site-release-example";
