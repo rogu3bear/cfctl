@@ -1012,7 +1012,12 @@ pub(super) async fn read_live_worker_deployment_state(
         ));
     }
     let service_name = worker_deployment::service_name(adapter_targets)?;
-    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let base_url = API_BASE_URL;
+    #[cfg(test)]
+    let fixture_url = WORKER_STATE_TEST_URL.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let base_url = fixture_url.as_deref().unwrap_or(base_url);
+    let executor = Executor::new(http_client()?, base_url)?;
     let settings_source = exact_worker_deployment_read_capability(
         catalog,
         worker_deployment::SETTINGS_CAPABILITY_ID,
@@ -1095,6 +1100,11 @@ pub(super) async fn read_live_worker_deployment_state(
     };
     let evidence = store.write_observation_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static WORKER_STATE_TEST_URL: String;
 }
 
 async fn read_worker_version_detail(

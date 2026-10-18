@@ -76,8 +76,10 @@ pub(super) async fn begin_oauth_login(
     arguments: AuthLoginArgs,
 ) -> Result<ResultEnvelopeV2> {
     let client_id = require_oauth_client_id(arguments.client_id.as_deref())?;
+    require_oauth_profile_kind(profiles, &arguments.profile)?;
     let requested_scopes =
         resolve_login_scopes(store, profiles, secrets, &arguments.scopes).await?;
+    unchanged_oauth_profiles(store, profiles)?;
     let client = OAuthClientConfig::cfctl_public(client_id);
     let scopes: Vec<&str> = requested_scopes.iter().map(String::as_str).collect();
     let session = PkceSession::begin(&client, &scopes)?;
@@ -112,7 +114,18 @@ pub(super) async fn complete_oauth_login(
     secrets: &dyn SecretStore,
     arguments: AuthLoginArgs,
 ) -> Result<ResultEnvelopeV2> {
+    complete_oauth_login_using(store, profiles, secrets, arguments, read_stdin).await
+}
+
+pub(super) async fn complete_oauth_login_using(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    secrets: &dyn SecretStore,
+    arguments: AuthLoginArgs,
+    callback: impl FnOnce() -> Result<String>,
+) -> Result<ResultEnvelopeV2> {
     let client_id = require_oauth_client_id(arguments.client_id.as_deref())?;
+    require_oauth_profile_kind(profiles, &arguments.profile)?;
     let pending = profiles
         .pending_logins
         .get(&arguments.profile)
@@ -123,7 +136,7 @@ pub(super) async fn complete_oauth_login(
             "OAuth client ID differs from the pending login".to_owned(),
         ));
     }
-    let (state, code) = parse_callback(&read_stdin()?)?;
+    let (state, code) = parse_callback(&callback()?)?;
     if state != pending.state {
         return Err(CliError::Input(
             "OAuth state does not match the pending login".to_owned(),
@@ -143,6 +156,7 @@ pub(super) async fn complete_oauth_login(
     profile.oauth_client_id = Some(pending.client.client_id);
     profile.oauth_scopes = tokens.scopes().into_iter().map(str::to_owned).collect();
     profile.oauth_scope_inventory_hash = oauth_scope_inventory_hash(store)?;
+    unchanged_oauth_profiles(store, profiles)?;
     mark_credential_install_pending(store, profiles, &profile, true)?;
     secrets.store_oauth_tokens(&arguments.profile, &tokens)?;
     profiles.profiles.insert(arguments.profile.clone(), profile);
@@ -159,6 +173,28 @@ pub(super) async fn complete_oauth_login(
             "message": "OAuth login completed; tokens were stored in the platform credential store."
         }),
     ))
+}
+
+fn require_oauth_profile_kind(profiles: &ProfilesConfig, id: &str) -> Result<()> {
+    if profiles
+        .profiles
+        .get(id)
+        .is_some_and(|profile| profile.kind != ProfileKind::OAuth)
+    {
+        return Err(CliError::Input(format!(
+            "profile `{id}` already uses a different credential kind; choose a new OAuth profile ID"
+        )));
+    }
+    Ok(())
+}
+
+fn unchanged_oauth_profiles(store: &StateStore, expected: &ProfilesConfig) -> Result<()> {
+    if serde_json::to_value(ProfilesConfig::load(store)?)? != serde_json::to_value(expected)? {
+        return Err(CliError::Input(
+            "profile state changed during OAuth login; no local credential was installed; recheck profile custody before a new login".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn auth_status(

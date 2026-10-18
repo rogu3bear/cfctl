@@ -146,11 +146,17 @@ fn unique_claim(candidates: &[PathBuf], capability_id: &str) -> Result<Option<Cl
             Carrier::Generic
         } else {
             Carrier::typed_pack(&pack).ok_or_else(|| {
-                WorkspaceError::DiscoveryInvariant("selected operation carrier is unsupported".into())
+                WorkspaceError::DiscoveryInvariant(
+                    "selected operation carrier is unsupported".into(),
+                )
             })?
         }
     };
-    Ok(Some(Claim { repository, pack, carrier }))
+    Ok(Some(Claim {
+        repository,
+        pack,
+        carrier,
+    }))
 }
 
 // Explicit linked-checkout and typed source consumers keep their selected scope,
@@ -221,16 +227,8 @@ pub(super) fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 // Migration, projection, reply-admission and evidence packs share only this
 // routing invariant. Their selected execution contracts remain independent.
 pub(super) fn contains(repository: &Path, pack: &str, capability_id: &str) -> Result<bool> {
-    let Some(bytes) = git_blob(repository, Path::new(pack))? else {
-        return Ok(false);
-    };
-    let count = matching_ids(&pack_document(&bytes)?, capability_id);
-    if count > 1 {
-        return Err(WorkspaceError::DiscoveryInvariant(
-            "workspace operation id is ambiguous within its committed pack".into(),
-        ));
-    }
-    Ok(count == 1)
+    Ok(unique_claim(&[repository.to_path_buf()], capability_id)?
+        .is_some_and(|claim| claim.pack == Path::new(pack)))
 }
 
 #[cfg(test)]

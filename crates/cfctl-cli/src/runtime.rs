@@ -154,7 +154,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     if matches!(command, Command::Commands) {
         return Ok(crate::command_help::envelope());
     }
-    // Token intake checks and writes one whole profile configuration plus its
+    // Token intake and OAuth login write one whole profile configuration plus its
     // credential. Hold the existing exclusive runtime lock across that entire
     // transaction, including input and verification. Every ordinary invocation
     // already holds the shared side, so another profile writer cannot cross
@@ -166,6 +166,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
                 command: crate::EvidenceKeyCommand::PrivateActivate(_)
                     | crate::EvidenceKeyCommand::PrivateRebind(_)
             }) | crate::AuthCommand::ImportApiToken(_)
+                | crate::AuthCommand::Login(_)
         })
     );
     let _runtime_lock =

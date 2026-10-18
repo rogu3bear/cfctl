@@ -80,9 +80,11 @@ pub(super) async fn deploy_command(
         path: ".".to_owned(),
         source,
     })?;
+    #[cfg(test)]
+    let cwd = TEST_CWD.try_with(Clone::clone).unwrap_or(cwd);
     let root = deploy_root(&cwd, &store.workspace_roots()?)?;
     let file_path = root.join(FILE_NAME);
-    let file = read_deploy_file(&file_path)?;
+    let (file, control_bytes) = read_deploy_file(&file_path)?;
     let target = select_target(&file, &file_path, &arguments.target)?;
     admit_worker_lane(&arguments.target, &target.lane)?;
     let config = resolve_config(&root, &target.config)?;
@@ -95,6 +97,12 @@ pub(super) async fn deploy_command(
         &profile.id,
         profile.account_id.as_deref(),
     )?;
+    let control_head = require_committed_control(&root, &control_bytes)?;
+    if git_top_level(config.parent().unwrap_or(&root))? != root {
+        return Err(CliError::Input(
+            "deploy config must belong to the control file's Git repository".to_owned(),
+        ));
+    }
     let graph = discover_registered(store)?;
     let capability = upload_capability();
     let config_text = path_text(&config)?;
@@ -103,10 +111,14 @@ pub(super) async fn deploy_command(
         &capability,
         &upload_input(&config_text, &target.name, None),
     )?;
+    require_control_head(&message, &control_head)?;
+    #[cfg(test)]
+    let _ = BEFORE_CALL_TEST_HOOK.try_with(|hook| hook(store));
     let mut envelope = Box::pin(call_command(
         store,
         CallArgs {
             capability_id: UPLOAD_CAPABILITY_ID.to_owned(),
+            max_pages: None,
             source_checkout: crate::source_checkout::SourceCheckoutArgs::default(),
             selectors: Vec::new(),
             query: vec![
@@ -116,8 +128,8 @@ pub(super) async fn deploy_command(
             ],
             body_json: None,
             body_stdin: false,
-            profile: None,
-            account: None,
+            profile: Some(target.profile_id.clone()),
+            account: Some(target.account_id.clone()),
             if_match: None,
             if_none_match: None,
             value_out: None,
@@ -158,7 +170,7 @@ fn upload_projection(
     selected_account_id: Option<&str>,
 ) -> Result<Value> {
     let file_path = root.join(FILE_NAME);
-    let file = read_deploy_file(&file_path)?;
+    let (file, control_bytes) = read_deploy_file(&file_path)?;
     let target = select_target(&file, &file_path, target_name)?;
     admit_worker_lane(target_name, &target.lane)?;
     let config = resolve_config(root, &target.config)?;
@@ -169,12 +181,14 @@ fn upload_projection(
         selected_profile_id,
         selected_account_id,
     )?;
+    let control_head = require_committed_control(root, &control_bytes)?;
     let config_text = path_text(&config)?;
     let message = expected_upload_message(
         graph,
         capability,
         &upload_input(&config_text, &target.name, None),
     )?;
+    require_control_head(&message, &control_head)?;
     super::worker_deployment::prepare_target(
         graph,
         capability,
@@ -382,9 +396,13 @@ fn resolve_config(root: &Path, raw: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn read_deploy_file(path: &Path) -> Result<DeployFile> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+fn read_deploy_file(path: &Path) -> Result<(DeployFile, Vec<u8>)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Err(CliError::Input(format!(
                 "deploy control file `{}` is missing",
@@ -398,27 +416,97 @@ fn read_deploy_file(path: &Path) -> Result<DeployFile> {
             });
         }
     };
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
     if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
         return Err(CliError::Input(format!(
             "deploy control file `{}` must be a non-empty regular file no larger than {MAX_FILE_BYTES} bytes",
             path.display()
         )));
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)
+    #[cfg(test)]
+    let _ = AFTER_METADATA_TEST_HOOK.try_with(|hook| hook(path));
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|source| CliError::Io {
             path: path.display().to_string(),
             source,
         })?;
-    parse_deploy_file(&text)
+    if bytes.is_empty() || bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(CliError::Input(
+            "deploy control file exceeded its streamed byte bound".to_owned(),
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| CliError::Input("deploy control file is not UTF-8".to_owned()))?;
+    Ok((parse_deploy_file(text)?, bytes))
+}
+
+/// Read the immutable object named by one HEAD, rather than allowing an
+/// ignored or untracked control file to influence a plan citing another tree.
+fn require_committed_control(root: &Path, captured: &[u8]) -> Result<String> {
+    let git = |args: &[&str]| -> Result<Vec<u8>> {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|source| CliError::Io {
+                path: root.display().to_string(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(CliError::Input(
+                "deploy control file must be committed in the selected repository HEAD".to_owned(),
+            ));
+        }
+        Ok(output.stdout)
+    };
+    let head = String::from_utf8(git(&["rev-parse", "--verify", "HEAD"])?)
+        .map_err(|_| CliError::Input("deploy HEAD is not UTF-8".to_owned()))?;
+    let head = head.trim().to_owned();
+    if head.len() != 40 || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CliError::Input(
+            "deploy HEAD is not a complete Git identity".to_owned(),
+        ));
+    }
+    let object = format!("{head}:{FILE_NAME}");
+    let size = String::from_utf8(git(&["cat-file", "-s", &object])?)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    if size != Some(captured.len() as u64) {
+        return Err(CliError::Input(
+            "deploy control file differs from its committed HEAD bytes".to_owned(),
+        ));
+    }
+    // The size belongs to this immutable object, so this read cannot grow
+    // after the bound check even if another process moves HEAD.
+    if git(&["cat-file", "blob", &object])? != captured {
+        return Err(CliError::Input(
+            "deploy control file differs from its committed HEAD bytes".to_owned(),
+        ));
+    }
+    Ok(head)
+}
+
+fn require_control_head(message: &str, head: &str) -> Result<()> {
+    if !message.starts_with(&format!("source={head} artifact-sha256=")) {
+        return Err(CliError::Input(
+            "deploy source HEAD changed after the control file was captured".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static BEFORE_CALL_TEST_HOOK: fn(&StateStore);
+    pub(super) static TEST_CWD: PathBuf;
+    static AFTER_METADATA_TEST_HOOK: fn(&Path);
 }
 
 fn reject_forbidden_fields(value: &toml::Value, location: &str) -> Result<()> {
@@ -504,7 +592,8 @@ mod tests {
     use super::super::prelude::WorkspaceGraph;
     use super::{
         FILE_NAME, admit_worker_lane, deploy_root, parse_deploy_file, path_text, read_deploy_file,
-        resolve_config, select_target, upload_input, upload_projection,
+        require_committed_control, require_control_head, resolve_config, select_target,
+        upload_input, upload_projection,
     };
     use crate::Cli;
     use cfctl_core::{AdapterStatus, CapabilityV1, EffectClass, RiskClass};
@@ -801,6 +890,8 @@ account_id = "{ACCOUNT_ID}"
             valid_file().replace("name = \"cfctl-site\"", "name = \"other\""),
         )
         .expect("mismatched name");
+        commit_fixture(root.path());
+        let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("graph");
         let mismatch = upload_projection(
             &graph,
             &capability,
@@ -850,5 +941,62 @@ account_id = "{ACCOUNT_ID}"
                 repository.display()
             )
         );
+    }
+
+    #[test]
+    fn ignored_and_untracked_control_files_cannot_borrow_another_head() {
+        for ignored in [false, true] {
+            let root = tempfile::tempdir().expect("root");
+            fs::write(root.path().join("README"), "fixture").expect("source");
+            if ignored {
+                fs::write(root.path().join(".gitignore"), "cfctl.toml\n").expect("ignore");
+            }
+            commit_fixture(root.path());
+            fs::write(root.path().join(FILE_NAME), valid_file()).expect("control");
+            let (_, captured) = read_deploy_file(&root.path().join(FILE_NAME)).expect("read");
+            let error = require_committed_control(root.path(), &captured)
+                .expect_err("uncommitted control must fail");
+            assert!(error.to_string().contains("must be committed"), "{error}");
+        }
+    }
+
+    #[test]
+    fn control_bytes_and_planned_head_are_both_bound() {
+        let root = tempfile::tempdir().expect("root");
+        fs::write(root.path().join(FILE_NAME), valid_file()).expect("control");
+        commit_fixture(root.path());
+        let (_, captured) = read_deploy_file(&root.path().join(FILE_NAME)).expect("read");
+        let head = require_committed_control(root.path(), &captured).expect("committed");
+        assert!(
+            require_control_head(&format!("source={head} artifact-sha256=fixture"), &head).is_ok()
+        );
+        assert!(require_control_head("source=other artifact-sha256=fixture", &head).is_err());
+        let mut changed = captured;
+        changed[0] = b'S';
+        let error = require_committed_control(root.path(), &changed).expect_err("changed bytes");
+        assert!(
+            error.to_string().contains("committed HEAD bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn control_growth_after_opened_metadata_is_still_bounded() {
+        use std::io::Write as _;
+        fn grow(path: &Path) {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("open owned fixture")
+                .write_all(&vec![b' '; super::MAX_FILE_BYTES as usize])
+                .expect("grow owned fixture");
+        }
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join(FILE_NAME);
+        fs::write(&path, valid_file()).expect("control");
+        let error = super::AFTER_METADATA_TEST_HOOK
+            .sync_scope(grow as fn(&Path), || read_deploy_file(&path))
+            .expect_err("growth after metadata must fail");
+        assert!(error.to_string().contains("streamed byte bound"), "{error}");
     }
 }

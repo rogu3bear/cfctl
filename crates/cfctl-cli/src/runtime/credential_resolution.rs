@@ -12,6 +12,10 @@ use cfctl_core::hash_value;
 
 pub(super) fn platform_secrets(store: &StateStore) -> PlatformSecretStore {
     let root = store.paths().data_dir.join("auth").join("secrets");
+    #[cfg(test)]
+    if let Ok(secrets) = TEST_SECRETS.try_with(std::sync::Arc::clone) {
+        return PlatformSecretStore::private_only(root, secrets);
+    }
     if store.private_origin().is_some() {
         return PlatformSecretStore::private_only(
             root.clone(),
@@ -19,6 +23,11 @@ pub(super) fn platform_secrets(store: &StateStore) -> PlatformSecretStore {
         );
     }
     PlatformSecretStore::new(root)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static TEST_SECRETS: std::sync::Arc<cfctl_auth::MemorySecretStore>;
 }
 
 pub(super) fn describe_secret_backend(

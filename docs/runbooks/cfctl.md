@@ -239,13 +239,18 @@ OAuth is promoted:
 
 ```bash
 cfctl auth login --profile default --client-id <client-id> \
-  --account <account-id> --json
+  --account <account-id> --scope <scope-id> --json
 ```
 
 Open the returned authorization URL, then pipe the callback's one-time
 `STATE CODE` value into the same command with `--complete`. Use `auth status`,
 `profiles`, `use`, and `logout` for profile lifecycle. Import an emergency
 global key only through stdin; cfctl never selects it silently.
+
+For the first login, pass the OAuth scope IDs required by that client explicitly
+with repeated `--scope` flags. Omitting scopes requires an authenticated cached
+scope inventory, which a fresh installation does not have. Use a new profile ID
+if an API-token or emergency-key profile already has the requested name.
 
 If `doctor` reports an unsupported `wrangler_session` profile, it is inert
 metadata left by a pre-release experiment. `auth profiles` and `doctor` remain

@@ -211,6 +211,8 @@ fn authenticated_test_store_reopens_the_same_authority() {
 
 mod acceptance_rectification;
 mod d1_restore_proof;
+mod deploy_planning;
+mod oauth_completion;
 mod pages_and_delegated;
 mod pages_setup;
 mod worker_frozen_contracts;

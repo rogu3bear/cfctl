@@ -2,6 +2,78 @@ use super::*;
 use crate::source_checkout::SourceCheckoutArgs;
 use clap::Parser;
 
+fn oauth_arguments(complete: bool) -> AuthLoginArgs {
+    AuthLoginArgs {
+        profile: "default".into(),
+        client_id: Some("explicit-fixture-client".into()),
+        scopes: vec!["account:read".into()],
+        account: Some("account-a".into()),
+        complete,
+    }
+}
+
+#[tokio::test]
+async fn oauth_login_rejects_existing_token_kind_before_pending_secret_or_callback() {
+    let root = tempfile::tempdir().expect("root");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
+    let secrets = MemorySecretStore::default();
+    secrets
+        .store_api_token("default", "fixture-existing-token")
+        .expect("token");
+    let mut profiles = site_release_and_default_profiles(Some("default"));
+    profiles.save(&store).expect("profiles");
+    let before = fs::read(store.paths().profiles_file()).expect("before");
+    let error = begin_oauth_login(&store, &mut profiles, &secrets, oauth_arguments(false))
+        .await
+        .expect_err("must not start a different credential kind");
+    assert!(error.to_string().contains("different credential kind"));
+    let error = complete_oauth_login(&store, &mut profiles, &secrets, oauth_arguments(true))
+        .await
+        .expect_err("must refuse before reading callback or exchanging code");
+    assert!(error.to_string().contains("different credential kind"));
+    assert_eq!(
+        fs::read(store.paths().profiles_file()).expect("after"),
+        before
+    );
+    assert!(
+        secrets
+            .get("pending/default/pkce-verifier")
+            .expect("verifier")
+            .is_none()
+    );
+    assert!(
+        matches!(secrets.load_profile_credential(profiles.selected(None).expect("profile")).expect("credential"),
+        AuthCredential::Bearer { token } if token == "fixture-existing-token")
+    );
+}
+
+#[tokio::test]
+async fn first_oauth_login_with_explicit_client_and_scopes_needs_no_inventory_or_profile() {
+    let root = tempfile::tempdir().expect("root");
+    let store = authenticated_test_store(RuntimePaths::from_root(root.path()));
+    let secrets = MemorySecretStore::default();
+    let mut profiles = ProfilesConfig::default();
+    let result = begin_oauth_login(&store, &mut profiles, &secrets, oauth_arguments(false))
+        .await
+        .expect("explicit client and scope first-use path");
+    let url = url::Url::parse(result.result["authorization_url"].as_str().expect("URL"))
+        .expect("valid URL");
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "client_id" && value == "explicit-fixture-client")
+    );
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "scope" && value == "account:read")
+    );
+    assert_eq!(
+        profiles.pending_logins["default"].scopes,
+        vec!["account:read"]
+    );
+    assert!(profiles.profiles.is_empty());
+    assert!(require_oauth_client_id(None).is_err());
+}
+
 pub(super) fn emergency_global_key_as_current() -> ProfilesConfig {
     let mut profiles = BTreeMap::new();
     profiles.insert(
