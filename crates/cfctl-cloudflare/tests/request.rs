@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "request/csv_records.rs"]
+mod csv_records;
 #[path = "request/email_routing.rs"]
 mod email_routing;
 #[path = "request/pages_projects.rs"]

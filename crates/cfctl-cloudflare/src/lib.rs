@@ -8600,7 +8600,7 @@ async fn parse_csv_response(
     output_path: Option<&Path>,
 ) -> Result<CloudflareResponseV1> {
     let (mut bytes, byte_truncated) = read_bounded_body(response, request.max_bytes).await?;
-    let (rows, malformed, row_cut) = csv_record_count(&bytes, request.max_rows);
+    let (rows, malformed, row_cut) = csv_record_count(&bytes, request.max_rows, !byte_truncated);
     // Rows past the bound are dropped at a record boundary, as NDJSON drops
     // parsed rows past it; exactly `max_rows` rows is complete, not truncated.
     if let Some(length) = row_cut {
@@ -8639,7 +8639,11 @@ async fn parse_csv_response(
 /// Counts CSV data records after the header line. Returns the record count,
 /// whether the body ended inside a quoted field, and the byte length that
 /// keeps the header plus the first `max_rows` records when more follow.
-fn csv_record_count(bytes: &[u8], max_rows: u64) -> (u64, bool, Option<usize>) {
+fn csv_record_count(
+    bytes: &[u8],
+    max_rows: u64,
+    body_complete: bool,
+) -> (u64, bool, Option<usize>) {
     let mut quoted = false;
     let mut records = 0_u64;
     let mut index = 0;
@@ -8656,6 +8660,11 @@ fn csv_record_count(bytes: &[u8], max_rows: u64) -> (u64, bool, Option<usize>) {
             _ => {}
         }
         index += 1;
+    }
+    // A complete CSV response may end at the last field rather than a newline.
+    // A byte-limited prefix cannot establish that final record's completion.
+    if body_complete && !quoted && !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        records += 1;
     }
     (records.saturating_sub(1).min(max_rows), quoted, None)
 }
