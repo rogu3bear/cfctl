@@ -988,7 +988,11 @@ account_id = "{ACCOUNT_ID}"
                 .append(true)
                 .open(path)
                 .expect("open owned fixture")
-                .write_all(&vec![b' '; super::MAX_FILE_BYTES as usize])
+                .write_all(&vec![
+                    b' ';
+                    usize::try_from(super::MAX_FILE_BYTES)
+                        .expect("fixture limit fits usize")
+                ])
                 .expect("grow owned fixture");
         }
         let root = tempfile::tempdir().expect("root");

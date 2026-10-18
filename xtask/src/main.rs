@@ -1665,9 +1665,12 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
         ),
         (
             "CONTRIBUTING.md",
-            "The prebuilt v1.3.0 operator posture requires the identity-bearing lane.",
+            "Prebuilt binary publication requires the identity-bearing lane.",
         ),
-        ("CONTRIBUTING.md", "create `v1.3.0` as a new annotated tag"),
+        (
+            "CONTRIBUTING.md",
+            "create `v<release-version>` as a new annotated tag",
+        ),
         (
             "CONTRIBUTING.md",
             "Create an empty draft GitHub release from the verified tag",
@@ -1693,7 +1696,7 @@ fn validate_signed_release_posture_contract(documents: &[(&str, &str)]) -> Resul
         let normalized_required = required.split_whitespace().collect::<Vec<_>>().join(" ");
         if !normalized_content.contains(&normalized_required) {
             return Err(TaskError::InvalidSourceContract(format!(
-                "{path} omits signed v1.3.0 release posture anchor `{required}`"
+                "{path} omits signed release posture anchor `{required}`"
             )));
         }
     }
@@ -4600,6 +4603,24 @@ chmod +x "$8/$6/debug/xtask"
                 )
             })
             .collect::<Vec<_>>();
+        for anchor in [
+            "Prebuilt binary publication requires the identity-bearing lane.",
+            "create `v<release-version>` as a new annotated tag",
+        ] {
+            let mut missing = documents.clone();
+            let contribution = &mut missing
+                .iter_mut()
+                .find(|(path, _)| *path == "CONTRIBUTING.md")
+                .expect("contribution guide")
+                .1;
+            assert!(contribution.contains(anchor));
+            *contribution = contribution.replace(anchor, "omitted trust requirement");
+            let borrowed = missing
+                .iter()
+                .map(|(path, content)| (*path, content.as_str()))
+                .collect::<Vec<_>>();
+            assert!(validate_signed_release_posture_contract(&borrowed).is_err());
+        }
         documents
             .iter_mut()
             .find(|(path, _)| *path == "README.md")

@@ -92,8 +92,12 @@ managed agent integrations, and runs both doctors. It also reports the selected
 runtime's evidence-key status without changing credentials. An unresolved status
 remains visible but does not invalidate an offline installation; inspect
 `cfctl auth evidence-key status --json` before governed operations. Use
-`--check-only` for source proof or `--skip-agent-sync` for an intentional
-binary-only install.
+`--check-only` for source proof. `--skip-agent-sync` suppresses managed integration
+writes; both doctors still run and may return a failure for existing drift after
+the binary has been installed. For an isolated binary install, use the direct
+source-install command in `QUICKSTART.md` with a fresh `CARGO_INSTALL_ROOT`, then
+invoke that prefix's binary directly. Existing managed integrations retain their
+own health status.
 
 Bootstrap builds the verifier for the native Rust host, then runs that exact
 artifact after the Cargo build exits. The complete proof still runs before
