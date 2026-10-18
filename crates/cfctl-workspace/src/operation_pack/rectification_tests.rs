@@ -43,7 +43,8 @@ fn ownership_refuses_duplicate_generic_ids_before_binding() {
     for count in [2, 3] {
         let mut duplicate = pack.clone();
         for _ in 1..count {
-            duplicate.push_str(&format!("\n[[operation]]{operation}"));
+            duplicate.push_str("\n[[operation]]");
+            duplicate.push_str(operation);
         }
         let root = fixture(&duplicate);
         let error = inspect_workspace_operation_capability(&[root.path().to_path_buf()], ID)
