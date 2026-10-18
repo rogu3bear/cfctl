@@ -117,30 +117,12 @@ fn input_observation_requires_real_pipe_consumption() {
     );
 }
 
-#[test]
-fn concurrent_create_only_imports_serialize_before_input_and_never_replace_the_winner() {
-    let root = tempfile::tempdir().expect("isolated runtime");
-    super::seed_test_fallback_secret(root.path());
-    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("fixture store");
-    drop(
-        cfctl_storage::lock_runtime_selection(&RuntimePaths::from_root(root.path()), false)
-            .expect("initialize the existing runtime lock"),
-    );
-    let existing = ProfileMetadata::new("existing", ProfileKind::ApiToken, Some("account-a"));
-    let initial = json!({"schema_version":1,"current_profile":"existing","profiles":{"existing":existing},"pending_logins":{}});
-    store
-        .write_json(&store.paths().profiles_file(), &initial)
-        .expect("initial profile metadata");
-    let secrets = FileSecretStore::new(root.path().join("data/auth/secrets"));
-    secrets
-        .store_api_token("existing", "synthetic-existing")
-        .expect("existing credential");
-
+fn start_exclusive_import(runtime: &Path) -> (Imports, std::io::PipeWriter) {
     let (reader, mut winner_input) = std::io::pipe().expect("winner input pipe");
     let input_observer = reader
         .try_clone()
         .expect("observe the read side without consuming");
-    let mut imports = Imports(vec![import(root.path(), Stdio::from(reader))]);
+    let mut imports = Imports(vec![import(runtime, Stdio::from(reader))]);
     winner_input
         .write_all(b"synthetic-")
         .expect("queue winner prefix");
@@ -164,9 +146,32 @@ fn concurrent_create_only_imports_serialize_before_input_and_never_replace_the_w
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        exclusive_runtime_is_held(root.path()),
+        exclusive_runtime_is_held(runtime),
         "import reached input without holding the exclusive runtime lock"
     );
+    (imports, winner_input)
+}
+
+#[test]
+fn concurrent_create_only_imports_serialize_before_input_and_never_replace_the_winner() {
+    let root = tempfile::tempdir().expect("isolated runtime");
+    super::seed_test_fallback_secret(root.path());
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("fixture store");
+    drop(
+        cfctl_storage::lock_runtime_selection(&RuntimePaths::from_root(root.path()), false)
+            .expect("initialize the existing runtime lock"),
+    );
+    let existing = ProfileMetadata::new("existing", ProfileKind::ApiToken, Some("account-a"));
+    let initial = json!({"schema_version":1,"current_profile":"existing","profiles":{"existing":existing},"pending_logins":{}});
+    store
+        .write_json(&store.paths().profiles_file(), &initial)
+        .expect("initial profile metadata");
+    let secrets = FileSecretStore::new(root.path().join("data/auth/secrets"));
+    secrets
+        .store_api_token("existing", "synthetic-existing")
+        .expect("existing credential");
+
+    let (mut imports, mut winner_input) = start_exclusive_import(root.path());
     // These processes overlap at the protected input boundary. The old shared
     // import cannot satisfy the observed-exclusive-lock assertion above.
     imports.0.push(import(root.path(), Stdio::piped()));
