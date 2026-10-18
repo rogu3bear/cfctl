@@ -18,7 +18,7 @@ impl Drop for Imports {
     }
 }
 
-fn import(runtime: &Path) -> Child {
+fn import(runtime: &Path, input: Stdio) -> Child {
     Command::new(env!("CARGO_BIN_EXE_cfctl"))
         .env("CFCTL_HOME", runtime)
         .args([
@@ -33,14 +33,25 @@ fn import(runtime: &Path) -> Child {
             "--no-select",
             "--json",
         ])
-        .stdin(Stdio::piped())
+        .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("start actual CLI intake")
 }
 
-fn output(child: &mut Child) -> (ExitStatus, String) {
+fn output(child: &mut Child, phase: &str) -> (ExitStatus, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let timed_out = loop {
+        if child.try_wait().expect("poll CLI exit").is_some() {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop timed-out fixture child");
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let status = child.wait().expect("CLI exit");
     let mut text = String::new();
     child
@@ -55,7 +66,55 @@ fn output(child: &mut Child) -> (ExitStatus, String) {
         .expect("stderr")
         .read_to_string(&mut text)
         .expect("read stderr");
+    assert!(!timed_out, "{phase} did not terminate: {text}");
     (status, text)
+}
+
+fn exclusive_runtime_is_held(runtime: &Path) -> bool {
+    match cfctl_storage::lock_runtime_selection(&RuntimePaths::from_root(runtime), false) {
+        Ok(shared) => {
+            drop(shared);
+            false
+        }
+        Err(error) => {
+            assert!(
+                error
+                    .to_string()
+                    .contains("another cfctl invocation is using this runtime"),
+                "unexpected lock observation failure: {error}"
+            );
+            true
+        }
+    }
+}
+
+#[test]
+fn exclusive_lock_observation_rejects_shared_and_unlocked_states() {
+    let root = tempfile::tempdir().expect("isolated lock observation");
+    let paths = RuntimePaths::from_root(root.path());
+    let shared = cfctl_storage::lock_runtime_selection(&paths, false).expect("shared lock");
+    assert!(!exclusive_runtime_is_held(root.path()));
+    drop(shared);
+    assert!(!exclusive_runtime_is_held(root.path()));
+    let exclusive = cfctl_storage::lock_runtime_selection(&paths, true).expect("exclusive lock");
+    assert!(exclusive_runtime_is_held(root.path()));
+    drop(exclusive);
+    assert!(!exclusive_runtime_is_held(root.path()));
+}
+
+#[test]
+fn input_observation_requires_real_pipe_consumption() {
+    let (mut reader, mut writer) = std::io::pipe().expect("controlled input pipe");
+    writer.write_all(b"prefix").expect("queue input");
+    assert_eq!(
+        rustix::io::ioctl_fionread(&reader).expect("queued bytes"),
+        6
+    );
+    reader.read_exact(&mut [0; 6]).expect("consume input");
+    assert_eq!(
+        rustix::io::ioctl_fionread(&reader).expect("consumed bytes"),
+        0
+    );
 }
 
 #[test]
@@ -77,26 +136,41 @@ fn concurrent_create_only_imports_serialize_before_input_and_never_replace_the_w
         .store_api_token("existing", "synthetic-existing")
         .expect("existing credential");
 
-    let mut imports = Imports(vec![import(root.path()), import(root.path())]);
+    let (reader, mut winner_input) = std::io::pipe().expect("winner input pipe");
+    let input_observer = reader
+        .try_clone()
+        .expect("observe the read side without consuming");
+    let mut imports = Imports(vec![import(root.path(), Stdio::from(reader))]);
+    winner_input
+        .write_all(b"synthetic-")
+        .expect("queue winner prefix");
     let deadline = Instant::now() + Duration::from_secs(10);
-    // Both inputs are held open. With the old shared locks, both commands wait
-    // here and the test fails. An exclusive import admits exactly one; the other
-    // fails busy before reading a secret or taking a stale profile snapshot.
-    let rejected = loop {
-        if let Some(index) = imports
-            .0
-            .iter_mut()
-            .position(|child| child.try_wait().expect("poll import").is_some())
+    // A drained prefix establishes that the first process actually reached
+    // input, while withholding EOF prevents credential publication. Only then
+    // probe the lock, so the observer cannot itself reject an import at entry.
+    while rustix::io::ioctl_fionread(&input_observer).expect("winner queued input") != 0 {
+        if imports.0[0]
+            .try_wait()
+            .expect("poll winner startup")
+            .is_some()
         {
-            break index;
+            let (_, text) = output(&mut imports.0[0], "winner startup");
+            panic!("winner exited before consuming input: {text}");
         }
         assert!(
             Instant::now() < deadline,
-            "concurrent imports both reached input; profile transaction is not exclusive"
+            "winner did not reach input within its startup deadline"
         );
         std::thread::sleep(Duration::from_millis(10));
-    };
-    let (status, rejection) = output(&mut imports.0[rejected]);
+    }
+    assert!(
+        exclusive_runtime_is_held(root.path()),
+        "import reached input without holding the exclusive runtime lock"
+    );
+    // These processes overlap at the protected input boundary. The old shared
+    // import cannot satisfy the observed-exclusive-lock assertion above.
+    imports.0.push(import(root.path(), Stdio::piped()));
+    let (status, rejection) = output(&mut imports.0[1], "contending import");
     assert!(!status.success());
     assert!(
         rejection.contains("another cfctl invocation is using this runtime"),
@@ -110,22 +184,23 @@ fn concurrent_create_only_imports_serialize_before_input_and_never_replace_the_w
     let selection = Command::new(env!("CARGO_BIN_EXE_cfctl"))
         .env("CFCTL_HOME", root.path())
         .args(["auth", "use", "existing", "--json"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("concurrent ordinary profile writer");
-    assert!(!selection.status.success());
+    imports.0.push(selection);
+    let (selection_status, selection_output) = output(&mut imports.0[2], "profile selection");
+    assert!(!selection_status.success());
     assert!(
-        String::from_utf8_lossy(&selection.stderr)
-            .contains("another cfctl invocation is using this runtime")
+        selection_output.contains("another cfctl invocation is using this runtime"),
+        "{selection_output}"
     );
 
-    let winner = 1 - rejected;
-    imports.0[winner]
-        .stdin
-        .take()
-        .expect("winner input")
-        .write_all(b"synthetic-winner-token\n")
+    winner_input
+        .write_all(b"winner-token\n")
         .expect("complete winner intake");
-    let (status, success) = output(&mut imports.0[winner]);
+    drop(winner_input);
+    let (status, success) = output(&mut imports.0[0], "winner completion");
     assert!(status.success(), "{success}");
     let persisted: Value = store
         .read_json(&store.paths().profiles_file())
