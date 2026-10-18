@@ -182,10 +182,23 @@ struct Record {
 
 pub(super) struct Session {
     directory: PrivateDirectory,
-    _lock: fs::File,
+    _lock: SessionLock,
     request: Option<Request>,
     record: Option<Record>,
     ordinary: Option<RotationAttempt>,
+}
+
+// Start ownership at acquisition, including validation errors before Session
+// construction. The guard is deliberately private and cannot be cloned.
+struct SessionLock(fs::File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Session owns the critical section. A concurrent fork may retain the
+        // open-file description until exec despite CLOEXEC; closing our copy
+        // alone must not keep a completed session locked by that child.
+        let _unlock_result = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 impl Session {
@@ -200,7 +213,7 @@ impl Session {
         let root = PrivateDirectory::create(&data.join("analytics-profile-renewals"))?;
         let key = hash_value(&json!({"profile":args.profile}))?;
         let directory = PrivateDirectory::create(&root.location().join(key))?;
-        let lock = directory.lock(true)?;
+        let lock = SessionLock(directory.lock(true)?);
         let ordinary = RotationAttempt::load(&directory, store, args)?;
         let record: Option<Record> = directory
             .read("unmanaged-recovery.json", 65_536)?

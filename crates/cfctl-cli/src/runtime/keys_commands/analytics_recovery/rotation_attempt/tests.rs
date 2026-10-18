@@ -120,6 +120,7 @@ impl Fixture {
 #[test]
 fn interrupted_ordinary_mint_blocks_the_next_hourly_mint() {
     let f = Fixture::new();
+    let directory = f.session.directory.location().to_path_buf();
     assert!(
         RotationAttempt::claim(
             &f.session.directory,
@@ -132,6 +133,14 @@ fn interrupted_ordinary_mint_blocks_the_next_hourly_mint() {
     );
     drop(f.session);
     assert!(Session::open(&f.store, &f.args).is_err());
+    // Rejection retains the mint fence, but releases the validation session's
+    // kernel lock so a later inspection can reconcile the original attempt.
+    assert!(
+        PrivateDirectory::create(&directory)
+            .unwrap()
+            .lock(true)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -285,8 +294,19 @@ fn ordinary_rotation_preserves_the_unknown_bootstrap_predecessor_obligation() {
     f.session
         .close_ordinary(&f.store, &exact, &active, false)
         .unwrap();
+    // A concurrent fork can retain this open-file description until exec,
+    // even though the lock descriptor is CLOEXEC. Model that kernel reference
+    // explicitly so completion cannot depend on unrelated child scheduling.
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "Only this kernel-lifetime regression retains the deliberately RAII-only private field."
+    )]
+    let inherited_description = f.session._lock.0.try_clone().unwrap();
+    assert!(f.session.directory.lock(true).is_err());
     drop(f.session);
     let session = Session::open(&f.store, &f.args).unwrap();
+    drop(inherited_description);
+    assert!(session.directory.lock(true).is_err());
     assert!(session.has_unknown_predecessor());
     let mut envelope =
         ResultEnvelopeV2::success("keys renew-analytics-profile", json!({"state":"rotated"}));
@@ -299,4 +319,21 @@ fn ordinary_rotation_preserves_the_unknown_bootstrap_predecessor_obligation() {
         envelope.result["unmanaged_predecessor"]["automatic_revoke_permitted"],
         false
     );
+}
+
+#[test]
+fn session_lock_releases_on_early_error_without_releasing_a_new_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = PrivateDirectory::create(&root.path().join("private")).unwrap();
+    let file = directory.lock(true).unwrap();
+    let inherited_description = file.try_clone().unwrap();
+    let result: Result<()> = {
+        let _owner = super::super::SessionLock(file);
+        assert!(directory.lock(true).is_err());
+        Err(rejected("injected validation failure"))
+    };
+    assert!(result.is_err());
+    let _new_owner = directory.lock(true).unwrap();
+    drop(inherited_description);
+    assert!(directory.lock(true).is_err());
 }
