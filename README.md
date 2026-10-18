@@ -114,7 +114,7 @@ cfctl <area> <action> [target] [flags]
 ```
 
 The area stays first and the action says what happens. Direct operations such
-as `resolve`, `guide`, and `call` omit the area. Run `cfctl commands` to read
+as `resolve`, `guide`, `call`, and `deploy` omit the area. Run `cfctl commands` to read
 the complete executable command map at once, `cfctl commands --json` to consume
 the same map as data, or `cfctl <command path> --help` for exact arguments.
 The map is generated from the Clap command tree, so this document does not

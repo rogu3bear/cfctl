@@ -948,9 +948,34 @@ artifacts retain one identity regardless of config nesting. Canonical paths
 that escape the registered repository remain blocked before planning.
 
 For Worker code-only publication, keep artifact creation and production
-traffic promotion as two independently reviewed plans. The upload verifier
-reads the returned Worker version and requires both its exact ID and reviewed
-message; it does not change production traffic:
+traffic promotion as two independently reviewed plans. A registered
+application repository can name the upload in a committed `cfctl.toml` at
+its git top level. `cfctl deploy <target>` reads only that file, checks the
+target's profile and account against the profile already selected, and
+creates one `wrangler.versions-upload` plan. It does not approve, run,
+select a profile, or import a token. `lane` must be `worker`. cfctl derives
+the absolute config path and the exact
+`source=<full-source-sha> artifact-sha256=<artifact-sha256>` message; the
+file cannot set them.
+
+```toml
+schema_version = 1
+
+[target.site]
+lane = "worker"
+name = "cfctl-site"
+config = "wrangler.toml"
+profile_id = "cfctl-site-release-example"
+account_id = "0123456789abcdef0123456789abcdef"
+```
+
+```bash
+cfctl deploy site --json
+```
+
+The upload verifier reads the returned Worker version and requires both its
+exact ID and reviewed message; it does not change production traffic. The
+direct call remains:
 
 ```bash
 cfctl call wrangler.versions-upload \

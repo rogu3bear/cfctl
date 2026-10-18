@@ -13,7 +13,7 @@ cfctl <area> <action> [target] [flags]
 ```
 
 The area stays first and the action says what happens. Direct operations such
-as `resolve`, `guide`, and `call` omit the area. Plain-language goals go
+as `resolve`, `guide`, `call`, and `deploy` omit the area. Plain-language goals go
 through `cfctl resolve "<intent>"`; any other input that is not a command path
 fails closed with a usage error. Existing command paths remain compatible.
 
