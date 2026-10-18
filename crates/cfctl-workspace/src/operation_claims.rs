@@ -1,4 +1,5 @@
 //! Committed pack ownership, independent of a selected execution binder.
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::{Result, WorkspaceError, git_blob, operation_pack};
@@ -11,7 +12,12 @@ pub(super) fn unique_pack_claim(
     capability_id: &str,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
     let mut selected = None;
+    let mut declarations = 0usize;
+    let mut seen_repositories = BTreeSet::new();
     for repository in candidates {
+        if !seen_repositories.insert(repository) {
+            continue;
+        }
         for path in operation_pack::committed_pack_paths(repository)? {
             let Some(bytes) = git_blob(repository, &path)? else {
                 continue;
@@ -25,28 +31,32 @@ pub(super) fn unique_pack_claim(
             {
                 continue;
             }
-            for _ in 0..matching_ids(&document, capability_id) {
-                if selected.is_some() {
-                    return Err(invalid(&format!(
-                        "workspace operation id `{capability_id}` is ambiguous across committed pack declarations"
-                    )));
-                }
-                selected = Some((repository.clone(), path.clone()));
+            let count = matching_ids(&document, capability_id);
+            if count > 0 {
+                declarations = declarations
+                    .checked_add(count)
+                    .ok_or_else(|| invalid("committed operation declaration count overflow"))?;
+                selected.get_or_insert_with(|| (repository.clone(), path.clone()));
             }
         }
         // The ingress contract is another committed carrier, not a binder
         // fallback that can override an existing pack declaration.
         if super::reply_subdomain_ingress::claims_identity(repository, capability_id)? {
-            if selected.is_some() {
-                return Err(invalid(&format!(
-                    "workspace operation id `{capability_id}` is ambiguous across committed pack declarations"
-                )));
-            }
-            selected = Some((
-                repository.clone(),
-                super::reply_subdomain_ingress::SURFACE_PATH.into(),
-            ));
+            declarations = declarations
+                .checked_add(1)
+                .ok_or_else(|| invalid("committed operation declaration count overflow"))?;
+            selected.get_or_insert_with(|| {
+                (
+                    repository.clone(),
+                    super::reply_subdomain_ingress::SURFACE_PATH.into(),
+                )
+            });
         }
+    }
+    if declarations > 1 {
+        return Err(invalid(&format!(
+            "workspace operation id `{capability_id}` is ambiguous across {declarations} committed declarations"
+        )));
     }
     Ok(selected)
 }

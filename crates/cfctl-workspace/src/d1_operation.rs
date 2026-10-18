@@ -1420,7 +1420,28 @@ require_old_worker_compatibility = true
             "leptos-cf.d1-migrations-apply",
         )
         .expect_err("duplicate id fails closed");
-        assert!(error.to_string().contains("ambiguous across 2"));
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous across 2 committed declarations"),
+            "unexpected ownership rejection: {error}"
+        );
+        let third = fixture();
+        let error = load_workspace_d1_migration_capability(
+            &[
+                first.path().to_path_buf(),
+                second.path().to_path_buf(),
+                third.path().to_path_buf(),
+            ],
+            "leptos-cf.d1-migrations-apply",
+        )
+        .expect_err("three committed owners fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous across 3 committed declarations"),
+            "unexpected ownership rejection: {error}"
+        );
     }
 
     #[test]

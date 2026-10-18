@@ -39,12 +39,22 @@ fn ambiguous(roots: &[std::path::PathBuf]) {
 #[test]
 fn ownership_refuses_duplicate_generic_ids_before_binding() {
     let pack = supported();
-    let duplicate = format!(
-        "{pack}\n[[operation]]{}",
-        pack.split_once("[[operation]]").expect("operation").1
-    );
-    let root = fixture(&duplicate);
-    ambiguous(&[root.path().to_path_buf()]);
+    let operation = pack.split_once("[[operation]]").expect("operation").1;
+    for count in [2, 3] {
+        let mut duplicate = pack.clone();
+        for _ in 1..count {
+            duplicate.push_str(&format!("\n[[operation]]{operation}"));
+        }
+        let root = fixture(&duplicate);
+        let error = inspect_workspace_operation_capability(&[root.path().to_path_buf()], ID)
+            .expect_err("duplicate declarations must precede execution binding");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("ambiguous across {count} committed declarations")),
+            "unexpected ownership rejection: {error}"
+        );
+    }
 }
 
 #[test]

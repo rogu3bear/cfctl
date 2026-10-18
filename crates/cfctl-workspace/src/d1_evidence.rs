@@ -585,14 +585,31 @@ mod tests {
             .is_some()
         );
         let error = load_workspace_d1_evidence_capability(
-            &[first_path, second.path().to_path_buf()],
+            &[first_path.clone(), second.path().to_path_buf()],
             "star-maildesk-cf.d1-evidence-read",
         )
         .expect_err("distinct owners must remain ambiguous");
         assert!(
             error
                 .to_string()
-                .contains("ambiguous across 2 committed declarations")
+                .contains("ambiguous across 2 committed declarations"),
+            "unexpected ownership rejection: {error}"
+        );
+        let third = fixture();
+        let error = load_workspace_d1_evidence_capability(
+            &[
+                first_path,
+                second.path().to_path_buf(),
+                third.path().to_path_buf(),
+            ],
+            "star-maildesk-cf.d1-evidence-read",
+        )
+        .expect_err("three committed owners fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous across 3 committed declarations"),
+            "unexpected ownership rejection: {error}"
         );
     }
 
