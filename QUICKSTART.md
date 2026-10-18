@@ -31,7 +31,7 @@ above. The release procedure will add platform installation commands only when
 those independent trust roots can authenticate them.
 
 The reserved artifact namespace is
-`https://github.com/rogu3bear/cfctl/releases/download/v1.3.1/`; its presence in
+`https://github.com/rogu3bear/cfctl/releases/download/v1.3.2/`; its presence in
 source documentation is a version pin, not evidence that a release or any
 asset exists there.
 

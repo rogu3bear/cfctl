@@ -219,7 +219,7 @@ side effect of building:
 
 Making a draft public is always a separate operator action.
 
-The prebuilt v1.3.0 operator posture requires the identity-bearing lane. Publication is
+Prebuilt binary publication requires the identity-bearing lane. Publication is
 admissible only after both macOS binaries pass Developer ID signing and Apple
 notarization, and both `SHA256SUMS` and provenance pass Sigstore verification
 against the certificate identity and OIDC issuer committed independently to
@@ -227,9 +227,9 @@ against the certificate identity and OIDC issuer committed independently to
 double-builds, SPDX SBOMs, checksums, and commit-bound provenance remain
 independent requirements. The local `assemble` lane remains unsigned local
 evidence; its rendered installer fails closed and its outputs must not be
-published as v1.3.0.
+published as v<release-version>.
 
-Before `cargo xtask publish`, create `v1.3.0` as a new annotated tag at the
+Before `cargo xtask publish`, create `v<release-version>` as a new annotated tag at the
 exact commit named by release provenance and push it without force. Read back
 both the remote tag object and its peeled
 commit; an existing or mismatched tag is a stop, never a replacement target.
