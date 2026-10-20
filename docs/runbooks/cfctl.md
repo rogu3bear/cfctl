@@ -72,6 +72,17 @@ inspect `previous_catalog`. `discarded_invalid` means the corrupt current file
 was replaced without overwriting the last valid previous snapshot; ordinary
 catalog reads and plans remain fail-closed until that explicit repair succeeds.
 
+For catalog and local CLI discovery without accessing cfctl profiles,
+credentials, or an evidence signing key, run `cfctl catalog sync --no-auth
+--json`. This refreshes the official public catalog and documentation plus
+installed Wrangler/cloudflared help and version discovery. It reports
+`oauth_scope_inventory.status = "skipped"`, leaves the cached OAuth scope
+inventory untouched, and records unauthenticated audit evidence that cannot
+qualify authority. It does not establish account permissions or authorize a
+provider operation. Ordinary `catalog sync` retains its authenticated scope
+refresh and evidence behavior. Existing plans still require their catalog and
+producer pins to match after either refresh.
+
 Use `mutation_contract_gap_counts` to distinguish unknown risk, effect, cost,
 verification, rollback, permissions, and entitlement debt. Counts overlap;
 `capabilities_with_mutation_contract_gaps` counts affected operations once,

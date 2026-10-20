@@ -210,10 +210,16 @@ fn runtime_qualifying_state_store() -> Result<StateStore> {
 
 fn command_uses_nonqualifying_audit_evidence(command: &Command) -> bool {
     // Cancellation de-authorizes a plan. It may not be blocked by a missing
-    // evidence key, and its output never qualifies future authority.
+    // evidence key. Explicit public catalog discovery likewise must not open
+    // an evidence key. Neither audit output qualifies future authority.
     matches!(
         command,
         Command::Plans(arguments) if matches!(&arguments.command, crate::PlansCommand::Cancel(_))
+    ) || matches!(
+        command,
+        Command::Catalog(crate::CatalogArgs {
+            command: crate::CatalogCommand::Sync(crate::CatalogSyncArgs { no_auth: true })
+        })
     )
 }
 

@@ -565,7 +565,7 @@ pub struct CatalogArgs {
 #[derive(Debug, Subcommand)]
 pub enum CatalogCommand {
     /// Refresh the local executable capability catalog.
-    Sync,
+    Sync(CatalogSyncArgs),
     /// Search catalog capabilities by intent or feature.
     Search(SearchArgs),
     /// Show one capability's exact executable contract.
@@ -574,6 +574,13 @@ pub enum CatalogCommand {
     Changes,
     /// Report executable, delegated, UI, and blocked capability coverage.
     Coverage,
+}
+
+#[derive(Debug, Args)]
+pub struct CatalogSyncArgs {
+    /// Discover public official sources and local CLI help without cfctl credentials or evidence signing.
+    #[arg(long)]
+    pub no_auth: bool,
 }
 
 #[derive(Debug, Args)]

@@ -4,7 +4,8 @@ use super::credential_resolution::refresh_oauth_scopes_if_authenticated;
 use super::guide_generation::guide_document;
 use super::prelude::{
     CatalogCommand, CatalogIndex, CatalogSnapshot, CliError, EvidenceClass, GuideArgs,
-    GuideTopicArg, GuideTopicV1, Path, Result, ResultEnvelopeV2, StateStore, Value, json,
+    GuideTopicArg, GuideTopicV1, OfficialTextFeedsV1, Path, Result, ResultEnvelopeV2, StateStore,
+    Value, json,
 };
 use super::support::capability_missing;
 use super::support::catalog_index_file;
@@ -27,7 +28,9 @@ pub(super) async fn catalog_command(
     command: CatalogCommand,
 ) -> Result<ResultEnvelopeV2> {
     match command {
-        CatalogCommand::Sync => sync_catalog(store).await,
+        CatalogCommand::Sync(arguments) => {
+            sync_catalog_with_options(store, arguments.no_auth).await
+        }
         CatalogCommand::Search(arguments) => {
             let catalog = ensure_catalog(store).await?;
             let results: Vec<_> = catalog
@@ -104,6 +107,10 @@ pub(super) async fn catalog_command(
 }
 
 pub(super) async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
+    sync_catalog_with_options(store, false).await
+}
+
+async fn sync_catalog_with_options(store: &StateStore, no_auth: bool) -> Result<ResultEnvelopeV2> {
     let client = http_client()?;
     let (mut catalog, feeds) =
         tokio::try_join!(fetch_official(&client), fetch_official_text_feeds(&client))?;
@@ -159,7 +166,17 @@ pub(super) async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2>
     }
     ingest_governed_ui_capabilities(&mut catalog);
     catalog.refresh_hash()?;
-    let oauth_scope_status = match refresh_oauth_scopes_if_authenticated(store).await {
+    persist_catalog_sync(store, &catalog, &feeds, no_auth).await
+}
+
+async fn oauth_scope_inventory_status(store: &StateStore, no_auth: bool) -> Value {
+    if no_auth {
+        return json!({
+            "status": "skipped",
+            "reason": "--no-auth: cfctl profiles and credentials were not accessed; authenticated OAuth scope refresh was skipped"
+        });
+    }
+    match refresh_oauth_scopes_if_authenticated(store).await {
         Ok(Some(snapshot)) => json!({
             "status": "refreshed",
             "schema_hash": snapshot.get("schema_hash"),
@@ -167,25 +184,36 @@ pub(super) async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2>
         }),
         Ok(None) => json!({"status": "not_refreshed", "reason": "no active authenticated profile"}),
         Err(error) => json!({"status": "not_refreshed", "reason": error.to_string()}),
-    };
+    }
+}
+
+async fn persist_catalog_sync(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    feeds: &OfficialTextFeedsV1,
+    no_auth: bool,
+) -> Result<ResultEnvelopeV2> {
+    let oauth_scope_status = oauth_scope_inventory_status(store, no_auth).await;
     let current_path = store.paths().catalog_file();
     let previous_catalog = preserve_previous_catalog(store)?;
-    store.write_json(&current_path, &catalog)?;
-    store.write_json(&docs_file(store), &feeds)?;
+    store.write_json(&current_path, catalog)?;
+    store.write_json(&docs_file(store), feeds)?;
     let index_path = catalog_index_file(store);
-    CatalogIndex::rebuild(&index_path, &catalog)?;
-    let evidence = store.write_evidence(
-        EvidenceClass::LiveRead,
-        &json!({
-            "source": catalog.source_url,
-            "schema_hash": catalog.schema_hash,
-            "capability_count": catalog.capabilities.len(),
-            "docs_index_url": feeds.docs_index_url,
-            "changelog_url": feeds.changelog_url,
-            "oauth_scope_inventory": oauth_scope_status.clone(),
-            "previous_catalog": previous_catalog.clone(),
-        }),
-    )?;
+    CatalogIndex::rebuild(&index_path, catalog)?;
+    let observation = json!({
+        "source": catalog.source_url,
+        "schema_hash": catalog.schema_hash,
+        "capability_count": catalog.capabilities.len(),
+        "docs_index_url": feeds.docs_index_url,
+        "changelog_url": feeds.changelog_url,
+        "oauth_scope_inventory": oauth_scope_status.clone(),
+        "previous_catalog": previous_catalog.clone(),
+    });
+    let evidence = if no_auth {
+        store.write_audit_evidence(EvidenceClass::LiveRead, &observation)?
+    } else {
+        store.write_evidence(EvidenceClass::LiveRead, &observation)?
+    };
     Ok(ResultEnvelopeV2::success(
         "catalog sync",
         json!({
@@ -193,11 +221,18 @@ pub(super) async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2>
             "docs_fetched_at": feeds.fetched_at,
             "oauth_scope_inventory": oauth_scope_status,
             "previous_catalog": previous_catalog,
-            "message": format!("Catalog synced: {} API, CLI, and governed UI capabilities indexed.", catalog.capabilities.len())
+            "message": if no_auth {
+                format!("Catalog synced without cfctl credentials: {} API, CLI, and governed UI capabilities indexed. OAuth scope refresh skipped; audit evidence is unauthenticated and cannot qualify authority.", catalog.capabilities.len())
+            } else {
+                format!("Catalog synced: {} API, CLI, and governed UI capabilities indexed.", catalog.capabilities.len())
+            }
         }),
     )
     .with_evidence(evidence))
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn preserve_previous_catalog(store: &StateStore) -> Result<Value> {
     let current_path = store.paths().catalog_file();
