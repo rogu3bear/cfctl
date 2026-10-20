@@ -49,3 +49,6 @@ target/
 dist/
 node_modules/
 bridge/event-ingress/worker-configuration.d.ts
+
+# Local operator Cloudflare routing / standby directive
+/CLOUDFLARE.md

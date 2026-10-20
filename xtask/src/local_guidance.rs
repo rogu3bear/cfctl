@@ -4,7 +4,7 @@ use std::{fs, path::Path};
 
 // These observational notes receive domain and v1 checks; the command-map
 // contract remains specific to the operator adapters.
-const LOCAL_AGENT_FACING_NOTES: [&str; 2] = ["NUANCE.md", "WEB.md"];
+const LOCAL_AGENT_FACING_NOTES: [&str; 3] = ["CLOUDFLARE.md", "NUANCE.md", "WEB.md"];
 
 pub(super) fn paths() -> impl Iterator<Item = &'static str> {
     LOCAL_OPERATOR_ADAPTERS
@@ -152,7 +152,7 @@ mod tests {
     }
     #[test]
     fn known_root_anchored_paths_are_covered() {
-        check("/AGENTS.md\n/NUANCE.md\n/WEB.md\n").expect("known paths");
+        check("/AGENTS.md\n/CLOUDFLARE.md\n/NUANCE.md\n/WEB.md\n").expect("known paths");
     }
     #[test]
     fn repository_exact_ignored_paths_are_covered() {
