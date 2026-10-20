@@ -1,3 +1,5 @@
+> Cloudflare operations use the Cloudflare plugin/MCP directly. Dedicated cfctl source, build, and installation maintenance is operator-authorized; this does not restore cfctl routing or grant provider effects.
+
 # Adapter choice in cfctl
 
 There is no separate agent-selected tool-choice command. Search the catalog;

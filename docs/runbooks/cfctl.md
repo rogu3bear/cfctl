@@ -1,3 +1,5 @@
+> Cloudflare operations use the Cloudflare plugin/MCP directly. Dedicated cfctl source, build, and installation maintenance is operator-authorized; this does not restore cfctl routing or grant provider effects.
+
 # cfctl operator runbook
 
 ## Launch support triage
