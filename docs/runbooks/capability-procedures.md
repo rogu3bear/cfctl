@@ -1050,7 +1050,7 @@ single-writer change freeze from the final reread through verification.
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate
 `wrangler.pages` command. Bind the built directory, existing project,
-source branch, and exact source commit in the plan. Omitted `environment`
+provider branch, and exact artifact source commit in the plan. Omitted `environment`
 retains production intent:
 
 ```bash
@@ -1064,7 +1064,16 @@ cfctl call wrangler.pages-deploy \
 ```
 
 Planning first admits one regular, symlink-free artifact root owned by a clean,
-registered repository on a named branch. It records every uploadable and
+registered repository on a named branch. By default, `commit_hash` and `branch`
+must equal that checkout's HEAD and branch. The paired optional
+`checkout_commit` and `checkout_branch` selectors instead bind the clean reviewed
+procedure checkout separately from an ancestor artifact source commit and the
+authenticated production branch. This production-only mode requires the
+declared catalog contract and preserves ordinary workspace preconditions; it
+cannot be combined with `artifact_receipt`. See the
+[retained qualification contract](../pages-direct-setup.md#retain-a-qualified-artifact-across-a-release-procedure-change)
+for the exact schema and application owner's evidence obligations.
+Planning records every uploadable and
 multipart-control file by normalized path, byte size, and SHA-256, rejects an
 empty tree, path ambiguity, Wrangler-ignored sources, more than 20,000 assets,
 and files above the 25 MiB provider limit. It also binds the canonical Wrangler

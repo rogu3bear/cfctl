@@ -286,7 +286,7 @@ pub(super) fn manifest(root: &Path) -> Result<Value, CliError> {
     }))
 }
 
-fn repository_owning_path<'a>(
+pub(super) fn repository_owning_path<'a>(
     graph: &'a WorkspaceGraph,
     path: &Path,
 ) -> Option<&'a RepositoryNode> {
@@ -556,8 +556,11 @@ pub(super) fn prepare_target(
     }
     let environment = super::pages_intent::requested(capability, input)?;
     let root = artifact_root(input)?;
+    let retained = super::pages_retained_source::requested(capability, input, environment)?;
     let immutable = super::pages_immutable::requested(input);
-    let source = if immutable {
+    let source = if retained {
+        super::pages_retained_source::source(graph, input, &root)?
+    } else if immutable {
         super::pages_immutable::source(store, graph, input)?
     } else {
         let repository = repository_owning_path(graph, &root).ok_or_else(|| {
@@ -612,7 +615,7 @@ pub(super) fn prepare_target(
         build_worker_bundle(&root, &artifact, &producer)?.map(|(contract, _bytes)| contract);
     let transport_manifest = transport_manifest(&artifact, worker_bundle.as_ref())?;
     Ok(Some(json!({
-        "schema_version": if immutable { 2 } else { 1 },
+        "schema_version": if retained { 3 } else if immutable { 2 } else { 1 },
         "project_name": project_name(capability, input)?,
         "environment": environment.as_str(),
         "source": source,

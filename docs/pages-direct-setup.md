@@ -32,12 +32,66 @@ serving behavior and application acceptance require their own checks and
 authority. A failed post-upload check requires rectification, never replay.
 Source support does not install the binary or refresh an existing catalog.
 
+## Retain a qualified artifact across a release-procedure change
+
+The optional paired `checkout_commit` and `checkout_branch` query selectors on
+`wrangler.pages-deploy` separate three identities for a production direct upload:
+
+- `commit_hash` identifies the retained artifact's source commit and the commit
+  recorded on the provider deployment.
+- `checkout_commit` and `checkout_branch` identify the current reviewed release
+  procedure in the clean registered checkout.
+- `branch` identifies the provider deployment branch and must still match the
+  authenticated project's production branch.
+
+Both checkout selectors require the refreshed catalog's declared contract.
+Missing, null, empty or malformed values refuse planning, as do preview intent
+and any `artifact_receipt`. Without either selector, the original clean checkout
+HEAD and branch equality rules remain unchanged.
+
+```bash
+cfctl call wrangler.pages-deploy \
+  --query argument=/absolute/registered/repository/retained-upload \
+  --query project_name=example-web \
+  --query branch=main \
+  --query commit_hash=<full-artifact-source-sha> \
+  --query checkout_commit=<full-reviewed-procedure-sha> \
+  --query checkout_branch=release-procedure \
+  --json
+```
+
+The artifact must belong to the exact canonical physical registered checkout.
+That checkout must match both selectors, remain attached and clean, and have one
+safe GitHub origin without credentials or a matching effective Git URL rewrite.
+The artifact source commit must exist locally as a canonical full commit and
+be an ancestor of the procedure commit. Bounded local Git reads disable
+replacement objects, lazy fetching and optional locks; legacy grafts refuse
+planning. This route never fetches or integrates a remote branch.
+
+The resulting `pages_deployment` target has `schema_version: 3`. Its `source`
+contains `mode: "retained_artifact_v1"`, canonical `repository`, raw safe `origin`,
+`artifact_source: {commit, tree}`, and `checkout: {commit, tree, branch}`. The
+ordinary workspace HEAD, dirty-state and configuration preconditions remain
+active. The complete target is recomputed and compared before execution, so
+origin, procedure, artifact, producer or transport drift requires a new plan.
+Both checkout selectors are local controls and never reach Wrangler.
+
+This source binding does not authenticate an earlier application build or issue
+a native reproduction receipt. The application release owner must retain and
+validate its original artifact qualification, release evidence, exact upload
+projection and any procedure-only change allowlist. Those application evidence
+schemas and digests remain separate from cfctl's complete artifact manifest and
+closed transport manifest. Existing project/account/profile-generation pins,
+approval, one-use execution, exact deployment verification, uncertain-outcome
+rectification and reviewed restoration requirements apply unchanged.
+
 ## Deploy an immutable artifact while development advances
 
 The optional `artifact_receipt` query selector on `wrangler.pages-deploy`
-selects immutable-artifact mode. Without it, the existing clean registered
-checkout HEAD/branch requirements remain unchanged. It never treats a supplied
-commit string or matching archive manifest as proof of a build.
+selects immutable-artifact mode. It is incompatible with the paired checkout
+selectors above. Without either mode, the existing clean registered checkout
+HEAD/branch requirements remain unchanged. It never treats a supplied commit
+string or matching archive manifest as proof of a build.
 
 `cfctl guide pages-artifact-reproduce --json` describes the local producer.
 Call it with a JSON body containing `repository`, `commit`, `tree`, `account_id`,

@@ -1501,7 +1501,7 @@ pub(super) async fn wrangler_pages_boundary_requires_governed_structured_output(
     std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"pages-deploy\",\"version\":1,\"pages_project\":\"aos-web\",\"deployment_id\":\"{id}\",\"url\":\"https://example.pages.dev\"}}' '{{\"type\":\"pages-deploy-detailed\",\"version\":1,\"pages_project\":\"aos-web\",\"deployment_id\":\"{id}\",\"url\":\"https://example.pages.dev\",\"environment\":\"production\",\"production_branch\":\"main\",\"deployment_trigger\":{{\"metadata\":{{\"commit_hash\":\"{}\"}}}}}}' > \"$WRANGLER_OUTPUT_FILE_PATH\"\n",
+                "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in --checkout-commit*|--checkout-branch*|--environment*) exit 93;; esac\ndone\nprintf '%s\\n' '{{\"type\":\"pages-deploy\",\"version\":1,\"pages_project\":\"aos-web\",\"deployment_id\":\"{id}\",\"url\":\"https://example.pages.dev\"}}' '{{\"type\":\"pages-deploy-detailed\",\"version\":1,\"pages_project\":\"aos-web\",\"deployment_id\":\"{id}\",\"url\":\"https://example.pages.dev\",\"environment\":\"production\",\"production_branch\":\"main\",\"deployment_trigger\":{{\"metadata\":{{\"commit_hash\":\"{}\"}}}}}}' > \"$WRANGLER_OUTPUT_FILE_PATH\"\n",
                 "a".repeat(40)
             ),
         )
@@ -1525,7 +1525,8 @@ pub(super) async fn wrangler_pages_boundary_requires_governed_structured_output(
             &capability,
             &CallInput {
                 selectors: json!({}),
-                query: json!({"argument": root.path(), "project_name":"aos-web", "branch":"main", "commit_hash":"a".repeat(40)}),
+                query: json!({"argument": root.path(), "project_name":"aos-web", "branch":"main", "commit_hash":"a".repeat(40),
+                    "environment":"production", "checkout_commit":"b".repeat(40), "checkout_branch":"procedure/repair"}),
                 ..CallInput::default()
             },
             &cfctl_auth::AuthCredential::Bearer {

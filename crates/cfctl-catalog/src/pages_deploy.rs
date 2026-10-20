@@ -90,7 +90,7 @@ pub fn ingest_wrangler_pages_deploy_help(
         (
             "branch",
             true,
-            "Exact source branch; production matches the project production branch, preview must differ",
+            "Provider deployment branch; production matches the project production branch, preview must differ. Without checkout selectors it must also match the source checkout branch",
         ),
         (
             "commit_hash",
@@ -127,6 +127,30 @@ pub fn ingest_wrangler_pages_deploy_help(
             query: None,
         }),
     });
+    for (name, description, schema) in [
+        (
+            "checkout_commit",
+            "cfctl retained-artifact control: exact clean procedure checkout HEAD, paired with checkout_branch. Production only; commit_hash separately identifies the retained artifact source. Not a Wrangler flag",
+            serde_json::json!({"type":"string","pattern":"^[0-9a-f]{40}$"}),
+        ),
+        (
+            "checkout_branch",
+            "cfctl retained-artifact control: exact attached procedure checkout branch, paired with checkout_commit. The provider branch remains independent. Not a Wrangler flag",
+            serde_json::json!({"type":"string","minLength":1}),
+        ),
+    ] {
+        capability.selectors.push(SelectorV1 {
+            name: name.to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: Some(description.to_owned()),
+            contract: Some(SelectorContractV1 {
+                schema,
+                query: None,
+            }),
+        });
+    }
     pages_artifact::add_archive_selector(&mut capability);
     snapshot
         .capabilities

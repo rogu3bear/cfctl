@@ -34,4 +34,32 @@ fn qualified_pages_help_declares_closed_production_default_preview_intent() {
         "wrangler_pages_new_deployment_succeeds_by_returned_id"
     );
     assert!(capability.created_resource.is_some());
+    for (name, schema) in [
+        (
+            "checkout_commit",
+            serde_json::json!({"type":"string","pattern":"^[0-9a-f]{40}$"}),
+        ),
+        (
+            "checkout_branch",
+            serde_json::json!({"type":"string","minLength":1}),
+        ),
+    ] {
+        let selectors = capability
+            .selectors
+            .iter()
+            .filter(|s| s.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(selectors.len(), 1);
+        assert!(!selectors[0].required);
+        assert_eq!(selectors[0].location, "query");
+        assert_eq!(selectors[0].value_type, "string");
+        assert_eq!(
+            selectors[0]
+                .contract
+                .as_ref()
+                .expect("checkout contract")
+                .schema,
+            schema
+        );
+    }
 }
