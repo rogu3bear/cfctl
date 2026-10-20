@@ -1,7 +1,11 @@
 //! Deterministic risk, approval, and transaction policy.
 
-use cfctl_core::{CapabilityV1, EffectClass, PolicyDecisionV1, PolicyDisposition, RiskClass};
+use cfctl_core::{
+    AdapterStatus, CapabilityV1, EffectClass, PolicyDecisionV1, PolicyDisposition, RiskClass,
+};
 use serde::{Deserialize, Serialize};
+
+const INCREMENTAL_COST_REASON: &str = "operation can incur incremental cost";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactContext {
@@ -19,10 +23,7 @@ pub struct PolicyEngine;
 impl PolicyEngine {
     #[must_use]
     pub fn evaluate(&self, capability: &CapabilityV1, impact: &ImpactContext) -> PolicyDecisionV1 {
-        let mut reasons = Vec::new();
-        let mut disposition = PolicyDisposition::AutoExecute;
-        let mut requires_cost_ceiling = false;
-
+        // Blocking checks precede approval policy; their order selects the reason.
         if impact.selector_ambiguous {
             return decision(
                 PolicyDisposition::Blocked,
@@ -37,7 +38,7 @@ impl PolicyEngine {
                 false,
             );
         }
-        if capability.adapter_status == cfctl_core::AdapterStatus::Blocked {
+        if capability.adapter_status == AdapterStatus::Blocked {
             return decision(
                 PolicyDisposition::Blocked,
                 ["the capability adapter is blocked"],
@@ -64,12 +65,10 @@ impl PolicyEngine {
             );
         }
 
-        require_incremental_cost_approval(
-            capability,
-            &mut disposition,
-            &mut requires_cost_ceiling,
-            &mut reasons,
-        );
+        // Reasons retain insertion order because the CLI hashes the full decision.
+        let mut policy = decision(PolicyDisposition::AutoExecute, [], false);
+
+        require_incremental_cost_approval(capability, &mut policy);
 
         if capability.effect == EffectClass::ReadOnly
             && capability.risk == RiskClass::Read
@@ -83,79 +82,70 @@ impl PolicyEngine {
         }
 
         if impact.affected_repositories > 1 {
-            disposition = PolicyDisposition::ApprovalRequired;
-            reasons.push("operation affects multiple repositories".to_owned());
+            policy.disposition = PolicyDisposition::ApprovalRequired;
+            policy
+                .reasons
+                .push("operation affects multiple repositories".to_owned());
         }
         if impact.dependent_configurations > 0 || impact.has_unmanaged_dependencies {
-            disposition = PolicyDisposition::ApprovalRequired;
-            reasons.push("operation has dependent or unmanaged configuration".to_owned());
+            policy.disposition = PolicyDisposition::ApprovalRequired;
+            policy
+                .reasons
+                .push("operation has dependent or unmanaged configuration".to_owned());
         }
 
-        apply_effect_policy(
-            capability,
-            &mut disposition,
-            &mut requires_cost_ceiling,
-            &mut reasons,
-        );
+        apply_effect_policy(capability, &mut policy);
 
         if matches!(capability.risk, RiskClass::Unknown | RiskClass::CrossConfig) {
-            disposition = PolicyDisposition::ApprovalRequired;
-            reasons.push("risk is unknown or crosses configuration boundaries".to_owned());
+            policy.disposition = PolicyDisposition::ApprovalRequired;
+            policy
+                .reasons
+                .push("risk is unknown or crosses configuration boundaries".to_owned());
         }
-        if reasons.is_empty() {
-            reasons.push("known scoped reversible write".to_owned());
+        if policy.reasons.is_empty() {
+            policy
+                .reasons
+                .push("known scoped reversible write".to_owned());
         }
 
-        PolicyDecisionV1 {
-            schema_version: 1,
-            disposition,
-            reasons,
-            requires_cost_ceiling,
-        }
+        policy
     }
 }
 
-fn require_incremental_cost_approval(
-    capability: &CapabilityV1,
-    disposition: &mut PolicyDisposition,
-    requires_cost_ceiling: &mut bool,
-    reasons: &mut Vec<String>,
-) {
+fn require_incremental_cost_approval(capability: &CapabilityV1, policy: &mut PolicyDecisionV1) {
     if capability.cost.incremental {
-        *disposition = PolicyDisposition::ApprovalRequired;
-        *requires_cost_ceiling = true;
-        reasons.push("operation can incur incremental cost".to_owned());
+        policy.disposition = PolicyDisposition::ApprovalRequired;
+        policy.requires_cost_ceiling = true;
+        policy.reasons.push(INCREMENTAL_COST_REASON.to_owned());
     }
 }
 
-fn apply_effect_policy(
-    capability: &CapabilityV1,
-    disposition: &mut PolicyDisposition,
-    requires_cost_ceiling: &mut bool,
-    reasons: &mut Vec<String>,
-) {
+fn apply_effect_policy(capability: &CapabilityV1, policy: &mut PolicyDecisionV1) {
     match capability.effect {
         EffectClass::ReadOnly => {}
         EffectClass::DataWrite => {
-            *disposition = PolicyDisposition::ApprovalRequired;
-            reasons.push("operation writes database state".to_owned());
+            policy.disposition = PolicyDisposition::ApprovalRequired;
+            policy
+                .reasons
+                .push("operation writes database state".to_owned());
         }
         EffectClass::ReversibleWrite => {
             if capability.risk != RiskClass::ScopedWrite || !capability.rollback.supported {
-                *disposition = PolicyDisposition::ApprovalRequired;
-                reasons.push(
+                policy.disposition = PolicyDisposition::ApprovalRequired;
+                policy.reasons.push(
                     "write is not both known-scoped and backed by a declared rollback".to_owned(),
                 );
             }
         }
         EffectClass::Spend => {
-            *disposition = PolicyDisposition::ApprovalRequired;
-            *requires_cost_ceiling = true;
-            if !reasons
+            policy.disposition = PolicyDisposition::ApprovalRequired;
+            policy.requires_cost_ceiling = true;
+            if !policy
+                .reasons
                 .iter()
-                .any(|reason| reason == "operation can incur incremental cost")
+                .any(|reason| reason == INCREMENTAL_COST_REASON)
             {
-                reasons.push("operation can incur incremental cost".to_owned());
+                policy.reasons.push(INCREMENTAL_COST_REASON.to_owned());
             }
         }
         EffectClass::Destructive
@@ -163,8 +153,10 @@ fn apply_effect_policy(
         | EffectClass::IdentityOrOwnership
         | EffectClass::Irreversible
         | EffectClass::Unknown => {
-            *disposition = PolicyDisposition::ApprovalRequired;
-            reasons.push(format!("operation has {:?} effects", capability.effect));
+            policy.disposition = PolicyDisposition::ApprovalRequired;
+            policy
+                .reasons
+                .push(format!("operation has {:?} effects", capability.effect));
         }
     }
 }
