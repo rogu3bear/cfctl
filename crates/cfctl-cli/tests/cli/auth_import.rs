@@ -90,6 +90,28 @@ fn exclusive_runtime_is_held(runtime: &Path) -> bool {
 
 #[test]
 fn exclusive_lock_observation_rejects_shared_and_unlocked_states() {
+    // Other CLI tests spawn processes in parallel. A fork can retain a shared
+    // descriptor until exec even after this thread drops its copy. Keep this
+    // fixture's lock transitions inside a process that spawns no other tests.
+    const CHILD: &str = "CFCTL_TEST_ISOLATED_LOCK_OBSERVATION";
+    if std::env::var_os(CHILD).is_none() {
+        let mut fixture = Imports(vec![
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "auth_import::exclusive_lock_observation_rejects_shared_and_unlocked_states",
+                    "--exact",
+                ])
+                .env(CHILD, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("isolated lock observation"),
+        ]);
+        let (status, text) = output(&mut fixture.0[0], "isolated lock observation");
+        assert!(status.success(), "{text}");
+        assert!(text.contains("test result: ok. 1 passed;"), "{text}");
+        return;
+    }
     let root = tempfile::tempdir().expect("isolated lock observation");
     let paths = RuntimePaths::from_root(root.path());
     let shared = cfctl_storage::lock_runtime_selection(&paths, false).expect("shared lock");
