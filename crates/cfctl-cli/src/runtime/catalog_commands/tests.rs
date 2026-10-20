@@ -137,8 +137,10 @@ async fn default_sync_still_loads_profiles_and_attempts_the_selected_credential(
     assert_eq!(malformed["status"], "not_refreshed");
     assert_ne!(malformed["reason"], "no active authenticated profile");
 
-    let mut profiles = ProfilesConfig::default();
-    profiles.current_profile = Some("ambient".to_owned());
+    let mut profiles = ProfilesConfig {
+        current_profile: Some("ambient".to_owned()),
+        ..ProfilesConfig::default()
+    };
     profiles.profiles.insert(
         "ambient".to_owned(),
         ProfileMetadata::new("ambient", ProfileKind::ApiToken, Some("account")),
