@@ -8723,7 +8723,6 @@ fn apply_post_normalization_contracts(
     finalize_email_routing_subdomain_contract(capabilities);
     finalize_email_routing_rules_read_projection(capabilities);
     finalize_worker_script_delete_contract(capabilities);
-    finalize_worker_module_upload_contract(capabilities);
     finalize_worker_deployment_create_contract(capabilities);
     finalize_worker_cron_trigger_update_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
@@ -20250,54 +20249,6 @@ fn required_path_selectors(capability: &CapabilityV1, names: &[&str]) -> bool {
             selector.name == *name && selector.location == "path" && selector.required
         })
     })
-}
-
-/// Upload proves the new script id through settings readback. Previous module
-/// bytes are not retained, so traffic restoration stays on the native
-/// `worker-version-rollback` capability.
-fn finalize_worker_module_upload_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
-    let settings_read_supported =
-        capabilities
-            .get("worker-script-get-settings")
-            .is_some_and(|capability| {
-                capability.method == "GET"
-                    && capability.path == WORKER_SCRIPT_SETTINGS_PATH
-                    && capability.product == "Worker Script"
-                    && !capability.mutating
-            });
-    let Some(capability) = capabilities.get_mut("worker-script-upload-worker-module") else {
-        return;
-    };
-    let identity_confirmed = settings_read_supported
-        && capability.method == "PUT"
-        && capability.path == WORKER_SCRIPT_DELETE_PATH
-        && capability.product == "Worker Script"
-        && capability.mutating
-        && capability.request_schema.is_none()
-        && capability.permissions == ["Workers Scripts Write"]
-        && worker_json_envelope(capability)
-        && required_path_selectors(capability, &["account_id", "script_name"]);
-    if !identity_confirmed {
-        return;
-    }
-    capability.risk = RiskClass::CrossConfig;
-    capability.effect = EffectClass::ReversibleWrite;
-    bind_worker_control_plane_cost(capability);
-    capability.verification.required = true;
-    "worker_script_settings_id_matches_upload_response"
-        .clone_into(&mut capability.verification.strategy);
-    capability.same_path_read = Some(SamePathReadContractV1 {
-        path: WORKER_SCRIPT_SETTINGS_PATH.to_owned(),
-        read_capability_id: "worker-script-get-settings".to_owned(),
-        verified_response_fields: Vec::new(),
-    });
-    capability.rollback.supported = false;
-    capability.rollback.strategy = None;
-    capability.rollback.warning = Some(
-        "the upload response does not retain the previous module bytes. Restoring traffic is a separately reviewed worker-version-rollback to one exact prior version; this operation does not accept a force bypass"
-            .to_owned(),
-    );
-    refresh_dynamic_mutation_contract(capability);
 }
 
 fn worker_deployment_create_schema_supported(capability: &CapabilityV1) -> bool {
