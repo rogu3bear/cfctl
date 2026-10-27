@@ -11,6 +11,7 @@ pub mod pages_deployment;
 pub mod pages_projects;
 pub mod turnstile_secret;
 pub mod worker_frozen_upload;
+pub mod worker_module_upload;
 pub use email_routing::{
     EMAIL_ROUTING_ACCOUNT_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_ACCOUNT_RULES_LIST_PATH,
     EMAIL_ROUTING_RULES_LIST_CAPABILITY_ID, EMAIL_ROUTING_RULES_LIST_PATH,
@@ -2060,6 +2061,9 @@ impl CapabilityV1 {
         }
 
         let mut gaps = Vec::new();
+        if self.id == worker_module_upload::ID {
+            gaps.push(worker_module_upload::BLOCKING_GAP.to_owned());
+        }
         if self.risk == RiskClass::Unknown {
             gaps.push("operation-specific risk classification is missing".to_owned());
         }
@@ -2211,6 +2215,9 @@ impl CapabilityV1 {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn verification_contract_supported(&self) -> bool {
+        if self.id == worker_module_upload::ID {
+            return false;
+        }
         if !self.mutating {
             return true;
         }
@@ -2643,30 +2650,6 @@ impl CapabilityV1 {
                         .selectors
                         .iter()
                         .all(|selector| selector.location == "path")
-                    && ["account_id", "script_name"].iter().all(|name| {
-                        self.selectors.iter().any(|selector| {
-                            selector.name == *name
-                                && selector.location == "path"
-                                && selector.required
-                        })
-                    })
-                    && self.same_path_read.as_ref().is_some_and(|target| {
-                        target.path
-                            == "/accounts/{account_id}/workers/scripts/{script_name}/settings"
-                            && target.read_capability_id == "worker-script-get-settings"
-                            && target.verified_response_fields.is_empty()
-                    })
-            }
-            // Module upload returns a script id. The script GET is the raw
-            // module, so readback is the settings sub-path and must report
-            // that same id.
-            "worker_script_settings_id_matches_upload_response" => {
-                self.id == "worker-script-upload-worker-module"
-                    && self.method == "PUT"
-                    && self.path == "/accounts/{account_id}/workers/scripts/{script_name}"
-                    && self.product == "Worker Script"
-                    && self.request_schema.is_none()
-                    && self.permissions == ["Workers Scripts Write"]
                     && ["account_id", "script_name"].iter().all(|name| {
                         self.selectors.iter().any(|selector| {
                             selector.name == *name

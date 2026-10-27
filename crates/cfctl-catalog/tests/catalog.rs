@@ -1290,10 +1290,9 @@ fn worker_control_plane_fixture() -> Value {
 }
 
 #[test]
-fn worker_upload_deployment_and_cron_contracts_share_one_bounded_cost() {
+fn worker_deployment_and_cron_contracts_share_one_bounded_cost() {
     let snapshot = normalize_openapi(&worker_control_plane_fixture()).expect("worker catalog");
     for id in [
-        "worker-script-upload-worker-module",
         "worker-deployments-create-deployment",
         "worker-cron-trigger-update-cron-triggers",
     ] {
@@ -1328,16 +1327,6 @@ fn worker_upload_deployment_and_cron_contracts_share_one_bounded_cost() {
             "{id}"
         );
     }
-
-    let upload = snapshot
-        .get("worker-script-upload-worker-module")
-        .expect("upload");
-    assert_eq!(upload.risk, RiskClass::CrossConfig);
-    assert_eq!(upload.effect, EffectClass::ReversibleWrite);
-    assert_eq!(
-        upload.verification.strategy,
-        "worker_script_settings_id_matches_upload_response"
-    );
 
     let deployment = snapshot
         .get("worker-deployments-create-deployment")
@@ -15140,3 +15129,6 @@ fn native_worker_deployment_plan_is_preview_only_and_operation_complete() {
 }
 #[path = "catalog/handoff_secrets.rs"]
 mod handoff_secrets;
+
+#[path = "catalog/worker_module_upload.rs"]
+mod worker_module_upload;

@@ -865,31 +865,6 @@ fn evaluate_worker_version_rollback_readback(
     Ok((passed, basis, latest_id.map(Value::String), projected))
 }
 
-#[must_use]
-pub fn worker_script_upload_identity_matches(uploaded: &Value, settings: &Value) -> bool {
-    let uploaded_id = non_empty_string_field(uploaded, "id");
-    let settings_id = non_empty_string_field(settings, "id");
-    uploaded_id.is_some() && uploaded_id == settings_id && etag_pair_matches(uploaded, settings)
-}
-
-fn etag_pair_matches(uploaded: &Value, settings: &Value) -> bool {
-    match (
-        non_empty_string_field(uploaded, "etag"),
-        non_empty_string_field(settings, "etag"),
-    ) {
-        (None, None) => true,
-        (Some(left), Some(right)) => left == right,
-        _ => false,
-    }
-}
-
-fn non_empty_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|item| !item.is_empty())
-}
-
 /// Percentage deployments must name unique version ids and sum to 100. Order
 /// does not matter. A missing strategy on the readback is accepted; a
 /// different strategy is not.
@@ -4389,12 +4364,6 @@ impl Executor {
                 .await;
         }
 
-        if strategy == "worker_script_settings_id_matches_upload_response" {
-            return self
-                .verify_worker_module_upload(plan, apply_response, input, credential)
-                .await;
-        }
-
         if strategy == "worker_deployment_latest_matches_planned_versions" {
             return self
                 .verify_worker_deployment_create(plan, apply_response, input, credential)
@@ -4531,37 +4500,6 @@ impl Executor {
             readback: projected_readback,
             correlated_resource_id,
         })
-    }
-
-    async fn verify_worker_module_upload(
-        &self,
-        plan: &PlanV1,
-        apply_response: &CloudflareResponseV1,
-        input: &CallInput,
-        credential: &AuthCredential,
-    ) -> Result<OperationVerificationV1> {
-        let target = worker_mutation_read_target(&plan.capability)?;
-        let readback = self
-            .read_worker_mutation_target(
-                plan,
-                input,
-                credential,
-                target,
-                "Worker script settings readback",
-            )
-            .await?;
-        let matched =
-            worker_script_upload_identity_matches(&apply_response.result, &readback.result);
-        let passed = apply_response.success && readback.success && matched;
-        let basis = if passed {
-            "the script settings id matches the upload response".to_owned()
-        } else {
-            format!(
-                "Worker module upload was not proven (apply success={}, settings success={}, identity match={matched})",
-                apply_response.success, readback.success
-            )
-        };
-        Ok(redacted_worker_verification(plan, passed, basis, readback))
     }
 
     async fn verify_worker_deployment_create(
@@ -11708,9 +11646,6 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     if strategy == "worker_script_settings_returns_not_found_after_delete" {
         return validate_worker_script_delete_target(capability, input);
     }
-    if strategy == "worker_script_settings_id_matches_upload_response" {
-        return validate_worker_module_upload_target(capability, input);
-    }
     if strategy == "worker_deployment_latest_matches_planned_versions" {
         return validate_worker_deployment_create_target(capability, input);
     }
@@ -12294,19 +12229,6 @@ fn same_path_routing_header(capability: &CapabilityV1, selector: &SelectorV1) ->
         && !selector.required
         && selector.value_type == "string"
         && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
-}
-
-fn validate_worker_module_upload_target(
-    capability: &CapabilityV1,
-    input: &CallInput,
-) -> Result<()> {
-    let _target = worker_mutation_read_target(capability)?;
-    if !clean_verification_query(input) || !capability.verification_contract_supported() {
-        return Err(CloudflareError::MissingVerificationTarget(
-            "Worker module upload readback contract or query is not exact".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_worker_deployment_create_target(
@@ -12976,6 +12898,11 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    if capability.id == cfctl_core::worker_module_upload::ID {
+        return Err(CloudflareError::InvalidRequestBody(
+            cfctl_core::worker_module_upload::BLOCKING_GAP.to_owned(),
+        ));
+    }
     if capability.id == cfctl_core::custom_challenge_rule::ID
         && (!cfctl_core::custom_challenge_rule::supported(capability)
             || input.if_match.is_some()
@@ -16960,21 +16887,93 @@ fn request_property_path(parent: &str, property: &str) -> String {
 
 #[cfg(test)]
 mod worker_mutation_contract_tests {
-    use super::{
-        worker_cron_lists_match, worker_deployment_versions_match,
-        worker_script_upload_identity_matches,
-    };
+    use super::{worker_cron_lists_match, worker_deployment_versions_match};
     use serde_json::json;
 
     #[test]
-    fn upload_identity_matches_id_and_etag_without_retaining_bytes() {
-        let uploaded = json!({"id":"script-1","etag":"abc","script":"secret-bytes"});
-        let settings = json!({"id":"script-1","etag":"abc"});
-        assert!(worker_script_upload_identity_matches(&uploaded, &settings));
-        let drifted = json!({"id":"script-1","etag":"other"});
-        assert!(!worker_script_upload_identity_matches(&uploaded, &drifted));
-        let missing = json!({"etag":"abc"});
-        assert!(!worker_script_upload_identity_matches(&uploaded, &missing));
+    fn legacy_worker_module_upload_cannot_construct_a_json_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cap = cfctl_core::CapabilityV1::new(
+            cfctl_core::worker_module_upload::ID,
+            "Upload Worker Module",
+            "PUT",
+            "/accounts/{account_id}/workers/scripts/{script_name}",
+        );
+        let builder = super::RequestBuilder::new("https://fixture.invalid/client/v4")?;
+        for body in [
+            None,
+            Some(json!({"metadata": {}})),
+            Some(json!("multipart bytes")),
+        ] {
+            let input = super::CallInput {
+                selectors: json!({"account_id": "a".repeat(32), "script_name": "fixture"}),
+                body,
+                ..super::CallInput::default()
+            };
+            let error = builder
+                .build_unchecked(&cap, &input)
+                .err()
+                .ok_or("unsupported upload constructed a wire request")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains(cfctl_core::worker_module_upload::BLOCKING_GAP)
+            );
+            assert!(super::validate_request_contract(&cap, &input).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_module_upload_consumed_plan_refuses_every_verifier_without_dispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for strategy in [
+            "worker_script_settings_id_matches_upload_response",
+            "same_path_result_contains_planned_fields_after_mutation",
+        ] {
+            let mut cap = cfctl_core::CapabilityV1::new(
+                cfctl_core::worker_module_upload::ID,
+                "Upload Worker Module",
+                "PUT",
+                "/accounts/{account_id}/workers/scripts/{script_name}",
+            );
+            cap.verification.required = true;
+            cap.verification.strategy = strategy.into();
+            let input = super::CallInput {
+                selectors: json!({"account_id": "a".repeat(32), "script_name": "fixture"}),
+                body: Some(json!({"metadata": {}})),
+                ..super::CallInput::default()
+            };
+            let mut plan = cfctl_core::PlanV1::draft(
+                "fixture",
+                &"a".repeat(32),
+                "catalog-fixture",
+                cap,
+                serde_json::to_value(&input)?,
+            )?;
+            plan.status = cfctl_core::PlanStatus::Consumed;
+            let boundary = cfctl_core::BoundaryObservation::default();
+            let executor = super::Executor::new(reqwest::Client::new(), "https://fixture.invalid")?
+                .with_boundary_observation(boundary.clone());
+            let result = executor
+                .execute_consumed_plan_with_input(
+                    &mut plan,
+                    "catalog-fixture",
+                    &cfctl_auth::AuthCredential::Bearer {
+                        token: "fixture-not-a-credential".into(),
+                    },
+                    &input,
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(super::CloudflareError::UnsupportedVerificationStrategy(_))
+            ));
+            assert!(!boundary.attempted());
+            assert!(!boundary.mutation_attempted());
+            assert_eq!(plan.status, cfctl_core::PlanStatus::Consumed);
+        }
+        Ok(())
     }
 
     #[test]

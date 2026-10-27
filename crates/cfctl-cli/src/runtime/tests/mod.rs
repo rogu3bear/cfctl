@@ -217,6 +217,7 @@ mod pages_and_delegated;
 mod pages_setup;
 mod worker_frozen_contracts;
 mod worker_frozen_upload;
+mod worker_module_upload;
 use pages_and_delegated::*;
 mod import_admission;
 mod import_lineage;

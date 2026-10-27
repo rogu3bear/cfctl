@@ -646,11 +646,21 @@ pub(crate) fn capability_has_meaningful_request_body(capability: &CapabilityV1) 
         .is_some_and(|value_type| value_type != "object")
 }
 
+fn worker_module_upload_guidance() -> GuideActionV1 {
+    GuideActionV1 {
+        summary: "Keep this upload blocked. Extend cfctl with a hash-bound private multipart source/stage, exact module and settings verification, and uncertain-write recovery before planning. Pricing lookup or permission metadata alone cannot admit it. A separately authorized publication method retains its own exact-plan adoption and executor/recovery requirements.".to_owned(),
+        argv: Vec::new(),
+    }
+}
+
 pub(super) fn guide_next_action(
     capability: &CapabilityV1,
     contract_ready: bool,
     call_argv: Option<&[String]>,
 ) -> GuideActionV1 {
+    if capability.id == cfctl_core::worker_module_upload::ID {
+        return worker_module_upload_guidance();
+    }
     if contract_ready {
         let summary = if capability.mutating {
             "Create the preview plan with the exact generated argv; no Cloudflare mutation occurs until the resulting operation is run."
