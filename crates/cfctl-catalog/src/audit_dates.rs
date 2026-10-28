@@ -135,29 +135,29 @@ mod tests {
             |cap| {
                 cap.selectors
                     .iter_mut()
-                    .for_each(|s| s.location = "header".into())
+                    .for_each(|s| s.location = "header".into());
             },
             |cap| {
                 cap.selectors
                     .iter_mut()
-                    .for_each(|s| s.value_type = "integer".into())
+                    .for_each(|s| s.value_type = "integer".into());
             },
             |cap| {
                 cap.selectors.iter_mut().for_each(|s| {
-                    s.description = Some("Only a date, never RFC3339 timestamps".into())
-                })
+                    s.description = Some("Only a date, never RFC3339 timestamps".into());
+                });
             },
             |cap| cap.selectors.iter_mut().for_each(|s| s.contract = None),
             |cap| {
                 cap.selectors.iter_mut().for_each(|s| {
-                    s.contract.as_mut().expect("contract").schema["maxLength"] = json!(10)
-                })
+                    s.contract.as_mut().expect("contract").schema["maxLength"] = json!(10);
+                });
             },
             |cap| {
                 cap.selectors.iter_mut().for_each(|s| {
                     s.contract.as_mut().expect("contract").schema =
-                        json!({"type":"string","format":"date-time"})
-                })
+                        json!({"type":"string","format":"date-time"});
+                });
             },
         ];
         for mutate in mutations {
