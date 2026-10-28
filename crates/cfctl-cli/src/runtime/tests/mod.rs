@@ -210,6 +210,7 @@ fn authenticated_test_store_reopens_the_same_authority() {
 }
 
 mod acceptance_rectification;
+mod audit_dates;
 mod d1_restore_proof;
 mod deploy_planning;
 mod oauth_completion;

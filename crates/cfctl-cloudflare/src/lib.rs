@@ -16402,6 +16402,18 @@ fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()>
         return Ok(());
     };
     let valid = match format {
+        "date" => {
+            let bytes = value.as_bytes();
+            bytes.len() == 10
+                && bytes.iter().enumerate().all(|(index, byte)| {
+                    if matches!(index, 4 | 7) {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_digit()
+                    }
+                })
+                && NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+        }
         "date-time" => DateTime::parse_from_rfc3339(value).is_ok(),
         "email" => is_valid_ascii_email(value),
         "hostname" => is_valid_hostname(value),
