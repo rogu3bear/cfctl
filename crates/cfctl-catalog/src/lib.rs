@@ -3,6 +3,7 @@
 mod pages_deploy;
 pub use pages_deploy::ingest_wrangler_pages_deploy_help;
 
+mod audit_dates;
 mod d1_reconciliation;
 mod d1_transition;
 pub use d1_transition::proof_capability as d1_transition_proof_capability;
@@ -8679,6 +8680,7 @@ fn apply_post_normalization_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
+    audit_dates::finalize(capabilities);
     response_selection::finalize_queue_metrics(document, capabilities);
     response_selection::finalize_entitlement_reads(document, capabilities);
     finalize_pages_deployment_id_selector_contracts(capabilities);
