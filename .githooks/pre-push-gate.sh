@@ -78,13 +78,12 @@ case "$local_ref:$remote_ref" in
     ;;
 esac
 
-if ! initial_status="$(git status --porcelain=v1 --untracked-files=all)"; then
-  echo "pre-push REFUSED: could not observe checked-out source cleanliness" >&2
-  exit 1
-fi
-if [ -n "$initial_status" ]; then
-  echo "pre-push REFUSED: tracked and untracked source must be clean" >&2
-  exit 1
+source_state_dir="$(mktemp -d -t cfctl-pre-push-source.XXXXXX)"
+trap 'rm -rf -- "$source_state_dir"' EXIT
+bash "$ROOT_DIR/.githooks/pre-push-source.sh" "$source_state_dir/before"
+if [ -e experiments ]; then
+  echo "pre-push: proving tracked candidate with exact declared residue present (not a clean checkout)."
+  echo "pre-push: residue snapshot $(shasum -a 256 "$source_state_dir/before" | awk '{print $1}')"
 fi
 
 echo "pre-push: building and running the complete xtask verifier for ${head_oid:0:7}..."
@@ -139,12 +138,12 @@ if [ "$(git rev-parse "$local_ref")" != "$local_oid" ]; then
   echo "pre-push REFUSED: pushed ref changed during verification" >&2
   exit 1
 fi
-if ! current_status="$(git status --porcelain=v1 --untracked-files=all)"; then
-  echo "pre-push REFUSED: could not observe checked-out source cleanliness after verification" >&2
+if ! bash "$ROOT_DIR/.githooks/pre-push-source.sh" "$source_state_dir/after"; then
+  echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
   exit 1
 fi
 if [ "$current_head_ref" != "$head_ref" ] || [ "$current_head_oid" != "$head_oid" ] || \
-   [ -n "$current_status" ]; then
+   ! cmp -s "$source_state_dir/before" "$source_state_dir/after"; then
   echo "pre-push REFUSED: checked-out HEAD or source changed during verification" >&2
   exit 1
 fi

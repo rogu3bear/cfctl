@@ -156,9 +156,32 @@ Gate logic lives in `.githooks/pre-push-gate.sh`, which is not pinned, so it can
 change without re-pinning. The gate accepts only `CFCTL_PRE_PUSH_GATE=on`;
 there is no proof bypass. Ignored historical sidecars such as `LOCAL_CI.md` are
 inert and do not override this tracked gate or its current guard paths. It verifies
-the clean canonical checkout and rechecks its branch, HEAD, pushed ref and source
+the canonical tracked source and rechecks its branch, HEAD, pushed ref and source
 after verification. It creates no linked
 checkout and strips inherited Git context from proof subprocesses.
+
+The default admission rule still requires a clean tracked/index state and no
+untracked non-ignored files. One reviewed preservation declaration,
+`.githooks/pre-push-residue.tsv`, permits the exact nine unrelated AI Search
+experiment files to remain visible, untracked and in place. It declares each
+regular file's path, mode, length and SHA-256. Admission inventories all of
+`experiments/`, including ignored entries, and rejects missing or extra files,
+directories, symlinks, special files, changed content/modes and observation
+errors. It compares the complete preservation snapshot before and after proof.
+All other tracked/index dirt and undeclared untracked files remain refused.
+
+This classification depends on the reviewed input graph: Cargo has explicit
+workspace members; site Bun tests run under `site/scripts`; bridge checks run
+from `bridge/event-ingress`; none consumes these experiments. The declaration
+pins the full tracked input tree (mode, blob and path), excluding only itself
+to avoid a self-reference. A tracked input change invalidates the exception;
+updating that pin requires reviewing the non-consumption boundary again, never
+an automatic refresh in the hook. The normal full verifier still runs. Its
+receipt proves the tracked candidate with classified residue present, and does
+not qualify the experiments or label the checkout clean. Build identity remains
+unknown in this dirty checkout; bootstrap, installation and signed release keep
+their existing clean-source rules. No ignore rule, Git metadata, environment
+waiver, alternate checkout or build-identity override is used by this admission.
 
 One exact checked-out branch or one new annotated tag peeling to checked-out
 HEAD may be published per push. Lightweight, moved, existing and non-HEAD tags
