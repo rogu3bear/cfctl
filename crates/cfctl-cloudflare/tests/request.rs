@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "request/analytics_dates.rs"]
+mod analytics_dates;
 #[path = "request/csv_records.rs"]
 mod csv_records;
 #[path = "request/email_routing.rs"]

@@ -21,6 +21,7 @@ pub mod r2_recovery;
 pub mod r2_restore;
 mod r2_s3;
 mod read_dispatch;
+mod request_dates;
 mod response_header_rule;
 use d1_sql::reviewed_schema_statement_count;
 mod worker_version_artifact;
@@ -55,7 +56,7 @@ use cfctl_core::{
     normalize_email_routing_account_rule_set_with_page_size,
     normalize_email_routing_rule_set_with_page_size, request_header_is_reserved,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use md5::Md5;
@@ -12939,6 +12940,7 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_response_contract(capability)?;
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
+    request_dates::validate_analytics_dates(capability, input)?;
     validate_request_body(capability, input.body.as_ref())?;
     oauth_scopes::validate_request(capability, input)?;
     validate_d1_full_export_contract(capability, input)?;
@@ -15787,8 +15789,7 @@ fn analytics_timestamp(value: &Value, format: TimestampFormatV1) -> Result<DateT
                     "date values must use YYYY-MM-DD strings".to_owned(),
                 )
             })?;
-            NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                .ok()
+            request_dates::parse(value)
                 .and_then(|date| date.and_hms_opt(0, 0, 0))
                 .map(|datetime| datetime.and_utc())
                 .ok_or_else(|| {
@@ -16402,18 +16403,7 @@ fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()>
         return Ok(());
     };
     let valid = match format {
-        "date" => {
-            let bytes = value.as_bytes();
-            bytes.len() == 10
-                && bytes.iter().enumerate().all(|(index, byte)| {
-                    if matches!(index, 4 | 7) {
-                        *byte == b'-'
-                    } else {
-                        byte.is_ascii_digit()
-                    }
-                })
-                && NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
-        }
+        "date" => request_dates::parse(value).is_some(),
         "date-time" => DateTime::parse_from_rfc3339(value).is_ok(),
         "email" => is_valid_ascii_email(value),
         "hostname" => is_valid_hostname(value),
