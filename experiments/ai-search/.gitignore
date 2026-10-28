@@ -1,0 +1,3 @@
+# Real captured content and local comparison output remain private.
+*.capture.json
+report.json

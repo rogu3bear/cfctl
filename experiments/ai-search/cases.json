@@ -1,0 +1,10 @@
+[
+  {"id":"external-discovery","workload":"open_web","operation":"search","query":"Find the official API documentation for searching the open web with Firecrawl and retrieving full page Markdown.","sources":["https://docs.firecrawl.dev/features/search"],"terms":["scrapeOptions"]},
+  {"id":"external-ai-search-read","workload":"open_web","operation":"read","query":"Read the Cloudflare AI Search overview and identify its search use cases.","sources":["https://developers.cloudflare.com/ai-search/"],"terms":["knowledge"]},
+  {"id":"external-binding-read","workload":"open_web","operation":"read","query":"Read the Workers binding documentation and return the AI Search chunk response fields.","sources":["https://developers.cloudflare.com/ai-search/api/search/workers-binding/"],"terms":["chunks","item.key"]},
+  {"id":"external-pricing-read","workload":"open_web","operation":"read","query":"Read current AI Search pricing and report when billing begins.","sources":["https://developers.cloudflare.com/ai-search/platform/limits-pricing/"],"terms":["November 1, 2026"]},
+  {"id":"external-firecrawl-read","workload":"open_web","operation":"read","query":"Read the official Firecrawl search documentation and explain how to include page content.","sources":["https://docs.firecrawl.dev/features/search"],"terms":["scrapeOptions"]},
+  {"id":"external-mcp-read","workload":"open_web","operation":"read","query":"Read how AI Search MCP authentication works for a custom domain.","sources":["https://developers.cloudflare.com/ai-search/api/search/mcp/"],"terms":["Access","default_domain_enabled"]},
+  {"id":"corpus-domain-boundary","workload":"corpus","operation":"search","query":"Can AI Search automatically crawl an unrelated third-party domain?","sources":["https://developers.cloudflare.com/ai-search/configuration/data-source/website/"],"terms":["same Cloudflare account"]},
+  {"id":"corpus-search-auth","workload":"corpus","operation":"search","query":"Which permissions are required to call the AI Search REST search API?","sources":["https://developers.cloudflare.com/ai-search/api/search/rest-api/"],"terms":["AI Search:Edit","AI Search:Run"]}
+]

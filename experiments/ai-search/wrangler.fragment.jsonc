@@ -1,0 +1,7 @@
+// Merge this fragment into an existing, separately reviewed Worker config.
+// This is not a deployable Worker and makes no remote call by itself.
+// Browser quickAction requires compatibility_date >= 2026-03-24.
+{
+  "browser": { "binding": "BROWSER" },
+  "ai_search_namespaces": [{ "binding": "AI_SEARCH", "namespace": "default" }]
+}
