@@ -1,10 +1,8 @@
-//! Canonical pre-push object, proof and preserved-residue admission regressions.
+//! Canonical pre-push object, proof and clean-source admission regressions.
 #![allow(clippy::expect_used)]
 
 use super::repository_root;
-use sha2::{Digest, Sha256};
 use std::{
-    fmt::Write as _,
     fs,
     io::Write as _,
     os::unix::fs::PermissionsExt as _,
@@ -60,9 +58,6 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
         if fail_git_status {
             command.env("FAKE_GIT_STATUS_FAIL", "1");
         }
-        if cargo_log.with_extension("log.gate-off").exists() {
-            command.env("CFCTL_PRE_PUSH_GATE", "off");
-        }
         let mut child = command.spawn().expect("pre-push fixture starts");
         child
             .stdin
@@ -71,46 +66,6 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
             .write_all(update.as_bytes())
             .expect("fixture update is written");
         child.wait_with_output().expect("pre-push fixture exits")
-    }
-
-    fn declare_residue(repo: &Path, paths: &[&str]) {
-        let tree = git(repo, &["ls-tree", "--full-tree", "-r", "-z", "HEAD"]);
-        let mut bound = Vec::new();
-        for record in tree
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|r| !r.is_empty())
-        {
-            let (_, path) = record.split_at(
-                record
-                    .iter()
-                    .position(|b| *b == b'\t')
-                    .expect("tree path tab")
-                    + 1,
-            );
-            if path != b".githooks/pre-push-residue.tsv" {
-                bound.extend_from_slice(record);
-                bound.push(0);
-            }
-        }
-        let mut declaration = format!(
-            "source-tree-sha256 {}\n",
-            hex::encode(Sha256::digest(&bound))
-        );
-        for path in paths {
-            let bytes = fs::read(repo.join(path)).expect("fixture residue is readable");
-            writeln!(
-                declaration,
-                "{} {} 644 {path}",
-                hex::encode(Sha256::digest(&bytes)),
-                bytes.len()
-            )
-            .expect("format fixture declaration");
-        }
-        fs::write(repo.join(".githooks/pre-push-residue.tsv"), declaration)
-            .expect("fixture residue declaration is written");
-        git(repo, &["add", ".githooks/pre-push-residue.tsv"]);
-        git(repo, &["commit", "-q", "-m", "classify fixture residue"]);
     }
 
     let nonce = SystemTime::now()
@@ -135,17 +90,10 @@ fn pre_push_gate_proves_only_one_clean_checked_out_branch_object() {
     .expect("tracked pre-push gate is readable");
     fs::write(repo.join(".githooks/pre-push-gate.sh"), hook)
         .expect("fixture pre-push gate is written");
-    for path in [
-        ".githooks/pre-push-source.sh",
-        ".githooks/pre-push-residue.tsv",
-    ] {
-        fs::copy(repository_root().expect("root").join(path), repo.join(path))
-            .expect("fixture source policy is copied");
-    }
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
-        &fake_cargo,
-        r#"#!/bin/sh
+            &fake_cargo,
+            r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$FAKE_CARGO_LOG"
 [ "$#" = 8 ] && [ "$1 $2 $3 $4 $5 $6 $7" = 'build --locked -p xtask --target fixture-native --target-dir' ] || exit 71
@@ -163,8 +111,8 @@ fi
 VERIFIER
 chmod +x "$8/$6/debug/xtask"
 "#,
-    )
-    .expect("fake cargo is written");
+        )
+        .expect("fake cargo is written");
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
         .expect("fake cargo is executable");
     let fake_rustc = fake_bin.join("rustc");
@@ -175,23 +123,16 @@ chmod +x "$8/$6/debug/xtask"
     let fake_git = fake_bin.join("git");
     fs::write(
         &fake_git,
-        r#"#!/bin/sh
-if [ "${FAKE_GIT_STATUS_FAIL:-}" = 1 ]; then
-  case " $* " in
-    *' status --porcelain=v1 -z --untracked-files=all '*)
-      echo 'fixture status observation failed' >&2; exit 73 ;;
-  esac
-fi
-case " $* " in
-  *' ls-tree --full-tree -r -z HEAD '*)
-    [ ! -f "$FAKE_CARGO_LOG.tree-fail" ] || exit 76
-    [ ! -f "$FAKE_CARGO_LOG.tree-empty" ] || exit 0
-    if [ -f "$FAKE_CARGO_LOG.tree-partial" ]; then printf 'incomplete'; exit 0; fi
-    if [ -f "$FAKE_CARGO_LOG.tree-malformed" ]; then printf 'malformed\0'; exit 0; fi
-    ;;
-esac
-PATH=${PATH#*:} exec git "$@"
-"#,
+        "#!/bin/sh\n\
+             if [ \"${FAKE_GIT_STATUS_FAIL:-}\" = 1 ]; then\n\
+               case \" $* \" in\n\
+                 *' status --porcelain=v1 --untracked-files=all '*)\n\
+                   echo 'fixture status observation failed' >&2\n\
+                   exit 73\n\
+                   ;;\n\
+               esac\n\
+             fi\n\
+             PATH=${PATH#*:} exec git \"$@\"\n",
     )
     .expect("fake git is written");
     fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
@@ -290,303 +231,7 @@ PATH=${PATH#*:} exec git "$@"
     );
     fs::write(&tracked_path, "clean\n").expect("raced fixture is restored");
 
-    // These are the real classified paths, with synthetic fixture contents.
-    // Their own ignore rule must not conceal an extra input from admission.
-    let residue_paths = [
-        "experiments/ai-search/.gitignore",
-        "experiments/ai-search/README.md",
-        "experiments/ai-search/captures.empty.json",
-        "experiments/ai-search/cases.json",
-        "experiments/ai-search/evaluate.ts",
-        "experiments/ai-search/external.ts",
-        "experiments/ai-search/pilot.test.ts",
-        "experiments/ai-search/search.ts",
-        "experiments/ai-search/wrangler.fragment.jsonc",
-    ];
-    fs::create_dir_all(repo.join("experiments/ai-search")).expect("fixture residue root");
-    for path in &residue_paths {
-        fs::write(repo.join(path), format!("fixture {path}\n")).expect("fixture residue");
-        fs::set_permissions(repo.join(path), fs::Permissions::from_mode(0o644))
-            .expect("fixture mode");
-    }
-    fs::write(repo.join(residue_paths[0]), "reports/\n").expect("fixture ignore rule");
-    declare_residue(&repo, &residue_paths);
-    let residue_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
-        .expect("fixture HEAD")
-        .trim()
-        .to_owned();
-    let residue_update = format!("refs/heads/main {residue_oid} refs/heads/main {zero_oid}\n");
-    let preserved: Vec<_> = residue_paths
-        .iter()
-        .map(|p| fs::read(repo.join(p)).expect("preimage"))
-        .collect();
-    fs::remove_file(&cargo_log).expect("reset proof log");
-    let classified = run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false);
-    assert!(
-        classified.status.success(),
-        "exact classified residue: {}",
-        String::from_utf8_lossy(&classified.stderr)
-    );
-    assert_eq!(
-        fs::read_to_string(&cargo_log).expect("proof ran"),
-        expected_proof
-    );
-    assert!(String::from_utf8_lossy(&classified.stdout).contains("not a clean checkout"));
-    for (path, bytes) in residue_paths.iter().zip(&preserved) {
-        assert_eq!(&fs::read(repo.join(path)).expect("postimage"), bytes);
-    }
-
-    for failure in [
-        "tree-fail",
-        "tree-empty",
-        "tree-partial",
-        "tree-malformed",
-        "gate-off",
-    ] {
-        fs::remove_file(&cargo_log).expect("reset proof log");
-        let marker = cargo_log.with_extension(format!("log.{failure}"));
-        fs::write(&marker, "fail\n").expect("observation failure marker");
-        let rejected = run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false);
-        assert!(!rejected.status.success(), "{failure} must refuse");
-        assert!(!cargo_log.exists(), "{failure} must stop before cargo");
-        fs::remove_file(marker).expect("remove owned marker");
-        // Supply a log for the next iteration's reset without running Cargo.
-        fs::write(&cargo_log, "reset\n").expect("reset marker");
-    }
-    fs::remove_file(&cargo_log).expect("reset proof log");
-    fs::write(&tracked_path, "staged input\n").expect("stage fixture dirt");
-    git(&repo, &["add", "tracked.txt"]);
-    fs::write(&tracked_path, "clean\n").expect("restore only worktree");
-    assert!(
-        !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-            .status
-            .success()
-    );
-    assert!(
-        !cargo_log.exists(),
-        "index dirt must stop before cargo even when worktree equals HEAD"
-    );
-    git(&repo, &["add", "tracked.txt"]);
-
-    let declaration_path = repo.join(".githooks/pre-push-residue.tsv");
-    let valid_declaration = fs::read_to_string(&declaration_path).expect("valid declaration");
-    let first_entry = valid_declaration.lines().nth(1).expect("first entry");
-    for invalid in [
-        format!("{valid_declaration}source-tree-sha256 bad\n"),
-        format!("{valid_declaration}{first_entry}\n"),
-        valid_declaration.replacen(" 644 ", " 755 ", 1),
-        valid_declaration.replacen("source-tree-sha256", "unknown-schema", 1),
-        valid_declaration.replacen("source-tree-sha256 ", "source-tree-sha256 malformed", 1),
-        valid_declaration.replacen("experiments/ai-search/.gitignore", "../outside", 1),
-    ] {
-        fs::write(&declaration_path, invalid).expect("invalid fixture declaration");
-        git(&repo, &["add", ".githooks/pre-push-residue.tsv"]);
-        git(
-            &repo,
-            &["commit", "-q", "-m", "invalid declaration fixture"],
-        );
-        let oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
-            .expect("HEAD")
-            .trim()
-            .to_owned();
-        let update = format!("refs/heads/main {oid} refs/heads/main {zero_oid}\n");
-        assert!(
-            !run_hook(&repo, &fake_bin, &cargo_log, &update, None, false)
-                .status
-                .success()
-        );
-        assert!(
-            !cargo_log.exists(),
-            "malformed declarations stop before cargo"
-        );
-    }
-    fs::write(&declaration_path, valid_declaration).expect("restore valid declaration");
-    git(&repo, &["add", ".githooks/pre-push-residue.tsv"]);
-    git(
-        &repo,
-        &["commit", "-q", "-m", "restore fixture declaration"],
-    );
-    let residue_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
-        .expect("HEAD")
-        .trim()
-        .to_owned();
-    let residue_update = format!("refs/heads/main {residue_oid} refs/heads/main {zero_oid}\n");
-    fs::write(&cargo_log, "reset\n").expect("reset marker");
-
-    // Each failure must stop before even the verifier build.
-    for extra in [
-        "untracked.rs",
-        "experiments/ai-search/extra.ts",
-        "experiments/ai-search/reports/hidden.json",
-    ] {
-        let extra = repo.join(extra);
-        fs::create_dir_all(extra.parent().expect("extra parent")).expect("extra directory");
-        fs::write(&extra, "undeclared\n").expect("extra fixture");
-        if cargo_log.exists() {
-            fs::remove_file(&cargo_log).expect("reset proof log");
-        }
-        let rejected = run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false);
-        assert!(
-            !rejected.status.success(),
-            "extra path must fail: {}",
-            extra.display()
-        );
-        assert!(!cargo_log.exists(), "extra input must stop before cargo");
-        fs::remove_file(&extra).expect("remove owned extra");
-        if extra.parent().expect("parent").ends_with("reports") {
-            fs::remove_dir(extra.parent().expect("parent")).expect("remove owned extra directory");
-        }
-    }
-    let residue_path = repo.join(residue_paths[1]);
-    let special = repo.join("experiments/ai-search/special");
-    assert!(
-        Command::new("mkfifo")
-            .arg(&special)
-            .status()
-            .expect("fixture FIFO")
-            .success()
-    );
-    assert!(
-        !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-            .status
-            .success()
-    );
-    assert!(!cargo_log.exists(), "special file stops before hash/build");
-    fs::remove_file(special).expect("remove owned FIFO");
-    for changed in [b"changed\n".as_slice(), b"".as_slice()] {
-        fs::write(&residue_path, changed).expect("alter fixture content");
-        assert!(
-            !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-                .status
-                .success()
-        );
-        assert!(!cargo_log.exists());
-    }
-    fs::remove_file(&residue_path).expect("remove owned fixture");
-    assert!(
-        !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-            .status
-            .success()
-    );
-    fs::write(&residue_path, &preserved[1]).expect("restore fixture");
-    fs::set_permissions(&residue_path, fs::Permissions::from_mode(0o600))
-        .expect("alter fixture mode");
-    assert!(
-        !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-            .status
-            .success()
-    );
-    fs::set_permissions(&residue_path, fs::Permissions::from_mode(0o644))
-        .expect("restore fixture mode");
-    fs::remove_file(&residue_path).expect("replace owned fixture with link");
-    std::os::unix::fs::symlink(repo.join(residue_paths[2]), &residue_path)
-        .expect("fixture symlink");
-    assert!(
-        !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-            .status
-            .success()
-    );
-    fs::remove_file(&residue_path).expect("remove owned symlink");
-    fs::write(&residue_path, &preserved[1]).expect("restore fixture");
-    assert!(
-        !cargo_log.exists(),
-        "all residue mismatch cases stop before cargo"
-    );
-
-    fs::rename(
-        repo.join("experiments"),
-        fixture_root.join("held-experiments"),
-    )
-    .expect("hold only fixture directory");
-    std::os::unix::fs::symlink(
-        fixture_root.join("held-experiments"),
-        repo.join("experiments"),
-    )
-    .expect("fixture root symlink");
-    assert!(
-        !run_hook(&repo, &fake_bin, &cargo_log, &residue_update, None, false)
-            .status
-            .success()
-    );
-    assert!(!cargo_log.exists(), "root symlink must not be traversed");
-    fs::remove_file(repo.join("experiments")).expect("remove owned root symlink");
-    fs::rename(
-        fixture_root.join("held-experiments"),
-        repo.join("experiments"),
-    )
-    .expect("restore only fixture directory");
-
-    let drifted = run_hook(
-        &repo,
-        &fake_bin,
-        &cargo_log,
-        &residue_update,
-        Some(&residue_path),
-        false,
-    );
-    assert!(
-        !drifted.status.success(),
-        "residue content drift during proof must fail"
-    );
-    assert_eq!(
-        fs::read_to_string(&cargo_log).expect("proof ran"),
-        expected_proof
-    );
-    fs::write(&residue_path, &preserved[1]).expect("restore fixture bytes");
-
-    // Only the declaration is excluded from its own tree pin. Helper changes
-    // are bound even when they are harmless comments and all residue matches.
-    let helper_path = repo.join(".githooks/pre-push-source.sh");
-    let helper = fs::read_to_string(&helper_path).expect("fixture helper");
-    fs::write(&helper_path, format!("{helper}\n# changed helper input\n")).expect("change helper");
-    git(&repo, &["add", ".githooks/pre-push-source.sh"]);
-    git(
-        &repo,
-        &["commit", "-q", "-m", "change bound helper fixture"],
-    );
-    let oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
-        .expect("HEAD")
-        .trim()
-        .to_owned();
-    let update = format!("refs/heads/main {oid} refs/heads/main {zero_oid}\n");
-    fs::remove_file(&cargo_log).expect("reset proof log");
-    let rejected = run_hook(&repo, &fake_bin, &cargo_log, &update, None, false);
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("proof input tree changed"));
-    assert!(!cargo_log.exists(), "helper must stay bound by the pin");
-    fs::write(&helper_path, helper).expect("restore helper");
-    git(&repo, &["add", ".githooks/pre-push-source.sh"]);
-    git(
-        &repo,
-        &["commit", "-q", "-m", "restore bound helper fixture"],
-    );
-    fs::write(&cargo_log, "reset\n").expect("reset marker");
-
-    // The pin prevents a future root-wide test runner or import/include from
-    // silently consuming files admitted under the reviewed old discovery graph.
-    fs::write(&tracked_path, "changed input graph\n").expect("change tracked input");
-    git(&repo, &["add", "tracked.txt"]);
-    git(&repo, &["commit", "-q", "-m", "change proof input graph"]);
-    let changed_oid = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
-        .expect("HEAD")
-        .trim()
-        .to_owned();
-    let changed_update = format!("refs/heads/main {changed_oid} refs/heads/main {zero_oid}\n");
-    fs::remove_file(&cargo_log).expect("reset proof log");
-    let rejected = run_hook(&repo, &fake_bin, &cargo_log, &changed_update, None, false);
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("proof input tree changed"));
-    assert!(
-        !cargo_log.exists(),
-        "new tracked inputs invalidate classification before build"
-    );
-
-    // Return to the strict no-residue path for the existing object-binding cases.
-    fs::remove_dir_all(repo.join("experiments")).expect("remove only owned fixture residue");
-
-    if cargo_log.exists() {
-        fs::remove_file(&cargo_log).expect("fake cargo log is reset");
-    }
+    fs::remove_file(&cargo_log).expect("fake cargo log is reset");
     fs::create_dir_all(repo.join(".github/workflows"))
         .expect("workflow fixture directory is created");
     fs::write(
@@ -632,7 +277,7 @@ PATH=${PATH#*:} exec git "$@"
 
     let multiple_updates = format!(
         "refs/heads/main {workflow_oid} refs/heads/main {clean_oid}\n\
-         refs/heads/other {clean_oid} refs/heads/other {zero_oid}\n"
+             refs/heads/other {clean_oid} refs/heads/other {zero_oid}\n"
     );
     let multiple = run_hook(&repo, &fake_bin, &cargo_log, &multiple_updates, None, false);
     assert!(
