@@ -101,6 +101,11 @@ lifecycle.
 
 ## Workspace impact
 
+Maildesk reply containment uses a versioned workspace contract with separate
+pre-read, approved mutation, and authenticated readback. See the
+[containment workflow](reply-containment.md) for its exact input and evidence
+boundaries; an adapter install does not adopt a catalog or authorize execution.
+
 Discovery never escapes registered boundaries:
 
 ```bash
