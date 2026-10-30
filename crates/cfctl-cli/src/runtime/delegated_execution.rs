@@ -358,11 +358,14 @@ pub(super) async fn run_delegated_plan_boundary(
     if plan.capability.workspace_d1_policy_projection.is_some() {
         return workspace_d1_projection::run(store, plan, credential, boundary).await;
     }
-    if plan.capability.workspace_d1_reply_admission.is_some() {
+    if plan.capability.reply_admission_contract().is_some() {
         return Box::pin(workspace_d1_reply_admission::run(
             store, plan, credential, boundary,
         ))
         .await;
+    }
+    if plan.capability.reply_containment_contract().is_some() {
+        return super::workspace_d1_reply_containment::run(store, plan, credential, boundary).await;
     }
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let mut delegated_input =
@@ -520,11 +523,14 @@ pub(super) async fn verify_delegated_cli_plan(
     if plan.capability.workspace_d1_policy_projection.is_some() {
         return workspace_d1_projection::verify(store, plan, credential).await;
     }
-    if plan.capability.workspace_d1_reply_admission.is_some() {
+    if plan.capability.reply_admission_contract().is_some() {
         return Box::pin(workspace_d1_reply_admission::verify(
             store, plan, credential,
         ))
         .await;
+    }
+    if plan.capability.reply_containment_contract().is_some() {
+        return super::workspace_d1_reply_containment::verify(store, plan, credential).await;
     }
     if plan.capability.verification.strategy == "trycloudflare_https_url_reaches_reviewed_origin" {
         return verify_quick_tunnel_plan(input, receipt).await;

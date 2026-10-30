@@ -535,6 +535,9 @@ fn project_private_json_query_inner(
         .or_else(|| workspace_d1_evidence::project_private_query_rows(sql[0], &rows))
         .or_else(|| workspace_d1_projection::project_private_query_rows(sql[0], &rows))
         .or_else(|| workspace_d1_reply_admission::project_private_query_rows(sql[0], &rows))
+        .or_else(|| {
+            super::workspace_d1_reply_containment::project_private_query_rows(sql[0], &rows)
+        })
         .ok_or(())?
         .map_err(|_| ())?;
     if private_config.is_some_and(|private_config| {

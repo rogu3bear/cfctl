@@ -165,7 +165,10 @@ pub(super) async fn call_command(
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
     let is_workspace_d1_projection = capability.workspace_d1_policy_projection.is_some();
-    let is_workspace_d1_reply_admission = capability.workspace_d1_reply_admission.is_some();
+    let is_workspace_d1_reply_admission = capability.reply_admission_contract().is_some();
+    let is_containment_source = capability
+        .reply_containment_contract()
+        .is_some_and(|c| c.operation_kind != cfctl_core::ReplyContainmentOperationV3::Read);
     let is_r2_private_file_upload = capability.r2_private_file_upload.is_some();
     let is_r2_capture = capability.id == cfctl_core::r2_recovery::CAPTURE_ID;
     let is_r2_capture_verify = capability.id == cfctl_core::r2_recovery::VERIFY_ID;
@@ -175,6 +178,7 @@ pub(super) async fn call_command(
     if (is_d1_approved_mln_import
         || is_workspace_d1_projection
         || is_workspace_d1_reply_admission
+        || is_containment_source
         || is_r2_private_file_upload
         || is_r2_restore
         || is_r2_capture_verify)
@@ -484,6 +488,9 @@ pub(super) async fn call_command(
             &envelope,
         );
         apply_operational_proof_index_result(&mut envelope, proof_result);
+        if capability.reply_containment_contract().is_some() {
+            super::workspace_d1_reply_containment::seal_read(store, &mut envelope)?;
+        }
         return Ok(envelope);
     }
     let secrets = platform_secrets(store);
@@ -641,7 +648,7 @@ pub(super) async fn call_command(
         })?;
         adapter_targets.insert("workspace_d1_policy_projection".to_owned(), target);
     }
-    if capability.workspace_d1_reply_admission.is_some() {
+    if capability.reply_admission_contract().is_some() {
         let profiles = ProfilesConfig::load(store)?;
         let profile = profiles.selected(arguments.profile.as_deref())?;
         let account_id = resolve_account_id(
@@ -672,6 +679,31 @@ pub(super) async fn call_command(
             CliError::Input("workspace reply-admission target could not be derived".to_owned())
         })?;
         adapter_targets.insert("workspace_d1_reply_admission".to_owned(), target);
+    }
+    if capability.reply_containment_contract().is_some() {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        let account_id = resolve_account_id(
+            store,
+            profile,
+            arguments.account.as_deref(),
+            &prepared.input,
+        )?
+        .ok_or_else(|| CliError::Input("containment requires an exact account".into()))?;
+        let source = arguments
+            .source_file
+            .as_deref()
+            .ok_or_else(|| CliError::Input("containment requires a private source file".into()))?;
+        let target = super::workspace_d1_reply_containment::prepare_plan_target(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            profile,
+            &account_id,
+            source,
+        )?;
+        adapter_targets.insert("workspace_d1_reply_containment".into(), target);
     }
     if is_r2_restore {
         let profiles = ProfilesConfig::load(store)?;

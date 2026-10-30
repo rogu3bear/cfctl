@@ -67,6 +67,7 @@ fn typed_pack(path: &Path) -> bool {
         cfctl_core::workspace_d1::transition::admission::PACK_PATH,
         super::d1_policy_projection::PACK_RELATIVE_PATH,
         super::d1_reply_admission::PACK_RELATIVE_PATH,
+        super::d1_reply_containment::PACK_RELATIVE_PATH,
         cfctl_core::d1_read_inventory::D1_READ_PACK_PATH,
         super::d1_evidence::PACK_RELATIVE_PATH,
     ]

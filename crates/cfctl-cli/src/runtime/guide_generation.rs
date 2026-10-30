@@ -576,6 +576,10 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
         }
         return command;
     }
+    generic_capability_call_argv(capability)
+}
+
+fn generic_capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
     for selector in capability
         .selectors
@@ -594,6 +598,17 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     }
     if capability_has_meaningful_request_body(capability) {
         argv.push("--body-stdin".to_owned());
+    }
+    if capability
+        .reply_containment_contract()
+        .is_some_and(|contract| {
+            contract.operation_kind != cfctl_core::ReplyContainmentOperationV3::Read
+        })
+    {
+        argv.extend([
+            "--source-file".into(),
+            "<mode-0600-containment-json-path>".into(),
+        ]);
     }
     if is_secret_output_capability(capability) {
         let sink = if is_access_service_token_create_capability(capability)
@@ -658,6 +673,11 @@ pub(super) fn guide_next_action(
     contract_ready: bool,
     call_argv: Option<&[String]>,
 ) -> GuideActionV1 {
+    if let Some(action) =
+        super::workspace_d1_reply_containment::guide_next_action(capability, contract_ready)
+    {
+        return action;
+    }
     if capability.id == cfctl_core::worker_module_upload::ID {
         return worker_module_upload_guidance();
     }
@@ -673,6 +693,10 @@ pub(super) fn guide_next_action(
         };
     }
 
+    blocked_next_action(capability, call_argv)
+}
+
+fn blocked_next_action(capability: &CapabilityV1, call_argv: Option<&[String]>) -> GuideActionV1 {
     if let Some(action) = restricted_operation_guidance(capability) {
         return action;
     }
@@ -1129,8 +1153,9 @@ pub(super) fn guide_stage_document(
         blocking_gaps,
         &live_reads,
     );
-    let summary = guide_live_read_summary(stage, &live_reads)
-        .unwrap_or_else(|| guide_stage_summary(stage, capability));
+    let summary = super::workspace_d1_reply_containment::guide_summary(stage, capability)
+        .or_else(|| guide_live_read_summary(stage, &live_reads).map(str::to_owned))
+        .unwrap_or_else(|| guide_stage_summary(stage, capability).to_owned());
     let summary = if capability.id == cfctl_cloudflare::AUDIT_PAGE_ID
         && stage == cfctl_core::GuideStage::Discover
     {
@@ -1138,7 +1163,7 @@ pub(super) fn guide_stage_document(
             "{summary} Optional first-page mode: --max-pages 1 requires explicit matching profile/account, fresh cached catalog, private_file API-token profile, since/before UTC within ten minutes, limit 1..100 and direction asc; one request, no retry/redirect/refresh/continuation, 16 MiB body, 30 seconds. Sampled LiveRead is excluded from operational proof; whole-window completeness and attribution are not established."
         )
     } else {
-        summary.to_owned()
+        summary
     };
     let evidence_class = if capability.workflow.is_some() {
         if matches!(
@@ -1380,6 +1405,11 @@ pub(super) fn guide_stage_commands(
     use cfctl_core::GuideStage;
 
     let available = contract_state == GuideContractStateV1::Available;
+    if let Some(commands) =
+        super::workspace_d1_reply_containment::guide_commands(stage, capability, available)
+    {
+        return commands;
+    }
     let conditional =
         |command: Option<Vec<String>>| available.then_some(command).flatten().into_iter().collect();
     if capability.workflow.is_some() {

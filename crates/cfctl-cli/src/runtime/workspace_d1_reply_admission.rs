@@ -172,7 +172,7 @@ pub(super) fn prepare_plan_target(
     account_id: &str,
     source: &Path,
 ) -> Result<Option<Value>> {
-    let Some(contract) = capability.workspace_d1_reply_admission.as_ref() else {
+    let Some(contract) = capability.reply_admission_contract() else {
         return Ok(None);
     };
     let config = super::workspace_d1_config::validated_config(contract.into(), input)?;
@@ -220,7 +220,7 @@ pub(super) fn prepare_plan_target(
 }
 
 pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<Vec<PathBuf>>> {
-    let Some(c) = capability.workspace_d1_reply_admission.as_ref() else {
+    let Some(c) = capability.reply_admission_contract() else {
         return Ok(None);
     };
     Ok(Some(vec![
@@ -237,7 +237,7 @@ pub(super) fn local_artifact_paths(capability: &CapabilityV1) -> Result<Option<V
     reason = "one validation boundary rebinds repository, compiler runtime, private stage, candidate, control plane, and recovery proof"
 )]
 pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<()> {
-    let Some(contract) = plan.capability.workspace_d1_reply_admission.as_ref() else {
+    let Some(contract) = plan.capability.reply_admission_contract() else {
         return Ok(());
     };
     let current = load(store, &plan.capability.id)?.ok_or_else(|| {
@@ -246,7 +246,7 @@ pub(super) fn validate_bound_plan(store: &StateStore, plan: &PlanV1) -> Result<(
                 .to_owned(),
         )
     })?;
-    if current.workspace_d1_reply_admission.as_ref() != Some(contract) {
+    if current.reply_admission_contract() != Some(contract) {
         return Err(CliError::Input(
             "reply-admission repository authority drifted; create a new plan".to_owned(),
         ));
@@ -353,8 +353,7 @@ pub(super) async fn run(
     validate_bound_plan(store, plan)?;
     let contract = plan
         .capability
-        .workspace_d1_reply_admission
-        .as_ref()
+        .reply_admission_contract()
         .ok_or_else(|| CliError::Input("reply-admission contract missing".to_owned()))?;
     let target = target(plan)?;
     let root = Path::new(&contract.repository_root);
@@ -560,8 +559,7 @@ pub(super) async fn read(
     source: &Path,
 ) -> Result<Value> {
     let contract = capability
-        .workspace_d1_reply_admission
-        .as_ref()
+        .reply_admission_contract()
         .ok_or_else(|| CliError::Input("reply-admission read contract missing".to_owned()))?;
     if contract.operation_kind != "read"
         || contract.read_projection.as_deref() != Some("maildesk_reply_admission_read_v1")
@@ -573,7 +571,7 @@ pub(super) async fn read(
     let current = load(store, &capability.id)?.ok_or_else(|| {
         CliError::Input("reply-admission read operation is no longer uniquely available".to_owned())
     })?;
-    if current.workspace_d1_reply_admission.as_ref() != Some(contract) {
+    if current.reply_admission_contract() != Some(contract) {
         return Err(CliError::Input(
             "reply-admission read repository authority drifted".to_owned(),
         ));
@@ -745,8 +743,7 @@ async fn verify_inner(
     validate_bound_plan(store, plan)?;
     let contract = plan
         .capability
-        .workspace_d1_reply_admission
-        .as_ref()
+        .reply_admission_contract()
         .ok_or_else(|| CliError::Input("reply-admission contract missing".to_owned()))?;
     let target = target(plan)?;
     let id = candidate_id(store, target)?;

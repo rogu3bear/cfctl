@@ -61,7 +61,7 @@ pub fn load_workspace_d1_reply_admission_capability(
 ) -> Result<Option<CapabilityV1>> {
     Ok(
         super::load_workspace_operation_capability(roots, capability_id)?
-            .filter(|capability| capability.workspace_d1_reply_admission.is_some()),
+            .filter(|capability| capability.reply_admission_contract().is_some()),
     )
 }
 
@@ -286,7 +286,7 @@ fn capability(o: &Operation, contract: WorkspaceD1ReplyAdmissionContractV1) -> C
     c.rollback = RollbackSpecV1 { supported: false, strategy: None, warning: Some("automatic replay and rollback are forbidden; use the separately approved exact recovery bookmark".to_owned()) };
     c.adapter_status = AdapterStatus::DelegatedCli;
     c.blocked_reason = None;
-    c.workspace_d1_reply_admission = Some(contract);
+    c.workspace_d1_reply_admission = Some(contract.into());
     c
 }
 
@@ -352,7 +352,7 @@ fn read_capability(o: &Operation, contract: WorkspaceD1ReplyAdmissionContractV1)
         warning: None,
     };
     c.adapter_status = AdapterStatus::DelegatedCli;
-    c.workspace_d1_reply_admission = Some(contract);
+    c.workspace_d1_reply_admission = Some(contract.into());
     c
 }
 
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(capability.effect, EffectClass::DataWrite);
         assert!(capability.verification_contract_supported());
         let contract = capability
-            .workspace_d1_reply_admission
+            .reply_admission_contract()
             .expect("reply-admission contract");
         assert_eq!(contract.admission_table, "reply_admissions");
         assert_eq!(
@@ -539,7 +539,7 @@ mod tests {
         assert!(capability.request_schema.is_none());
         assert!(capability.mutation_contract_gaps().is_empty());
         let contract = capability
-            .workspace_d1_reply_admission
+            .reply_admission_contract()
             .expect("reply-admission read contract");
         assert_eq!(contract.operation_kind, "read");
         assert_eq!(

@@ -256,6 +256,7 @@ pub(super) fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> 
     workspace_d1_migration::validate_bound_plan(store, plan)?;
     workspace_d1_projection::validate_bound_plan(store, plan)?;
     workspace_d1_reply_admission::validate_bound_plan(store, plan)?;
+    super::workspace_d1_reply_containment::validate_bound_plan(store, plan)?;
     r2_private_upload::validate_bound_plan(store, plan, &platform_secrets(store))?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let graph = discover_registered(store)?;

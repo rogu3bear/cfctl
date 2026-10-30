@@ -67,6 +67,9 @@ pub(super) fn load_selected(
             super::d1_policy_projection::load_selected(selected, capability_id, mode)
         }
         Carrier::Reply => super::d1_reply_admission::load_selected(selected, capability_id, mode),
+        Carrier::Containment => {
+            super::d1_reply_containment::load_selected(selected, capability_id, mode)
+        }
         Carrier::Reads => super::d1_reads::load_selected(selected, capability_id, mode),
         Carrier::Evidence => super::d1_evidence::load_selected(selected, capability_id, mode),
         Carrier::Ingress => {
@@ -91,6 +94,7 @@ enum Carrier {
     Qualification,
     Projection,
     Reply,
+    Containment,
     Reads,
     Evidence,
     Ingress,
@@ -108,6 +112,10 @@ impl Carrier {
                 Self::Projection,
             ),
             (super::d1_reply_admission::PACK_RELATIVE_PATH, Self::Reply),
+            (
+                super::d1_reply_containment::PACK_RELATIVE_PATH,
+                Self::Containment,
+            ),
             (
                 cfctl_core::d1_read_inventory::D1_READ_PACK_PATH,
                 Self::Reads,

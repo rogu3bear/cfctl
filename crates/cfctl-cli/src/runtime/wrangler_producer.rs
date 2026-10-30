@@ -428,6 +428,28 @@ pub(super) fn snapshot_at(
     discovered: &Path,
     operation: &str,
 ) -> Result<Value, CliError> {
+    snapshot_expected_source(discovered, &capability.source, operation)
+}
+
+/// Typed workspace contracts bind an explicit version instead of a catalog
+/// help entry. Preserve the same executable, interpreter and closure proof.
+pub(super) fn snapshot_declared_version(
+    discovered: &Path,
+    version: &str,
+    operation: &str,
+) -> Result<Value, CliError> {
+    snapshot_expected_source(
+        discovered,
+        &format!("wrangler {version} {operation} help"),
+        operation,
+    )
+}
+
+fn snapshot_expected_source(
+    discovered: &Path,
+    expected_source: &str,
+    operation: &str,
+) -> Result<Value, CliError> {
     let executable = fs::canonicalize(discovered).map_err(|source| CliError::Io {
         path: discovered.display().to_string(),
         source,
@@ -475,10 +497,9 @@ pub(super) fn snapshot_at(
         .env("NO_COLOR", "1")
         .env("WRANGLER_SEND_METRICS", "false");
     let version = probe_output(&mut version_command)?.trim().to_owned();
-    if version.is_empty() || capability.source != format!("wrangler {version} {operation} help") {
+    if version.is_empty() || expected_source != format!("wrangler {version} {operation} help") {
         return Err(CliError::Input(format!(
-            "Wrangler producer version `{version}` does not match the catalog source `{}`; sync the catalog before planning",
-            capability.source
+            "Wrangler producer version `{version}` does not match the catalog source `{expected_source}`; sync the catalog before planning"
         )));
     }
     Ok(json!({
@@ -487,7 +508,7 @@ pub(super) fn snapshot_at(
         "execution_closure": closure,
         "interpreter": interpreter,
         "version": version,
-        "catalog_source": capability.source,
+        "catalog_source": expected_source,
     }))
 }
 
