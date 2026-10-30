@@ -117,6 +117,19 @@ verifiers are unchanged. Source/compiler adoption must be qualified separately;
 consumers admitting compiler versions explicitly must review version 4 before
 accepting its new receipts. Old receipts remain historical evidence, not newly
 qualified observations under the new build.
+Compiler version 5 additionally admits direct, no-argument
+`PRAGMA integrity_check;`, including an explicit `main` qualifier, with the
+exact output name `integrity_check`. It retains the same statement, schema,
+parameter, source, credential, time and output bounds; arguments, assignments,
+other schemas and additional statements remain rejected. A committed success
+probe can require exactly one non-null text row with value `ok`. This preserves
+full-integrity semantics; it does not substitute `quick_check` or establish
+that D1 accepts the direct PRAGMA. Provider support must be qualified separately.
+All newly emitted read results carry compiler version 5, including unchanged
+inventories. Consumers with explicit version allowlists must review and admit
+version 5 and rebind their declared source before accepting those receipts.
+Older receipts remain historical. The separate transition full-integrity
+consumer's pinned SQL and provider-activation requirements are unchanged.
 Only declared main-table columns and compiler-approved functions are
 accepted. Undeclared or caller-supplied parameters, multiple statements, DDL/DML, EXPLAIN, transactions,
 attachment, configuration PRAGMAs, recursive CTEs, extension calls and
