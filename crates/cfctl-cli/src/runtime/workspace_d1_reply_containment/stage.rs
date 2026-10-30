@@ -93,7 +93,8 @@ fn publish(dir: &PrivateDirectory, name: &str, bytes: &[u8], id: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{directory, load, retain_sql, write};
+    use cfctl_storage::{PrivateDirectory, StateStore};
     use serde_json::json;
     #[test]
     fn stage_is_private_immutable_and_bound_to_its_bytes()

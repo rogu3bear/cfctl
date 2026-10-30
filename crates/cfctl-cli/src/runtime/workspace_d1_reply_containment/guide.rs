@@ -143,9 +143,10 @@ pub(in crate::runtime) fn guide_summary(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)] // Missing expected guide stages must fail the test.
-    use super::*;
+    use super::Operation;
     use cfctl_core::{
-        AdapterStatus, CapabilityAuthorityScopeV1, EffectClass, GuideContractStateV1, RiskClass,
+        AdapterStatus, CapabilityAuthorityScopeV1, CapabilityV1, EffectClass, GuideContractStateV1,
+        GuideStage, RiskClass,
     };
     #[test]
     fn all_three_guides_keep_inputs_and_proof_stages_distinct() {
