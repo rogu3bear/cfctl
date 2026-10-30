@@ -1,5 +1,11 @@
 //! Executable, interpreter, and dependency identity shared by the two frozen
 //! Wrangler transports. Each caller supplies its exact catalog operation.
+mod bin_alias;
+#[cfg(test)]
+pub(super) mod test_support;
+#[cfg(test)]
+mod tests;
+
 use super::CliError;
 use cfctl_core::{CapabilityV1, hash_value};
 use serde_json::{Value, json};
@@ -236,6 +242,26 @@ fn producer_package_roots(wrangler_root: &Path) -> Result<Vec<(String, PathBuf)>
 }
 
 fn producer_closure(executable: &Path) -> Result<Value, CliError> {
+    producer_closure_with_limits(executable, MAX_PRODUCER_FILE_COUNT, MAX_PRODUCER_BYTES)
+}
+
+fn package_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    Ok(WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CliError::Input(format!("Wrangler package cannot be inspected: {error}")))?
+        .into_iter()
+        .filter(|entry| entry.path() != root)
+        .map(walkdir::DirEntry::into_path)
+        .collect())
+}
+
+fn producer_closure_with_limits(
+    executable: &Path,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<Value, CliError> {
     let package_root = wrangler_package_root(executable);
     let executable_parent = executable
         .parent()
@@ -249,17 +275,7 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
     let mut files = Vec::new();
     for (component, root) in &roots {
         let mut paths = if package_root.is_some() {
-            WalkDir::new(root)
-                .follow_links(false)
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    CliError::Input(format!("Wrangler package cannot be inspected: {error}"))
-                })?
-                .into_iter()
-                .filter(|entry| entry.path() != root)
-                .map(walkdir::DirEntry::into_path)
-                .collect::<Vec<_>>()
+            package_paths(root)?
         } else {
             vec![executable.to_path_buf()]
         };
@@ -269,7 +285,37 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
                 path: path.display().to_string(),
                 source,
             })?;
-            if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            if metadata.file_type().is_symlink() {
+                let Some(package_root) = package_root.as_ref() else {
+                    return Err(CliError::Input(format!(
+                        "Wrangler producer closure contains an ambiguous entry `{}`",
+                        path.display()
+                    )));
+                };
+                let (binding, size) = bin_alias::snapshot(
+                    &path,
+                    &roots,
+                    common_node_modules(package_root)?,
+                    max_bytes - total_bytes,
+                )?;
+                total_bytes += size;
+                let relative = path.strip_prefix(root).map_err(|_| {
+                    CliError::Input("Wrangler producer closure escaped its package root".to_owned())
+                })?;
+                files.push(json!({
+                    "component": component,
+                    "path": relative.to_string_lossy().replace('\\', "/"),
+                    "kind": "package_bin_alias",
+                    "binding": binding,
+                }));
+                if files.len() > max_files {
+                    return Err(CliError::Input(format!(
+                        "Wrangler producer closure contains more than {max_files} files"
+                    )));
+                }
+                continue;
+            }
+            if !metadata.is_file() && !metadata.is_dir() {
                 return Err(CliError::Input(format!(
                     "Wrangler producer closure contains an ambiguous entry `{}`",
                     path.display()
@@ -281,9 +327,9 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
             total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
                 CliError::Input("Wrangler producer closure size overflowed".to_owned())
             })?;
-            if total_bytes > MAX_PRODUCER_BYTES {
+            if total_bytes > max_bytes {
                 return Err(CliError::Input(format!(
-                    "Wrangler producer closure exceeds {MAX_PRODUCER_BYTES} bytes"
+                    "Wrangler producer closure exceeds {max_bytes} bytes"
                 )));
             }
             let bytes = fs::read(&path).map_err(|source| CliError::Io {
@@ -299,21 +345,30 @@ fn producer_closure(executable: &Path) -> Result<Value, CliError> {
                 "size": metadata.len(),
                 "sha256": hex::encode(Sha256::digest(&bytes)),
             }));
-            if files.len() > MAX_PRODUCER_FILE_COUNT {
+            if files.len() > max_files {
                 return Err(CliError::Input(format!(
-                    "Wrangler producer closure contains more than {MAX_PRODUCER_FILE_COUNT} files"
+                    "Wrangler producer closure contains more than {max_files} files"
                 )));
             }
         }
     }
-    let manifest = json!(&files);
+    producer_manifest(&roots, &files, total_bytes, package_root.is_some())
+}
+
+fn producer_manifest(
+    roots: &[(String, PathBuf)],
+    files: &[Value],
+    total_bytes: u64,
+    package: bool,
+) -> Result<Value, CliError> {
+    let manifest = json!(files);
     let manifest_sha256 = hash_value(&manifest).map_err(|error| {
         CliError::Input(format!(
             "Wrangler producer closure cannot be hashed: {error}"
         ))
     })?;
     Ok(json!({
-        "kind": if package_root.is_some() { "node_dependency_graph" } else { "single_file" },
+        "kind": if package { "node_dependency_graph" } else { "single_file" },
         "roots": roots.iter().map(|(component, root)| json!({"component": component, "root": root})).collect::<Vec<_>>(),
         "file_count": files.len(),
         "total_bytes": total_bytes,

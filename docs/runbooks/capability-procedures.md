@@ -1079,7 +1079,13 @@ empty tree, path ambiguity, Wrangler-ignored sources, more than 20,000 assets,
 and files above the 25 MiB provider limit. It also binds the canonical Wrangler
 launcher, its exact interpreter, and a deterministic path/size/SHA-256 manifest
 of Wrangler's complete installed production/optional dependency graph. The
-bounded graph includes `wrangler-dist/cli.js`, the `blake3-wasm` implementation
+producer admits a package-manager bin symlink only when it directly matches
+the owning package's declared dependency and that dependency's `bin` entry.
+It binds the literal link, owner, target path and target bytes; dangling,
+escaping, chained and directory aliases remain rejected. Other symlinks remain
+unsupported. This producer rule applies to both Pages and frozen Worker
+artifacts; it does not relax the symlink-free application artifact contract.
+The bounded graph includes `wrangler-dist/cli.js`, the `blake3-wasm` implementation
 that determines provider asset hashes, `esbuild`, and the selected
 platform-native builder used for `_worker.js`, along with the version that
 generated the catalog carrier. When `_worker.js` is present, cfctl uses that

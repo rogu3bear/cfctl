@@ -276,13 +276,7 @@ impl BoundFrozenArtifact {
         }
         let discovered = which::which("wrangler")
             .map_err(|_| files::failure("Wrangler disappeared before execution"))?;
-        if wrangler_producer::snapshot_at(capability, &discovered, "versions upload")?
-            != self.admitted.producer
-        {
-            return Err(files::failure(
-                "Wrangler executable, interpreter, or dependency closure drifted",
-            ));
-        }
+        validate_bound_producer_at(capability, &self.admitted.producer, &discovered)?;
         Ok(())
     }
 
@@ -306,6 +300,19 @@ impl BoundFrozenArtifact {
             "provider_output_retained": false, "produced_version_id": version_id,
         }))
     }
+}
+
+fn validate_bound_producer_at(
+    capability: &CapabilityV1,
+    expected: &Value,
+    discovered: &Path,
+) -> Result<()> {
+    if &wrangler_producer::snapshot_at(capability, discovered, "versions upload")? != expected {
+        return Err(files::failure(
+            "Wrangler executable, interpreter, or dependency closure drifted",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn stage(
@@ -388,4 +395,28 @@ pub(super) fn stage(
         admitted,
     };
     Ok(Some(bound))
+}
+
+#[cfg(test)]
+mod producer_alias_tests {
+    #![allow(clippy::expect_used)]
+    use super::{validate_bound_producer_at, wrangler_producer};
+    use crate::runtime::wrangler_producer::test_support::BinFixture;
+
+    #[test]
+    fn frozen_worker_producer_rechecks_declared_bin_alias_identity() {
+        for drift in ["link", "bytes", "declaration"] {
+            let fixture = BinFixture::new(true);
+            let capability = BinFixture::capability("versions upload");
+            let expected =
+                wrangler_producer::snapshot_at(&capability, &fixture.executable, "versions upload")
+                    .expect("admitted alias");
+            validate_bound_producer_at(&capability, &expected, &fixture.executable)
+                .expect("unchanged producer");
+            fixture.drift(drift);
+            assert!(
+                validate_bound_producer_at(&capability, &expected, &fixture.executable).is_err()
+            );
+        }
+    }
 }

@@ -766,6 +766,23 @@ fn producer_identity_rejects_unchanged_launcher_with_drifted_asset_hasher() {
 }
 
 #[test]
+fn pages_producer_rechecks_declared_bin_alias_identity() {
+    use crate::runtime::wrangler_producer::test_support::BinFixture;
+
+    for drift in ["link", "bytes", "declaration"] {
+        let fixture = BinFixture::new(true);
+        let capability = BinFixture::capability("pages deploy");
+        let producer =
+            wrangler_producer_at(&capability, &fixture.executable).expect("admitted alias");
+        let target = json!({"pages_deployment":{"provider_request":{"producer":producer}}});
+        validate_bound_producer_at(&capability, &target, &fixture.executable)
+            .expect("unchanged producer");
+        fixture.drift(drift);
+        assert!(validate_bound_producer_at(&capability, &target, &fixture.executable).is_err());
+    }
+}
+
+#[test]
 fn wrangler_output_requires_one_consistent_provider_returned_id() {
     let id = "22222222-2222-4222-8222-222222222222";
     let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
