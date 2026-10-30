@@ -65,17 +65,19 @@ impl AuthorityContext {
 enum ReadKind {
     WorkspaceReplySubdomainIngress,
     WorkspaceD1ReplyAdmission,
+    WorkspaceD1ReplyContainment,
     WorkspaceD1Evidence,
     Generic,
 }
 
 impl ReadKind {
     fn classify(capability: &CapabilityV1) -> Self {
-        if capability.workspace_reply_subdomain_ingress.is_some() {
+        if capability.reply_containment_contract().is_some() {
+            Self::WorkspaceD1ReplyContainment
+        } else if capability.workspace_reply_subdomain_ingress.is_some() {
             Self::WorkspaceReplySubdomainIngress
         } else if capability
-            .workspace_d1_reply_admission
-            .as_ref()
+            .reply_admission_contract()
             .is_some_and(|contract| contract.operation_kind == "read")
         {
             Self::WorkspaceD1ReplyAdmission
@@ -88,6 +90,7 @@ impl ReadKind {
 
     fn receipt_is_complete(self, receipt: &Value) -> bool {
         match self {
+            Self::WorkspaceD1ReplyContainment => true,
             Self::WorkspaceReplySubdomainIngress => {
                 workspace_reply_subdomain_ingress::receipt_is_complete(receipt)
             }
@@ -101,6 +104,13 @@ impl ReadKind {
 
     fn apply_verification(self, envelope: &mut ResultEnvelopeV2, receipt_is_complete: bool) {
         match self {
+            Self::WorkspaceD1ReplyContainment => {
+                envelope.ok = true;
+                envelope.performed = true;
+                envelope.operation_id = Some(uuid::Uuid::new_v4().to_string());
+                envelope.verification.state = VerificationState::Passed;
+                envelope.verification.basis = Some("fixed native containment read completed; result distinguishes observed containment from ambiguity".into());
+            }
             Self::WorkspaceReplySubdomainIngress => {
                 set_workspace_reply_subdomain_ingress_verification(envelope, receipt_is_complete);
             }
@@ -131,6 +141,20 @@ impl ExecutionContext<'_> {
         let request = &self.request;
         let authority = &self.authority;
         let receipt = match self.kind {
+            ReadKind::WorkspaceD1ReplyContainment => {
+                let account_id =
+                    authority.exact_account("containment read requires an exact account")?;
+                super::workspace_d1_reply_containment::read(
+                    request.store,
+                    request.capability,
+                    request.input,
+                    &authority.credential,
+                    &authority.profile,
+                    account_id,
+                    request.reply_admission_source,
+                )
+                .await?
+            }
             ReadKind::WorkspaceReplySubdomainIngress => {
                 let account_id = authority.exact_account(
                     "workspace reply-subdomain ingress read requires an exact account",

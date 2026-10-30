@@ -34,6 +34,12 @@ pub use artifact_digest::{
     WORKER_VERSION_ARTIFACT_DIGEST_ID, WORKER_VERSION_ARTIFACT_PATH,
 };
 
+pub mod reply_lifecycle;
+pub use reply_lifecycle::{
+    ReplyContainmentOperationV3, ReplyContainmentSchemaV3, WorkspaceD1ReplyContainmentContractV3,
+    WorkspaceD1ReplyLifecycleContract,
+};
+
 mod maildesk_evidence;
 pub use maildesk_evidence::MaildeskD1EvidenceV1;
 pub mod workspace_d1;
@@ -1878,7 +1884,7 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_d1_policy_projection: Option<WorkspaceD1PolicyProjectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_d1_reply_admission: Option<WorkspaceD1ReplyAdmissionContractV1>,
+    pub workspace_d1_reply_admission: Option<WorkspaceD1ReplyLifecycleContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_reply_subdomain_ingress: Option<WorkspaceReplySubdomainIngressContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1928,6 +1934,22 @@ pub const WORKER_DEPLOYMENT_PLAN_CAPABILITY_ID: &str = "worker-deployment-plan";
 pub const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
 
 impl CapabilityV1 {
+    /// The legacy slot retains admission-v1 wire bytes while containment-v2
+    /// remains a separate, non-interchangeable lifecycle contract.
+    #[must_use]
+    pub fn reply_admission_contract(&self) -> Option<&WorkspaceD1ReplyAdmissionContractV1> {
+        self.workspace_d1_reply_admission
+            .as_ref()
+            .and_then(WorkspaceD1ReplyLifecycleContract::admission)
+    }
+
+    #[must_use]
+    pub fn reply_containment_contract(&self) -> Option<&WorkspaceD1ReplyContainmentContractV3> {
+        self.workspace_d1_reply_admission
+            .as_ref()
+            .and_then(WorkspaceD1ReplyLifecycleContract::containment)
+    }
+
     /// Reports whether this capability may only execute against a qualifying
     /// evidence authority.
     ///
@@ -2273,13 +2295,17 @@ impl CapabilityV1 {
                                 && contract.rollback_capability_id == "d1-restore-exact-bookmark"
                         })
             }
+            "workspace_d1_reply_containment_pre_read_v3"
+            | "workspace_d1_reply_containment_apply_v3"
+            | "workspace_d1_reply_containment_readback_v3" => self.reply_containment_contract()
+                .is_some_and(|contract| contract.verification_supported(self)),
             "workspace_d1_reply_admission_exact_readback" => {
                 self.authority_scope == Some(CapabilityAuthorityScopeV1::WorkspaceOwned)
                     && self.adapter_status == AdapterStatus::DelegatedCli
                     && self.method == "POST"
                     && self.risk == RiskClass::ScopedWrite
                     && self.effect == EffectClass::DataWrite
-                    && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
+                    && self.reply_admission_contract().is_some_and(|contract| {
                         contract.operation_kind == "activate"
                             && !contract.repository_root.is_empty()
                             && !contract.repository_head.is_empty()
@@ -2308,7 +2334,7 @@ impl CapabilityV1 {
                     && !self.mutating
                     && self.risk == RiskClass::Read
                     && self.effect == EffectClass::ReadOnly
-                    && self.workspace_d1_reply_admission.as_ref().is_some_and(|contract| {
+                    && self.reply_admission_contract().is_some_and(|contract| {
                         contract.operation_kind == "read"
                             && !contract.repository_root.is_empty()
                             && !contract.repository_head.is_empty()

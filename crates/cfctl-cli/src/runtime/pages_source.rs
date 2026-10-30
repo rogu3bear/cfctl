@@ -581,6 +581,9 @@ pub(super) fn plan_local_artifact_paths(
     if let Some(paths) = workspace_d1_reply_admission::local_artifact_paths(capability)? {
         return Ok(paths);
     }
+    if let Some(paths) = super::workspace_d1_reply_containment::local_artifact_paths(capability)? {
+        return Ok(paths);
+    }
     if worker_deployment::binds_artifact(capability) {
         return worker_deployment::artifact_paths(capability, input);
     }

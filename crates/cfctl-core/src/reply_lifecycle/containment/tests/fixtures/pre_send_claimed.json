@@ -1,0 +1,273 @@
+{
+  "source": {
+    "compiler_sha256": "sha256:2aa0d5ca68d2980b0ae057d14d54d32031a6a1699809cd4ddd685fde717b5964",
+    "head": "b8dee8896e39807543d7b4011fa1982c96506210",
+    "state": "V3_OWNER_LOCAL_CI_PASS"
+  },
+  "now": "2026-08-25T12:00:30.000Z",
+  "request": {
+    "schema_version": 3,
+    "action": "pre_send_rollback",
+    "candidate": {
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "dirty": false
+    },
+    "control_plane": {
+      "cfctl_build_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "profile_sha256": "sha256:ce584b5a00056c67b50bc9be504fc3c39722b7a263eacb3781703e3ba64cce9c",
+      "account_sha256": "sha256:9f6e2bd23f7dbb21236af0351f30e6945b267d7c8b8ae777868e9196a0b588c3",
+      "credential_generation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "production_database_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "controller": {
+      "transaction_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "correlation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "scope_manifest_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "source": {
+      "route_id": "route:security",
+      "relay_id": "relay:old",
+      "reply_admission_id": "admission:one"
+    },
+    "reason": "wrong_identity",
+    "requested_at": "2026-08-25T12:00:00.000Z"
+  },
+  "pre_read": {
+    "schema_version": 2,
+    "generated_at": "2026-08-25T12:00:05.000Z",
+    "ok": true,
+    "command": "call",
+    "capability_id": "star-maildesk-cf.reply-containment-pre-read",
+    "operation_id": "pre-read:test",
+    "profile_id": "profile:test",
+    "account_id": "account:test",
+    "performed": true,
+    "policy_decision": {
+      "schema_version": 1,
+      "disposition": "auto_execute",
+      "reasons": [],
+      "requires_cost_ceiling": false
+    },
+    "verification": {
+      "state": "passed",
+      "basis": null,
+      "observed_at": null
+    },
+    "evidence": [],
+    "error": null,
+    "attestation": null,
+    "result": {
+      "adapter": "maildesk_reply_containment_pre_read_v3",
+      "authority": {
+        "cfctl_build_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "profile_sha256": "sha256:ce584b5a00056c67b50bc9be504fc3c39722b7a263eacb3781703e3ba64cce9c",
+        "account_sha256": "sha256:9f6e2bd23f7dbb21236af0351f30e6945b267d7c8b8ae777868e9196a0b588c3",
+        "credential_generation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "production_database_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "observed_at": "2026-08-25T12:00:05.000Z",
+      "provider_output_retained": false,
+      "body_returned": false,
+      "request_sha256": "sha256:00c68083fdf3d1829df68bbe209041b9771d6b2a581f5e2488544d4e95b9a732",
+      "source_state": {
+        "route_id": "route:security",
+        "relay": {
+          "id": "relay:old",
+          "revoked_at": null,
+          "superseded_by_relay_id": null,
+          "expires_at": "2099-08-26T00:00:00.000Z",
+          "route_id": "route:security",
+          "thread_id": "thread:one"
+        },
+        "reply_admission": {
+          "id": "admission:one",
+          "status": "claimed",
+          "transaction_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "thread_id": "thread:one",
+          "correlation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "scope_manifest_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "candidate_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+          "claimed_attempt_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+          "provider_boundary_at": null,
+          "terminal_at": null,
+          "expires_at": "2099-08-26T00:00:00.000Z",
+          "route_id": "route:security",
+          "relay_id": "relay:old",
+          "claimed_attempt_id": "attempt:one",
+          "claimed_payload_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "replacement": null
+      },
+      "source_state_sha256": "sha256:7d3df49e363065295863b09cfc923fc1be814ea6a25b6cb3afcfc9b1b5bc9b63",
+      "match_count": 1,
+      "relationship_verified": true,
+      "attempt_observation": {
+        "schema_version": 1,
+        "kind": "maildesk_reply_attempt_observation",
+        "admission_ref_sha256": "sha256:a0d9a356a69b68fd5cb67cbf97362a358cbfc869ecd28f6f9334197d9c78ef9c",
+        "relay_ref_sha256": "sha256:a9e74984b169815e3ab25f9ade09fd46ba201834ecd4de8160d95527d1140746",
+        "source_admission_transaction_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "attempt_ref_sha256": "sha256:bf9d12d0417e35489ed0f5844fe21a16d093c53b1280456e521697f462183b99",
+        "attempt_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "claimed_payload_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "status": "authorized",
+        "provider_message_id_sha256": null,
+        "error_code": null,
+        "updated_at": "2026-08-25T11:59:30.000Z"
+      },
+      "attempt_observation_sha256": "sha256:e810e83c203eeac20b8eb609d0ef1dddfd2c1b7d05870c0e0aad151aeb57b15d",
+      "prior_containment": null
+    }
+  },
+  "compiled": {
+    "schema_version": 3,
+    "kind": "maildesk_reply_containment",
+    "status": "plan_required",
+    "performed": false,
+    "provider_boundary_performed": false,
+    "send_blocked": false,
+    "replay_allowed": false,
+    "corrective_send_allowed": false,
+    "retry_allowed": false,
+    "cannot_unsend": false,
+    "attempt_observation_sha256": "sha256:e810e83c203eeac20b8eb609d0ef1dddfd2c1b7d05870c0e0aad151aeb57b15d",
+    "source_state": {
+      "route_id": "route:security",
+      "relay": {
+        "id": "relay:old",
+        "revoked_at": null,
+        "superseded_by_relay_id": null,
+        "expires_at": "2099-08-26T00:00:00.000Z",
+        "route_id": "route:security",
+        "thread_id": "thread:one"
+      },
+      "reply_admission": {
+        "id": "admission:one",
+        "status": "claimed",
+        "transaction_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "thread_id": "thread:one",
+        "correlation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "scope_manifest_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "candidate_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "claimed_attempt_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "provider_boundary_at": null,
+        "terminal_at": null,
+        "expires_at": "2099-08-26T00:00:00.000Z",
+        "route_id": "route:security",
+        "relay_id": "relay:old",
+        "claimed_attempt_id": "attempt:one",
+        "claimed_payload_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "replacement": null
+    },
+    "attempt_observation": {
+      "schema_version": 1,
+      "kind": "maildesk_reply_attempt_observation",
+      "admission_ref_sha256": "sha256:a0d9a356a69b68fd5cb67cbf97362a358cbfc869ecd28f6f9334197d9c78ef9c",
+      "relay_ref_sha256": "sha256:a9e74984b169815e3ab25f9ade09fd46ba201834ecd4de8160d95527d1140746",
+      "source_admission_transaction_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "attempt_ref_sha256": "sha256:bf9d12d0417e35489ed0f5844fe21a16d093c53b1280456e521697f462183b99",
+      "attempt_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "claimed_payload_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "status": "authorized",
+      "provider_message_id_sha256": null,
+      "error_code": null,
+      "updated_at": "2026-08-25T11:59:30.000Z"
+    },
+    "prior_containment": null,
+    "readback_binding": {
+      "containment_transaction_sha256": "sha256:ce3ac681d006e71e040d4109cd496bb808344440c34454ebeb372d623e655d02",
+      "controller_transaction_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source_admission_transaction_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "correlation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "scope_manifest_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "source_state_sha256": "sha256:7d3df49e363065295863b09cfc923fc1be814ea6a25b6cb3afcfc9b1b5bc9b63",
+      "route_ref_sha256": "sha256:ca137fa5425451f28da5bb7914f830fb59e310402610c59380e7ae99885c21c1",
+      "relay_ref_sha256": "sha256:a9e74984b169815e3ab25f9ade09fd46ba201834ecd4de8160d95527d1140746",
+      "reply_admission_ref_sha256": "sha256:a0d9a356a69b68fd5cb67cbf97362a358cbfc869ecd28f6f9334197d9c78ef9c",
+      "attempt_observation_sha256": "sha256:e810e83c203eeac20b8eb609d0ef1dddfd2c1b7d05870c0e0aad151aeb57b15d"
+    },
+    "authority": {
+      "cfctl_build_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "profile_sha256": "sha256:ce584b5a00056c67b50bc9be504fc3c39722b7a263eacb3781703e3ba64cce9c",
+      "account_sha256": "sha256:9f6e2bd23f7dbb21236af0351f30e6945b267d7c8b8ae777868e9196a0b588c3",
+      "credential_generation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "production_database_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "pre_read_operation_id": "pre-read:test",
+    "pre_read_receipt_sha256": "sha256:b608fdb257fd064b693dc934a08aeeae89b1271edc37b5b8095df76ee4c5db3d",
+    "request_sha256": "sha256:00c68083fdf3d1829df68bbe209041b9771d6b2a581f5e2488544d4e95b9a732",
+    "transaction_sha256": "sha256:ce3ac681d006e71e040d4109cd496bb808344440c34454ebeb372d623e655d02",
+    "plan": {
+      "capability_id": "star-maildesk-cf.reply-containment-apply",
+      "effect": "plan_v2_required",
+      "semantic_bundle_sha256": "sha256:4870e045c479ad1dec79a6152487dcfffa3f6227ab94b683ba29de0da95f00ce",
+      "records": [
+        {
+          "kind": "relay_revocation",
+          "id": "relay-revocation:ce3ac681d006e71e040d4109cd496bb8",
+          "controller_transaction_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "relay_id": "relay:old",
+          "reason": "wrong_identity",
+          "revoked_at": "2026-08-25T12:00:00.000Z",
+          "expected_revoked_at": null,
+          "expected_expires_at": "2099-08-26T00:00:00.000Z",
+          "expected_superseded_by_relay_id": null
+        },
+        {
+          "id": "admission-containment:ce3ac681d006e71e040d4109cd496bb8",
+          "controller_transaction_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "reply_admission_id": "admission:one",
+          "reply_admission_transaction_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "expected_status": "claimed",
+          "expected_claimed_attempt_id": "attempt:one",
+          "expected_claimed_payload_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "expected_claimed_attempt_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+          "expected_provider_boundary_at": null,
+          "expected_terminal_at": null,
+          "expected_expires_at": "2099-08-26T00:00:00.000Z",
+          "kind": "reply_admission_revocation",
+          "terminal_status": "revoked",
+          "revoked_at": "2026-08-25T12:00:00.000Z"
+        },
+        {
+          "kind": "route_outbound_quarantine",
+          "id": "route-quarantine:ce3ac681d006e71e040d4109cd496bb8",
+          "controller_transaction_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "route_id": "route:security",
+          "relay_id": "relay:old",
+          "reply_admission_id": "admission:one",
+          "action": "quarantine",
+          "reason": "wrong_identity",
+          "quarantined_at": "2026-08-25T12:00:00.000Z"
+        },
+        {
+          "kind": "containment_plan",
+          "id": "containment-plan:ce3ac681d006e71e040d4109cd496bb8",
+          "controller_transaction_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "transaction_sha256": "sha256:ce3ac681d006e71e040d4109cd496bb808344440c34454ebeb372d623e655d02",
+          "correlation_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "scope_manifest_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "operation_kind": "pre_send_rollback",
+          "cannot_unsend": false,
+          "attempt_observation_sha256": "sha256:e810e83c203eeac20b8eb609d0ef1dddfd2c1b7d05870c0e0aad151aeb57b15d",
+          "authority_sha256": "sha256:504d21de45f3cfc5ba02e24bd6ea33498e28525bb75ab97511dcf8b32cb437c2",
+          "pre_read_receipt_sha256": "sha256:b608fdb257fd064b693dc934a08aeeae89b1271edc37b5b8095df76ee4c5db3d",
+          "source_state_sha256": "sha256:7d3df49e363065295863b09cfc923fc1be814ea6a25b6cb3afcfc9b1b5bc9b63",
+          "route_id": "route:security",
+          "relay_id": "relay:old",
+          "reply_admission_id": "admission:one",
+          "outcome": "planned",
+          "record_count": 4
+        }
+      ]
+    },
+    "rollback": {
+      "strategy": "new_controller_transaction",
+      "old_relay_reactivation_allowed": false,
+      "old_relay_expiry_extension_allowed": false
+    },
+    "body_free": true
+  }
+}

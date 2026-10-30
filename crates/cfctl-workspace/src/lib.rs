@@ -22,10 +22,12 @@ mod d1_qualification;
 mod d1_read_source;
 mod d1_reads;
 mod d1_reply_admission;
+mod d1_reply_containment;
 pub use d1_read_source::{
     load_workspace_d1_read_from_checkout, revalidate_workspace_d1_read_registration,
 };
 pub use d1_reads::revalidate_workspace_d1_read_inventory;
+pub use d1_reply_containment::load_workspace_d1_reply_containment_capability;
 mod operation_claims;
 mod operation_identity;
 mod operation_pack;

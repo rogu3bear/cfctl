@@ -31,6 +31,7 @@ const DESCRIPTOR_MAC_DOMAIN: &str = "evidence-descriptor-v2";
 const PROOF_MAC_DOMAIN: &str = "operational-proof-v2";
 
 mod history;
+mod reply_containment;
 pub(crate) use history::AuthenticatedHistoryV1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1161,7 +1162,9 @@ fn validate_descriptor(descriptor: &EvidenceDescriptorV1, expected_body_path: &P
         || (descriptor.metadata != Value::Null
             && !(descriptor.class == EvidenceClass::LocalProof
                 && descriptor.metadata
-                    == json!({"native_producer":cfctl_core::pages_artifact::PRODUCER_ID,"version":1})))
+                    == json!({"native_producer":cfctl_core::pages_artifact::PRODUCER_ID,"version":1}))
+            && !(descriptor.class == EvidenceClass::LiveRead
+                && reply_containment::known_origin(&descriptor.metadata)))
     {
         return Err(unsafe_managed_document(
             expected_body_path,

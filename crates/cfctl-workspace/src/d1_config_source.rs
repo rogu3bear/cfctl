@@ -4,6 +4,7 @@ use super::{Result, WorkspaceError, git_blob, git_optional, inspect_git};
 use cfctl_core::{
     WorkspaceD1EvidenceContractV1, WorkspaceD1MigrationContractV1,
     WorkspaceD1PolicyProjectionContractV1, WorkspaceD1ReplyAdmissionContractV1,
+    WorkspaceD1ReplyContainmentContractV3,
 };
 use sha2::{Digest as _, Sha256};
 use std::path::{Component, Path};
@@ -46,7 +47,8 @@ borrow_source!(
     WorkspaceD1MigrationContractV1,
     WorkspaceD1EvidenceContractV1,
     WorkspaceD1PolicyProjectionContractV1,
-    WorkspaceD1ReplyAdmissionContractV1
+    WorkspaceD1ReplyAdmissionContractV1,
+    WorkspaceD1ReplyContainmentContractV3
 );
 
 impl D1ConfigSource<'_> {
