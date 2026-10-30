@@ -1,7 +1,11 @@
 //! Disposable package layout shared by the actual producer consumers' tests.
-#![allow(clippy::expect_used, clippy::wildcard_imports)]
-use super::*;
-use std::os::unix::fs::{PermissionsExt, symlink};
+#![allow(clippy::expect_used)]
+use cfctl_core::CapabilityV1;
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::PathBuf,
+};
 
 pub(crate) struct BinFixture {
     pub _root: tempfile::TempDir,
